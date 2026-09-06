@@ -10,6 +10,39 @@ export interface Env {
 
 export { RoomDO };
 
+const roomCreationLimit = new Map<string, { count: number; resetAt: number }>();
+
+function checkRoomRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = roomCreationLimit.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    roomCreationLimit.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (entry.count >= 20) {
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
+function applySecurityHeaders(res: Response): Response {
+  const headers = new Headers(res.headers);
+  headers.set("X-Frame-Options", "DENY");
+  headers.set("X-Content-Type-Options", "nosniff");
+  headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  headers.set(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws: https://rtc.live.cloudflare.com; frame-ancestors 'none';",
+  );
+  headers.set("Permissions-Policy", "display-capture=(self), camera=(), microphone=()");
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -30,19 +63,20 @@ export default {
       return stub.fetch(request);
     }
 
-    // There is deliberately no /api/ice endpoint. TURN credentials let the bearer
-    // relay traffic through our Cloudflare allocation on our bandwidth, and room
-    // codes are client-forgeable (isValidRoomCode only checks the format), so
-    // gating on one would authorise nothing. Credentials are instead issued by the
-    // Durable Object in the `welcome` message, where holding an accepted WebSocket
-    // in the room is the authorisation.
-
     // GET /api/room -> { code: generateRoomCode() } as JSON.
     if (request.method === "GET" && url.pathname === "/api/room") {
+      const clientIp = request.headers.get("CF-Connecting-IP");
+      if (clientIp && !checkRoomRateLimit(clientIp)) {
+        return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+          status: 429,
+          headers: { "Content-Type": "application/json", "Retry-After": "60" },
+        });
+      }
       return Response.json({ code: generateRoomCode() });
     }
 
-    // Fallthrough to static assets
-    return env.ASSETS.fetch(request);
+    // Fallthrough to static assets with security headers applied
+    const assetRes = await env.ASSETS.fetch(request);
+    return applySecurityHeaders(assetRes);
   },
 };

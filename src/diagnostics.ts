@@ -52,7 +52,7 @@ function addRow(test: string, status: Status, details: string): (s: Status, d: s
 // ---- ICE candidate gathering ---------------------------------------------
 
 /** Gather ICE candidates for a throwaway connection. Always resolves. */
-async function gather(config: RTCConfiguration, timeoutMs = 8000): Promise<Cand[]> {
+async function gather(config: RTCConfiguration, timeoutMs = 15000): Promise<Cand[]> {
   const pc = new RTCPeerConnection(config);
   const found: Cand[] = [];
   try {
@@ -87,9 +87,13 @@ async function gather(config: RTCConfiguration, timeoutMs = 8000): Promise<Cand[
 // a different external port per destination, so identical ports across all three
 // means endpoint-independent mapping (hole punching will work) and differing ports
 // mean symmetric NAT (it won't, and TURN will be required).
+// Deliberately no :53 endpoint here. UDP/53 is widely intercepted for DNS, and a
+// black-holing STUN server does not merely get skipped — measured on a real network,
+// including stun.cloudflare.com:53 produced srflx=0 across the whole gathering, so
+// this check reported "UDP to STUN is blocked" on a connection where STUN worked fine.
+// Two distinct hosts are still enough for the symmetric-NAT comparison below.
 const STUN_PROBES: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
-  { urls: "stun:stun.cloudflare.com:53" },
   { urls: "stun:stun.l.google.com:19302" },
 ];
 

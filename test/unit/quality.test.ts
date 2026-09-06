@@ -83,7 +83,12 @@ function fakeSender(initial: Record<string, unknown>) {
       getParameters: () => structuredClone(params),
       setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
     } as unknown as RTCRtpSender,
-    current: () => (params["encodings"] as Array<Record<string, unknown>>)[0],
+    current: (): Record<string, unknown> => {
+      const encodings = params["encodings"] as Array<Record<string, unknown>>;
+      const first = encodings[0];
+      if (!first) throw new Error("sender has no encodings");
+      return first;
+    },
   };
 }
 
@@ -117,5 +122,241 @@ describe("applyVideoEncoding", () => {
     const f = fakeSender({ active: true });
     await applyVideoEncoding(f.sender, PRESET);
     expect(f.current()["active"]).toBe(true);
+  });
+
+  it("handles an empty encodings array gracefully", async () => {
+    let params: Record<string, unknown> = { encodings: [] };
+    const sender = {
+      getParameters: () => structuredClone(params),
+      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+    } as unknown as RTCRtpSender;
+
+    await applyVideoEncoding(sender, PRESET);
+    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(6_000_000);
+  });
+});
+
+describe("applyAudioEncoding", () => {
+  it("enables audio and sets high-fidelity bitrate ceiling", async () => {
+    const f = fakeSender({ active: false });
+    await (await import("@src/quality")).applyAudioEncoding(f.sender);
+    expect(f.current()["active"]).toBe(true);
+    expect(f.current()["maxBitrate"]).toBe(256_000);
+  });
+
+  it("handles empty encodings array on audio sender", async () => {
+    let params: Record<string, unknown> = { encodings: [] };
+    const sender = {
+      getParameters: () => structuredClone(params),
+      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+    } as unknown as RTCRtpSender;
+
+    await (await import("@src/quality")).applyAudioEncoding(sender);
+    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["active"]).toBe(true);
+  });
+});
+
+describe("preferCodec", () => {
+  it("does nothing if setCodecPreferences is not supported", async () => {
+    const { preferCodec } = await import("@src/quality");
+    expect(() => preferCodec({} as unknown as RTCRtpTransceiver, "h264")).not.toThrow();
+  });
+
+  it("does nothing if getCapabilities returns null or no codecs", async () => {
+    const { preferCodec } = await import("@src/quality");
+    const orig = (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender;
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => null,
+    };
+    const tx = { setCodecPreferences: () => {} } as unknown as RTCRtpTransceiver;
+    expect(() => preferCodec(tx, "h264")).not.toThrow();
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = orig;
+  });
+
+  it("reorders codecs with the preferred codec first", async () => {
+    const { preferCodec } = await import("@src/quality");
+    const codecs = [
+      { mimeType: "video/VP8" },
+      { mimeType: "video/H264" },
+      { mimeType: "video/AV1" },
+    ];
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs }),
+    };
+
+    let setPreferencesArg: Array<{ mimeType: string }> = [];
+    const tx = {
+      setCodecPreferences: (c: Array<{ mimeType: string }>) => {
+        setPreferencesArg = c;
+      },
+    } as unknown as RTCRtpTransceiver;
+
+    preferCodec(tx, "h264");
+    expect(setPreferencesArg[0]?.mimeType).toBe("video/H264");
+    expect(setPreferencesArg.map((c) => c.mimeType)).toEqual([
+      "video/H264",
+      "video/VP8",
+      "video/AV1",
+    ]);
+  });
+
+  it("handles when preferred codec is not offered by browser", async () => {
+    const { preferCodec } = await import("@src/quality");
+    const codecs = [{ mimeType: "video/VP8" }];
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs }),
+    };
+
+    let called = false;
+    const tx = {
+      setCodecPreferences: () => { called = true; },
+    } as unknown as RTCRtpTransceiver;
+
+    preferCodec(tx, "av1");
+    expect(called).toBe(false);
+  });
+
+  it("swallows errors thrown by setCodecPreferences", async () => {
+    const { preferCodec } = await import("@src/quality");
+    const codecs = [{ mimeType: "video/H264" }];
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs }),
+    };
+
+    const tx = {
+      setCodecPreferences: () => { throw new Error("unsupported codec order"); },
+    } as unknown as RTCRtpTransceiver;
+
+    expect(() => preferCodec(tx, "h264")).not.toThrow();
+  });
+});
+
+describe("tuneReceiverLatency", () => {
+  it("sets jitterBufferTarget in milliseconds", async () => {
+    const { tuneReceiverLatency } = await import("@src/quality");
+    const receiver = { jitterBufferTarget: 100 } as unknown as RTCRtpReceiver;
+    tuneReceiverLatency(receiver, 20);
+    expect((receiver as unknown as { jitterBufferTarget: number }).jitterBufferTarget).toBe(20);
+  });
+
+  it("sets playoutDelayHint in seconds", async () => {
+    const { tuneReceiverLatency } = await import("@src/quality");
+    const receiver = { playoutDelayHint: 1 } as unknown as RTCRtpReceiver;
+    tuneReceiverLatency(receiver, 50);
+    expect((receiver as unknown as { playoutDelayHint: number }).playoutDelayHint).toBe(0.05);
+  });
+
+  it("swallows errors if properties throw", async () => {
+    const { tuneReceiverLatency } = await import("@src/quality");
+    const receiver = {} as unknown as RTCRtpReceiver;
+    Object.defineProperty(receiver, "jitterBufferTarget", {
+      get: () => 0,
+      set: () => { throw new Error("read only"); },
+    });
+    expect(() => tuneReceiverLatency(receiver, 10)).not.toThrow();
+  });
+});
+
+describe("BitrateAdapter", () => {
+  function makeSender(getStatsReport: () => RTCStatsReport) {
+    let params: Record<string, unknown> = { encodings: [{ active: true, maxBitrate: PRESET.maxBitrate }] };
+    return {
+      getParameters: () => structuredClone(params),
+      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+      getStats: async () => getStatsReport(),
+    } as unknown as RTCRtpSender;
+  }
+
+  it("backs off on sustained packet loss and climbs back on sustained good reception", async () => {
+    const { BitrateAdapter } = await import("@src/quality");
+
+    let packetsSent = 1000;
+    let packetsLost = 0;
+    const sender = makeSender(() => {
+      const map = new Map<string, unknown>();
+      map.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
+      map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
+      return map as unknown as RTCStatsReport;
+    });
+
+    const adapter = new BitrateAdapter(sender, PRESET, 1_000_000);
+    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
+
+    // First sample establishes baseline
+    await (adapter as unknown as { tick: () => Promise<void> }).tick();
+    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
+
+    // One bad sample (10% loss > 3% threshold): consecutiveBad = 1, should not drop yet
+    packetsSent += 100;
+    packetsLost += 10;
+    await (adapter as unknown as { tick: () => Promise<void> }).tick();
+    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
+
+    // Second bad sample (10% loss): consecutiveBad = 2 -> drops by 25% (0.75x)
+    packetsSent += 100;
+    packetsLost += 10;
+    await (adapter as unknown as { tick: () => Promise<void> }).tick();
+    const droppedBitrate = Math.round(PRESET.maxBitrate * 0.75);
+    expect(adapter.bitrate).toBe(droppedBitrate);
+
+    // Now 5 good samples with 0 loss: climbs back by 1.15x
+    for (let i = 0; i < 4; i++) {
+      packetsSent += 100;
+      await (adapter as unknown as { tick: () => Promise<void> }).tick();
+      expect(adapter.bitrate).toBe(droppedBitrate);
+    }
+    // 5th good sample:
+    packetsSent += 100;
+    await (adapter as unknown as { tick: () => Promise<void> }).tick();
+    expect(adapter.bitrate).toBe(Math.round(droppedBitrate * 1.15));
+  });
+
+  it("handles missing or throwing getStats gracefully", async () => {
+    const { BitrateAdapter } = await import("@src/quality");
+    const brokenSender = {
+      getParameters: () => ({ encodings: [{}] }),
+      setParameters: async () => {},
+      getStats: async () => { throw new Error("network error"); },
+    } as unknown as RTCRtpSender;
+
+    const adapter = new BitrateAdapter(brokenSender, PRESET);
+    await expect((adapter as unknown as { tick: () => Promise<void> }).tick()).resolves.not.toThrow();
+  });
+
+  it("handles start and stop timer", async () => {
+    const { BitrateAdapter } = await import("@src/quality");
+    const sender = makeSender(() => new Map() as unknown as RTCStatsReport);
+    const adapter = new BitrateAdapter(sender, PRESET);
+    adapter.start(100);
+    adapter.stop();
+    adapter.stop(); // idempotent
+  });
+
+  it("handles incomplete or non-advancing stats in sampleLossRatio", async () => {
+    const { BitrateAdapter } = await import("@src/quality");
+
+    // Case 1: missing packetsSent or packetsLost
+    let map = new Map<string, unknown>();
+    map.set("outbound", { type: "outbound-rtp", kind: "video" }); // no packetsSent
+    map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video" }); // no packetsLost
+    const sender1 = makeSender(() => map as unknown as RTCStatsReport);
+    const adapter1 = new BitrateAdapter(sender1, PRESET);
+    await (adapter1 as unknown as { tick: () => Promise<void> }).tick();
+    expect(adapter1.bitrate).toBe(PRESET.maxBitrate);
+
+    // Case 2: packetsSent doesn't advance (dSent <= 0)
+    let packetsSent = 500;
+    let packetsLost = 10;
+    const sender2 = makeSender(() => {
+      const m = new Map<string, unknown>();
+      m.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
+      m.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
+      return m as unknown as RTCStatsReport;
+    });
+    const adapter2 = new BitrateAdapter(sender2, PRESET);
+    await (adapter2 as unknown as { tick: () => Promise<void> }).tick(); // baseline
+    // Tick again without incrementing packetsSent -> dSent == 0 -> returns null
+    await (adapter2 as unknown as { tick: () => Promise<void> }).tick();
+    expect(adapter2.bitrate).toBe(PRESET.maxBitrate);
   });
 });

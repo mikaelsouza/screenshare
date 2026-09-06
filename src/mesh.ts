@@ -18,6 +18,7 @@ import {
   preferCodec,
   tuneReceiverLatency,
 } from "./quality";
+import { parseCandidate } from "./stats";
 
 export interface MeshOptions {
   iceServers: RTCIceServer[];
@@ -25,6 +26,8 @@ export interface MeshOptions {
   codec: CodecName;
   /** Receive-side jitter buffer target, ms. 0 = lowest latency. */
   jitterBufferTargetMs: number;
+  /** When true, forces WebRTC through TURN relay only to protect user IP address. */
+  relayOnly?: boolean;
 }
 
 export interface MeshCallbacks {
@@ -70,11 +73,16 @@ class PeerLink {
       iceServers: opts.iceServers,
       bundlePolicy: "max-bundle",
       rtcpMuxPolicy: "require",
+      iceTransportPolicy: opts.relayOnly ? "relay" : "all",
     });
 
     this.pc.onnegotiationneeded = () => void this.negotiate();
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
+        if (this.opts.relayOnly) {
+          const parsed = parseCandidate(candidate);
+          if (parsed && parsed.type !== "relay") return;
+        }
         this.send({
           k: "ice",
           candidate: {

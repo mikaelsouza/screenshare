@@ -82,9 +82,31 @@
         width: 140px;
         text-align: center;
       }
-      input[type="text"]:focus {
+      input[type="text"]:focus,
+      input[type="password"]:focus {
         outline: none;
         border-color: var(--accent-color);
+      }
+      input[type="password"] {
+        background-color: var(--bg-color);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        font-family: inherit;
+        width: 140px;
+        text-align: center;
+      }
+      .privacy-label {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        cursor: pointer;
+        user-select: none;
+        margin-left: 0.5rem;
       }
       button {
         background-color: var(--surface-hover);
@@ -230,14 +252,20 @@
 
     <div class="toolbar">
       <input type="text" id="room-code" placeholder="Room code" maxlength="8" autocomplete="off" spellcheck="false" />
+      <input type="password" id="room-pass" placeholder="Password (opt)" autocomplete="off" />
       <button type="button" id="join" class="primary">Join</button>
       <button type="button" id="create">Create</button>
+      <label class="privacy-label" title="Force media through TURN relay so peers never see your IP address">
+        <input type="checkbox" id="relay-only" />
+        Hide IP (Relay only)
+      </label>
     </div>
 
     <main id="stage"></main>
 
     <div id="controls">
       <button type="button" id="share" class="primary">Share screen</button>
+      <button type="button" id="mute-audio" style="display: none;">Mute audio</button>
       <label class="field" for="preset">Quality</label>
       <select id="preset" title="Applies immediately while sharing"></select>
       <label class="field" for="codec">Codec</label>

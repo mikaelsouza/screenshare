@@ -22,6 +22,7 @@ interface PeerAttachment {
   name: string;
   sharing: boolean;
   joined: boolean;
+  ip?: string;
 }
 
 function getAttachment(ws: WebSocket): PeerAttachment | null {
@@ -58,6 +59,9 @@ export class RoomDO extends DurableObject<Env> {
     current: null,
   };
 
+  /** Optional room password set by the first peer to join. */
+  private roomPassword: string | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
@@ -67,6 +71,36 @@ export class RoomDO extends DurableObject<Env> {
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+
+    // Origin check against request host to prevent Cross-Site WebSocket Hijacking
+    const origin = request.headers.get("Origin");
+    if (origin) {
+      try {
+        const originHost = new URL(origin).host;
+        const reqHost = new URL(request.url).host;
+        if (originHost !== reqHost) {
+          return new Response("Forbidden origin", { status: 403 });
+        }
+      } catch {
+        return new Response("Invalid origin", { status: 403 });
+      }
+    }
+
+    // Limit sockets per IP if connecting from Cloudflare (prevents single-IP uplink/mesh DoS)
+    const clientIp = request.headers.get("CF-Connecting-IP");
+    if (clientIp) {
+      const MAX_SOCKETS_PER_IP = 5;
+      let ipCount = 0;
+      for (const s of this.ctx.getWebSockets()) {
+        const att = getAttachment(s);
+        if (att && att.ip === clientIp) {
+          ipCount++;
+        }
+      }
+      if (ipCount >= MAX_SOCKETS_PER_IP) {
+        return new Response("Too many connections from this IP", { status: 429 });
+      }
     }
 
     // The room cap counts only *joined* peers, so without a ceiling here a client
@@ -89,6 +123,7 @@ export class RoomDO extends DurableObject<Env> {
       name: "",
       sharing: false,
       joined: false,
+      ip: clientIp ?? undefined,
     };
     server.serializeAttachment(attachment);
 
@@ -119,6 +154,21 @@ export class RoomDO extends DurableObject<Env> {
           return;
         }
 
+        // Verify room password if one has been set
+        if (this.roomPassword !== null) {
+          if (!clientMsg.password || clientMsg.password !== this.roomPassword) {
+            sendSafe(ws, {
+              t: "error",
+              code: "bad-password",
+              message: "Incorrect or missing room password",
+            });
+            try {
+              ws.close(1008, "Incorrect password");
+            } catch {}
+            return;
+          }
+        }
+
         const otherPeers: PeerInfo[] = [];
         const otherSockets: WebSocket[] = [];
 
@@ -133,6 +183,11 @@ export class RoomDO extends DurableObject<Env> {
             });
             otherSockets.push(s);
           }
+        }
+
+        // If this is the first peer to join and they provided a password, set it for the room
+        if (otherPeers.length === 0 && clientMsg.password) {
+          this.roomPassword = clientMsg.password;
         }
 
         // Reject with "room-full" and close(1008) if the count of ALREADY-JOINED sockets is >= MAX_ROOM_SIZE
@@ -300,12 +355,18 @@ export class RoomDO extends DurableObject<Env> {
       id: attachment.id,
     };
 
+    let remainingJoined = 0;
     for (const s of this.ctx.getWebSockets()) {
       if (s === ws) continue;
       const att = getAttachment(s);
       if (att && att.joined) {
+        remainingJoined++;
         sendSafe(s, leftMsg);
       }
+    }
+
+    if (remainingJoined === 0) {
+      this.roomPassword = null;
     }
   }
 }

@@ -46,6 +46,7 @@ export class SignalingClient {
     private readonly room: string,
     private readonly displayName: string,
     private readonly handlers: SignalingHandlers,
+    private readonly password?: string,
   ) {}
 
   connect(): void {
@@ -60,7 +61,15 @@ export class SignalingClient {
     ws.onopen = () => {
       this.attempts = 0;
       this.handlers.onStatus("open");
-      this.send({ t: "join", room: this.room, displayName: this.displayName });
+      const joinMsg: ClientMessage = {
+        t: "join",
+        room: this.room,
+        displayName: this.displayName,
+      };
+      if (this.password) {
+        joinMsg.password = this.password;
+      }
+      this.send(joinMsg);
       this.startPing();
     };
 

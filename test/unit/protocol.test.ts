@@ -57,6 +57,12 @@ describe("isValidRoomCode", () => {
     expect(isValidRoomCode("../../etc")).toBe(false);
     expect(isValidRoomCode("A/B/C/D/E")).toBe(false);
   });
+
+  it("rejects non-string inputs safely", () => {
+    expect(isValidRoomCode(123 as unknown as string)).toBe(false);
+    expect(isValidRoomCode(null as unknown as string)).toBe(false);
+    expect(isValidRoomCode(undefined as unknown as string)).toBe(false);
+  });
 });
 
 describe("parseClientMessage", () => {
@@ -110,6 +116,27 @@ describe("parseClientMessage", () => {
     expect(msg).not.toHaveProperty("isAdmin");
   });
 
+  it("accepts a join message with a password", () => {
+    expect(
+      parseClientMessage(
+        JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: "mik", password: "secret" }),
+      ),
+    ).toEqual({ t: "join", room: "ABCDEFGH", displayName: "mik", password: "secret" });
+  });
+
+  it("handles usernameFragment explicitly set to null", () => {
+    const msg = parseClientMessage(
+      JSON.stringify({
+        t: "signal",
+        to: "p1",
+        data: { k: "ice", candidate: { candidate: "c", usernameFragment: null } },
+      }),
+    );
+    expect(msg).toMatchObject({
+      data: { k: "ice", candidate: { candidate: "c", usernameFragment: null } },
+    });
+  });
+
   it("returns null for malformed input instead of throwing", () => {
     const bad = [
       "", "not json", "[]", "null", "42", '"str"',
@@ -121,8 +148,14 @@ describe("parseClientMessage", () => {
       JSON.stringify({ t: "signal", to: "p1" }),
       JSON.stringify({ t: "signal", to: 1, data: { k: "offer", sdp: "v=0" } }),
       JSON.stringify({ t: "signal", to: "p1", data: { k: "offer" } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "offer", sdp: 123 } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "answer", sdp: 123 } }),
       JSON.stringify({ t: "signal", to: "p1", data: { k: "nope", sdp: "v=0" } }),
       JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { sdpMid: "0" } } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: 123 } } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", sdpMid: 123 } } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", sdpMLineIndex: "0" } } }),
+      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", usernameFragment: 123 } } }),
       JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: null } }),
       JSON.stringify({ t: "signal", to: "p1", data: [] }),
     ];

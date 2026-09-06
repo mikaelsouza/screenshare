@@ -104,4 +104,126 @@ describe("SignalingClient reconnection", () => {
     vi.advanceTimersByTime(120_000);
     expect(FakeWebSocket.instances.length).toBe(1);
   });
+
+  it("dispatches all incoming server messages to their respective handlers", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    // welcome
+    ws.onmessage?.({
+      data: JSON.stringify({
+        t: "welcome",
+        selfId: "me",
+        peers: [{ id: "p1", name: "bob", sharing: false }],
+        iceServers: [{ urls: "stun:example.com" }],
+      }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }]);
+
+    // peer-joined
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "peer-joined", peer: { id: "p2", name: "charlie", sharing: true } }),
+    });
+    expect(h.onPeerJoined).toHaveBeenCalledWith({ id: "p2", name: "charlie", sharing: true });
+
+    // peer-left
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "peer-left", id: "p2" }),
+    });
+    expect(h.onPeerLeft).toHaveBeenCalledWith("p2");
+
+    // signal
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "signal", from: "p1", data: { k: "offer", sdp: "v=0" } }),
+    });
+    expect(h.onSignal).toHaveBeenCalledWith("p1", { k: "offer", sdp: "v=0" });
+
+    // peer-state
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "peer-state", id: "p1", sharing: true }),
+    });
+    expect(h.onPeerState).toHaveBeenCalledWith("p1", true);
+
+    // ping and pong are ignored
+    ws.onmessage?.({ data: "ping" });
+    ws.onmessage?.({ data: "pong" });
+
+    // unparseable message is ignored without throwing
+    ws.onmessage?.({ data: "not json" });
+    ws.onerror?.();
+  });
+
+  it("sends signals and state updates", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers(), "my-password");
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    expect(JSON.parse(ws.sent[0]!)).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+      password: "my-password",
+    });
+
+    c.signal("p1", { k: "answer", sdp: "v=0" });
+    expect(JSON.parse(ws.sent[1]!)).toEqual({
+      t: "signal",
+      to: "p1",
+      data: { k: "answer", sdp: "v=0" },
+    });
+
+    c.setSharing(true);
+    expect(JSON.parse(ws.sent[2]!)).toEqual({
+      t: "state",
+      sharing: true,
+    });
+  });
+
+  it("sends pings every 30 seconds when open", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    vi.advanceTimersByTime(30_000);
+    expect(ws.sent).toContain("ping");
+
+    c.close();
+  });
+
+  it("uses ws: protocol when running on http:", () => {
+    vi.stubGlobal("location", { protocol: "http:", host: "localhost:8787" });
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    expect(ws.url).toBe("ws://localhost:8787/ws/ABCDEFGH");
+    c.close();
+  });
+
+  it("safely handles send when socket is not open", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    // Not connected yet
+    expect(() => c.send({ t: "state", sharing: false })).not.toThrow();
+  });
+
+  it("defaults to empty array when welcome message omits iceServers", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({
+        t: "welcome",
+        selfId: "p1",
+        peers: [],
+      }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], []);
+    c.close();
+  });
 });

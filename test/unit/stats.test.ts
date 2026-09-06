@@ -151,6 +151,30 @@ describe("isDirect", () => {
     expect(h).not.toBeNull();
     expect(isDirect(h!)).toBe(false);
   });
+
+  it("includes packet loss percentage when loss is significant", () => {
+    const s = summarize({
+      candidateType: "srflx",
+      remoteCandidateType: "srflx",
+      rttMs: 15,
+      availableOutgoingBitrate: 8_000_000,
+      packetLossRatio: 0.045, // 4.5%
+      outboundBitrate: 6_000_000,
+      framesPerSecond: 60,
+      frameWidth: 1920,
+      frameHeight: 1080,
+      encoderImplementation: "NVENC",
+      jitterBufferDelayMs: 5,
+    });
+    expect(s).toContain("4.5% loss");
+  });
+
+  it("identifies unknown routes with isRouteUnknown", async () => {
+    const { isRouteUnknown } = await import("@src/stats");
+    expect(isRouteUnknown({ candidateType: "unknown", remoteCandidateType: "srflx" } as LinkHealth)).toBe(true);
+    expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "unknown" } as LinkHealth)).toBe(true);
+    expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "srflx" } as LinkHealth)).toBe(false);
+  });
 });
 
 describe("parseCandidate", () => {
@@ -182,5 +206,11 @@ describe("parseCandidate", () => {
 
   it("returns null for an empty candidate (the end-of-gathering sentinel)", () => {
     expect(parseCandidate({ candidate: "" } as RTCIceCandidate)).toBeNull();
+  });
+
+  it("handles malformed candidate string gracefully", () => {
+    expect(parseCandidate({ candidate: "invalid string" } as unknown as RTCIceCandidate)).toMatchObject({
+      type: "unknown",
+    });
   });
 });

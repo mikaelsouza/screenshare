@@ -28,9 +28,12 @@ function el<T extends HTMLElement>(id: string): T {
 
 const ui = {
   roomInput: el<HTMLInputElement>("room-code"),
+  passInput: el<HTMLInputElement>("room-pass"),
+  relayOnly: el<HTMLInputElement>("relay-only"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
   shareBtn: el<HTMLButtonElement>("share"),
+  muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
   stage: el<HTMLDivElement>("stage"),
   status: el<HTMLElement>("status"),
   preset: el<HTMLSelectElement>("preset"),
@@ -305,6 +308,10 @@ async function startSharingInner(): Promise<void> {
 
   client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
+  if (capture.audio) {
+    ui.muteAudioBtn.style.display = "inline-block";
+    ui.muteAudioBtn.textContent = "Mute audio";
+  }
 }
 
 async function stopSharing(): Promise<void> {
@@ -317,6 +324,7 @@ async function stopSharing(): Promise<void> {
   renderSelfPreview(null);
   client?.setSharing(false);
   ui.shareBtn.textContent = "Share screen";
+  ui.muteAudioBtn.style.display = "none";
 }
 
 // ---- room ----------------------------------------------------------------
@@ -324,7 +332,7 @@ async function stopSharing(): Promise<void> {
 /** Incremented per join so a superseded in-flight join can detect it lost the race. */
 let joinGeneration = 0;
 
-async function joinRoom(code: string): Promise<void> {
+async function joinRoom(code: string, password?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setStatus("That doesn't look like a valid room code.", "error");
     return;
@@ -336,66 +344,80 @@ async function joinRoom(code: string): Promise<void> {
   const displayName = localStorage.getItem("name") ?? `guest-${Math.random().toString(36).slice(2, 6)}`;
   localStorage.setItem("name", displayName);
 
-  client = new SignalingClient(code, displayName, {
-    onStatus: (s) => setStatus(s === "open" ? `In room ${code}` : `Connection ${s}…`),
+  client = new SignalingClient(
+    code,
+    displayName,
+    {
+      onStatus: (s) =>
+        setStatus(
+          s === "open"
+            ? `In room ${code}${ui.relayOnly.checked ? " (Privacy Mode)" : ""}`
+            : `Connection ${s}…`,
+        ),
 
-    onWelcome: (selfId, peers, iceServers) => {
-      // The signalling socket reconnects on any network blip, and the server issues
-      // a fresh peer id each time, so onWelcome fires again. Without closing the old
-      // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
-      // peers that have already replaced us — a silent bandwidth leak that compounds
-      // with every reconnect.
-      mesh?.close();
-      monitors.clear();
-      mesh = new Mesh(
-        selfId,
-        {
-          // Minted by the Durable Object and delivered with the welcome, so holding a
-          // joined WebSocket is what authorises them.
-          iceServers: iceServers.length > 0 ? iceServers : FALLBACK_ICE,
-          preset: QUALITY_PRESETS[currentPreset()],
-          codec: currentCodec(),
-          jitterBufferTargetMs: 0,
-        },
-        (to, data) => client?.signal(to, data),
-        {
-          onRemoteStream: (peerId, stream) => {
-            const video = tileFor(peerId);
-            video.srcObject = stream;
-            startPlayback(video, peerId);
+      onWelcome: (selfId, peers, iceServers) => {
+        // The signalling socket reconnects on any network blip, and the server issues
+        // a fresh peer id each time, so onWelcome fires again. Without closing the old
+        // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
+        // peers that have already replaced us — a silent bandwidth leak that compounds
+        // with every reconnect.
+        mesh?.close();
+        monitors.clear();
+        mesh = new Mesh(
+          selfId,
+          {
+            // Minted by the Durable Object and delivered with the welcome, so holding a
+            // joined WebSocket is what authorises them.
+            iceServers: iceServers.length > 0 ? iceServers : FALLBACK_ICE,
+            preset: QUALITY_PRESETS[currentPreset()],
+            codec: currentCodec(),
+            jitterBufferTargetMs: 0,
+            relayOnly: ui.relayOnly.checked,
           },
-          onRemoteStreamGone: (peerId) => removeTile(peerId),
-          onConnectionState: (peerId, state) => {
-            if (state === "failed") {
-              console.warn(`[main] connection to ${peerId} failed`);
-            }
+          (to, data) => client?.signal(to, data),
+          {
+            onRemoteStream: (peerId, stream) => {
+              const video = tileFor(peerId);
+              video.srcObject = stream;
+              startPlayback(video, peerId);
+            },
+            onRemoteStreamGone: (peerId) => removeTile(peerId),
+            onConnectionState: (peerId, state) => {
+              if (state === "failed") {
+                console.warn(`[main] connection to ${peerId} failed`);
+              }
+            },
           },
-        },
-      );
-      for (const p of peers) {
-        names.set(p.id, p.name);
-        mesh.addPeer(p.id);
-      }
-      setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`);
-      if (capture) void mesh.setCapture(capture);
-      startHealthPolling();
-    },
+        );
+        for (const p of peers) {
+          names.set(p.id, p.name);
+          mesh.addPeer(p.id);
+        }
+        setStatus(
+          `In room ${code}${ui.relayOnly.checked ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+        );
+        if (capture) void mesh.setCapture(capture);
+        startHealthPolling();
+      },
 
-    onPeerJoined: (peer: PeerInfo) => {
-      names.set(peer.id, peer.name);
-      mesh?.addPeer(peer.id);
+      onPeerJoined: (peer: PeerInfo) => {
+        names.set(peer.id, peer.name);
+        mesh?.addPeer(peer.id);
+        setStatus(`${peer.name} joined room ${code}`, "info");
+      },
+      onPeerLeft: (id) => {
+        mesh?.removePeer(id);
+        names.delete(id);
+        removeTile(id);
+      },
+      onSignal: (from, data) => void mesh?.handleSignal(from, data),
+      onPeerState: (id, sharing) => {
+        if (!sharing) removeTile(id);
+      },
+      onError: (code, message) => setStatus(`${code}: ${message}`, "error"),
     },
-    onPeerLeft: (id) => {
-      mesh?.removePeer(id);
-      names.delete(id);
-      removeTile(id);
-    },
-    onSignal: (from, data) => void mesh?.handleSignal(from, data),
-    onPeerState: (id, sharing) => {
-      if (!sharing) removeTile(id);
-    },
-    onError: (code, message) => setStatus(`${code}: ${message}`, "error"),
-  });
+    password,
+  );
 
   client.connect();
   location.hash = code;
@@ -410,6 +432,7 @@ function leaveRoom(): void {
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
   names.clear();
+  ui.muteAudioBtn.style.display = "none";
 }
 
 // ---- quality controls ----------------------------------------------------
@@ -453,6 +476,23 @@ function initQualityControls(): void {
     localStorage.setItem("codec", ui.codec.value);
     if (capture) setStatus("Codec applies the next time you start sharing.", "warn");
   });
+  // Privacy toggle (Relay only)
+  ui.relayOnly.checked = localStorage.getItem("relay_only") === "true";
+  ui.relayOnly.addEventListener("change", () => {
+    localStorage.setItem("relay_only", String(ui.relayOnly.checked));
+    if (mesh) {
+      setStatus("Privacy mode change will apply on next room connection.", "info");
+    }
+  });
+
+  // Mute audio button for active sharer
+  ui.muteAudioBtn.addEventListener("click", () => {
+    if (capture?.audio) {
+      capture.audio.enabled = !capture.audio.enabled;
+      ui.muteAudioBtn.textContent = capture.audio.enabled ? "Mute audio" : "Unmute audio";
+      setStatus(capture.audio.enabled ? "Game audio live" : "Game audio muted", "info");
+    }
+  });
 }
 
 initQualityControls();
@@ -469,7 +509,9 @@ initQualityControls();
 
 // ---- wiring --------------------------------------------------------------
 
-ui.joinBtn.addEventListener("click", () => void joinRoom(ui.roomInput.value.trim().toUpperCase()));
+ui.joinBtn.addEventListener("click", () =>
+  void joinRoom(ui.roomInput.value.trim().toUpperCase(), ui.passInput.value.trim() || undefined),
+);
 
 ui.createBtn.addEventListener("click", () => {
   void (async () => {
@@ -481,7 +523,7 @@ ui.createBtn.addEventListener("click", () => {
       const { code } = (await res.json()) as { code: string };
       if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
       ui.roomInput.value = code;
-      await joinRoom(code);
+      await joinRoom(code, ui.passInput.value.trim() || undefined);
     } catch (err) {
       console.error("[main] could not create a room", err);
       setStatus("Could not create a room. Check your connection and try again.", "error");
@@ -499,5 +541,5 @@ window.addEventListener("beforeunload", () => leaveRoom());
 const fromHash = location.hash.replace(/^#/, "").toUpperCase();
 if (fromHash) {
   ui.roomInput.value = fromHash;
-  void joinRoom(fromHash);
+  void joinRoom(fromHash, ui.passInput.value.trim() || undefined);
 }

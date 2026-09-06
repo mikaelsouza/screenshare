@@ -39,7 +39,7 @@ export type SignalData =
   | { k: "ice"; candidate: IceCandidateInit };
 
 export type ClientMessage =
-  | { t: "join"; room: string; displayName: string }
+  | { t: "join"; room: string; displayName: string; password?: string }
   | { t: "signal"; to: PeerId; data: SignalData }
   | { t: "state"; sharing: boolean };
 
@@ -53,7 +53,14 @@ export type ServerMessage =
   | { t: "peer-state"; id: PeerId; sharing: boolean }
   | { t: "error"; code: ErrorCode; message: string };
 
-export type ErrorCode = "room-full" | "bad-message" | "unknown-peer" | "bad-room-code";
+export type ErrorCode =
+  | "room-full"
+  | "bad-message"
+  | "unknown-peer"
+  | "bad-room-code"
+  | "bad-password"
+  | "forbidden-origin"
+  | "rate-limited";
 
 /**
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.
@@ -114,11 +121,15 @@ export function parseClientMessage(raw: string): ClientMessage | null {
     switch (record.t) {
       case "join": {
         if (typeof record.room === "string" && typeof record.displayName === "string") {
-          return {
+          const joinMsg: ClientMessage = {
             t: "join",
             room: record.room,
             displayName: record.displayName,
           };
+          if (typeof record.password === "string") {
+            joinMsg.password = record.password;
+          }
+          return joinMsg;
         }
         return null;
       }

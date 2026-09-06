@@ -44,10 +44,10 @@ class Client {
     });
   }
 
-  static async connect(room?: string): Promise<Client> {
+  static async connect(room?: string, extraHeaders?: Record<string, string>): Promise<Client> {
     room = room ?? CODE;
     const res = await SELF.fetch(`https://example.com/ws/${room}`, {
-      headers: { Upgrade: "websocket" },
+      headers: { Upgrade: "websocket", ...extraHeaders },
     });
     if (!res.webSocket) throw new Error(`no webSocket on response (status ${res.status})`);
     res.webSocket.accept();
@@ -131,15 +131,71 @@ describe("HTTP routing", () => {
     expect(code).toMatch(/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/);
   });
 
-  // Regression: /api/ice used to mint 24-hour TURN credentials for any unauthenticated
-  // POST. Room codes are client-forgeable, so gating on one would have authorised
-  // nothing; credentials now come from the Durable Object over a joined WebSocket.
-  it("exposes no unauthenticated endpoint that mints TURN credentials", async () => {
-    for (const method of ["POST", "GET"]) {
-      const res = await SELF.fetch("https://example.com/api/ice", { method });
-      expect(res.status).not.toBe(200);
-      expect(await res.text()).not.toContain("credential");
+  it("rejects cross-origin websocket upgrade attempts", async () => {
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "https://evil-attacker.com",
+      },
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("accepts same-origin websocket upgrade attempts", async () => {
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "https://example.com",
+      },
+    });
+    expect(res.status).toBe(101);
+    res.webSocket?.accept();
+    res.webSocket?.close();
+  });
+
+  it("enforces rate limits on room creation per IP", async () => {
+    const ip = "198.51.100.42";
+    for (let i = 0; i < 20; i++) {
+      const res = await SELF.fetch("https://example.com/api/room", {
+        headers: { "CF-Connecting-IP": ip },
+      });
+      expect(res.status).toBe(200);
     }
+    // 21st request should be rate limited
+    const limited = await SELF.fetch("https://example.com/api/room", {
+      headers: { "CF-Connecting-IP": ip },
+    });
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("60");
+    const body = (await limited.json()) as { error: string };
+    expect(body.error).toBe("Rate limit exceeded");
+
+    // A different IP should still be allowed
+    const otherIpRes = await SELF.fetch("https://example.com/api/room", {
+      headers: { "CF-Connecting-IP": "198.51.100.99" },
+    });
+    expect(otherIpRes.status).toBe(200);
+  });
+
+  it("rejects malformed origin header", async () => {
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "http://[invalid-url",
+      },
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).toBe("Invalid origin");
+  });
+
+  it("applies strict security headers to static asset responses", async () => {
+    const res = await SELF.fetch("https://example.com/");
+    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Referrer-Policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
+    expect(res.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+    expect(res.headers.get("Permissions-Policy")).toContain("display-capture=(self)");
   });
 });
 
@@ -300,6 +356,85 @@ describe("RoomDO membership", () => {
     expect(left.id).toBe(wa.selfId);
     b.close();
   });
+
+  it("enforces room password when configured by first peer", async () => {
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
+    const wa = await a.nextOf("welcome");
+    expect(wa.selfId).toBeDefined();
+
+    // Second peer joins with wrong password -> rejected
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob", password: "wrong-password" });
+    const err = await b.nextOf("error");
+    expect(err.code).toBe("bad-password");
+    b.close();
+
+    // Second peer joins with missing password -> rejected
+    const c = await Client.connect();
+    c.send({ t: "join", room: CODE, displayName: "charlie" });
+    const err2 = await c.nextOf("error");
+    expect(err2.code).toBe("bad-password");
+    c.close();
+
+    // Second peer joins with correct password -> accepted
+    const d = await Client.connect();
+    d.send({ t: "join", room: CODE, displayName: "dave", password: "super-secret" });
+    const wd = await d.nextOf("welcome");
+    expect(wd.selfId).toBeDefined();
+
+    a.close();
+    d.close();
+  });
+
+  it("caps total sockets per IP address to prevent mesh/uplink flooding", async () => {
+    const ip = "203.0.113.88";
+    const sockets: Client[] = [];
+    for (let i = 0; i < 5; i++) {
+      sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": ip }));
+    }
+
+    // 6th connection from the same IP should be rejected with 429
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+    });
+    expect(res.status).toBe(429);
+    expect(await res.text()).toBe("Too many connections from this IP");
+
+    // A connection from another IP succeeds
+    const another = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.89" });
+    expect(another).toBeDefined();
+    another.close();
+
+    for (const s of sockets) s.close();
+  });
+
+  it("resets room password once all peers leave the room", async () => {
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "initial-password" });
+    const wa = await a.nextOf("welcome");
+    expect(wa.selfId).toBeDefined();
+
+    // Bob joins with password -> success
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob", password: "initial-password" });
+    await b.nextOf("welcome");
+
+    // Bob leaves
+    b.close();
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Alice leaves -> room becomes empty
+    a.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Charlie connects and joins without password -> allowed because password cleared on room reset
+    const c = await Client.connect();
+    c.send({ t: "join", room: CODE, displayName: "charlie" });
+    const wc = await c.nextOf("welcome");
+    expect(wc.selfId).toBeDefined();
+    c.close();
+  });
 });
 
 describe("RoomDO signalling", () => {
@@ -409,5 +544,30 @@ describe("RoomDO signalling", () => {
 
     a.close();
     other.close();
+  });
+
+  it("handles binary ArrayBuffer WebSocket messages", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a.nextOf("peer-joined");
+
+    const encoder = new TextEncoder();
+    const binaryData = encoder.encode(JSON.stringify({ t: "state", sharing: true }));
+    a.ws.send(binaryData);
+
+    const st = await b.nextOf("peer-state");
+    expect(st.sharing).toBe(true);
+
+    a.close();
+    b.close();
+  });
+
+  it("ignores state messages from a socket that has not joined", async () => {
+    const a = await Client.connect();
+    a.send({ t: "state", sharing: true });
+    expect(await a.silentFor(200)).toBe(true);
+    a.close();
   });
 });

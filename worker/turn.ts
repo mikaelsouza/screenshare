@@ -1,5 +1,10 @@
+import { dropPort53, hasUrls } from "@shared/ice";
 import type { IceServerConfig } from "@shared/protocol";
-import type { Env } from "./index";
+
+export interface TurnEnv {
+  TURN_KEY_ID?: string;
+  TURN_API_TOKEN?: string;
+}
 
 const CF_STUN_SERVER: IceServerConfig = {
   urls: "stun:stun.cloudflare.com:3478",
@@ -20,7 +25,7 @@ interface CachedIce {
  * and credentials are identical for everyone in the room anyway.
  */
 export async function getIceServers(
-  env: Env,
+  env: TurnEnv,
   cache: { current: CachedIce | null },
 ): Promise<IceServerConfig[]> {
   const now = Date.now();
@@ -42,7 +47,7 @@ export async function getIceServers(
 const CF_TURN_CREDENTIALS_ENDPOINT = (keyId: string) =>
   `https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`;
 
-export async function mintIceServers(env: Env): Promise<{ iceServers: IceServerConfig[] }> {
+export async function mintIceServers(env: TurnEnv): Promise<{ iceServers: IceServerConfig[] }> {
   if (!env.TURN_KEY_ID || !env.TURN_API_TOKEN) {
     console.warn("TURN_KEY_ID or TURN_API_TOKEN is not configured; using STUN only");
     return { iceServers: [CF_STUN_SERVER] };
@@ -72,7 +77,7 @@ export async function mintIceServers(env: Env): Promise<{ iceServers: IceServerC
 
     const data = (await res.json()) as { iceServers?: IceServerConfig[] };
     const remoteServers = Array.isArray(data.iceServers) ? data.iceServers : [];
-    return { iceServers: [CF_STUN_SERVER, ...remoteServers] };
+    return { iceServers: [CF_STUN_SERVER, ...remoteServers].map(dropPort53).filter(hasUrls) };
   } catch (err) {
     console.warn("Failed to contact Cloudflare TURN API; using STUN only:", err);
     return { iceServers: [CF_STUN_SERVER] };
