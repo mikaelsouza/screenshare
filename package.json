@@ -1,0 +1,27 @@
+{
+  "name": "screenshare",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.worker.json",
+    "preview": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "postinstall": "./scripts/patch-workerd.sh || true",
+    "test:unit": "vitest run --config vitest.config.ts",
+    "test:worker": "vitest run --config vitest.workers.config.ts",
+    "test:e2e": "npm run build && node --test --test-concurrency=1 test/e2e/*.test.mjs",
+    "test": "npm run check && npm run test:unit && npm run test:worker",
+    "test:all": "npm run test && npm run test:e2e"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5",
+    "playwright-core": "^1",
+    "typescript": "^5.6",
+    "vite": "^6",
+    "vitest": "^4.1.0",
+    "wrangler": "^4"
+  }
+}

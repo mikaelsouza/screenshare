@@ -1,0 +1,25 @@
+{
+  "name": "screenshare",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-08-22",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    // "none", NOT "single-page-application": SPA fallback rewrites every unmatched
+    // path to index.html, which would swallow /ws/* and /api/* before they ever
+    // reach the Worker. With "none" they fall through to the Worker as intended.
+    "not_found_handling": "none",
+    // Belt and braces: force these through the Worker regardless of asset matching.
+    "run_worker_first": ["/ws/*", "/api/*"]
+  },
+
+  "durable_objects": {
+    "bindings": [{ "name": "ROOMS", "class_name": "RoomDO" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomDO"] }]
+
+  // Attach the custom domain once DNS is ready:
+  // "routes": [{ "pattern": "screenshare.webmikas.<tld>", "custom_domain": true }]
+}

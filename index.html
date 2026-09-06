@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%233b82f6'/%3E%3Crect x='3' y='4' width='10' height='6' rx='1' fill='%23fff'/%3E%3Crect x='6' y='11' width='4' height='1' fill='%23fff'/%3E%3C/svg%3E" />
+    <title>Screenshare</title>
+    <style>
+      :root {
+        --bg-color: #121214;
+        --surface-color: #1a1a1e;
+        --surface-hover: #26262b;
+        --border-color: #2e2e36;
+        --text-primary: #ededed;
+        --text-secondary: #8e8e99;
+        --accent-color: #3b82f6;
+        --accent-hover: #2563eb;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        background-color: var(--bg-color);
+        color: var(--text-primary);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0.75rem 1.5rem;
+        background-color: var(--surface-color);
+        border-bottom: 1px solid var(--border-color);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+      }
+      .brand h1 {
+        font-size: 1.125rem;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+      }
+      .header-links a {
+        color: var(--text-secondary);
+        text-decoration: none;
+        font-size: 0.875rem;
+        padding: 0.35rem 0.65rem;
+        border-radius: 4px;
+        transition: color 0.15s, background-color 0.15s;
+      }
+      .header-links a:hover {
+        color: var(--text-primary);
+        background-color: var(--surface-hover);
+      }
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        padding: 1rem 1.5rem;
+        background-color: var(--surface-color);
+        border-bottom: 1px solid var(--border-color);
+        flex-wrap: wrap;
+      }
+      input[type="text"] {
+        background-color: var(--bg-color);
+        border: 1px solid var(--border-color);
+        color: var(--text-primary);
+        padding: 0.5rem 0.75rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        font-family: inherit;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        width: 140px;
+        text-align: center;
+      }
+      input[type="text"]:focus {
+        outline: none;
+        border-color: var(--accent-color);
+      }
+      button {
+        background-color: var(--surface-hover);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        padding: 0.5rem 1rem;
+        border-radius: 6px;
+        font-size: 0.875rem;
+        font-weight: 500;
+        cursor: pointer;
+        transition: background-color 0.15s, border-color 0.15s;
+      }
+      button:hover {
+        background-color: #323238;
+      }
+      button.primary {
+        background-color: var(--accent-color);
+        border-color: var(--accent-color);
+        color: #ffffff;
+      }
+      button.primary:hover {
+        background-color: var(--accent-hover);
+      }
+      #stage {
+        flex: 1;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+        gap: 1rem;
+        padding: 1rem;
+        align-content: center;
+        justify-items: center;
+        min-height: 0;
+      }
+      #stage:empty::before {
+        content: "No active screen shares. Join or create a room to get started.";
+        color: var(--text-secondary);
+        font-size: 0.95rem;
+        grid-column: 1 / -1;
+        align-self: center;
+        text-align: center;
+        padding: 2rem;
+      }
+      #controls {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        padding: 0.75rem 1.5rem;
+        background-color: var(--surface-color);
+        border-top: 1px solid var(--border-color);
+      }
+      #status {
+        font-size: 0.875rem;
+        color: var(--text-secondary);
+      }
+      #status[data-kind="warn"] { color: #fbbf24; }
+      #status[data-kind="error"] { color: #f87171; }
+
+      .tile {
+        position: relative;
+        width: 100%;
+        background: #000;
+        border: 1px solid var(--border-color);
+        border-radius: 8px;
+        overflow: hidden;
+        aspect-ratio: 16 / 9;
+      }
+      .tile video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+      }
+      .tile-label {
+        position: absolute;
+        left: 0.5rem;
+        bottom: 0.5rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.65);
+        font-size: 0.75rem;
+        color: var(--text-primary);
+      }
+      .tile-health {
+        position: absolute;
+        right: 0.5rem;
+        bottom: 0.5rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.65);
+        font-size: 0.7rem;
+        font-variant-numeric: tabular-nums;
+        color: var(--text-secondary);
+      }
+      /* A relayed stream is the one outcome worth flagging in the UI: it still
+         works, but it is going through TURN instead of peer-to-peer. */
+      .tile-health[data-direct="false"] {
+        color: #fbbf24;
+      }
+      #controls .field {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        margin-left: 0.5rem;
+      }
+      #controls select {
+        background: var(--surface-color);
+        color: var(--text-primary);
+        border: 1px solid var(--border-color);
+        border-radius: 6px;
+        padding: 0.35rem 0.5rem;
+        font-size: 0.8rem;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <h1>Screenshare</h1>
+      </div>
+      <nav class="header-links">
+        <a href="/diagnostics">Diagnostics</a>
+      </nav>
+    </header>
+
+    <div class="toolbar">
+      <input type="text" id="room-code" placeholder="Room code" maxlength="8" autocomplete="off" spellcheck="false" />
+      <button type="button" id="join" class="primary">Join</button>
+      <button type="button" id="create">Create</button>
+    </div>
+
+    <main id="stage"></main>
+
+    <div id="controls">
+      <button type="button" id="share" class="primary">Share screen</button>
+      <label class="field" for="preset">Quality</label>
+      <select id="preset" title="Applies immediately while sharing"></select>
+      <label class="field" for="codec">Codec</label>
+      <select id="codec" title="Applies the next time you start sharing"></select>
+      <span id="status" data-kind="info">Not connected</span>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
