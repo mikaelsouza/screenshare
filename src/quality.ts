@@ -42,7 +42,11 @@ export async function applyVideoEncoding(
   const e = params.encodings[0];
   if (!e) return;
 
-  e.active = true;
+  // Deliberately do NOT force active = true. Send-side pausing sets active = false
+  // for peers who are not looking at this tile, and a BitrateAdapter tick calling
+  // through here would silently resume uploading video nobody is watching —
+  // defeating the largest bandwidth lever the room-size budget depends on.
+  // Resuming is the explicit job of setSenderActive().
   e.maxBitrate = bitrateOverride ?? preset.maxBitrate;
   e.maxFramerate = preset.frameRate;
   e.scaleResolutionDownBy = 1;

@@ -217,8 +217,26 @@ async function checkLoopback(): Promise<void> {
   const a = new RTCPeerConnection();
   const b = new RTCPeerConnection();
   try {
-    a.onicecandidate = (e) => { if (e.candidate) void b.addIceCandidate(e.candidate); };
-    b.onicecandidate = (e) => { if (e.candidate) void a.addIceCandidate(e.candidate); };
+    // Candidates start arriving as soon as setLocalDescription runs — before the
+    // peer has a remote description. Feeding them straight in makes addIceCandidate
+    // reject with InvalidStateError, drops the candidate, and (being `void`ed)
+    // surfaces as an unhandled rejection. Buffer until the remote description is set.
+    const queues = new Map<RTCPeerConnection, RTCIceCandidate[]>([[a, []], [b, []]]);
+    const deliver = (target: RTCPeerConnection, cand: RTCIceCandidate): void => {
+      if (!target.remoteDescription) {
+        queues.get(target)?.push(cand);
+        return;
+      }
+      void target.addIceCandidate(cand).catch(() => {});
+    };
+    const drain = (target: RTCPeerConnection): void => {
+      const queued = queues.get(target);
+      if (!queued) return;
+      for (const c of queued.splice(0)) void target.addIceCandidate(c).catch(() => {});
+    };
+
+    a.onicecandidate = (e) => { if (e.candidate) deliver(b, e.candidate); };
+    b.onicecandidate = (e) => { if (e.candidate) deliver(a, e.candidate); };
 
     const ch = a.createDataChannel("loopback");
     const opened = new Promise<boolean>((resolve) => {
@@ -229,9 +247,11 @@ async function checkLoopback(): Promise<void> {
     const offer = await a.createOffer();
     await a.setLocalDescription(offer);
     await b.setRemoteDescription(offer);
+    drain(b);
     const answer = await b.createAnswer();
     await b.setLocalDescription(answer);
     await a.setRemoteDescription(answer);
+    drain(a);
 
     const ok = await opened;
     row(

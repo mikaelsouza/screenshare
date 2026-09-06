@@ -50,6 +50,8 @@ class PeerLink {
 
   private control: RTCDataChannel | null = null;
   private remoteWantsVideo = true;
+  /** What we last asked the far end for; flushed when the channel opens. */
+  private desiredView: boolean | null = null;
 
   private videoSender: RTCRtpSender | null = null;
   private audioSender: RTCRtpSender | null = null;
@@ -190,7 +192,9 @@ class PeerLink {
     if (!this.videoSender) return;
     this.adapter?.stop();
     await applyVideoEncoding(this.videoSender, this.opts.preset);
-    if (!this.remoteWantsVideo) await this.setSenderActive(false);
+    // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
+    // in both directions rather than only pausing.
+    await this.setSenderActive(this.remoteWantsVideo);
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
   }
@@ -208,7 +212,7 @@ class PeerLink {
     if (tx) preferCodec(tx, this.opts.codec);
 
     await applyVideoEncoding(this.videoSender, this.opts.preset);
-    if (!this.remoteWantsVideo) await this.setSenderActive(false);
+    await this.setSenderActive(this.remoteWantsVideo);
 
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
@@ -230,16 +234,35 @@ class PeerLink {
     this.audioSender = null;
   }
 
-  /** Tell the far end whether we're currently rendering their video. */
+  /**
+   * Tell the far end whether we're currently rendering their video.
+   *
+   * The request is remembered and flushed on channel open. Tiles below the fold
+   * fire their IntersectionObserver immediately on join, while the control channel
+   * is still "connecting" — dropping that first `want:false` left the far end
+   * uploading full-bitrate video for a tile the viewer never scrolls to, for the
+   * whole session.
+   */
   requestRemoteVideo(want: boolean): void {
-    if (this.control?.readyState === "open") {
-      const msg: ControlMessage = { c: "view", want };
+    this.desiredView = want;
+    this.flushViewRequest();
+  }
+
+  private flushViewRequest(): void {
+    if (this.desiredView === null || this.control?.readyState !== "open") return;
+    const msg: ControlMessage = { c: "view", want: this.desiredView };
+    try {
       this.control.send(JSON.stringify(msg));
+    } catch (err) {
+      console.warn(`[mesh] could not send view state to ${this.peerId}`, err);
     }
   }
 
   private bindControl(ch: RTCDataChannel): void {
     this.control = ch;
+    ch.onopen = () => this.flushViewRequest();
+    // The receiving side binds an already-open channel, so onopen will not fire.
+    if (ch.readyState === "open") this.flushViewRequest();
     ch.onmessage = (ev) => {
       let msg: ControlMessage;
       try {
@@ -275,7 +298,11 @@ class PeerLink {
 
   close(): void {
     this.adapter?.stop();
-    this.control?.close();
+    if (this.control) {
+      this.control.onopen = null;
+      this.control.onmessage = null;
+      this.control.close();
+    }
     this.pc.onnegotiationneeded = null;
     this.pc.onicecandidate = null;
     this.pc.ontrack = null;

@@ -124,6 +124,33 @@ describe("isDirect", () => {
     expect(summarize({ ...base, candidateType: "relay" })).toContain("relayed");
     expect(summarize(base)).toContain("direct");
   });
+
+  // Regression: isDirect used to be `!== "relay"` on both fields, so the "unknown"
+  // sentinel returned before ICE nominates a pair reported as direct — rendering
+  // `direct (unknown)` and suppressing the relay warning on a possibly-relayed link.
+  it("does not claim an unknown route is direct", () => {
+    expect(isDirect({ ...base, candidateType: "unknown", remoteCandidateType: "unknown" })).toBe(false);
+    expect(isDirect({ ...base, candidateType: "unknown" })).toBe(false);
+    expect(isDirect({ ...base, remoteCandidateType: "unknown" })).toBe(false);
+  });
+
+  it("distinguishes 'not yet known' from 'known and relayed' in the summary", () => {
+    const unknown = summarize({ ...base, candidateType: "unknown", remoteCandidateType: "unknown" });
+    expect(unknown).toContain("connecting");
+    expect(unknown).not.toContain("direct");
+    expect(unknown).not.toContain("relayed");
+  });
+
+  it("accepts prflx, which is a legitimate direct path", () => {
+    expect(isDirect({ ...base, candidateType: "prflx", remoteCandidateType: "host" })).toBe(true);
+  });
+
+  it("reports unknown routes for an empty stats report rather than claiming direct", async () => {
+    const pc = { getStats: async () => new Map() as unknown as RTCStatsReport } as unknown as RTCPeerConnection;
+    const h = await new LinkMonitor(pc).read();
+    expect(h).not.toBeNull();
+    expect(isDirect(h!)).toBe(false);
+  });
 });
 
 describe("parseCandidate", () => {

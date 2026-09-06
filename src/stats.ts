@@ -143,15 +143,35 @@ export class LinkMonitor {
   }
 }
 
-/** True when the connection is direct — the outcome this project is designed for. */
+/** Candidate types that represent a genuine peer-to-peer path. */
+const DIRECT_CANDIDATE_TYPES = ["host", "srflx", "prflx"];
+
+/**
+ * True when the connection is provably direct — the outcome this project exists for.
+ *
+ * Requires a positively direct candidate type rather than merely "not relay": both
+ * fields fall back to the sentinel "unknown" before ICE nominates a pair, and
+ * treating that as direct would render `direct (unknown)` and suppress the relay
+ * warning on a connection that may well be relayed.
+ */
 export function isDirect(h: LinkHealth): boolean {
-  return h.candidateType !== "relay" && h.remoteCandidateType !== "relay";
+  return (
+    DIRECT_CANDIDATE_TYPES.includes(h.candidateType) &&
+    DIRECT_CANDIDATE_TYPES.includes(h.remoteCandidateType)
+  );
+}
+
+/** True when the route is not yet known, as opposed to known-and-relayed. */
+export function isRouteUnknown(h: LinkHealth): boolean {
+  return h.candidateType === "unknown" || h.remoteCandidateType === "unknown";
 }
 
 /** Compact one-line summary for a tile label or console log. */
 export function summarize(h: LinkHealth): string {
   const bits: string[] = [];
-  bits.push(isDirect(h) ? `direct (${h.candidateType})` : "relayed (TURN)");
+  bits.push(
+    isRouteUnknown(h) ? "connecting…" : isDirect(h) ? `direct (${h.candidateType})` : "relayed (TURN)",
+  );
   if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms rtt`);
   if (h.outboundBitrate !== null) bits.push(`${(h.outboundBitrate / 1e6).toFixed(1)} Mbps`);
   if (h.framesPerSecond !== null) bits.push(`${Math.round(h.framesPerSecond)}fps`);

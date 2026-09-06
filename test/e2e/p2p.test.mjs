@@ -133,6 +133,30 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.ok(encoding.length > 0, "sharer encoded no frames");
   });
 
+  // Regression: tiles relied on the `autoplay` attribute while unmuted, which Chrome
+  // blocks without a user gesture — a shared deep link produced a permanently black
+  // tile. This suite used to relax the autoplay policy, hiding exactly that.
+  it("actually plays the received video, not just receives it", async () => {
+    const playing = await waitFor(
+      viewer,
+      () => {
+        const v = [...document.querySelectorAll(".tile video")].find((el) => el.srcObject);
+        if (!v) return null;
+        return { paused: v.paused, readyState: v.readyState, t: v.currentTime };
+      },
+      { label: "a tile with a stream", timeout: 30_000 },
+    );
+    assert.equal(playing.paused, false, `video element is paused: ${JSON.stringify(playing)}`);
+
+    // currentTime must advance — a non-paused element that never renders is still broken.
+    const t0 = await viewer.evaluate(() =>
+      [...document.querySelectorAll(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0);
+    await new Promise((r) => setTimeout(r, 1500));
+    const t1 = await viewer.evaluate(() =>
+      [...document.querySelectorAll(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0);
+    assert.ok(t1 > t0, `playback did not advance: ${t0} -> ${t1}`);
+  });
+
   it("connects directly rather than through a TURN relay", async () => {
     // The premise of the whole design: media must not pass through a server.
     // On loopback both ends are host candidates; the assertion that matters is

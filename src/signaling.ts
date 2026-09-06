@@ -38,6 +38,8 @@ export class SignalingClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private attempts = 0;
   private closedByUs = false;
+  /** Set when the server rejected us permanently; suppresses all reconnection. */
+  private fatal = false;
 
   constructor(
     private readonly room: string,
@@ -46,6 +48,7 @@ export class SignalingClient {
   ) {}
 
   connect(): void {
+    if (this.fatal) return;
     this.closedByUs = false;
     this.handlers.onStatus("connecting");
 
@@ -73,9 +76,17 @@ export class SignalingClient {
       this.dispatch(msg);
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       this.stopPing();
       this.handlers.onStatus("closed");
+      // 1008 (policy violation) is how the server says "do not come back" — room
+      // full, or a bad room code. Reconnecting re-triggers the same rejection
+      // forever at the backoff cap, burning a Worker request and a Durable Object
+      // wake-up per cycle while overwriting the message explaining what happened.
+      if (ev.code === 1008) {
+        this.fatal = true;
+        return;
+      }
       if (!this.closedByUs) this.scheduleReconnect();
     };
 
@@ -132,7 +143,7 @@ export class SignalingClient {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectTimer !== null) return;
+    if (this.fatal || this.reconnectTimer !== null) return;
     // Exponential backoff with jitter, capped at 15s.
     const delay = Math.min(15_000, 500 * 2 ** this.attempts) * (0.7 + Math.random() * 0.6);
     this.attempts++;

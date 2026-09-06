@@ -9,6 +9,12 @@ import {
 } from "@shared/protocol";
 import type { Env } from "./index";
 
+/**
+ * Ceiling on total sockets held by one room, joined or not. Generous relative to
+ * MAX_ROOM_SIZE so reconnects and half-open sockets are not turned into failures.
+ */
+const MAX_SOCKETS = MAX_ROOM_SIZE * 4;
+
 interface PeerAttachment {
   id: string;
   name: string;
@@ -54,6 +60,14 @@ export class RoomDO extends DurableObject<Env> {
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+
+    // The room cap counts only *joined* peers, so without a ceiling here a client
+    // could open unbounded sockets that never send `join`. They would never be
+    // rejected, and every subsequent signalling message in the room would have to
+    // walk all of them. Allow headroom for sockets mid-handshake or mid-reconnect.
+    if (this.ctx.getWebSockets().length >= MAX_SOCKETS) {
+      return new Response("Too many connections to this room", { status: 429 });
     }
 
     const pair = new WebSocketPair();
@@ -228,17 +242,27 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  async webSocketClose(
-    ws: WebSocket,
-    _code: number,
-    _reason: string,
-    _wasClean: boolean,
-  ): Promise<void> {
+  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.handleLeave(ws);
+    // Cloudflare's hibernation contract requires the server to complete the closing
+    // handshake. Without this the socket stays in getWebSockets() forever, so every
+    // later join/signal/state does a deserializeAttachment() on a corpse and the
+    // object never becomes evictable.
+    try {
+      // 1005/1006 are "no status" sentinels and are not valid to echo back.
+      ws.close(code === 1005 || code === 1006 ? 1000 : code, reason);
+    } catch {
+      // Already fully closed.
+    }
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     this.handleLeave(ws);
+    try {
+      ws.close(1011, "socket error");
+    } catch {
+      // Already fully closed.
+    }
   }
 
   private handleLeave(ws: WebSocket): void {

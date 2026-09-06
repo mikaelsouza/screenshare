@@ -46,6 +46,7 @@ const names = new Map<PeerId, string>();
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
 const monitors = new Map<PeerId, LinkMonitor>();
+const observers = new Map<PeerId, IntersectionObserver>();
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
 function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void {
@@ -98,20 +99,61 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
 
   // Send-side pausing: tell the sharer to stop encoding for us when their tile
   // isn't on screen. This is the biggest bandwidth lever in a multi-sharer room.
+  // Ignore callbacks for a tile we have already torn down: removal itself queues an
+  // intersection change, and acting on it would tell a peer to pause a sender that a
+  // freshly-created tile has just asked to resume.
   const io = new IntersectionObserver(
     (entries) => {
+      if (observers.get(peerId) !== io) return;
       for (const e of entries) mesh?.setViewing(peerId, e.isIntersecting);
     },
     { threshold: 0.1 },
   );
   io.observe(wrap);
+  observers.set(peerId, io);
 
   return video;
+}
+
+/**
+ * Start playback explicitly instead of relying on the `autoplay` attribute.
+ *
+ * Measured behaviour (Chromium 152) is that a MediaStream srcObject is exempt from
+ * the autoplay policy and plays unmuted without a user gesture, so this is defensive
+ * rather than a fix for an observed failure. It costs nothing and removes the
+ * dependency on that exemption holding: if a future browser does apply the policy,
+ * the attribute alone would yield a silently black tile, whereas this retries muted
+ * (always permitted) and offers click-to-unmute instead.
+ */
+function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
+  void video.play().catch(() => {
+    video.muted = true;
+    void video.play().then(
+      () => {
+        const health = healthEls.get(peerId);
+        if (health) health.textContent = "muted — click to unmute";
+        video.addEventListener(
+          "click",
+          () => {
+            video.muted = false;
+            void video.play().catch(() => {});
+          },
+          { once: true },
+        );
+      },
+      () => setStatus("The browser blocked video playback. Click anywhere, then rejoin.", "warn"),
+    );
+  });
 }
 
 function removeTile(peerId: PeerId): void {
   const video = tiles.get(peerId);
   if (!video) return;
+  // Disconnect before removing: an observer left attached to a detached subtree
+  // leaks both the observer and the <video> with its former srcObject, and keeps
+  // firing stale callbacks.
+  observers.get(peerId)?.disconnect();
+  observers.delete(peerId);
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
@@ -162,6 +204,9 @@ function renderSelfPreview(stream: MediaStream | null): void {
   const v = tileFor(id);
   v.muted = true; // never monitor your own audio
   v.srcObject = stream;
+  // Muted playback is always permitted by the autoplay policy, but call play()
+  // explicitly so the preview does not depend on the attribute alone.
+  void v.play().catch(() => {});
 }
 
 // ---- sharing -------------------------------------------------------------
@@ -171,8 +216,18 @@ function currentPreset(): QualityPresetName {
   return stored && stored in QUALITY_PRESETS ? (stored as QualityPresetName) : DEFAULT_PRESET;
 }
 
+const CODEC_NAMES = ["h264", "vp9", "av1", "vp8"] as const;
+
+function isCodecName(v: string | null): v is CodecName {
+  return v !== null && (CODEC_NAMES as readonly string[]).includes(v);
+}
+
 function currentCodec(): CodecName {
-  return (localStorage.getItem("codec") as CodecName | null) ?? DEFAULT_CODEC;
+  // Unlike the preset, this used to be an unchecked cast. A stale or hand-edited
+  // value reached preferCodec, where the CODEC_MIME lookup returned undefined and
+  // threw mid-share — leaving the screen captured but no peer ever told.
+  const stored = localStorage.getItem("codec");
+  return isCodecName(stored) ? stored : DEFAULT_CODEC;
 }
 
 /**
@@ -193,8 +248,26 @@ function captureBlockedReason(): string | null {
   return "This browser does not support getDisplayMedia. Chrome or Edge on desktop is required.";
 }
 
+/** Set for the whole of startSharing, including the await on the OS picker. */
+let sharingPending = false;
+
 async function startSharing(): Promise<void> {
-  if (!mesh || capture) return;
+  // `capture` is only assigned after getDisplayMedia resolves, which can take
+  // seconds while the picker is open. Guarding on it alone lets a second click
+  // open a second picker and orphan the first MediaStream, leaving Chrome's
+  // "sharing your screen" bar attached to a stream nothing references.
+  if (!mesh || capture || sharingPending) return;
+  sharingPending = true;
+
+  try {
+    await startSharingInner();
+  } finally {
+    sharingPending = false;
+  }
+}
+
+async function startSharingInner(): Promise<void> {
+  if (!mesh) return;
 
   const blocked = captureBlockedReason();
   if (blocked) {
@@ -215,7 +288,18 @@ async function startSharing(): Promise<void> {
 
   stopCaptureListener = onCaptureEnded(capture, () => void stopSharing());
   renderSelfPreview(capture.stream);
-  await mesh.setCapture(capture);
+
+  try {
+    await mesh.setCapture(capture);
+  } catch (err) {
+    // Never leave the screen captured but no peer told: tear the whole thing down
+    // so the UI and the browser's sharing indicator agree with reality.
+    console.error("[main] failed to attach capture to peers", err);
+    setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
+    await stopSharing();
+    return;
+  }
+
   client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
 }
@@ -234,14 +318,22 @@ async function stopSharing(): Promise<void> {
 
 // ---- room ----------------------------------------------------------------
 
+/** Incremented per join so a superseded in-flight join can detect it lost the race. */
+let joinGeneration = 0;
+
 async function joinRoom(code: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setStatus("That doesn't look like a valid room code.", "error");
     return;
   }
 
+  const generation = ++joinGeneration;
   leaveRoom();
   const iceServers = await fetchIceServers();
+  // leaveRoom() ran before this await, so a second join starting during the fetch
+  // would also see client === null and neither would tear the other down. The loser
+  // must bail rather than open a second socket that silently holds a room slot.
+  if (generation !== joinGeneration) return;
   const displayName = localStorage.getItem("name") ?? `guest-${Math.random().toString(36).slice(2, 6)}`;
   localStorage.setItem("name", displayName);
 
@@ -267,7 +359,9 @@ async function joinRoom(code: string): Promise<void> {
         (to, data) => client?.signal(to, data),
         {
           onRemoteStream: (peerId, stream) => {
-            tileFor(peerId).srcObject = stream;
+            const video = tileFor(peerId);
+            video.srcObject = stream;
+            startPlayback(video, peerId);
           },
           onRemoteStreamGone: (peerId) => removeTile(peerId),
           onConnectionState: (peerId, state) => {
@@ -378,10 +472,19 @@ ui.joinBtn.addEventListener("click", () => void joinRoom(ui.roomInput.value.trim
 
 ui.createBtn.addEventListener("click", () => {
   void (async () => {
-    const res = await fetch("/api/room");
-    const { code } = (await res.json()) as { code: string };
-    ui.roomInput.value = code;
-    await joinRoom(code);
+    // Without the ok check a 500 or an HTML error page throws inside this voided
+    // IIFE, so the button looks completely inert with the stale status still shown.
+    try {
+      const res = await fetch("/api/room");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const { code } = (await res.json()) as { code: string };
+      if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
+      ui.roomInput.value = code;
+      await joinRoom(code);
+    } catch (err) {
+      console.error("[main] could not create a room", err);
+      setStatus("Could not create a room. Check your connection and try again.", "error");
+    }
   })();
 });
 

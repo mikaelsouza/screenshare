@@ -1,9 +1,32 @@
 import { SELF } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { MAX_ROOM_SIZE, PING, PONG, type ServerMessage } from "@shared/protocol";
 
-const CODE = "ABCDEFGH";
 const CODE2 = "JKMNPQRS";
+
+/**
+ * Every test gets its own room code, so a Durable Object is never shared between
+ * tests. Sockets are closed without awaiting the server's webSocketClose, so a
+ * shared code let one test's peers still occupy the room when the next one started —
+ * which made the room-full test read `room-full` where it expected `welcome`.
+ */
+let roomCounter = 0;
+const ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+function freshRoom(): string {
+  roomCounter++;
+  let n = roomCounter;
+  let out = "";
+  for (let i = 0; i < 8; i++) {
+    out = ALPHABET[n % ALPHABET.length] + out;
+    n = Math.floor(n / ALPHABET.length);
+  }
+  return out;
+}
+
+let CODE = freshRoom();
+beforeEach(() => {
+  CODE = freshRoom();
+});
 
 /** A connected client with a queue, so tests can await specific messages. */
 class Client {
@@ -21,7 +44,8 @@ class Client {
     });
   }
 
-  static async connect(room = CODE): Promise<Client> {
+  static async connect(room?: string): Promise<Client> {
+    room = room ?? CODE;
     const res = await SELF.fetch(`https://example.com/ws/${room}`, {
       headers: { Upgrade: "websocket" },
     });
@@ -39,11 +63,19 @@ class Client {
     const queued = this.queue.shift();
     if (queued) return Promise.resolve(queued);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timed out waiting for message")), timeoutMs);
-      this.waiters.push((m) => {
+      const waiter = (m: ServerMessage): void => {
         clearTimeout(timer);
         resolve(m);
-      });
+      };
+      const timer = setTimeout(() => {
+        // Remove the waiter, or the next message is handed to this already-settled
+        // promise and lost instead of being queued — which silently breaks any read
+        // that follows a deliberate timeout such as silentFor().
+        const i = this.waiters.indexOf(waiter);
+        if (i !== -1) this.waiters.splice(i, 1);
+        reject(new Error("timed out waiting for message"));
+      }, timeoutMs);
+      this.waiters.push(waiter);
     });
   }
 
@@ -205,6 +237,34 @@ describe("RoomDO membership", () => {
 
     late.close();
     for (const c of joined.slice(1)) c.close();
+  });
+
+  // Regression: the room cap counts only joined peers, and fetch() accepted every
+  // upgrade, so a client could open unbounded sockets that never send `join` and make
+  // every later signalling message in that room walk all of them.
+  it("caps total sockets so unjoined connections cannot pile up", async () => {
+    const open: Client[] = [];
+    let rejected = 0;
+    // Well past MAX_ROOM_SIZE, and none of these ever send `join`.
+    for (let i = 0; i < MAX_ROOM_SIZE * 4 + 4; i++) {
+      try {
+        open.push(await Client.connect());
+      } catch {
+        rejected++;
+      }
+    }
+    expect(rejected).toBeGreaterThan(0);
+    for (const c of open) c.close();
+  });
+
+  it("returns 429 rather than accepting an unbounded number of sockets", async () => {
+    const open: Client[] = [];
+    for (let i = 0; i < MAX_ROOM_SIZE * 4; i++) {
+      try { open.push(await Client.connect()); } catch { break; }
+    }
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, { headers: { Upgrade: "websocket" } });
+    expect(res.status).toBe(429);
+    for (const c of open) c.close();
   });
 
   it("broadcasts peer-left when a socket closes", async () => {

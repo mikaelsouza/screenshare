@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mungeOpusSdp } from "@src/quality";
+import { applyVideoEncoding, mungeOpusSdp } from "@src/quality";
 
 /** Minimal but realistic audio m-line, matching what Chrome actually emits. */
 function sdpWith(fmtp: string | null, pt = "111"): string {
@@ -72,5 +72,50 @@ describe("mungeOpusSdp", () => {
   it("is idempotent", () => {
     const once = mungeOpusSdp(sdpWith("minptime=10"));
     expect(mungeOpusSdp(once)).toBe(once);
+  });
+});
+
+/** Minimal RTCRtpSender double that records what setParameters received. */
+function fakeSender(initial: Record<string, unknown>) {
+  let params: Record<string, unknown> = { encodings: [{ ...initial }] };
+  return {
+    sender: {
+      getParameters: () => structuredClone(params),
+      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+    } as unknown as RTCRtpSender,
+    current: () => (params["encodings"] as Array<Record<string, unknown>>)[0],
+  };
+}
+
+const PRESET = { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 };
+
+describe("applyVideoEncoding", () => {
+  it("applies the preset's bitrate and framerate", async () => {
+    const f = fakeSender({ active: true });
+    await applyVideoEncoding(f.sender, PRESET);
+    expect(f.current()["maxBitrate"]).toBe(6_000_000);
+    expect(f.current()["maxFramerate"]).toBe(60);
+  });
+
+  it("honours a bitrate override from the adapter", async () => {
+    const f = fakeSender({ active: true });
+    await applyVideoEncoding(f.sender, PRESET, 2_000_000);
+    expect(f.current()["maxBitrate"]).toBe(2_000_000);
+  });
+
+  // Regression: this used to set `active = true` unconditionally, so a BitrateAdapter
+  // tick silently resumed a sender that send-side pausing had switched off — quietly
+  // uploading video nobody was watching and defeating the main bandwidth lever.
+  it("does not resurrect a sender that send-side pausing disabled", async () => {
+    const f = fakeSender({ active: false });
+    await applyVideoEncoding(f.sender, PRESET, 3_000_000);
+    expect(f.current()["active"]).toBe(false);
+    expect(f.current()["maxBitrate"]).toBe(3_000_000);
+  });
+
+  it("leaves an active sender active", async () => {
+    const f = fakeSender({ active: true });
+    await applyVideoEncoding(f.sender, PRESET);
+    expect(f.current()["active"]).toBe(true);
   });
 });
