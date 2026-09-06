@@ -22,6 +22,8 @@
             # is a generic binary that will not run here, so the test drives the
             # Nix-built browser through playwright-core instead.
             pkgs.chromium
+            # GitHub CLI, for repo creation and release chores.
+            pkgs.gh
           ];
 
           NIX_GLIBC = pkgs.glibc;
