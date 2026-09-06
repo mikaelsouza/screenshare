@@ -75,6 +75,10 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(ws.status, 426, "expected websocket-only endpoint to reject a plain GET");
     const bad = await fetch(`${BASE_URL}/ws/short`);
     assert.equal(bad.status, 400);
+
+    // TURN credentials must not be obtainable without a joined WebSocket.
+    const ice = await fetch(`${BASE_URL}/api/ice`, { method: "POST" });
+    assert.notEqual(ice.status, 200, "/api/ice should no longer mint credentials");
   });
 
   it("loads the app for both peers and joins them to one room", async () => {

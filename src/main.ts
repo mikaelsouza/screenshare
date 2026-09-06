@@ -54,19 +54,11 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
   ui.status.dataset["kind"] = kind;
 }
 
-async function fetchIceServers(): Promise<RTCIceServer[]> {
-  try {
-    const res = await fetch("/api/ice", { method: "POST" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = (await res.json()) as { iceServers?: RTCIceServer[] };
-    return body.iceServers ?? [];
-  } catch (err) {
-    // A missing TURN config must not stop the app: direct P2P is the common path
-    // and doesn't need TURN at all.
-    console.warn("[main] /api/ice failed, continuing with public STUN only", err);
-    return [{ urls: "stun:stun.cloudflare.com:3478" }];
-  }
-}
+/**
+ * STUN-only fallback. Enough for the direct peer-to-peer path, which is the common
+ * case; only the relay fallback needs the credentials the server mints.
+ */
+const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
 
 // ---- tiles ---------------------------------------------------------------
 
@@ -329,10 +321,6 @@ async function joinRoom(code: string): Promise<void> {
 
   const generation = ++joinGeneration;
   leaveRoom();
-  const iceServers = await fetchIceServers();
-  // leaveRoom() ran before this await, so a second join starting during the fetch
-  // would also see client === null and neither would tear the other down. The loser
-  // must bail rather than open a second socket that silently holds a room slot.
   if (generation !== joinGeneration) return;
   const displayName = localStorage.getItem("name") ?? `guest-${Math.random().toString(36).slice(2, 6)}`;
   localStorage.setItem("name", displayName);
@@ -340,7 +328,7 @@ async function joinRoom(code: string): Promise<void> {
   client = new SignalingClient(code, displayName, {
     onStatus: (s) => setStatus(s === "open" ? `In room ${code}` : `Connection ${s}…`),
 
-    onWelcome: (selfId, peers) => {
+    onWelcome: (selfId, peers, iceServers) => {
       // The signalling socket reconnects on any network blip, and the server issues
       // a fresh peer id each time, so onWelcome fires again. Without closing the old
       // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
@@ -351,7 +339,9 @@ async function joinRoom(code: string): Promise<void> {
       mesh = new Mesh(
         selfId,
         {
-          iceServers,
+          // Minted by the Durable Object and delivered with the welcome, so holding a
+          // joined WebSocket is what authorises them.
+          iceServers: iceServers.length > 0 ? iceServers : FALLBACK_ICE,
           preset: QUALITY_PRESETS[currentPreset()],
           codec: currentCodec(),
           jitterBufferTargetMs: 0,

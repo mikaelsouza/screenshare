@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  type IceServerConfig,
   MAX_ROOM_SIZE,
   PING,
   PONG,
@@ -8,6 +9,7 @@ import {
   parseClientMessage,
 } from "@shared/protocol";
 import type { Env } from "./index";
+import { getIceServers } from "./turn";
 
 /**
  * Ceiling on total sockets held by one room, joined or not. Generous relative to
@@ -51,6 +53,11 @@ function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
 }
 
 export class RoomDO extends DurableObject<Env> {
+  /** TURN credentials are identical for everyone here, so mint once per room. */
+  private readonly iceCache: { current: { iceServers: IceServerConfig[]; expiresAt: number } | null } = {
+    current: null,
+  };
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
@@ -152,11 +159,22 @@ export class RoomDO extends DurableObject<Env> {
           return;
         }
 
-        // Send this socket: { t:"welcome", selfId, peers: [...other joined peers] }
+        // Mint TURN credentials here rather than from a public HTTP endpoint: reaching
+        // this line requires a live WebSocket that has been accepted into the room, so
+        // the socket itself is the authorisation. A failure must not block the join —
+        // direct P2P is the common path and needs no TURN at all.
+        let iceServers: IceServerConfig[] = [];
+        try {
+          iceServers = await getIceServers(this.env, this.iceCache);
+        } catch (err) {
+          console.error("[room] could not mint ICE servers", err);
+        }
+
         sendSafe(ws, {
           t: "welcome",
           selfId: attachment.id,
           peers: otherPeers,
+          iceServers,
         });
 
         // Broadcast to others: { t:"peer-joined", peer: { id, name, sharing:false } }

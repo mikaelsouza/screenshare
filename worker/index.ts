@@ -1,6 +1,5 @@
 import { generateRoomCode, isValidRoomCode } from "@shared/protocol";
 import { RoomDO } from "./room";
-import { mintIceServers } from "./turn";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -31,20 +30,12 @@ export default {
       return stub.fetch(request);
     }
 
-    // POST /api/ice -> return await mintIceServers(env) as JSON.
-    // 500 -> a JSON error body, never a raw stack trace.
-    if (request.method === "POST" && url.pathname === "/api/ice") {
-      try {
-        const ice = await mintIceServers(env);
-        return Response.json(ice);
-      } catch (err) {
-        console.error("Error minting ICE servers:", err);
-        return new Response(JSON.stringify({ error: "Failed to mint ICE servers" }), {
-          status: 500,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
+    // There is deliberately no /api/ice endpoint. TURN credentials let the bearer
+    // relay traffic through our Cloudflare allocation on our bandwidth, and room
+    // codes are client-forgeable (isValidRoomCode only checks the format), so
+    // gating on one would authorise nothing. Credentials are instead issued by the
+    // Durable Object in the `welcome` message, where holding an accepted WebSocket
+    // in the room is the authorisation.
 
     // GET /api/room -> { code: generateRoomCode() } as JSON.
     if (request.method === "GET" && url.pathname === "/api/room") {

@@ -6,6 +6,7 @@
  */
 
 import {
+  type IceServerConfig,
   PING,
   PONG,
   type ClientMessage,
@@ -16,7 +17,7 @@ import {
 } from "@shared/protocol";
 
 export interface SignalingHandlers {
-  onWelcome(selfId: PeerId, peers: PeerInfo[]): void;
+  onWelcome(selfId: PeerId, peers: PeerInfo[], iceServers: IceServerConfig[]): void;
   onPeerJoined(peer: PeerInfo): void;
   onPeerLeft(id: PeerId): void;
   onSignal(from: PeerId, data: SignalData): void;
@@ -98,7 +99,7 @@ export class SignalingClient {
   private dispatch(msg: ServerMessage): void {
     switch (msg.t) {
       case "welcome":
-        this.handlers.onWelcome(msg.selfId, msg.peers);
+        this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? []);
         break;
       case "peer-joined":
         this.handlers.onPeerJoined(msg.peer);

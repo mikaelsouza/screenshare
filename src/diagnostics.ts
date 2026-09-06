@@ -8,6 +8,7 @@
  * This page names the cause.
  */
 
+import { PING, PONG, type ServerMessage } from "@shared/protocol";
 import { systemAudioSupport } from "./capture";
 import { type ParsedCandidate as Cand, parseCandidate } from "./stats";
 
@@ -121,13 +122,54 @@ function checkBrowser(): void {
   );
 }
 
-async function checkIceConfig(): Promise<RTCIceServer[]> {
-  const row = addRow("TURN credentials", "running", "Requesting from /api/ice…");
+/**
+ * Fetch ICE servers the way the app does: open a real room WebSocket and read them
+ * off the welcome. There is no public /api/ice to query — credentials are authorised
+ * by holding a joined socket — so this also exercises the genuine path end to end.
+ */
+async function fetchIceViaRoom(timeoutMs = 10_000): Promise<RTCIceServer[]> {
+  const res = await fetch("/api/room");
+  if (!res.ok) throw new Error(`/api/room returned HTTP ${res.status}`);
+  const { code } = (await res.json()) as { code: string };
+
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/${code}`);
+
   try {
-    const res = await fetch("/api/ice", { method: "POST" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const body = (await res.json()) as { iceServers?: RTCIceServer[] };
-    const servers = body.iceServers ?? [];
+    return await new Promise<RTCIceServer[]>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timed out waiting for welcome")), timeoutMs);
+      ws.onopen = () => ws.send(JSON.stringify({ t: "join", room: code, displayName: "diagnostics" }));
+      ws.onerror = () => {
+        clearTimeout(timer);
+        reject(new Error("signalling socket failed"));
+      };
+      ws.onmessage = (ev) => {
+        const raw = String(ev.data);
+        if (raw === PONG || raw === PING) return;
+        let msg: ServerMessage;
+        try {
+          msg = JSON.parse(raw) as ServerMessage;
+        } catch {
+          return;
+        }
+        if (msg.t === "welcome") {
+          clearTimeout(timer);
+          resolve(msg.iceServers as RTCIceServer[]);
+        } else if (msg.t === "error") {
+          clearTimeout(timer);
+          reject(new Error(`${msg.code}: ${msg.message}`));
+        }
+      };
+    });
+  } finally {
+    try { ws.close(); } catch { /* already closed */ }
+  }
+}
+
+async function checkIceConfig(): Promise<RTCIceServer[]> {
+  const row = addRow("TURN credentials", "running", "Joining a temporary room to request them…");
+  try {
+    const servers = await fetchIceViaRoom();
     const hasTurn = servers.some((s) => {
       const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
       return urls.some((u) => typeof u === "string" && u.startsWith("turn"));
@@ -140,7 +182,7 @@ async function checkIceConfig(): Promise<RTCIceServer[]> {
     );
     return servers;
   } catch (err) {
-    row("warn", `Could not reach /api/ice (${String(err)}). Falling back to public STUN.`);
+    row("warn", `Could not obtain ICE servers (${String(err)}). Falling back to public STUN.`);
     return STUN_PROBES;
   }
 }

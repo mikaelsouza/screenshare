@@ -14,6 +14,13 @@ export const ROOM_CODE_LENGTH = 8;
 export const PING = "ping";
 export const PONG = "pong";
 
+/** Serializable subset of RTCIceServer, shared by the worker and the client. */
+export interface IceServerConfig {
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}
+
 export type PeerId = string;
 export interface PeerInfo {
   id: PeerId;
@@ -37,7 +44,9 @@ export type ClientMessage =
   | { t: "state"; sharing: boolean };
 
 export type ServerMessage =
-  | { t: "welcome"; selfId: PeerId; peers: PeerInfo[] }
+  // iceServers ride along with the welcome rather than being served from a public
+  // endpoint: possession of a joined WebSocket is what authorises TURN credentials.
+  | { t: "welcome"; selfId: PeerId; peers: PeerInfo[]; iceServers: IceServerConfig[] }
   | { t: "peer-joined"; peer: PeerInfo }
   | { t: "peer-left"; id: PeerId }
   | { t: "signal"; from: PeerId; data: SignalData }

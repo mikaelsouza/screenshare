@@ -131,14 +131,15 @@ describe("HTTP routing", () => {
     expect(code).toMatch(/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/);
   });
 
-  it("falls back to STUN-only when TURN secrets are unset, rather than failing", async () => {
-    // A missing TURN config must not break the app: direct P2P is the common path
-    // and needs no TURN at all.
-    const res = await SELF.fetch("https://example.com/api/ice", { method: "POST" });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { iceServers: Array<{ urls: string | string[] }> };
-    expect(body.iceServers.length).toBeGreaterThan(0);
-    expect(JSON.stringify(body.iceServers)).toContain("stun:");
+  // Regression: /api/ice used to mint 24-hour TURN credentials for any unauthenticated
+  // POST. Room codes are client-forgeable, so gating on one would have authorised
+  // nothing; credentials now come from the Durable Object over a joined WebSocket.
+  it("exposes no unauthenticated endpoint that mints TURN credentials", async () => {
+    for (const method of ["POST", "GET"]) {
+      const res = await SELF.fetch("https://example.com/api/ice", { method });
+      expect(res.status).not.toBe(200);
+      expect(await res.text()).not.toContain("credential");
+    }
   });
 });
 
@@ -148,6 +149,26 @@ describe("RoomDO membership", () => {
     const welcome = await a.join("alice");
     expect(welcome.selfId).toBeTruthy();
     expect(welcome.peers).toEqual([]);
+    a.close();
+  });
+
+  it("delivers ICE servers with the welcome, so a joined socket is the authorisation", async () => {
+    const a = await Client.connect();
+    const welcome = await a.join("alice");
+    expect(Array.isArray(welcome.iceServers)).toBe(true);
+    a.close();
+  });
+
+  it("degrades to STUN-only when TURN secrets are unset, rather than blocking the join", async () => {
+    // No TURN secrets are configured under test. Direct P2P needs no TURN at all, so
+    // the join must still succeed and hand back a usable STUN-only configuration.
+    const a = await Client.connect();
+    const welcome = await a.join("alice");
+    expect(welcome.selfId).toBeTruthy();
+
+    const urls = JSON.stringify(welcome.iceServers);
+    expect(urls).toContain("stun:");
+    expect(urls).not.toContain("turn:");
     a.close();
   });
 
