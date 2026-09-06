@@ -47,6 +47,7 @@ const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
 const monitors = new Map<PeerId, LinkMonitor>();
 const observers = new Map<PeerId, IntersectionObserver>();
+const unmutePrompts = new Map<PeerId, HTMLElement>();
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
 function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void {
@@ -110,32 +111,40 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
 /**
  * Start playback explicitly instead of relying on the `autoplay` attribute.
  *
- * Measured behaviour (Chromium 152) is that a MediaStream srcObject is exempt from
- * the autoplay policy and plays unmuted without a user gesture, so this is defensive
- * rather than a fix for an observed failure. It costs nothing and removes the
- * dependency on that exemption holding: if a future browser does apply the policy,
- * the attribute alone would yield a silently black tile, whereas this retries muted
- * (always permitted) and offers click-to-unmute instead.
+ * Confirmed against the live deployment: opening a shared /#ROOMCODE link with no
+ * prior user gesture gets unmuted play() rejected by Chrome's autoplay policy, so
+ * the attribute alone yields a silently black tile. Retrying muted always succeeds,
+ * and the viewer is offered an explicit click to restore audio.
+ *
+ * The prompt is its own overlay rather than text in the health badge, because the
+ * stats poller rewrites that badge every two seconds and would erase it.
  */
 function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
   void video.play().catch(() => {
     video.muted = true;
     void video.play().then(
-      () => {
-        const health = healthEls.get(peerId);
-        if (health) health.textContent = "muted — click to unmute";
-        video.addEventListener(
-          "click",
-          () => {
-            video.muted = false;
-            void video.play().catch(() => {});
-          },
-          { once: true },
-        );
-      },
-      () => setStatus("The browser blocked video playback. Click anywhere, then rejoin.", "warn"),
+      () => showUnmutePrompt(video, peerId),
+      () => setStatus("The browser blocked video playback. Click the tile to start it.", "warn"),
     );
   });
+}
+
+/** Click-to-unmute affordance shown when the autoplay policy forced muted playback. */
+function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
+  const wrap = video.closest(".tile");
+  if (!wrap || wrap.querySelector(".tile-unmute")) return;
+
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "tile-unmute";
+  btn.textContent = "Click to unmute";
+  btn.addEventListener("click", () => {
+    video.muted = false;
+    void video.play().catch(() => {});
+    btn.remove();
+  });
+  wrap.append(btn);
+  unmutePrompts.set(peerId, btn);
 }
 
 function removeTile(peerId: PeerId): void {
@@ -146,6 +155,8 @@ function removeTile(peerId: PeerId): void {
   // firing stale callbacks.
   observers.get(peerId)?.disconnect();
   observers.delete(peerId);
+  unmutePrompts.get(peerId)?.remove();
+  unmutePrompts.delete(peerId);
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);

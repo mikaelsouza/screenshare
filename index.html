@@ -184,6 +184,25 @@
       .tile-health[data-direct="false"] {
         color: #fbbf24;
       }
+      .tile-unmute {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 0.5rem;
+        background: rgba(0, 0, 0, 0.45);
+        color: #fff;
+        font-size: 0.9rem;
+        font-weight: 500;
+        cursor: pointer;
+        border: 0;
+        width: 100%;
+      }
+      .tile-unmute::before {
+        content: "🔇";
+        font-size: 1.4rem;
+      }
       #controls .field {
         font-size: 0.8rem;
         color: var(--text-secondary);

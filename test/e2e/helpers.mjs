@@ -53,12 +53,12 @@ export async function launchBrowser() {
       "--use-fake-device-for-media-stream",
       "--use-fake-ui-for-media-stream",
       // Request the STRICT autoplay policy rather than the permissive one this suite
-      // used to pass. Measured behaviour (Chromium 152): a <video> whose source is a
-      // MediaStream srcObject autoplays unmuted even under this policy, so the strict
-      // setting does not currently change the outcome — MediaStream sources appear to
-      // be exempt. It is set anyway so the suite errs toward what a real user faces
-      // instead of quietly relaxing a restriction, and so the exemption changing in a
-      // future Chromium shows up here as a failure.
+      // used to pass. Relaxing it hid a real defect: against the live deployment,
+      // unmuted play() on a remote MediaStream IS rejected without a user gesture,
+      // so relying on the `autoplay` attribute alone produced a silently black tile.
+      // An earlier probe suggested MediaStream sources were exempt; that probe was
+      // wrong — it used about:blank and a local canvas stream rather than a remote
+      // track on a navigated page. Keep this strict.
       "--autoplay-policy=document-user-activation-required",
       "--allow-running-insecure-content",
       "--disable-dev-shm-usage",
