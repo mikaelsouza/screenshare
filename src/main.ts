@@ -43,8 +43,6 @@ const ui = {
 
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
-/** Room code whose join was rejected for a bad/missing password, awaiting a retry. */
-let pendingPasswordCode: string | null = null;
 let capture: CaptureResult | null = null;
 let stopCaptureListener: (() => void) | null = null;
 
@@ -417,7 +415,6 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
           );
         }
-        pendingPasswordCode = null;
         if (capture) void mesh.setCapture(capture);
         startHealthPolling();
       },
@@ -442,7 +439,6 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // is closed with 1008 and will not retry by itself, but joinRoom() builds a
         // fresh SignalingClient, so pressing Join (or Enter) genuinely retries.
         if (code === "bad-password") {
-          pendingPasswordCode = codeToJoin;
           setStatus(`Room ${codeToJoin} needs a password. Enter it and press Join.`, "warn");
           ui.passInput.value = "";
           ui.passInput.focus();
@@ -554,7 +550,10 @@ for (const input of [ui.roomInput, ui.passInput]) {
   input.addEventListener("keydown", (ev) => {
     if (ev.key !== "Enter") return;
     ev.preventDefault();
-    const code = (pendingPasswordCode ?? ui.roomInput.value).trim().toUpperCase();
+    // Always the input, never a remembered code: the user may have typed a different
+    // room while the "needs a password" prompt was still showing, and Enter must go
+    // where the Join button next to it would go.
+    const code = ui.roomInput.value.trim().toUpperCase();
     void joinRoom(code, ui.passInput.value.trim() || undefined);
   });
 }

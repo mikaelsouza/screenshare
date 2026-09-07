@@ -33,6 +33,14 @@ export interface SignalingHandlers {
  */
 const PING_INTERVAL_MS = 30_000;
 
+/**
+ * "Try Again Later": the server is at capacity right now. Worth retrying — the
+ * condition is usually a half-open socket that has not been reaped yet — but not
+ * forever, or a genuinely over-subscribed room becomes an endless silent retry.
+ */
+const TRY_AGAIN_LATER = 1013;
+const MAX_CAPACITY_RETRIES = 5;
+
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -41,6 +49,8 @@ export class SignalingClient {
   private closedByUs = false;
   /** Set when the server rejected us permanently; suppresses all reconnection. */
   private fatal = false;
+  /** Consecutive 1013 refusals, so a full room does not retry indefinitely. */
+  private capacityRefusals = 0;
 
   constructor(
     private readonly room: string,
@@ -60,6 +70,7 @@ export class SignalingClient {
 
     ws.onopen = () => {
       this.attempts = 0;
+      this.capacityRefusals = 0;
       this.handlers.onStatus("open");
       const joinMsg: ClientMessage = {
         t: "join",
@@ -96,6 +107,15 @@ export class SignalingClient {
       if (ev.code === 1008) {
         this.fatal = true;
         return;
+      }
+      // Capacity is transient, so retry — but bounded, and say so when giving up.
+      if (ev.code === TRY_AGAIN_LATER) {
+        this.capacityRefusals++;
+        if (this.capacityRefusals > MAX_CAPACITY_RETRIES) {
+          this.fatal = true;
+          this.handlers.onError("rate-limited", "The room is still at capacity. Try again in a minute.");
+          return;
+        }
       }
       if (!this.closedByUs) this.scheduleReconnect();
     };

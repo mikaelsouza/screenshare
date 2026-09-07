@@ -227,3 +227,66 @@ describe("SignalingClient reconnection", () => {
     c.close();
   });
 });
+
+describe("SignalingClient capacity refusals", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "https:", host: "example.com" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("retries a 1013 refusal rather than treating it as terminal", () => {
+    // Capacity is transient — usually a half-open socket the runtime has not reaped —
+    // so a client refused for it must come back. 1008 would strand a user who did
+    // nothing wrong, and a failed handshake (1006) would retry forever with no reason
+    // ever shown.
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    FakeWebSocket.instances[0]!.serverClose(1013);
+    vi.advanceTimersByTime(30_000);
+    expect(FakeWebSocket.instances.length).toBe(2);
+  });
+
+  it("gives up after repeated 1013s, and says why", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    for (let i = 0; i < 6; i++) {
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
+      vi.advanceTimersByTime(30_000);
+    }
+    const opened = FakeWebSocket.instances.length;
+    expect(h.onError).toHaveBeenCalledWith("rate-limited", expect.stringContaining("capacity"));
+
+    // And it stays given up: no further sockets after the last refusal.
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.instances.length).toBe(opened);
+  });
+
+  it("forgets earlier refusals once a connection succeeds", () => {
+    // Otherwise a long-lived session that hit capacity a few times over an evening
+    // would eventually refuse to reconnect at all.
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    for (let i = 0; i < 4; i++) {
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
+      vi.advanceTimersByTime(30_000);
+    }
+    FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.open();
+
+    // With the counter reset, four more refusals must each still produce a reconnect.
+    // Without the reset the fifth cumulative refusal would have tripped the limit.
+    const afterOpen = FakeWebSocket.instances.length;
+    for (let i = 0; i < 4; i++) {
+      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
+      vi.advanceTimersByTime(30_000);
+    }
+    expect(FakeWebSocket.instances.length).toBe(afterOpen + 4);
+  });
+});

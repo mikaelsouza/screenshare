@@ -17,6 +17,19 @@ export { RoomDO };
  */
 const roomCreationLimit = new RateLimiter(20, 60_000, 10_000);
 
+/**
+ * Per-IP throttle on WebSocket upgrades.
+ *
+ * /api/room only returns a random string; /ws/:code is the expensive one, because
+ * idFromName() instantiates a Durable Object for any format-valid code. Without a
+ * limit here one client can spin up unbounded distinct Durable Objects by cycling
+ * random codes, and the per-room MAX_SOCKETS_PER_IP cap cannot see it — that cap is
+ * per-object, and this attack never uses the same object twice.
+ *
+ * Generous enough that reconnect backoff and a houseful of tabs never reach it.
+ */
+const wsUpgradeLimit = new RateLimiter(60, 60_000, 10_000);
+
 function checkRoomRateLimit(ip: string): boolean {
   return roomCreationLimit.check(ip);
 }
@@ -26,9 +39,31 @@ function applySecurityHeaders(res: Response): Response {
   headers.set("X-Frame-Options", "DENY");
   headers.set("X-Content-Type-Options", "nosniff");
   headers.set("Referrer-Policy", "strict-origin-when-cross-origin");
+  // script-src has no 'unsafe-inline': neither page carries an inline <script> (both
+  // load a module by src, and Vite emits external chunks), so allowing it would
+  // re-open the main class of XSS that CSP exists to stop and buy nothing. style-src
+  // keeps it, because both pages do have an inline <style> block.
+  //
+  // connect-src is 'self' rather than a blanket `wss: ws:`. The signalling socket is
+  // same-origin, and in an app whose whole point is that media never leaves a direct
+  // peer link, "any host, any WebSocket" is a ready-made exfiltration channel for
+  // injected script. rtc.live.cloudflare.com is not listed because only the Worker
+  // ever talks to it — the page never does.
+  //
+  // base-uri and form-action do not inherit from default-src, so they need saying.
   headers.set(
     "Content-Security-Policy",
-    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' wss: ws: https://rtc.live.cloudflare.com; frame-ancestors 'none';",
+    [
+      "default-src 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "object-src 'none'",
+    ].join("; "),
   );
   headers.set("Permissions-Policy", "display-capture=(self), camera=(), microphone=()");
   return new Response(res.body, {
@@ -51,6 +86,13 @@ export default {
         return new Response(JSON.stringify({ error: "Invalid room code" }), {
           status: 400,
           headers: { "Content-Type": "application/json" },
+        });
+      }
+      const clientIp = request.headers.get("CF-Connecting-IP");
+      if (clientIp && !wsUpgradeLimit.check(clientIp)) {
+        return new Response(JSON.stringify({ error: "Too many connection attempts" }), {
+          status: 429,
+          headers: { "Content-Type": "application/json", "Retry-After": "60" },
         });
       }
       const id = env.ROOMS.idFromName(code);

@@ -28,6 +28,20 @@ beforeEach(() => {
   CODE = freshRoom();
 });
 
+/**
+ * Mirrors RoomDO.hashPassword, so a test can seed storage the way the object would.
+ * The Durable Object id is the salt, which is what stops the same password producing
+ * the same hash in two different rooms.
+ */
+async function passwordHash(room: string, password: string): Promise<string> {
+  const id = env.ROOMS.idFromName(room).toString();
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${id}:${password}`));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** How many sockets one IP may hold in a room; mirrors MAX_SOCKETS_PER_IP. */
+const PER_IP_CAP = MAX_ROOM_SIZE * 2;
+
 /** A connected client with a queue, so tests can await specific messages. */
 class Client {
   private queue: ServerMessage[] = [];
@@ -163,6 +177,37 @@ describe("HTTP routing", () => {
     res.webSocket?.close();
   });
 
+  it("rate limits WebSocket upgrades, not just room creation", async () => {
+    // /api/room only returns a random string; /ws/:code is the expensive one, because
+    // idFromName() instantiates a Durable Object for any format-valid code. The
+    // per-room socket cap cannot see this: it is per-object, and cycling codes never
+    // uses the same object twice.
+    const ip = "198.51.100.7";
+    let limited = 0;
+    for (let i = 0; i < 70; i++) {
+      const res = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
+        headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+      });
+      if (res.status === 429) limited++;
+      // Accept before closing: an unaccepted WebSocket throws on close().
+      if (res.webSocket) {
+        res.webSocket.accept();
+        res.webSocket.close();
+      }
+    }
+    expect(limited).toBeGreaterThan(0);
+
+    // A different address is unaffected.
+    const other = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.8" },
+    });
+    expect(other.status).toBe(101);
+    if (other.webSocket) {
+      other.webSocket.accept();
+      other.webSocket.close();
+    }
+  });
+
   it("enforces rate limits on room creation per IP", async () => {
     const ip = "198.51.100.42";
     for (let i = 0; i < 20; i++) {
@@ -203,8 +248,22 @@ describe("HTTP routing", () => {
     expect(res.headers.get("X-Frame-Options")).toBe("DENY");
     expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
     expect(res.headers.get("Referrer-Policy")).toBe("strict-origin-when-cross-origin");
-    expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
-    expect(res.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    // 'unsafe-inline' on script-src re-opens the main class of XSS that CSP exists to
+    // stop, and neither page has an inline <script> to justify it. style-src does need
+    // it: both pages carry an inline <style>.
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toMatch(/script-src[^;]*unsafe-inline/);
+    expect(csp).toMatch(/style-src[^;]*'unsafe-inline'/);
+    // A blanket `wss: ws:` would let injected script open a socket to any host — an
+    // exfiltration channel in an app whose whole point is that media stays direct.
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).not.toMatch(/connect-src[^;]*wss:/);
+    // Neither of these inherits from default-src, so both must be stated.
+    expect(csp).toContain("base-uri 'none'");
+    expect(csp).toContain("form-action 'none'");
     expect(res.headers.get("Permissions-Policy")).toContain("display-capture=(self)");
   });
 });
@@ -349,7 +408,7 @@ describe("RoomDO membership", () => {
     for (const c of open) c.close();
   });
 
-  it("closes 1008 rather than accepting an unbounded number of sockets", async () => {
+  it("closes 1013 rather than accepting an unbounded number of sockets", async () => {
     const open: Client[] = [];
     for (let i = 0; i < MAX_ROOM_SIZE * 4; i++) {
       open.push(await Client.connect());
@@ -407,7 +466,7 @@ describe("RoomDO membership", () => {
   it("caps total sockets per IP address to prevent mesh/uplink flooding", async () => {
     const ip = "203.0.113.88";
     const sockets: Client[] = [];
-    for (let i = 0; i < MAX_ROOM_SIZE; i++) {
+    for (let i = 0; i < PER_IP_CAP; i++) {
       sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": ip }));
     }
 
@@ -424,13 +483,16 @@ describe("RoomDO membership", () => {
     for (const s of sockets) s.close();
   });
 
-  it("refuses an over-cap connection with 1008, not a failed handshake", async () => {
+  it("refuses an over-cap connection with 1013, not a failed handshake", async () => {
     // A non-101 answer reaches the page as close code 1006, which SignalingClient
     // cannot distinguish from a network blip: it would reconnect forever at the
-    // backoff cap. The handshake must complete so the close code can say "terminal".
+    // backoff cap. The handshake must complete so the close code can carry meaning —
+    // and 1013 rather than 1008, because capacity is transient: half-open sockets the
+    // runtime has not reaped yet make a full room briefly over-cap, and 1008 would
+    // permanently strand a user who did nothing wrong.
     const ip = "203.0.113.90";
     const sockets: Client[] = [];
-    for (let i = 0; i < MAX_ROOM_SIZE; i++) {
+    for (let i = 0; i < PER_IP_CAP; i++) {
       sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": ip }));
     }
 
@@ -449,7 +511,7 @@ describe("RoomDO membership", () => {
         resolve((ev as CloseEvent).code);
       });
     });
-    expect(closeCode).toBe(1008);
+    expect(closeCode).toBe(1013);
 
     for (const s of sockets) s.close();
   });
@@ -465,10 +527,18 @@ describe("RoomDO membership", () => {
 
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("password"),
+      state.storage.get<string>("passwordHash"),
     );
-    expect(stored).toBe("super-secret");
+    expect(stored).toBe(await passwordHash(CODE, "super-secret"));
+    // And the plaintext is nowhere in storage: room passwords come out of users'
+    // ordinary password habits, so they are worth more than this one room.
+    expect(stored).not.toContain("super-secret");
     a.close();
+  });
+
+  it("salts the hash per room, so the same password differs between rooms", async () => {
+    const other = freshRoom();
+    expect(await passwordHash(CODE, "same")).not.toBe(await passwordHash(other, "same"));
   });
 
   it("enforces a password that only exists in storage, as it would after a wake", async () => {
@@ -476,9 +546,8 @@ describe("RoomDO membership", () => {
     // state a woken object is in: durable storage has it, instance memory does not.
     // The old code read an instance field and would have waved this join straight in.
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    await runInDurableObject(stub, (_instance, state) =>
-      state.storage.put("password", "from-storage"),
-    );
+    const hash = await passwordHash(CODE, "from-storage");
+    await runInDurableObject(stub, (_instance, state) => state.storage.put("passwordHash", hash));
 
     const a = await Client.connect();
     a.send({ t: "join", room: CODE, displayName: "alice" });
@@ -519,6 +588,77 @@ describe("RoomDO membership", () => {
     back.close();
   });
 
+  it("does not let a stranger claim an unprotected room", async () => {
+    // The hijack the "first peer in an empty room" rule allowed: an unprotected room
+    // is empty for the length of every reconnect, and permanently once the session
+    // ends while its code lives on in location.hash and in whatever link was shared.
+    // Setting a password there would lock the real occupants out for the full TTL.
+    const alice = await Client.connect();
+    await alice.join("alice");
+    alice.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const mallory = await Client.connect();
+    mallory.send({ t: "join", room: CODE, displayName: "mallory", password: "pwned" });
+    await mallory.nextOf("welcome");
+    mallory.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Alice comes back with no password and is let straight in.
+    const back = await Client.connect();
+    const w = await back.join("alice");
+    expect(w.selfId).toBeDefined();
+    back.close();
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const stored = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get<string>("passwordHash"),
+    );
+    expect(stored).toBeUndefined();
+  });
+
+  it("throttles repeated wrong-password attempts", async () => {
+    // Refusing a guess only closes that one socket, and MAX_SOCKETS_PER_IP bounds
+    // concurrency rather than attempts over time, so without a throttle an attacker
+    // holding the room code can guess as fast as they can open sockets.
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
+    await a.nextOf("welcome");
+
+    const started = Date.now();
+    for (let i = 0; i < 4; i++) {
+      const guess = await Client.connect();
+      guess.send({ t: "join", room: CODE, displayName: "mallory", password: `guess-${i}` });
+      const err = await guess.nextOf("error");
+      expect(err.code).toBe("bad-password");
+      guess.close();
+    }
+    // 250ms + 500 + 750 + 1000 = 2.5s of enforced delay. Allow slack for scheduling.
+    expect(Date.now() - started).toBeGreaterThan(1_500);
+
+    a.close();
+  });
+
+  it("clamps an oversized password instead of failing the storage write", async () => {
+    // A Durable Object value tops out at 128 KiB while a WebSocket frame may be 1 MiB,
+    // so an unclamped password made storage.put reject; the rejection escaped
+    // webSocketMessage, the peer never got `welcome`, and the socket died with 1006 —
+    // which the client then retried, reproducing the same failure forever.
+    const huge = "x".repeat(200_000);
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: huge });
+    const wa = await a.nextOf("welcome");
+    expect(wa.selfId).toBeDefined();
+
+    // Only the first 128 characters count, so that prefix is the password now.
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob", password: "x".repeat(128) });
+    expect((await b.nextOf("welcome")).selfId).toBeDefined();
+
+    a.close();
+    b.close();
+  });
+
   it("erases an abandoned room when the alarm fires", async () => {
     // The password is kept indefinitely for reconnects, so something has to reclaim it
     // eventually or every room code ever used costs storage forever.
@@ -532,7 +672,7 @@ describe("RoomDO membership", () => {
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("password"),
+      state.storage.get<string>("passwordHash"),
     );
     expect(stored).toBeUndefined();
 
@@ -554,9 +694,9 @@ describe("RoomDO membership", () => {
 
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("password"),
+      state.storage.get<string>("passwordHash"),
     );
-    expect(stored).toBe("initial-password");
+    expect(stored).toBe(await passwordHash(CODE, "initial-password"));
 
     a.close();
     b.close();

@@ -19,15 +19,50 @@ import { getIceServers } from "./turn";
 const MAX_SOCKETS = MAX_ROOM_SIZE * 4;
 
 /**
- * Sockets one IP may hold in a single room. Must be at least MAX_ROOM_SIZE: a
- * household, office or CGNAT block shares one address, and a limit below the room
- * cap would make a full room unreachable for exactly the friends most likely to be
- * sitting next to each other. MAX_SOCKETS above still bounds the room overall.
+ * Sockets one IP may hold in a single room.
+ *
+ * Must be comfortably above MAX_ROOM_SIZE. A household, office or CGNAT block shares
+ * one address, so a limit at the room cap would make a full room unreachable for
+ * exactly the friends most likely to be sitting next to each other — and worse, it
+ * counts half-open sockets the runtime has not yet reaped, so a single reconnect
+ * inside a full room would be refused. Same 2x reasoning as MAX_SOCKETS above.
  */
-const MAX_SOCKETS_PER_IP = MAX_ROOM_SIZE;
+const MAX_SOCKETS_PER_IP = MAX_ROOM_SIZE * 2;
 
-/** Storage key holding the room password, if the room has one. */
-const PASSWORD_KEY = "password";
+/** Storage key holding the salted hash of the room password, if the room has one. */
+const PASSWORD_KEY = "passwordHash";
+
+/**
+ * Storage key marking that this room has been joined at least once.
+ *
+ * Only the join that creates the room may set its password. Without this, an
+ * *unprotected* room could be claimed by anyone holding the code: the room is empty
+ * for the whole duration of any reconnect (and forever after the session ends, while
+ * the code lives on in location.hash and in whatever link was shared), so a stranger
+ * could join first, set a password, and lock the real occupants out.
+ */
+const CLAIMED_KEY = "claimed";
+
+/** Storage key holding the room's failed-password-attempt counter. */
+const PW_FAIL_KEY = "pwFail";
+
+/** Longest password accepted. Bounds the storage write and the hashing work. */
+const MAX_PASSWORD_LENGTH = 128;
+
+/** Window over which failed password attempts accumulate. */
+const PW_FAIL_WINDOW_MS = 15 * 60 * 1000;
+
+/**
+ * Failures after which joins are refused outright rather than merely delayed.
+ *
+ * The delay below is the real throttle; this exists so an attacker cannot convert the
+ * delay into a billing attack by holding the object awake indefinitely. Far beyond
+ * typo territory, so legitimate users never reach it.
+ */
+const PW_FAIL_HARD_LIMIT = 50;
+
+/** Ceiling on the per-attempt delay, for the same billing reason. */
+const PW_FAIL_MAX_DELAY_MS = 2_000;
 
 /**
  * How long an empty room keeps its password before the object erases itself.
@@ -98,26 +133,37 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /**
+ * "Try Again Later" — the standard close code for a transient capacity refusal.
+ *
+ * Capacity limits must NOT use 1008: the client treats that as terminal and stops
+ * reconnecting, so a household that briefly exceeded the per-IP cap (half-open
+ * sockets the runtime has not reaped yet, say) would have to reload the page. Nor can
+ * they fail the handshake, which reaches the page as 1006 and is retried forever
+ * because it is indistinguishable from a network blip. 1013 is retried, with backoff
+ * and a bounded number of attempts.
+ */
+const TRY_AGAIN_LATER = 1013;
+
+/**
  * Refuse a connection in a way the browser can actually report.
  *
  * Answering the upgrade with a non-101 status makes the handshake fail, and all the
  * page sees is close code 1006 with no body — indistinguishable from a network blip,
  * so SignalingClient reconnects forever at the backoff cap, burning a Worker request
- * and a Durable Object wake-up per cycle. Completing the handshake and closing with
- * 1008 instead gives the client the terminal signal it already understands, and lets
- * us say why first.
+ * and a Durable Object wake-up per cycle. Completing the handshake lets us say what
+ * happened, and pick a close code that says whether coming back is worth trying.
  *
  * The server side is taken with `accept()`, not `ctx.acceptWebSocket()`, so it never
  * enters getWebSockets() and a rejection cannot itself consume room capacity.
  */
-function rejectUpgrade(code: ErrorCode, message: string): Response {
+function rejectUpgrade(code: ErrorCode, message: string, closeCode = 1008): Response {
   const pair = new WebSocketPair();
   const client = pair[0];
   const server = pair[1];
   server.accept();
   sendSafe(server, { t: "error", code, message });
   try {
-    server.close(1008, message);
+    server.close(closeCode, message);
   } catch {
     // Already gone; the client still gets the close.
   }
@@ -147,8 +193,48 @@ export class RoomDO extends DurableObject<Env> {
    * be re-armed: the room would silently become permanently unprotected. Joins are
    * rare and the read is cheap, so going to storage each time is the honest fix.
    */
-  private async getRoomPassword(): Promise<string | null> {
+  private async getRoomPasswordHash(): Promise<string | null> {
     return (await this.ctx.storage.get<string>(PASSWORD_KEY)) ?? null;
+  }
+
+  /**
+   * Salted SHA-256 of a room password, hex encoded.
+   *
+   * Room passwords come out of users' ordinary password habits, so the plaintext is
+   * worth more than access to this one room and should not sit in storage. The Durable
+   * Object id is a stable, room-specific salt, so the same password in two rooms does
+   * not produce the same hash.
+   */
+  private async hashPassword(password: string): Promise<string> {
+    const data = new TextEncoder().encode(`${this.ctx.id.toString()}:${password}`);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /**
+   * Throttle for wrong-password joins.
+   *
+   * Refusing a guess only closes that one socket, so without this an attacker holding
+   * the room code can guess at whatever rate they can open sockets — MAX_SOCKETS_PER_IP
+   * bounds concurrency, never attempts over time. The password is the only thing
+   * between them and the room's media.
+   *
+   * Delay rather than lockout, so an attacker cannot deny the room to its actual users
+   * by burning attempts. A legitimate typo or two costs a few hundred milliseconds
+   * nobody notices; sustained guessing runs into the cap and then the hard limit.
+   *
+   * Returns the delay to serve before answering, or null to refuse immediately.
+   */
+  private async notePasswordFailure(): Promise<number | null> {
+    const now = Date.now();
+    const entry = (await this.ctx.storage.get<{ count: number; resetAt: number }>(PW_FAIL_KEY)) ?? null;
+    const next =
+      entry && entry.resetAt > now
+        ? { count: entry.count + 1, resetAt: entry.resetAt }
+        : { count: 1, resetAt: now + PW_FAIL_WINDOW_MS };
+    await this.ctx.storage.put(PW_FAIL_KEY, next);
+    if (next.count > PW_FAIL_HARD_LIMIT) return null;
+    return Math.min(next.count * 250, PW_FAIL_MAX_DELAY_MS);
   }
 
   /**
@@ -198,7 +284,11 @@ export class RoomDO extends DurableObject<Env> {
         }
       }
       if (ipCount >= MAX_SOCKETS_PER_IP) {
-        return rejectUpgrade("rate-limited", "Too many connections from your network");
+        return rejectUpgrade(
+          "rate-limited",
+          "Too many connections from your network",
+          TRY_AGAIN_LATER,
+        );
       }
     }
 
@@ -207,7 +297,7 @@ export class RoomDO extends DurableObject<Env> {
     // rejected, and every subsequent signalling message in the room would have to
     // walk all of them. Allow headroom for sockets mid-handshake or mid-reconnect.
     if (this.ctx.getWebSockets().length >= MAX_SOCKETS) {
-      return rejectUpgrade("rate-limited", "Too many connections to this room");
+      return rejectUpgrade("rate-limited", "Too many connections to this room", TRY_AGAIN_LATER);
     }
 
     const pair = new WebSocketPair();
@@ -253,10 +343,21 @@ export class RoomDO extends DurableObject<Env> {
           return;
         }
 
+        // Clamp before anything touches storage. displayName is clamped below for the
+        // same reason; an unbounded password would exceed the 128 KiB Durable Object
+        // value limit, and the rejected put would propagate out of webSocketMessage
+        // and kill the socket with 1006 — which the client then retries forever.
+        const offered = clientMsg.password?.slice(0, MAX_PASSWORD_LENGTH);
+
         // Verify room password if one has been set
-        const roomPassword = await this.getRoomPassword();
-        if (roomPassword !== null) {
-          if (!clientMsg.password || !timingSafeEqual(clientMsg.password, roomPassword)) {
+        const roomPasswordHash = await this.getRoomPasswordHash();
+        if (roomPasswordHash !== null) {
+          const offeredHash = offered ? await this.hashPassword(offered) : null;
+          if (offeredHash === null || !timingSafeEqual(offeredHash, roomPasswordHash)) {
+            const delayMs = await this.notePasswordFailure();
+            if (delayMs !== null) {
+              await scheduler.wait(delayMs);
+            }
             sendSafe(ws, {
               t: "error",
               code: "bad-password",
@@ -285,12 +386,17 @@ export class RoomDO extends DurableObject<Env> {
           }
         }
 
-        // The first peer into an unprotected room may set its password. Guarded on
-        // roomPassword being null as well as the room being empty: if one is already
-        // stored, the check above has just validated it and rewriting it here would be
-        // a no-op at best and a way to change it at worst.
-        if (otherPeers.length === 0 && roomPassword === null && clientMsg.password) {
-          await this.ctx.storage.put(PASSWORD_KEY, clientMsg.password);
+        // Only the join that creates the room may set its password. An empty room is
+        // NOT enough: an unprotected room is empty for the length of every reconnect,
+        // and permanently once the session ends while its code lives on in a shared
+        // link — so "first peer in an empty room" would let a stranger claim someone
+        // else's room and lock them out of it.
+        const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
+        if (!claimed) {
+          if (offered) {
+            await this.ctx.storage.put(PASSWORD_KEY, await this.hashPassword(offered));
+          }
+          await this.ctx.storage.put(CLAIMED_KEY, true);
         }
 
         // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
