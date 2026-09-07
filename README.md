@@ -14,26 +14,84 @@ signalling per session and then goes quiet.
 Browser A ──┐                                    ┌── Browser B
             │  WebSocket (signalling only)       │
             └──►  Worker ──► RoomDO (per room) ◄─┘
-                    │
-                    └──► POST /api/ice ──► Cloudflare Realtime (mints TURN creds)
+                                  │
+                                  └──► Cloudflare Realtime (mints TURN creds,
+                                       delivered inside the `welcome` message)
 
 Browser A ═══════════ SRTP media, direct P2P ═══════════ Browser B
                   (never touches any server)
 ```
 
-- **Worker** (`worker/index.ts`) — serves the built frontend, routes `/ws/:code` to the
-  Durable Object, and mints short-lived TURN credentials at `/api/ice` (the Cloudflare
-  API token must not reach the browser).
+- **Worker** (`worker/index.ts`) — serves the built frontend with security headers,
+  hands out room codes at `/api/room`, and routes `/ws/:code` to the Durable Object.
+
+  There is deliberately **no public endpoint that mints TURN credentials.** An earlier
+  design had `POST /api/ice` gated on a room code, which authorises nothing: room codes
+  are client-forgeable, so anyone could mint relay credentials on our Cloudflare
+  allocation. The Durable Object now issues them inside the `welcome` message, so
+  holding a WebSocket that has been accepted into a room is the authorisation. (That
+  bar is still low — see Known issues.)
 - **RoomDO** (`worker/room.ts`) — one Durable Object per room code, holding the
   WebSocket connections and routing signalling between peers. It forwards `data`
   verbatim and never parses SDP. Uses the WebSocket Hibernation API, so idle rooms
-  cost nothing.
+  cost nothing — which is also the source of the subtlest bug this project has had
+  (see Room passwords below).
 - **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, full-mesh peer
   management, and per-peer bitrate adaptation.
 
 Roughly 10% of peer pairs sit behind CGNAT or a symmetric NAT and cannot connect
 directly; those fall back to a TURN relay automatically. `/diagnostics` reports which
 path a given network actually took.
+
+### Rooms, passwords and privacy
+
+Room codes are 8 characters from a 31-character alphabet with `O/0/I/1/L` removed, so
+they survive being read aloud. The code maps to a Durable Object via `idFromName`, which
+is deterministic — hence the entropy.
+
+**Room passwords** are optional and set by the join that *creates* the room. Two things
+about the implementation are load-bearing:
+
+- The password lives in **durable storage**, not an instance field. This object
+  hibernates as soon as signalling quiets down, which is seconds after ICE completes,
+  so an in-memory password read back as `null` on the next wake while the original
+  peers were still connected — and because the "first peer sets it" branch only fires
+  for an empty room, it was never re-armed. A protected room silently became a
+  permanently open one. It is stored salted-hashed (SHA-256 over the Durable Object id
+  plus the password), never in plaintext.
+- Only the **claiming** join may set a password, tracked by a persisted flag. "First
+  peer into an empty room" is not sufficient: a room is empty for the length of every
+  reconnect, and permanently once a session ends while its code lives on in a shared
+  link, so that rule let a stranger claim someone else's room and lock them out.
+
+Wrong guesses are throttled with a growing delay rather than a lockout, so the throttle
+cannot be turned around into a denial of service against the room's own users. A
+*missing* password is not counted as a guess — every deep link and every refresh
+arrives without one.
+
+**Privacy mode** (`Hide IP`) forces `iceTransportPolicy: "relay"` so peers see only the
+TURN relay's address, never yours. It **fails closed**: if no TURN server is available
+the app refuses to connect and says so, rather than quietly downgrading to a direct
+connection that would leak the very thing the checkbox promises to hide.
+
+### Abuse limits
+
+Per-IP, and all of them chosen to be invisible in normal use:
+
+| Limit | Value | Why it is where it is |
+| ----- | ----- | --------------------- |
+| Room creation | 20/min | `/api/room` only returns a random string |
+| WebSocket upgrades | 60/min | The expensive route: `idFromName` instantiates a Durable Object for any valid code |
+| Sockets per IP per room | 16 (`MAX_ROOM_SIZE * 2`) | A household or CGNAT block shares one address, so this must exceed the room cap, with headroom for half-open sockets |
+| Sockets per room | 32 (`MAX_ROOM_SIZE * 4`) | Unjoined sockets do not count against the room cap and would otherwise pile up |
+| SDP / ICE candidate size | 64 KB / 1 KB | Unbounded, a joined peer could loop 1 MB blobs at another peer through the object |
+
+A refusal **completes the WebSocket handshake and then closes**, rather than answering
+with a 4xx. This is not incidental: a non-101 answer reaches the browser as a bare close
+code 1006 with no body, which is indistinguishable from a network blip, so the client
+reconnects forever and the user is never told why. Terminal refusals close 1008;
+transient capacity refusals close 1013, which the client retries with backoff a bounded
+number of times before giving up with a message.
 
 ### Bandwidth
 
@@ -89,10 +147,16 @@ npm run test:all     # everything, including the browser tests
 ```
 
 The end-to-end tests launch two Chromium browsers, join them to one room, share a
-synthetic stream, and assert that frames actually decode on the far side **and** that
-the selected ICE candidate pair is direct rather than a relay — the premise of the
-whole design. `getDisplayMedia` is stubbed with a canvas stream because headless
-Chrome has no screen picker; everything downstream of the picker is real.
+synthetic stream, and assert that frames actually decode on the far side and that the
+selected ICE candidate pair is not a relay. `getDisplayMedia` is stubbed with a canvas
+stream because headless Chrome has no screen picker; everything downstream of the
+picker is real.
+
+**These tests do not validate NAT traversal.** Both browsers run on one machine, so the
+pair they select is `host <-> host`. They prove signalling, negotiation, encode and
+decode; they say nothing about whether two people on different networks connect
+directly, which is the premise of the whole design. Only two humans on two networks can
+answer that, and `/diagnostics` is the tool for it.
 
 ## Deploying
 
@@ -103,7 +167,16 @@ Chrome has no screen picker; everything downstream of the picker is real.
    npx wrangler secret put TURN_API_TOKEN
    ```
 3. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
-4. `npm run deploy`
+4. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
+   the workerd suite, builds, and deploys with `cloudflare/wrangler-action`. `npm run
+   deploy` does the same thing by hand.
+
+`wrangler.jsonc` sets `run_worker_first: true`, which routes *every* request through the
+Worker rather than serving matched assets straight off the edge. That is what makes the
+security headers actually reach the document — with a path list, `applySecurityHeaders`
+decorated `/api/room` and nothing else, and the page a browser loads shipped with no CSP
+and no `X-Frame-Options` at all. The cost is a Worker invocation per asset, which is
+negligible against 100k/day.
 
 Cloudflare terminates TLS automatically for a Worker custom domain, which
 `getDisplayMedia` requires. Note that the Cloudflare proxy drops idle WebSockets after
@@ -126,7 +199,12 @@ Exact versions are pinned in `package.json` instead.
 ```
 index.html, diagnostics.html   entry points (Vite roots them here)
 shared/protocol.ts             message types shared by worker and frontend
-worker/                        Worker entry, RoomDO, TURN credential minting
+shared/ice.ts                  ICE server filtering (see the port 53 note below)
+worker/index.ts                routing, rate limits, security headers
+worker/room.ts                 RoomDO: membership, signalling, passwords
+worker/turn.ts                 Cloudflare Realtime TURN credential minting
+worker/upgrade.ts              WebSocket refusals that a browser can actually read
+worker/ratelimit.ts            bounded fixed-window per-key throttle
 src/capture.ts                 getDisplayMedia + track configuration
 src/quality.ts                 encoder params, codec choice, Opus SDP, bitrate adaptation
 src/mesh.ts                    full-mesh peer connections, perfect negotiation
@@ -135,3 +213,60 @@ src/stats.ts                   getStats extraction and ICE candidate parsing
 src/diagnostics.ts             connection test page
 test/unit, test/worker, test/e2e
 ```
+
+## The port 53 trap
+
+Cloudflare's TURN allocation includes endpoints on UDP port 53. **We filter every one of
+them out** (`shared/ice.ts`), and the reason is worth recording, because the symptom
+looks nothing like the cause.
+
+Port 53 is DNS, and many networks intercept it. When one ICE endpoint black-holes, Chrome
+does not merely skip it — on the network this was found on, it produced **zero**
+server-reflexive candidates overall. Measured in isolation: `cloudflare:3478` alone gave
+`srflx=1`; `cloudflare:53` alone gave `srflx=0`; all three servers including `:53` gave
+`srflx=0`. With the port filtered, `host=2 srflx=1 relay=6`; without it, `host=2 srflx=0
+relay=8`.
+
+The consequence is that every connection is forced onto a TURN relay — the exact thing
+this architecture exists to avoid — while the app looks like it is working fine. The
+diagnostics page reports it as "No server-reflexive candidate", which reads like a
+firewall problem.
+
+The filter regex is `/:53(?:\?|$)/`, and the `(?:\?|$)` is load-bearing: a bare `:53`
+substring also matches `:5349`, and silently dropping `turns:5349` would remove the TLS
+relay that restrictive networks depend on. There is a test for exactly that trap.
+
+## Known issues
+
+Open defects, in rough order of how likely you are to hit them:
+
+- **Transceiver leak on repeated sharing** (`src/mesh.ts`). `addTrack`/`removeTrack`
+  mean every share -> unshare cycle permanently adds two transceivers and two SDP
+  m-lines to every peer connection: `removeTrack` leaves the transceiver in place
+  already marked as having sent, so the next `addTrack` cannot reuse it. Toggle sharing
+  twenty times in an evening and a 7-peer mesh is carrying 40 m-lines per connection.
+  The fix is one persistent transceiver per link plus `replaceTrack`.
+- **TURN credentials are cheap to obtain.** Anyone can create a room, join it, and
+  receive two-hour relay credentials on our Cloudflare allocation. The rate limits blunt
+  this; they do not prevent it.
+- **`/diagnostics` reports symmetric NAT falsely on multi-homed machines.** It compares
+  srflx ports across all local interfaces rather than across STUN servers, so a laptop
+  with Wi-Fi and Ethernet both up, or any VPN adapter, looks symmetric even behind a
+  plain cone NAT.
+- **The 720p/6 Mbps floor is not enforced.** `BitrateAdapter`'s floor is 1.5 Mbps and the
+  `720p30` preset ships at 4 Mbps, both below the figure stated as a hard commitment.
+  Either the floor is real and both should change, or it is not and the claim should go.
+
+## Not yet verified
+
+Distinct from the above: these are not known to be broken, they have simply never been
+tested.
+
+- **NAT traversal between two real networks.** The premise of the design. See Testing.
+- **Glass-to-glass latency.** The headline requirement — latency wins over quality when
+  they conflict — has never once been measured. Put a millisecond timer on the sharer's
+  screen, photograph both monitors, read the difference.
+- **Game audio**, on any platform where it can be captured at all.
+- **8-person rooms with real media**, and multiple simultaneous sharers.
+- **Hardware H.264 encoding.** Check `encoderImplementation` in `chrome://webrtc-internals`
+  is not a software fallback; if it is, the encoder is competing with the game for CPU.
