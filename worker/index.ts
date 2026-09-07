@@ -1,6 +1,7 @@
 import { generateRoomCode, isValidRoomCode } from "@shared/protocol";
 import { RateLimiter } from "./ratelimit";
 import { RoomDO } from "./room";
+import { TRY_AGAIN_LATER, isUpgrade, rejectUpgrade } from "./upgrade";
 
 export interface Env {
   ASSETS: Fetcher;
@@ -82,18 +83,25 @@ export default {
     const wsPrefix = "/ws/";
     if (request.method === "GET" && (url.pathname.startsWith(wsPrefix) || url.pathname === "/ws")) {
       const code = url.pathname.startsWith(wsPrefix) ? url.pathname.slice(wsPrefix.length) : "";
+      // A JSON body is unreadable by a WebSocket client: a non-101 answer reaches the
+      // page as a bare 1006, which it retries forever. Speak the refusal over the
+      // socket when one was asked for, and keep JSON only for a plain HTTP probe.
       if (!isValidRoomCode(code)) {
-        return new Response(JSON.stringify({ error: "Invalid room code" }), {
-          status: 400,
-          headers: { "Content-Type": "application/json" },
-        });
+        return isUpgrade(request)
+          ? rejectUpgrade("bad-room-code", "That room code is not valid")
+          : new Response(JSON.stringify({ error: "Invalid room code" }), {
+              status: 400,
+              headers: { "Content-Type": "application/json" },
+            });
       }
       const clientIp = request.headers.get("CF-Connecting-IP");
       if (clientIp && !wsUpgradeLimit.check(clientIp)) {
-        return new Response(JSON.stringify({ error: "Too many connection attempts" }), {
-          status: 429,
-          headers: { "Content-Type": "application/json", "Retry-After": "60" },
-        });
+        return isUpgrade(request)
+          ? rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER)
+          : new Response(JSON.stringify({ error: "Too many connection attempts" }), {
+              status: 429,
+              headers: { "Content-Type": "application/json", "Retry-After": "60" },
+            });
       }
       const id = env.ROOMS.idFromName(code);
       const stub = env.ROOMS.get(id);

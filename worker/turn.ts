@@ -1,4 +1,4 @@
-import { dropPort53, hasUrls } from "@shared/ice";
+import { dropPort53, hasTurnServer, hasUrls } from "@shared/ice";
 import type { IceServerConfig } from "@shared/protocol";
 
 export interface TurnEnv {
@@ -14,6 +14,9 @@ export const TURN_TTL_SECONDS = 2 * 60 * 60;
 
 /** Re-mint a little before expiry so nobody is handed a credential about to die. */
 const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+
+/** How long a failed mint is remembered. Short enough that a blip is not an outage. */
+export const FAILED_MINT_CACHE_MS = 30 * 1000;
 
 interface CachedIce {
   iceServers: IceServerConfig[];
@@ -32,9 +35,18 @@ export async function getIceServers(
   if (cache.current && cache.current.expiresAt > now) return cache.current.iceServers;
 
   const { iceServers } = await mintIceServers(env);
+
+  // A mint that failed falls back to STUN only. Caching that for the credential TTL
+  // would leave the room without any relay for nearly two hours on the strength of one
+  // transient API error: every pair behind a symmetric NAT silently fails to connect,
+  // and relay-only mode is unavailable to everyone for the rest of the window. Retry
+  // it in seconds instead.
+  const succeeded = hasTurnServer(iceServers);
   cache.current = {
     iceServers,
-    expiresAt: now + TURN_TTL_SECONDS * 1000 - REFRESH_MARGIN_MS,
+    expiresAt: succeeded
+      ? now + TURN_TTL_SECONDS * 1000 - REFRESH_MARGIN_MS
+      : now + FAILED_MINT_CACHE_MS,
   };
   return iceServers;
 }

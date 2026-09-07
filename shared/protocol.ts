@@ -11,6 +11,20 @@ export const MAX_ROOM_SIZE = 8;
 export const ROOM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no O/0/I/1/L
 export const ROOM_CODE_LENGTH = 8;
 
+/**
+ * Largest SDP blob accepted in a signal.
+ *
+ * A real offer for an 8-way mesh with a handful of codecs runs to a few KB; 64 KB is
+ * far above anything legitimate. Without a cap, a joined peer can send a 1 MB `sdp`
+ * in a tight loop: every frame wakes the Durable Object and is forwarded verbatim to
+ * the victim's socket, which is server-mediated amplification against a peer plus
+ * unbounded object CPU and wall-clock billing.
+ */
+export const MAX_SDP_LENGTH = 64 * 1024;
+
+/** Largest ICE candidate line accepted. Real ones are a couple of hundred bytes. */
+export const MAX_CANDIDATE_LENGTH = 1024;
+
 export const PING = "ping";
 export const PONG = "pong";
 
@@ -59,6 +73,7 @@ export type ErrorCode =
   | "unknown-peer"
   | "bad-room-code"
   | "bad-password"
+  | "password-ignored"
   | "forbidden-origin"
   | "rate-limited";
 
@@ -146,7 +161,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
 
         const sig = record.data as Record<string, unknown>;
 
-        if (sig.k === "offer" && typeof sig.sdp === "string") {
+        if (sig.k === "offer" && typeof sig.sdp === "string" && sig.sdp.length <= MAX_SDP_LENGTH) {
           return {
             t: "signal",
             to: record.to,
@@ -154,7 +169,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           };
         }
 
-        if (sig.k === "answer" && typeof sig.sdp === "string") {
+        if (sig.k === "answer" && typeof sig.sdp === "string" && sig.sdp.length <= MAX_SDP_LENGTH) {
           return {
             t: "signal",
             to: record.to,
@@ -169,7 +184,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           !Array.isArray(sig.candidate)
         ) {
           const cand = sig.candidate as Record<string, unknown>;
-          if (typeof cand.candidate !== "string") {
+          if (typeof cand.candidate !== "string" || cand.candidate.length > MAX_CANDIDATE_LENGTH) {
             return null;
           }
 

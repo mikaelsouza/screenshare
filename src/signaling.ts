@@ -69,8 +69,13 @@ export class SignalingClient {
     this.ws = ws;
 
     ws.onopen = () => {
-      this.attempts = 0;
-      this.capacityRefusals = 0;
+      // Deliberately NOT resetting attempts or capacityRefusals here. A refusal also
+      // completes the handshake — the server answers 101 and then closes, so that the
+      // close code can carry a reason at all — so `open` fires for rejected sockets
+      // too. Resetting on open made the backoff and the capacity bound unreachable:
+      // every refusal looked like a fresh success, so the client hammered the Worker
+      // roughly twice a second forever and never reported why. Only a welcome proves
+      // we are actually in the room.
       this.handlers.onStatus("open");
       const joinMsg: ClientMessage = {
         t: "join",
@@ -128,6 +133,9 @@ export class SignalingClient {
   private dispatch(msg: ServerMessage): void {
     switch (msg.t) {
       case "welcome":
+        // Proof the connection actually worked, which is what clears the counters.
+        this.attempts = 0;
+        this.capacityRefusals = 0;
         this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? []);
         break;
       case "peer-joined":

@@ -39,6 +39,31 @@ async function passwordHash(room: string, password: string): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/**
+ * Read a refusal spoken over a completed handshake.
+ *
+ * A refusal answers 101 and then closes, so that the close code and an error frame can
+ * explain themselves. A non-101 answer would reach the browser as a bare 1006 that it
+ * retries forever.
+ */
+async function refusal(res: Response): Promise<{ code: string; closeCode: number }> {
+  if (!res.webSocket) throw new Error(`expected a webSocket, got status ${res.status}`);
+  const ws = res.webSocket;
+  ws.accept();
+  return new Promise((resolve, reject) => {
+    let code = "";
+    const timer = setTimeout(() => reject(new Error("no close received")), 2000);
+    ws.addEventListener("message", (ev) => {
+      const msg = JSON.parse(String((ev as MessageEvent).data)) as ServerMessage;
+      if (msg.t === "error") code = msg.code;
+    });
+    ws.addEventListener("close", (ev) => {
+      clearTimeout(timer);
+      resolve({ code, closeCode: (ev as CloseEvent).code });
+    });
+  });
+}
+
 /** How many sockets one IP may hold in a room; mirrors MAX_SOCKETS_PER_IP. */
 const PER_IP_CAP = MAX_ROOM_SIZE * 2;
 
@@ -135,7 +160,14 @@ class Client {
 describe("HTTP routing", () => {
   it("rejects an invalid room code before reaching the Durable Object", async () => {
     const res = await SELF.fetch("https://example.com/ws/nope", { headers: { Upgrade: "websocket" } });
+    expect(await refusal(res)).toEqual({ code: "bad-room-code", closeCode: 1008 });
+  });
+
+  it("still answers a plain HTTP probe for a bad code with JSON", async () => {
+    // Only a client that asked for a WebSocket gets the refusal over one.
+    const res = await SELF.fetch("https://example.com/ws/nope");
     expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "Invalid room code" });
   });
 
   it("rejects a room code that could traverse into another object's namespace", async () => {
@@ -162,7 +194,7 @@ describe("HTTP routing", () => {
         Origin: "https://evil-attacker.com",
       },
     });
-    expect(res.status).toBe(403);
+    expect(await refusal(res)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
   });
 
   it("accepts same-origin websocket upgrade attempts", async () => {
@@ -183,19 +215,21 @@ describe("HTTP routing", () => {
     // per-room socket cap cannot see this: it is per-object, and cycling codes never
     // uses the same object twice.
     const ip = "198.51.100.7";
-    let limited = 0;
-    for (let i = 0; i < 70; i++) {
+    const sockets: WebSocket[] = [];
+    for (let i = 0; i < 60; i++) {
       const res = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
         headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
       });
-      if (res.status === 429) limited++;
-      // Accept before closing: an unaccepted WebSocket throws on close().
       if (res.webSocket) {
         res.webSocket.accept();
-        res.webSocket.close();
+        sockets.push(res.webSocket);
       }
     }
-    expect(limited).toBeGreaterThan(0);
+
+    const over = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+    });
+    expect(await refusal(over)).toEqual({ code: "rate-limited", closeCode: 1013 });
 
     // A different address is unaffected.
     const other = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
@@ -206,6 +240,7 @@ describe("HTTP routing", () => {
       other.webSocket.accept();
       other.webSocket.close();
     }
+    for (const ws of sockets) ws.close();
   });
 
   it("enforces rate limits on room creation per IP", async () => {
@@ -239,8 +274,7 @@ describe("HTTP routing", () => {
         Origin: "http://[invalid-url",
       },
     });
-    expect(res.status).toBe(403);
-    expect(await res.text()).toBe("Invalid origin");
+    expect(await refusal(res)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
   });
 
   it("applies strict security headers to static asset responses", async () => {
@@ -656,6 +690,82 @@ describe("RoomDO membership", () => {
     expect((await b.nextOf("welcome")).selfId).toBeDefined();
 
     a.close();
+    b.close();
+  });
+
+  it("does not count a missing password as a brute-force attempt", async () => {
+    // Every deep-link open and every refresh of a protected room arrives with no
+    // password. Charging those to the counter made eight friends reloading a few
+    // times each throttle their own room, and eventually trip the hard limit.
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
+    await a.nextOf("welcome");
+
+    const started = Date.now();
+    for (let i = 0; i < 5; i++) {
+      const c = await Client.connect();
+      c.send({ t: "join", room: CODE, displayName: "bob" });
+      expect((await c.nextOf("error")).code).toBe("bad-password");
+      c.close();
+    }
+    // No delay was served, unlike the wrong-password path.
+    expect(Date.now() - started).toBeLessThan(1_000);
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const fails = await runInDurableObject(stub, (_i, state) => state.storage.get("pwFail"));
+    expect(fails).toBeUndefined();
+    a.close();
+  });
+
+  it("refuses rather than speeds up once past the brute-force hard limit", async () => {
+    // The throttle used to invert here: past the limit it returned null and the caller
+    // skipped the delay, so crossing it made guessing faster than being throttled.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const hash = await passwordHash(CODE, "real");
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put("passwordHash", hash);
+      await state.storage.put("pwFail", { count: 999, resetAt: Date.now() + 60_000 });
+    });
+
+    const started = Date.now();
+    const c = await Client.connect();
+    c.send({ t: "join", room: CODE, displayName: "mallory", password: "wrong" });
+    const err = await c.nextOf("error");
+    expect(err.code).toBe("rate-limited");
+    // Refused outright: no delay served, and no hashing done.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    c.close();
+
+    // 1013, not 1008: the window expires, and the real password must work afterwards.
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    res.webSocket!.accept();
+    res.webSocket!.send(JSON.stringify({ t: "join", room: CODE, displayName: "m", password: "x" }));
+    const closeCode = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("never closed")), 2000);
+      res.webSocket!.addEventListener("close", (ev) => {
+        clearTimeout(timer);
+        resolve((ev as CloseEvent).code);
+      });
+    });
+    expect(closeCode).toBe(1013);
+  });
+
+  it("tells a peer their password was ignored on an unprotected room", async () => {
+    // Dropping it silently let someone believe they had protected a room that was in
+    // fact open to anyone holding the code.
+    const a = await Client.connect();
+    await a.join("alice");
+    a.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob", password: "too-late" });
+    const err = await b.nextOf("error");
+    expect(err.code).toBe("password-ignored");
+    // The join still succeeds; this is a warning, not a rejection.
+    expect((await b.nextOf("welcome")).selfId).toBeDefined();
     b.close();
   });
 

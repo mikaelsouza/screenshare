@@ -11,8 +11,14 @@
     // path to index.html, which would swallow /ws/* and /api/* before they ever
     // reach the Worker. With "none" they fall through to the Worker as intended.
     "not_found_handling": "none",
-    // Belt and braces: force these through the Worker regardless of asset matching.
-    "run_worker_first": ["/ws/*", "/api/*"]
+    // Every request, not just /ws and /api. With a path list, anything that matches an
+    // asset is served straight off the edge and the Worker never runs — so the
+    // security headers applied in applySecurityHeaders() reached /api/room and nothing
+    // else. The document itself, the one thing that needs a CSP and X-Frame-Options,
+    // shipped bare. Routing everything through the Worker keeps one source of truth
+    // for those headers; the cost is a Worker invocation per asset, which is nothing
+    // against 100k/day for a room of friends.
+    "run_worker_first": true
   },
 
   "durable_objects": {

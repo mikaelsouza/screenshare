@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 import {
-  type ErrorCode,
   type IceServerConfig,
   MAX_ROOM_SIZE,
   PING,
@@ -11,6 +10,7 @@ import {
 } from "@shared/protocol";
 import type { Env } from "./index";
 import { getIceServers } from "./turn";
+import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
 /**
  * Ceiling on total sockets held by one room, joined or not. Generous relative to
@@ -132,44 +132,6 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
-/**
- * "Try Again Later" — the standard close code for a transient capacity refusal.
- *
- * Capacity limits must NOT use 1008: the client treats that as terminal and stops
- * reconnecting, so a household that briefly exceeded the per-IP cap (half-open
- * sockets the runtime has not reaped yet, say) would have to reload the page. Nor can
- * they fail the handshake, which reaches the page as 1006 and is retried forever
- * because it is indistinguishable from a network blip. 1013 is retried, with backoff
- * and a bounded number of attempts.
- */
-const TRY_AGAIN_LATER = 1013;
-
-/**
- * Refuse a connection in a way the browser can actually report.
- *
- * Answering the upgrade with a non-101 status makes the handshake fail, and all the
- * page sees is close code 1006 with no body — indistinguishable from a network blip,
- * so SignalingClient reconnects forever at the backoff cap, burning a Worker request
- * and a Durable Object wake-up per cycle. Completing the handshake lets us say what
- * happened, and pick a close code that says whether coming back is worth trying.
- *
- * The server side is taken with `accept()`, not `ctx.acceptWebSocket()`, so it never
- * enters getWebSockets() and a rejection cannot itself consume room capacity.
- */
-function rejectUpgrade(code: ErrorCode, message: string, closeCode = 1008): Response {
-  const pair = new WebSocketPair();
-  const client = pair[0];
-  const server = pair[1];
-  server.accept();
-  sendSafe(server, { t: "error", code, message });
-  try {
-    server.close(closeCode, message);
-  } catch {
-    // Already gone; the client still gets the close.
-  }
-  return new Response(null, { status: 101, webSocket: client });
-}
-
 export class RoomDO extends DurableObject<Env> {
   /** TURN credentials are identical for everyone here, so mint once per room. */
   private readonly iceCache: { current: { iceServers: IceServerConfig[]; expiresAt: number } | null } = {
@@ -266,10 +228,10 @@ export class RoomDO extends DurableObject<Env> {
         const originHost = new URL(origin).host;
         const reqHost = new URL(request.url).host;
         if (originHost !== reqHost) {
-          return new Response("Forbidden origin", { status: 403 });
+          return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
         }
       } catch {
-        return new Response("Invalid origin", { status: 403 });
+        return rejectUpgrade("forbidden-origin", "Malformed Origin header");
       }
     }
 
@@ -353,11 +315,39 @@ export class RoomDO extends DurableObject<Env> {
         const roomPasswordHash = await this.getRoomPasswordHash();
         if (roomPasswordHash !== null) {
           const offeredHash = offered ? await this.hashPassword(offered) : null;
-          if (offeredHash === null || !timingSafeEqual(offeredHash, roomPasswordHash)) {
+          if (offeredHash === null) {
+            // No password supplied at all. This is the ordinary first contact — a
+            // shared /#CODE link, or a refresh — not an attempt at the password, so it
+            // must not feed the brute-force counter or pay its delay. Counting it made
+            // eight friends reloading a few times each throttle their own room.
+            sendSafe(ws, {
+              t: "error",
+              code: "bad-password",
+              message: "This room needs a password",
+            });
+            try {
+              ws.close(1008, "Password required");
+            } catch {}
+            return;
+          }
+          if (!timingSafeEqual(offeredHash, roomPasswordHash)) {
             const delayMs = await this.notePasswordFailure();
-            if (delayMs !== null) {
-              await scheduler.wait(delayMs);
+            if (delayMs === null) {
+              // Past the hard limit: refuse without delay and without hashing, so the
+              // throttle cannot be turned into a way to hold this object awake. 1013,
+              // not 1008, because the window expires and someone with the real
+              // password must be able to get in afterwards.
+              sendSafe(ws, {
+                t: "error",
+                code: "rate-limited",
+                message: "Too many password attempts. Try again later.",
+              });
+              try {
+                ws.close(TRY_AGAIN_LATER, "Too many password attempts");
+              } catch {}
+              return;
             }
+            await scheduler.wait(delayMs);
             sendSafe(ws, {
               t: "error",
               code: "bad-password",
@@ -397,6 +387,16 @@ export class RoomDO extends DurableObject<Env> {
             await this.ctx.storage.put(PASSWORD_KEY, await this.hashPassword(offered));
           }
           await this.ctx.storage.put(CLAIMED_KEY, true);
+        } else if (offered && roomPasswordHash === null) {
+          // The room already exists and has no password, and this peer supplied one.
+          // Silently dropping it let someone believe they had protected a room that
+          // was in fact open to anyone with the code — the worst possible outcome for
+          // a security control. Say so instead; the join itself still succeeds.
+          sendSafe(ws, {
+            t: "error",
+            code: "password-ignored",
+            message: "This room has no password. Yours was ignored — create a new room to set one.",
+          });
         }
 
         // Someone is in the room, so it is not abandoned. Cancel any pending erasure.

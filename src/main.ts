@@ -43,6 +43,15 @@ const ui = {
 
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
+/**
+ * Whether relay-only is actually in force on the live mesh.
+ *
+ * Not the same as the checkbox. The status line used to read the checkbox directly, so
+ * it announced "(Privacy Mode)" from the moment the socket opened — before the welcome
+ * carrying the ICE servers had arrived, and therefore before anything had verified a
+ * relay was even available.
+ */
+let relayActive = false;
 let capture: CaptureResult | null = null;
 let stopCaptureListener: (() => void) | null = null;
 
@@ -354,7 +363,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       onStatus: (s) =>
         setStatus(
           s === "open"
-            ? `In room ${code}${ui.relayOnly.checked ? " (Privacy Mode)" : ""}`
+            ? `In room ${code}${relayActive ? " (Privacy Mode)" : ""}`
             : `Connection ${s}…`,
         ),
 
@@ -373,10 +382,25 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 
         // Fall back to a normal connection rather than a broken one. Privacy mode is a
         // preference; silently connecting nobody is not a way to honour it.
-        let relayOnly = ui.relayOnly.checked;
-        const relayUnavailable = relayOnly && !hasTurnServer(servers);
-        if (relayUnavailable) relayOnly = false;
+        // Privacy mode must fail closed. Downgrading to iceTransportPolicy "all"
+        // signals host and srflx candidates — the user's real IP — to every peer,
+        // which is precisely what the checkbox promises to prevent. A security
+        // control that quietly turns itself off is worse than one that is absent,
+        // because the user goes on believing it is working.
+        const relayOnly = ui.relayOnly.checked;
+        relayActive = false;
+        if (relayOnly && !hasTurnServer(servers)) {
+          setStatus(
+            "Privacy mode is on but no TURN relay is configured, so your IP cannot be hidden. " +
+              "Not connecting. Untick Hide IP to join without it.",
+            "error",
+          );
+          client?.close();
+          client = null;
+          return;
+        }
 
+        relayActive = relayOnly;
         mesh = new Mesh(
           selfId,
           {
@@ -405,16 +429,9 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           names.set(p.id, p.name);
           mesh.addPeer(p.id);
         }
-        if (relayUnavailable) {
-          setStatus(
-            `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected. Privacy mode is OFF: no TURN relay is configured here, and relay-only would have connected to nobody.`,
-            "warn",
-          );
-        } else {
-          setStatus(
-            `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
-          );
-        }
+        setStatus(
+          `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+        );
         if (capture) void mesh.setCapture(capture);
         startHealthPolling();
       },
@@ -438,9 +455,15 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // say so in plain language and put the cursor where the fix goes. The socket
         // is closed with 1008 and will not retry by itself, but joinRoom() builds a
         // fresh SignalingClient, so pressing Join (or Enter) genuinely retries.
+        if (code === "password-ignored") {
+          setStatus(message, "warn");
+          return;
+        }
         if (code === "bad-password") {
           setStatus(`Room ${codeToJoin} needs a password. Enter it and press Join.`, "warn");
-          ui.passInput.value = "";
+          // Do NOT clear the field. The rejection can arrive while the user is already
+          // typing — the server deliberately delays a wrong guess — and wiping it then
+          // destroys what they were halfway through entering.
           ui.passInput.focus();
           return;
         }
@@ -460,6 +483,7 @@ function leaveRoom(): void {
   client = null;
   mesh?.close();
   mesh = null;
+  relayActive = false;
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
   names.clear();

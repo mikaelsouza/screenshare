@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_CANDIDATE_LENGTH,
+  MAX_SDP_LENGTH,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
   generateRoomCode,
@@ -160,5 +162,40 @@ describe("parseClientMessage", () => {
       JSON.stringify({ t: "signal", to: "p1", data: [] }),
     ];
     for (const raw of bad) expect(parseClientMessage(raw), raw).toBeNull();
+  });
+});
+
+describe("signal size limits", () => {
+  // Unbounded, a joined peer could send a 1 MB sdp in a tight loop: every frame wakes
+  // the Durable Object and is forwarded verbatim to the victim's socket — amplification
+  // against a peer, plus unbounded object CPU and wall-clock billing.
+  const sig = (data: unknown): unknown =>
+    parseClientMessage(JSON.stringify({ t: "signal", to: "peer-1", data }));
+
+  it("accepts an SDP right at the limit and rejects one byte more", () => {
+    expect(sig({ k: "offer", sdp: "v".repeat(MAX_SDP_LENGTH) })).not.toBeNull();
+    expect(sig({ k: "offer", sdp: "v".repeat(MAX_SDP_LENGTH + 1) })).toBeNull();
+    expect(sig({ k: "answer", sdp: "v".repeat(MAX_SDP_LENGTH) })).not.toBeNull();
+    expect(sig({ k: "answer", sdp: "v".repeat(MAX_SDP_LENGTH + 1) })).toBeNull();
+  });
+
+  it("accepts a candidate at the limit and rejects one byte more", () => {
+    const cand = (n: number) => ({
+      k: "ice",
+      candidate: { candidate: "c".repeat(n), sdpMid: "0", sdpMLineIndex: 0 },
+    });
+    expect(sig(cand(MAX_CANDIDATE_LENGTH))).not.toBeNull();
+    expect(sig(cand(MAX_CANDIDATE_LENGTH + 1))).toBeNull();
+  });
+
+  it("still accepts a realistically sized offer", () => {
+    // The cap must not be so tight that an 8-way mesh offer trips it.
+    expect(sig({ k: "offer", sdp: "v=0\r\n" + "a=rtpmap:111 opus/48000/2\r\n".repeat(200) })).not.toBeNull();
+  });
+
+  it("rejects an empty-string sdp as it would any malformed signal", () => {
+    expect(sig({ k: "offer", sdp: "" })).not.toBeNull();
+    expect(sig({ k: "offer" })).toBeNull();
+    expect(sig({ k: "offer", sdp: 123 })).toBeNull();
   });
 });

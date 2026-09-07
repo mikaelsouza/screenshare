@@ -1,5 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { PORT_53, dropPort53, hasTurnServer, hasUrls } from "@shared/ice";
+import type { IceServerConfig } from "@shared/protocol";
+import { FAILED_MINT_CACHE_MS, TURN_TTL_SECONDS, getIceServers } from "../../worker/turn";
 
 
 describe("PORT_53", () => {
@@ -210,5 +212,65 @@ describe("hasTurnServer", () => {
 
   it("does not mistake a hostname containing 'turn' for a relay", () => {
     expect(hasTurnServer([{ urls: "stun:returning.example.com:3478" }])).toBe(false);
+  });
+});
+
+describe("getIceServers caching", () => {
+  const OK_RESPONSE = {
+    iceServers: [
+      { urls: ["turn:turn.cloudflare.com:3478?transport=udp"], username: "u", credential: "c" },
+    ],
+  };
+
+  function fakeFetch(queue: Array<Response | Error>): { calls: number } {
+    const state = { calls: 0 };
+    vi.stubGlobal("fetch", async () => {
+      const next = queue[Math.min(state.calls, queue.length - 1)];
+      state.calls++;
+      if (next instanceof Error) throw next;
+      return next!.clone();
+    });
+    return state;
+  }
+
+  afterEach(() => vi.unstubAllGlobals());
+
+  const env = { TURN_KEY_ID: "k", TURN_API_TOKEN: "t" };
+
+  it("serves a successful mint from cache instead of re-minting", async () => {
+    const calls = fakeFetch([Response.json(OK_RESPONSE)]);
+    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
+    await getIceServers(env, cache);
+    await getIceServers(env, cache);
+    expect(calls.calls).toBe(1);
+  });
+
+  it("retries a failed mint in seconds, not after the credential TTL", async () => {
+    // A mint that fails falls back to STUN only. Caching that for the full TTL left the
+    // room with no relay for nearly two hours on one transient error: every pair behind
+    // a symmetric NAT silently fails, and relay-only is unavailable to everyone.
+    const calls = fakeFetch([new Error("network down"), Response.json(OK_RESPONSE)]);
+    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
+
+    const first = await getIceServers(env, cache);
+    expect(hasTurnServer(first)).toBe(false);
+
+    const ttl = cache.current!.expiresAt - Date.now();
+    expect(ttl).toBeLessThanOrEqual(FAILED_MINT_CACHE_MS);
+    // Emphatically shorter than the success TTL, which is close to two hours.
+    expect(ttl).toBeLessThan(TURN_TTL_SECONDS * 1000 / 10);
+
+    // Once that short window lapses the next join mints again, and now succeeds.
+    cache.current!.expiresAt = Date.now() - 1;
+    const second = await getIceServers(env, cache);
+    expect(hasTurnServer(second)).toBe(true);
+    expect(calls.calls).toBe(2);
+  });
+
+  it("gives a successful mint the long TTL", async () => {
+    fakeFetch([Response.json(OK_RESPONSE)]);
+    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
+    await getIceServers(env, cache);
+    expect(cache.current!.expiresAt - Date.now()).toBeGreaterThan(TURN_TTL_SECONDS * 1000 / 2);
   });
 });

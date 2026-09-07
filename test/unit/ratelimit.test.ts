@@ -52,3 +52,45 @@ describe("RateLimiter", () => {
     expect(rl.check("keep", 3)).toBe(false);
   });
 });
+
+describe("RateLimiter boundaries", () => {
+  it("treats the window as expiring exactly at resetAt, not after", () => {
+    const rl = new RateLimiter(1, 1_000, 100);
+    expect(rl.check("a", 0)).toBe(true);
+    expect(rl.check("a", 999)).toBe(false);
+    // resetAt is 1000 and the check is `resetAt <= now`, so 1000 is a fresh window.
+    expect(rl.check("a", 1_000)).toBe(true);
+  });
+
+  it("allows exactly max requests, never max + 1", () => {
+    for (const max of [1, 2, 20]) {
+      const rl = new RateLimiter(max, 60_000, 100);
+      for (let i = 0; i < max; i++) expect(rl.check("a", 0), `request ${i}`).toBe(true);
+      expect(rl.check("a", 0)).toBe(false);
+    }
+  });
+
+  it("keeps one key's budget entirely separate from another's", () => {
+    const rl = new RateLimiter(1, 60_000, 100);
+    expect(rl.check("a", 0)).toBe(true);
+    expect(rl.check("b", 0)).toBe(true);
+    expect(rl.check("a", 0)).toBe(false);
+    expect(rl.check("b", 0)).toBe(false);
+  });
+
+  it("survives a maxEntries of 1, where every insert evicts the last", () => {
+    const rl = new RateLimiter(5, 60_000, 1);
+    expect(rl.check("a", 0)).toBe(true);
+    expect(rl.check("b", 0)).toBe(true);
+    expect(rl.size).toBeLessThanOrEqual(1);
+  });
+
+  it("does not let a clock that goes backwards refuse forever", () => {
+    // Durable Object time can jump; an entry written with a future resetAt must still
+    // expire rather than wedging the key shut.
+    const rl = new RateLimiter(1, 1_000, 100);
+    expect(rl.check("a", 10_000)).toBe(true);
+    expect(rl.check("a", 5_000)).toBe(false);
+    expect(rl.check("a", 11_001)).toBe(true);
+  });
+});

@@ -241,6 +241,14 @@ describe("SignalingClient capacity refusals", () => {
     vi.unstubAllGlobals();
   });
 
+  /** What a refusal actually looks like: 101 handshake, so `open` fires, then close. */
+  function refuse(code = 1013): void {
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
+    ws.open();
+    ws.serverClose(code);
+    vi.advanceTimersByTime(30_000);
+  }
+
   it("retries a 1013 refusal rather than treating it as terminal", () => {
     // Capacity is transient — usually a half-open socket the runtime has not reaped —
     // so a client refused for it must come back. 1008 would strand a user who did
@@ -248,8 +256,7 @@ describe("SignalingClient capacity refusals", () => {
     // ever shown.
     const c = new SignalingClient("ABCDEFGH", "alice", handlers());
     c.connect();
-    FakeWebSocket.instances[0]!.serverClose(1013);
-    vi.advanceTimersByTime(30_000);
+    refuse();
     expect(FakeWebSocket.instances.length).toBe(2);
   });
 
@@ -257,10 +264,7 @@ describe("SignalingClient capacity refusals", () => {
     const h = handlers();
     const c = new SignalingClient("ABCDEFGH", "alice", h);
     c.connect();
-    for (let i = 0; i < 6; i++) {
-      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
-      vi.advanceTimersByTime(30_000);
-    }
+    for (let i = 0; i < 6; i++) refuse();
     const opened = FakeWebSocket.instances.length;
     expect(h.onError).toHaveBeenCalledWith("rate-limited", expect.stringContaining("capacity"));
 
@@ -274,19 +278,17 @@ describe("SignalingClient capacity refusals", () => {
     // would eventually refuse to reconnect at all.
     const c = new SignalingClient("ABCDEFGH", "alice", handlers());
     c.connect();
-    for (let i = 0; i < 4; i++) {
-      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
-      vi.advanceTimersByTime(30_000);
-    }
-    FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.open();
+    for (let i = 0; i < 4; i++) refuse();
 
-    // With the counter reset, four more refusals must each still produce a reconnect.
+    // A welcome, not a bare `open`, is what proves the connection worked.
+    const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "a", peers: [], iceServers: [] }) });
+
+    // With the counter cleared, four more refusals must each still reconnect.
     // Without the reset the fifth cumulative refusal would have tripped the limit.
-    const afterOpen = FakeWebSocket.instances.length;
-    for (let i = 0; i < 4; i++) {
-      FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!.serverClose(1013);
-      vi.advanceTimersByTime(30_000);
-    }
-    expect(FakeWebSocket.instances.length).toBe(afterOpen + 4);
+    const afterWelcome = FakeWebSocket.instances.length;
+    for (let i = 0; i < 4; i++) refuse();
+    expect(FakeWebSocket.instances.length).toBe(afterWelcome + 4);
   });
 });
