@@ -32,3 +32,19 @@ export function dropPort53(server: IceServerConfig): IceServerConfig {
 export function hasUrls(server: IceServerConfig): boolean {
   return Array.isArray(server.urls) ? server.urls.length > 0 : Boolean(server.urls);
 }
+
+/**
+ * Whether a relay is actually reachable with these servers.
+ *
+ * Relay-only mode sets iceTransportPolicy "relay" and additionally discards every
+ * non-relay candidate, so with a STUN-only list it gathers nothing at all and every
+ * peer connection fails with no visible cause. That list is not hypothetical: it is
+ * exactly what arrives when TURN_KEY_ID/TURN_API_TOKEN are unset, when minting fails,
+ * and whenever the client's STUN-only fallback is used.
+ */
+export function hasTurnServer(servers: readonly IceServerConfig[]): boolean {
+  return servers.some((s) => {
+    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
+    return urls.some((u) => u.startsWith("turn:") || u.startsWith("turns:"));
+  });
+}

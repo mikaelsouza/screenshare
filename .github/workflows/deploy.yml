@@ -25,6 +25,11 @@ jobs:
         run: |
           npm run check
           npm run test:unit
+          # The Durable Object suite runs in real workerd and is the only thing
+          # covering room capacity, password enforcement and hibernation. Leaving it
+          # out of CI meant a regression in worker/room.ts could ship to production
+          # with a fully green pipeline.
+          npm run test:worker
 
       - name: Build static assets
         run: npm run build

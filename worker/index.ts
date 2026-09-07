@@ -1,4 +1,5 @@
 import { generateRoomCode, isValidRoomCode } from "@shared/protocol";
+import { RateLimiter } from "./ratelimit";
 import { RoomDO } from "./room";
 
 export interface Env {
@@ -10,20 +11,14 @@ export interface Env {
 
 export { RoomDO };
 
-const roomCreationLimit = new Map<string, { count: number; resetAt: number }>();
+/**
+ * Per-IP room-creation throttle. See RateLimiter for the isolate-scoping caveat:
+ * this blunts a trivial flood, it is not a global guarantee.
+ */
+const roomCreationLimit = new RateLimiter(20, 60_000, 10_000);
 
 function checkRoomRateLimit(ip: string): boolean {
-  const now = Date.now();
-  const entry = roomCreationLimit.get(ip);
-  if (!entry || entry.resetAt <= now) {
-    roomCreationLimit.set(ip, { count: 1, resetAt: now + 60_000 });
-    return true;
-  }
-  if (entry.count >= 20) {
-    return false;
-  }
-  entry.count++;
-  return true;
+  return roomCreationLimit.check(ip);
 }
 
 function applySecurityHeaders(res: Response): Response {

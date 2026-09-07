@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { PORT_53, dropPort53, hasUrls } from "@shared/ice";
+import { PORT_53, dropPort53, hasTurnServer, hasUrls } from "@shared/ice";
 
 
 describe("PORT_53", () => {
@@ -186,5 +186,29 @@ describe("worker turn credentials", () => {
     const servers = await getIceServers(env, cache);
     expect(servers).toEqual([{ urls: "stun:stun.cloudflare.com:3478" }]);
     expect(cache.current?.expiresAt).toBeGreaterThan(Date.now());
+  });
+});
+
+describe("hasTurnServer", () => {
+  it("is false for a STUN-only list", () => {
+    // This is exactly what the client receives when TURN_KEY_ID/TURN_API_TOKEN are
+    // unset, when minting throws, and whenever the STUN-only fallback is used.
+    expect(hasTurnServer([{ urls: "stun:stun.cloudflare.com:3478" }])).toBe(false);
+    expect(hasTurnServer([])).toBe(false);
+  });
+
+  it("finds a relay however the list is shaped", () => {
+    expect(hasTurnServer([{ urls: "turn:turn.cloudflare.com:3478?transport=udp" }])).toBe(true);
+    expect(hasTurnServer([{ urls: "turns:turn.cloudflare.com:443?transport=tcp" }])).toBe(true);
+    expect(
+      hasTurnServer([{ urls: ["stun:stun.cloudflare.com:3478", "turn:turn.cloudflare.com:3478"] }]),
+    ).toBe(true);
+    expect(
+      hasTurnServer([{ urls: "stun:stun.cloudflare.com:3478" }, { urls: "turns:h:5349" }]),
+    ).toBe(true);
+  });
+
+  it("does not mistake a hostname containing 'turn' for a relay", () => {
+    expect(hasTurnServer([{ urls: "stun:returning.example.com:3478" }])).toBe(false);
   });
 });

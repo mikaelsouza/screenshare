@@ -8,7 +8,7 @@ export default defineConfig({
     environment: "node",
     coverage: {
       provider: "v8",
-      include: ["shared/**/*.ts", "src/**/*.ts", "worker/turn.ts"],
+      include: ["shared/**/*.ts", "src/**/*.ts", "worker/turn.ts", "worker/ratelimit.ts"],
       exclude: ["src/main.ts", "src/diagnostics.ts"],
       reporter: ["text", "json", "html"],
     },

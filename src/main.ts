@@ -4,6 +4,7 @@
  * Everything latency-critical lives in mesh.ts / quality.ts. This file is glue.
  */
 
+import { hasTurnServer } from "@shared/ice";
 import { MAX_ROOM_SIZE, isValidRoomCode, type PeerId, type PeerInfo } from "@shared/protocol";
 import {
   captureScreen,
@@ -42,6 +43,8 @@ const ui = {
 
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
+/** Room code whose join was rejected for a bad/missing password, awaiting a retry. */
+let pendingPasswordCode: string | null = null;
 let capture: CaptureResult | null = null;
 let stopCaptureListener: (() => void) | null = null;
 
@@ -63,6 +66,7 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
  * case; only the relay fallback needs the credentials the server mints.
  */
 const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
+
 
 // ---- tiles ---------------------------------------------------------------
 
@@ -338,6 +342,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
     return;
   }
 
+  const codeToJoin = code;
   const generation = ++joinGeneration;
   leaveRoom();
   if (generation !== joinGeneration) return;
@@ -363,16 +368,25 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // with every reconnect.
         mesh?.close();
         monitors.clear();
+
+        // Minted by the Durable Object and delivered with the welcome, so holding a
+        // joined WebSocket is what authorises them.
+        const servers: RTCIceServer[] = iceServers.length > 0 ? iceServers : FALLBACK_ICE;
+
+        // Fall back to a normal connection rather than a broken one. Privacy mode is a
+        // preference; silently connecting nobody is not a way to honour it.
+        let relayOnly = ui.relayOnly.checked;
+        const relayUnavailable = relayOnly && !hasTurnServer(servers);
+        if (relayUnavailable) relayOnly = false;
+
         mesh = new Mesh(
           selfId,
           {
-            // Minted by the Durable Object and delivered with the welcome, so holding a
-            // joined WebSocket is what authorises them.
-            iceServers: iceServers.length > 0 ? iceServers : FALLBACK_ICE,
+            iceServers: servers,
             preset: QUALITY_PRESETS[currentPreset()],
             codec: currentCodec(),
             jitterBufferTargetMs: 0,
-            relayOnly: ui.relayOnly.checked,
+            relayOnly,
           },
           (to, data) => client?.signal(to, data),
           {
@@ -393,9 +407,17 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           names.set(p.id, p.name);
           mesh.addPeer(p.id);
         }
-        setStatus(
-          `In room ${code}${ui.relayOnly.checked ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
-        );
+        if (relayUnavailable) {
+          setStatus(
+            `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected. Privacy mode is OFF: no TURN relay is configured here, and relay-only would have connected to nobody.`,
+            "warn",
+          );
+        } else {
+          setStatus(
+            `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+          );
+        }
+        pendingPasswordCode = null;
         if (capture) void mesh.setCapture(capture);
         startHealthPolling();
       },
@@ -414,7 +436,20 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       onPeerState: (id, sharing) => {
         if (!sharing) removeTile(id);
       },
-      onError: (code, message) => setStatus(`${code}: ${message}`, "error"),
+      onError: (code, message) => {
+        // A wrong password is the one error the user can actually fix from here, so
+        // say so in plain language and put the cursor where the fix goes. The socket
+        // is closed with 1008 and will not retry by itself, but joinRoom() builds a
+        // fresh SignalingClient, so pressing Join (or Enter) genuinely retries.
+        if (code === "bad-password") {
+          pendingPasswordCode = codeToJoin;
+          setStatus(`Room ${codeToJoin} needs a password. Enter it and press Join.`, "warn");
+          ui.passInput.value = "";
+          ui.passInput.focus();
+          return;
+        }
+        setStatus(`${code}: ${message}`, "error");
+      },
     },
     password,
   );
@@ -513,6 +548,17 @@ ui.joinBtn.addEventListener("click", () =>
   void joinRoom(ui.roomInput.value.trim().toUpperCase(), ui.passInput.value.trim() || undefined),
 );
 
+// Typing a password and pressing Enter is the natural retry after a bad-password
+// rejection; without this the user has to notice the Join button to get back in.
+for (const input of [ui.roomInput, ui.passInput]) {
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    const code = (pendingPasswordCode ?? ui.roomInput.value).trim().toUpperCase();
+    void joinRoom(code, ui.passInput.value.trim() || undefined);
+  });
+}
+
 ui.createBtn.addEventListener("click", () => {
   void (async () => {
     // Without the ok check a 500 or an HTML error page throws inside this voided
@@ -538,6 +584,12 @@ ui.shareBtn.addEventListener("click", () => {
 window.addEventListener("beforeunload", () => leaveRoom());
 
 // Deep link: /#ROOMCODE joins straight away.
+//
+// The password box is necessarily empty this early, so a link to a protected room
+// gets rejected on this first attempt. That is fine, and better than not trying at
+// all: the overwhelmingly common case is an unprotected room, and `bad-password` is
+// handled as a recoverable prompt rather than a dead end, so the protected case turns
+// into "enter the password and press Enter" instead of a silent failure.
 const fromHash = location.hash.replace(/^#/, "").toUpperCase();
 if (fromHash) {
   ui.roomInput.value = fromHash;
