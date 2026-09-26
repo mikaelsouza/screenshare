@@ -153,6 +153,7 @@
         display: flex;
         align-items: center;
         justify-content: center;
+        flex-wrap: wrap;
         gap: 0.75rem;
         padding: 0.75rem 1.5rem;
         background-color: var(--surface-color);
@@ -238,6 +239,60 @@
         padding: 0.35rem 0.5rem;
         font-size: 0.8rem;
       }
+      /* Author display rules below would otherwise override the hidden attribute. */
+      [hidden] { display: none !important; }
+      /* Audio source: the prompt after a whole-screen pick, and the live chip. */
+      #audio-prompt {
+        align-self: center;
+        width: min(460px, calc(100% - 2rem));
+        margin: 0 auto 0.75rem;
+        padding: 1rem;
+        display: grid;
+        gap: 0.75rem;
+        background: var(--surface-color);
+        border: 1px solid var(--border-color);
+        border-radius: 10px;
+        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+      }
+      #audio-prompt h2 {
+        margin: 0;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+      #audio-prompt p {
+        margin: 0;
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+      }
+      #audio-prompt .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+      #audio-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.2rem 0.3rem 0.2rem 0.75rem;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        background: var(--bg-color);
+        font-size: 0.8rem;
+      }
+      #audio-chip::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #34d399;
+        flex: none;
+      }
+      #audio-chip[data-kind="warn"]::before { background: #fbbf24; }
+      #audio-chip[data-kind="off"]::before { background: var(--text-secondary); }
+      #audio-chip button {
+        padding: 0.2rem 0.6rem;
+        font-size: 0.75rem;
+      }
     </style>
   </head>
   <body>
@@ -263,8 +318,31 @@
 
     <main id="stage"></main>
 
+    <section id="audio-prompt" hidden aria-labelledby="audio-prompt-title">
+      <h2 id="audio-prompt-title">Which app should viewers hear?</h2>
+      <p id="audio-prompt-text">
+        You're sharing your whole screen. Pick the game's window and only its sound is sent.
+        Discord and music stay private.
+      </p>
+      <div class="row">
+        <button type="button" id="audio-pick-app" class="primary">Pick game window</button>
+        <button type="button" id="audio-pick-system">Use all system audio</button>
+        <button type="button" id="audio-pick-none">No audio</button>
+      </div>
+    </section>
+
     <div id="controls">
       <button type="button" id="share" class="primary">Share screen</button>
+      <label class="field" for="audio-mode">Audio</label>
+      <select id="audio-mode" title="Applies the next time you start sharing">
+        <option value="app">Game only</option>
+        <option value="system">All system audio</option>
+        <option value="none">No audio</option>
+      </select>
+      <span id="audio-chip" hidden>
+        <span id="audio-chip-text"></span>
+        <button type="button" id="audio-change">Change</button>
+      </span>
       <button type="button" id="mute-audio" style="display: none;">Mute audio</button>
       <label class="field" for="preset">Quality</label>
       <select id="preset" title="Applies immediately while sharing"></select>
