@@ -2,10 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_PRESET,
   QUALITY_PRESETS,
+  captureAudioOnly,
   captureScreen,
   onCaptureEnded,
+  stopAudioSource,
   stopCapture,
   systemAudioSupport,
+  windowAudioSupport,
 } from "@src/capture";
 
 describe("QUALITY_PRESETS", () => {
@@ -119,13 +122,54 @@ describe("systemAudioSupport", () => {
   });
 });
 
+describe("windowAudioSupport", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  function stubUa(userAgent: string, platform = "Windows") {
+    vi.stubGlobal("navigator", { userAgent, userAgentData: { platform }, platform: "Win32" });
+  }
+
+  it("supports Chrome 141 and newer on Windows", () => {
+    stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/141.0.0.0 Safari/537.36");
+    expect(windowAudioSupport()).toEqual({ supported: true });
+  });
+
+  it("supports Edge, which carries Chromium's version", () => {
+    stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0");
+    expect(windowAudioSupport().supported).toBe(true);
+  });
+
+  it("asks older Chrome to update", () => {
+    stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36");
+    const res = windowAudioSupport();
+    expect(res.supported).toBe(false);
+    expect(res.reason).toContain("141");
+  });
+
+  it("passes on the system-audio reason where there is no audio at all", () => {
+    vi.stubGlobal("navigator", {
+      userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/150.0.0.0",
+      userAgentData: { platform: "macOS" },
+      platform: "MacIntel",
+    });
+    const res = windowAudioSupport();
+    expect(res.supported).toBe(false);
+    expect(res.reason).toContain("macOS");
+  });
+});
+
 describe("captureScreen and track helpers", () => {
-  function makeTrack(kind: "video" | "audio") {
+  function makeTrack(kind: "video" | "audio", settings: Record<string, unknown> = {}, label = "") {
     let endedHandler: (() => void) | null = null;
     let stopped = false;
     return {
       kind,
+      label,
+      enabled: true,
       contentHint: "",
+      getSettings: () => settings,
       get stopped() { return stopped; },
       stop: () => { stopped = true; },
       addEventListener: vi.fn((event: string, handler: () => void) => {
@@ -171,7 +215,7 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    const result = await captureScreen(QUALITY_PRESETS["1080p60"], true);
+    const result = await captureScreen(QUALITY_PRESETS["1080p60"], "app");
     expect(result.stream).toBe(stream);
     expect(result.video).toBe(vTrack);
     expect(result.audio).toBe(aTrack);
@@ -194,7 +238,7 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    const result = await captureScreen(QUALITY_PRESETS["720p30"], false);
+    const result = await captureScreen(QUALITY_PRESETS["720p30"], "none");
     expect(result.audio).toBeNull();
     const callArgs = getDisplayMediaMock.mock.calls[0]?.[0];
     expect(callArgs.audio).toBe(false);
@@ -208,7 +252,7 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    await expect(captureScreen(QUALITY_PRESETS["1080p60"], true)).rejects.toThrow(
+    await expect(captureScreen(QUALITY_PRESETS["1080p60"], "app")).rejects.toThrow(
       "getDisplayMedia returned no video track",
     );
     expect((aTrack as unknown as { stopped: boolean }).stopped).toBe(true);
@@ -235,5 +279,73 @@ describe("captureScreen and track helpers", () => {
     stopCapture({ stream, video: vTrack, audio: aTrack });
     expect(vTrack.stopped).toBe(true);
     expect(aTrack.stopped).toBe(true);
+  });
+
+  function stubGetDisplayMedia(stream: MediaStream) {
+    const mock = vi.fn().mockResolvedValue(stream);
+    (navigator.mediaDevices as unknown as { getDisplayMedia: typeof mock }).getDisplayMedia = mock;
+    return mock;
+  }
+
+  it("asks for only the window's audio in app mode, and no system audio for screens", async () => {
+    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), null));
+    await captureScreen(QUALITY_PRESETS["1080p60"], "app");
+    expect(mock.mock.calls[0]?.[0]).toMatchObject({ windowAudio: "window", systemAudio: "exclude" });
+  });
+
+  it("offers system audio for screens and windows in system mode", async () => {
+    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), null));
+    await captureScreen(QUALITY_PRESETS["1080p60"], "system");
+    expect(mock.mock.calls[0]?.[0]).toMatchObject({ windowAudio: "system", systemAudio: "include" });
+  });
+
+  it("reports which surface was picked", async () => {
+    stubGetDisplayMedia(makeStream(makeTrack("video", { displaySurface: "monitor" }), null));
+    const result = await captureScreen(QUALITY_PRESETS["1080p60"], "app");
+    expect(result.surface).toBe("monitor");
+  });
+
+  it("captures a window's audio alone and keeps its thumbnail running but disabled", async () => {
+    const video = makeTrack("video", {}, "League of Legends (TM) Client");
+    const audio = makeTrack("audio");
+    const mock = stubGetDisplayMedia(makeStream(video, audio));
+
+    const source = await captureAudioOnly("window");
+    expect(mock.mock.calls[0]?.[0]).toMatchObject({
+      displaySurface: "window",
+      monitorTypeSurfaces: "exclude",
+      windowAudio: "window",
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    });
+    expect(source?.track).toBe(audio);
+    expect(source?.kind).toBe("window");
+    expect(source?.label).toBe("League of Legends (TM) Client");
+    expect(audio.contentHint).toBe("music");
+    expect(video.enabled).toBe(false);
+    expect((video as unknown as { stopped: boolean }).stopped).toBe(false);
+
+    stopAudioSource(source!);
+    expect((video as unknown as { stopped: boolean }).stopped).toBe(true);
+    expect((audio as unknown as { stopped: boolean }).stopped).toBe(true);
+  });
+
+  it("hides Chrome's opaque window ids instead of showing them as a name", async () => {
+    stubGetDisplayMedia(makeStream(makeTrack("video", {}, "window:1234:0"), makeTrack("audio")));
+    const source = await captureAudioOnly("window");
+    expect(source?.label).toBeNull();
+  });
+
+  it("asks for a screen with system audio for the system fallback", async () => {
+    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), makeTrack("audio")));
+    const source = await captureAudioOnly("system");
+    expect(mock.mock.calls[0]?.[0]).toMatchObject({ displaySurface: "monitor", systemAudio: "include" });
+    expect(source?.kind).toBe("system");
+  });
+
+  it("returns null and releases the capture when the pick had no audio", async () => {
+    const video = makeTrack("video");
+    stubGetDisplayMedia(makeStream(video, null));
+    expect(await captureAudioOnly("window")).toBeNull();
+    expect((video as unknown as { stopped: boolean }).stopped).toBe(true);
   });
 });

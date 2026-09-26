@@ -31,16 +31,54 @@ export const DEFAULT_PRESET: QualityPresetName = "1080p60";
  */
 interface ChromeDisplayMediaOptions extends DisplayMediaStreamOptions {
   systemAudio?: "include" | "exclude";
+  /** Chrome/Edge 141+. What audio to offer when a window is picked. A hint only. */
+  windowAudio?: "window" | "system" | "exclude";
   selfBrowserSurface?: "include" | "exclude";
   monitorTypeSurfaces?: "include" | "exclude";
   surfaceSwitching?: "include" | "exclude";
 }
 
+/**
+ * Where the shared audio should come from.
+ *
+ *  - "app": only the game's own audio. Picking a window asks Chrome for that window's
+ *    audio; picking a whole screen offers no audio at all, and the app then asks for a
+ *    second pick of the game window just for its sound (captureAudioOnly). This is the
+ *    point of the project: viewers hear the game, never Discord or music.
+ *  - "system": everything the PC plays.
+ *  - "none": video only.
+ */
+export type AudioMode = "app" | "system" | "none";
+
+export const AUDIO_MODES: readonly AudioMode[] = ["app", "system", "none"];
+export const DEFAULT_AUDIO_MODE: AudioMode = "app";
+
+export function isAudioMode(v: string | null): v is AudioMode {
+  return v !== null && (AUDIO_MODES as readonly string[]).includes(v);
+}
+
+/** What picker #1 returned. Chrome reports it on the video track's settings. */
+export type Surface = "monitor" | "window" | "browser" | "unknown";
+
 export interface CaptureResult {
   stream: MediaStream;
   video: MediaStreamTrack;
-  /** Null when the user unticked "share audio", or on a platform that can't. */
+  /**
+   * The track currently being sent. Null when the user unticked "share audio", on a
+   * platform that can't, or while a whole-screen share waits for an audio pick.
+   * May be swapped mid-share for one from captureAudioOnly.
+   */
   audio: MediaStreamTrack | null;
+  surface?: Surface;
+}
+
+/** Audio borrowed from a second, audio-only pick. Its own stream must be stopped with it. */
+export interface AudioSource {
+  stream: MediaStream;
+  track: MediaStreamTrack;
+  kind: "window" | "system";
+  /** The picked window's title when Chrome exposes one, for the UI. */
+  label: string | null;
 }
 
 /**
@@ -79,9 +117,51 @@ export function systemAudioSupport(): { supported: boolean; reason?: string } {
   return { supported: true };
 }
 
+/** First Chromium version with the `windowAudio` option. */
+export const WINDOW_AUDIO_MIN_CHROME = 141;
+
+/**
+ * Whether the browser understands `windowAudio`, which "app" mode depends on.
+ * Older versions silently ignore the option and fall back to offering system audio.
+ * Edge shares Chromium's version numbers, so the Chrome/NN token covers both.
+ */
+export function windowAudioSupport(): { supported: boolean; reason?: string } {
+  const base = systemAudioSupport();
+  if (!base.supported) return base;
+  const major = Number(/Chrom(?:e|ium)\/(\d+)/.exec(navigator.userAgent)?.[1] ?? NaN);
+  if (!Number.isFinite(major) || major < WINDOW_AUDIO_MIN_CHROME) {
+    return {
+      supported: false,
+      reason:
+        `Sharing only a game's audio needs Chrome or Edge ${WINDOW_AUDIO_MIN_CHROME} or newer. ` +
+        "Update your browser, or pick \"All system audio\".",
+    };
+  }
+  return { supported: true };
+}
+
+/**
+ * All three OFF. These are voice-call DSP: echo cancellation eats game audio as
+ * "echo", noise suppression strips ambience, and AGC pumps the volume on every
+ * explosion. They are the usual cause of "the audio sounds underwater".
+ */
+const GAME_AUDIO: MediaTrackConstraints = {
+  channelCount: 2,
+  sampleRate: 48000,
+  echoCancellation: false,
+  noiseSuppression: false,
+  autoGainControl: false,
+};
+
+function surfaceOf(track: MediaStreamTrack): Surface {
+  const s = (track.getSettings?.() as MediaTrackSettings & { displaySurface?: string } | undefined)
+    ?.displaySurface;
+  return s === "monitor" || s === "window" || s === "browser" ? s : "unknown";
+}
+
 export async function captureScreen(
   preset: QualityPreset,
-  wantAudio: boolean,
+  mode: AudioMode,
 ): Promise<CaptureResult> {
   const options: ChromeDisplayMediaOptions = {
     video: {
@@ -89,20 +169,12 @@ export async function captureScreen(
       height: { ideal: preset.height },
       frameRate: { ideal: preset.frameRate, max: preset.frameRate },
     },
-    audio: wantAudio
-      ? {
-          channelCount: 2,
-          sampleRate: 48000,
-          // All three OFF. These are voice-call DSP: echo cancellation eats game
-          // audio as "echo", noise suppression strips ambience, and AGC pumps the
-          // volume on every explosion. They are the usual cause of "the audio
-          // sounds underwater".
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        }
-      : false,
-    systemAudio: "include",
+    audio: mode === "none" ? false : GAME_AUDIO,
+    // In "app" mode a whole-screen pick must not offer system audio: that is exactly
+    // the mix of Discord and music this mode exists to keep out. The app asks for the
+    // game's window separately instead.
+    systemAudio: mode === "system" ? "include" : "exclude",
+    windowAudio: mode === "app" ? "window" : mode === "system" ? "system" : "exclude",
     selfBrowserSurface: "exclude",
     monitorTypeSurfaces: "include",
     surfaceSwitching: "include",
@@ -124,7 +196,67 @@ export async function captureScreen(
   video.contentHint = "motion";
   if (audio) audio.contentHint = "music";
 
-  return { stream, video, audio };
+  return { stream, video, audio, surface: surfaceOf(video) };
+}
+
+/**
+ * Chrome labels capture tracks either with the window title or with an opaque id
+ * like "window:1234:0". Only the former is worth showing.
+ */
+function readableLabel(track: MediaStreamTrack | undefined): string | null {
+  const label = track?.label?.trim();
+  if (!label || /^(window|screen|web-contents-media-stream):/i.test(label)) return null;
+  return label;
+}
+
+/**
+ * Picker #2: capture audio only, to go with a whole-screen share.
+ *
+ * getDisplayMedia cannot be asked for audio alone, so this requests the smallest
+ * video the browser will give and then leaves that track running but disabled.
+ * Stopping it outright might end the capture, and the audio with it; Chrome does
+ * not document either way, and a disabled 1 fps thumbnail costs next to nothing.
+ *
+ * Needs its own click: Chrome only opens a picker from a user gesture, and the
+ * first picker has already used that click up.
+ *
+ * Resolves null when the user picked something without audio (or unticked it).
+ */
+export async function captureAudioOnly(kind: "window" | "system"): Promise<AudioSource | null> {
+  const options: ChromeDisplayMediaOptions = {
+    video: { width: { ideal: 320 }, height: { ideal: 180 }, frameRate: { ideal: 1, max: 1 } },
+    audio: GAME_AUDIO,
+    selfBrowserSurface: "exclude",
+    surfaceSwitching: "exclude",
+    ...(kind === "window"
+      ? {
+          // Windows only: a tab or screen here would bring the wrong audio.
+          displaySurface: "window" as const,
+          monitorTypeSurfaces: "exclude" as const,
+          windowAudio: "window" as const,
+          systemAudio: "exclude" as const,
+        }
+      : {
+          displaySurface: "monitor" as const,
+          monitorTypeSurfaces: "include" as const,
+          systemAudio: "include" as const,
+        }),
+  };
+
+  const stream = await navigator.mediaDevices.getDisplayMedia(options);
+  const track = stream.getAudioTracks()[0];
+  if (!track) {
+    stream.getTracks().forEach((t) => t.stop());
+    return null;
+  }
+  const video = stream.getVideoTracks()[0];
+  if (video) video.enabled = false;
+  track.contentHint = "music";
+  return { stream, track, kind, label: kind === "window" ? readableLabel(video) : null };
+}
+
+export function stopAudioSource(source: AudioSource): void {
+  source.stream.getTracks().forEach((t) => t.stop());
 }
 
 /** Fires when the user clicks the browser's own "Stop sharing" bar. */

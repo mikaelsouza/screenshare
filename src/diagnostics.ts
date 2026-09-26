@@ -9,7 +9,7 @@
  */
 
 import { PING, PONG, type ServerMessage } from "@shared/protocol";
-import { systemAudioSupport } from "./capture";
+import { systemAudioSupport, windowAudioSupport } from "./capture";
 import { type ParsedCandidate as Cand, parseCandidate } from "./stats";
 
 type Status = "pass" | "warn" | "fail" | "running";
@@ -124,6 +124,19 @@ function checkBrowser(): void {
     audio.supported ? "pass" : "warn",
     audio.reason ?? "System/game audio capture is available.",
   );
+
+  // Only worth a row of its own when system audio works at all; otherwise it would
+  // repeat the reason above.
+  if (audio.supported) {
+    const game = windowAudioSupport();
+    addRow(
+      "Game-only audio",
+      game.supported ? "pass" : "warn",
+      game.reason ??
+        "This browser can be asked for just one window's audio. Whether it honours that is up to " +
+          "Chrome and Windows; the app falls back to offering all system audio if not.",
+    );
+  }
 }
 
 /**

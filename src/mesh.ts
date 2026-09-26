@@ -211,10 +211,20 @@ class PeerLink {
     await this.detachCapture();
 
     this.videoSender = this.pc.addTrack(capture.video, capture.stream);
+    // Always open an audio sender, even while silent. A whole-screen share starts
+    // with no audio and gets the game's audio from a second pick moments later, and
+    // the user can swap sources mid-share. With the sender already negotiated, each
+    // of those is a replaceTrack with no renegotiation. Tagging it with the video's
+    // stream keeps the two in one MediaStream on the far end, so they play in sync.
     if (capture.audio) {
       this.audioSender = this.pc.addTrack(capture.audio, capture.stream);
-      await applyAudioEncoding(this.audioSender);
+    } else {
+      this.audioSender = this.pc.addTransceiver("audio", {
+        direction: "sendonly",
+        streams: [capture.stream],
+      }).sender;
     }
+    await applyAudioEncoding(this.audioSender);
 
     const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
     if (tx) preferCodec(tx, this.opts.codec);
@@ -224,6 +234,11 @@ class PeerLink {
 
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
+  }
+
+  /** Swap the audio being sent without renegotiating. Null sends silence. */
+  async replaceAudio(track: MediaStreamTrack | null): Promise<void> {
+    await this.audioSender?.replaceTrack(track);
   }
 
   async detachCapture(): Promise<void> {
@@ -365,6 +380,16 @@ export class Mesh {
         capture ? l.attachCapture(capture) : l.detachCapture(),
       ),
     );
+  }
+
+  /**
+   * Swap the shared audio for every peer. Also updates the capture itself, so a peer
+   * who joins later is sent the current source rather than the original one.
+   */
+  async setAudioTrack(track: MediaStreamTrack | null): Promise<void> {
+    if (!this.capture) return;
+    this.capture.audio = track;
+    await Promise.all([...this.links.values()].map((l) => l.replaceAudio(track)));
   }
 
   setViewing(peerId: PeerId, viewing: boolean): void {

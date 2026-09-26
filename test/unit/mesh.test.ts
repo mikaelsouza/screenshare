@@ -69,13 +69,14 @@ class FakeRTCPeerConnection {
     this.addedCandidates.push(candidate);
   }
 
-  addTrack(track: MediaStreamTrack, ..._streams: MediaStream[]): RTCRtpSender {
+  addTrack(track: MediaStreamTrack | null, ..._streams: MediaStream[]): RTCRtpSender {
     let params: Record<string, unknown> = { encodings: [{ active: true, maxBitrate: 5_000_000 }] };
     const sender = {
       track,
       getParameters: () => structuredClone(params),
       setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
       getStats: async () => new Map() as unknown as RTCStatsReport,
+      replaceTrack: async (t: MediaStreamTrack | null) => { (sender as { track: unknown }).track = t; },
     } as unknown as RTCRtpSender;
     this.senders.push(sender);
 
@@ -86,6 +87,11 @@ class FakeRTCPeerConnection {
     this.transceivers.push(transceiver);
 
     return sender;
+  }
+
+  addTransceiver(_kind: string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
+    const sender = this.addTrack(null);
+    return this.transceivers.find((t) => t.sender === sender)!;
   }
 
   removeTrack(sender: RTCRtpSender): void {
@@ -246,6 +252,39 @@ describe("Mesh and PeerLink", () => {
 
     await mesh.setCapture(null);
     expect(pc.senders.length).toBe(0);
+  });
+
+  it("opens a silent audio sender and swaps audio in without renegotiating", async () => {
+    const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addPeer("bob");
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const videoTrack = { kind: "video" } as unknown as MediaStreamTrack;
+    const capture: CaptureResult = {
+      stream: { getTracks: () => [videoTrack] } as unknown as MediaStream,
+      video: videoTrack,
+      audio: null,
+    };
+    await mesh.setCapture(capture);
+    // Video plus an audio sender with nothing on it yet.
+    expect(pc.senders.length).toBe(2);
+    expect(pc.senders[1]!.track).toBeNull();
+
+    const gameAudio = { kind: "audio" } as unknown as MediaStreamTrack;
+    await mesh.setAudioTrack(gameAudio);
+    expect(pc.senders.length).toBe(2);
+    expect(pc.senders[1]!.track).toBe(gameAudio);
+    // A peer joining later must get the current source, not the original silence.
+    expect(capture.audio).toBe(gameAudio);
+
+    mesh.addPeer("carol");
+    await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+    const late = FakeRTCPeerConnection.instances[1]!;
+    expect(late.senders.some((s) => s.track === gameAudio)).toBe(true);
+
+    await mesh.setAudioTrack(null);
+    expect(pc.senders[1]!.track).toBeNull();
   });
 
   it("sends and handles view control messages via data channel", () => {

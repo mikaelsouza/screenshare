@@ -115,6 +115,34 @@ connections are independent, one person on bad wifi degrades only their own stre
   only it exposes the encoder controls this app depends on.
 - **macOS Chrome cannot capture system audio** — tab audio only. Screen sharing works;
   game audio does not. There is no workaround. Linux/Wayland is similar.
+- **Game-only audio needs Chrome or Edge 141+** (the `windowAudio` option). Older versions
+  ignore it and offer system audio instead; the Share button warns.
+
+## Game audio without Discord or music
+
+The Audio selector next to Share screen picks where sound comes from. The default,
+**Game only**, never sends system audio, because system audio includes voice chat and
+music.
+
+- **Share a window** (the game): Chrome is asked for that window's own audio
+  (`windowAudio: "window"`).
+- **Share the whole screen**: whole-screen shares can only carry system audio, so none is
+  requested. The app then asks "Which app should viewers hear?" and opens Chrome's
+  picker a second time, windows only, so you can pick the game. It keeps that capture's
+  audio and discards its picture. This second picker needs its own click; Chrome only
+  opens a picker from a click, and the first one used it up.
+- The audio chip next to Stop sharing shows the current source. **Change** swaps it live
+  without reconnecting anyone. **Use all system audio** is the fallback when a window
+  has no audio Chrome can share.
+
+Games whose launcher and match are separate windows, such as League of Legends, need a
+re-pick when the match starts: the client's audio does not include the game's. When a
+picked window closes, the chip turns yellow and offers **Pick again**. The video keeps
+going throughout.
+
+The audio track is always negotiated, even while silent, so every swap is a
+`replaceTrack` with no renegotiation, and it shares the video's `MediaStream` so viewers
+keep lip sync.
 
 ## Getting started
 
@@ -266,7 +294,10 @@ tested.
 - **Glass-to-glass latency.** The headline requirement — latency wins over quality when
   they conflict — has never once been measured. Put a millisecond timer on the sharer's
   screen, photograph both monitors, read the difference.
-- **Game audio**, on any platform where it can be captured at all.
+- **Game audio**, on any platform where it can be captured at all. In particular: whether
+  Chrome on Windows honours `windowAudio: "window"` (per-app audio), whether the
+  audio-only second capture stays in sync with the screen video, and whether Chrome
+  exposes the picked window's title (the chip falls back to "game window").
 - **8-person rooms with real media**, and multiple simultaneous sharers.
 - **Hardware H.264 encoding.** Check `encoderImplementation` in `chrome://webrtc-internals`
   is not a software fallback; if it is, the encoder is competing with the game for CPU.

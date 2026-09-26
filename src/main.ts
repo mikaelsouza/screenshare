@@ -7,12 +7,19 @@
 import { hasTurnServer } from "@shared/ice";
 import { MAX_ROOM_SIZE, isValidRoomCode, type PeerId, type PeerInfo } from "@shared/protocol";
 import {
+  captureAudioOnly,
   captureScreen,
+  isAudioMode,
   onCaptureEnded,
+  stopAudioSource,
   stopCapture,
   systemAudioSupport,
+  windowAudioSupport,
+  DEFAULT_AUDIO_MODE,
   QUALITY_PRESETS,
   DEFAULT_PRESET,
+  type AudioMode,
+  type AudioSource,
   type CaptureResult,
   type QualityPresetName,
 } from "./capture";
@@ -35,6 +42,15 @@ const ui = {
   createBtn: el<HTMLButtonElement>("create"),
   shareBtn: el<HTMLButtonElement>("share"),
   muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
+  audioMode: el<HTMLSelectElement>("audio-mode"),
+  audioChip: el<HTMLElement>("audio-chip"),
+  audioChipText: el<HTMLElement>("audio-chip-text"),
+  audioChangeBtn: el<HTMLButtonElement>("audio-change"),
+  audioPrompt: el<HTMLElement>("audio-prompt"),
+  audioPromptText: el<HTMLElement>("audio-prompt-text"),
+  audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
+  audioPickSystemBtn: el<HTMLButtonElement>("audio-pick-system"),
+  audioPickNoneBtn: el<HTMLButtonElement>("audio-pick-none"),
   stage: el<HTMLDivElement>("stage"),
   status: el<HTMLElement>("status"),
   preset: el<HTMLSelectElement>("preset"),
@@ -54,6 +70,12 @@ let mesh: Mesh | null = null;
 let relayActive = false;
 let capture: CaptureResult | null = null;
 let stopCaptureListener: (() => void) | null = null;
+/** A second, audio-only capture (picker #2) whose audio replaced the screen's own. */
+let audioSource: AudioSource | null = null;
+/** Survives audio swaps, so a new source doesn't unmute what the user muted. */
+let audioMuted = false;
+/** Set when the audio being sent ended by itself, e.g. the game window closed. */
+let audioLost = false;
 
 const names = new Map<PeerId, string>();
 const tiles = new Map<PeerId, HTMLVideoElement>();
@@ -265,6 +287,142 @@ function captureBlockedReason(): string | null {
   return "This browser does not support getDisplayMedia. Chrome or Edge on desktop is required.";
 }
 
+function currentAudioMode(): AudioMode {
+  const stored = localStorage.getItem("audio_mode");
+  return isAudioMode(stored) ? stored : DEFAULT_AUDIO_MODE;
+}
+
+// ---- audio source --------------------------------------------------------
+
+/** Describe the audio currently being sent, for the chip next to Stop sharing. */
+function audioDescription(): { text: string; kind: "ok" | "warn" | "off" } {
+  if (audioLost) return { text: "Audio stopped: that window closed", kind: "warn" };
+  if (!capture?.audio) return { text: "No audio", kind: "off" };
+  if (audioSource) {
+    return audioSource.kind === "window"
+      ? { text: `Game audio: ${audioSource.label ?? "game window"}`, kind: "ok" }
+      : { text: "All system audio", kind: "ok" };
+  }
+  if (capture.surface === "browser") return { text: "Tab audio", kind: "ok" };
+  if (capture.surface === "window" && currentAudioMode() === "app") {
+    return { text: "Game audio: shared window", kind: "ok" };
+  }
+  return { text: "All system audio", kind: "ok" };
+}
+
+function renderAudioControls(): void {
+  if (!capture) {
+    ui.audioChip.hidden = true;
+    ui.audioPrompt.hidden = true;
+    ui.muteAudioBtn.style.display = "none";
+    ui.audioMode.disabled = false;
+    return;
+  }
+  const { text, kind } = audioDescription();
+  ui.audioChip.hidden = false;
+  ui.audioChip.dataset["kind"] = kind;
+  ui.audioChipText.textContent = text;
+  ui.audioChangeBtn.textContent = audioLost ? "Pick again" : "Change";
+  ui.audioMode.disabled = true;
+  if (capture.audio) {
+    ui.muteAudioBtn.style.display = "inline-block";
+    ui.muteAudioBtn.textContent = audioMuted ? "Unmute audio" : "Mute audio";
+  } else {
+    ui.muteAudioBtn.style.display = "none";
+  }
+}
+
+const AUDIO_PROMPT_TEXT = {
+  screen:
+    "You're sharing your whole screen. Pick the game's window and only its sound is sent. " +
+    "Discord and music stay private.",
+  missing:
+    "No audio came with that pick. Pick the game's window to send only its sound, or use all system audio.",
+  empty: "That window had no audio Chrome could share. Try another window, or use all system audio.",
+  lost: "The audio you were sharing stopped, probably because that window closed. Pick where it should come from now.",
+  change: "Pick where the audio comes from. The video keeps going while you choose.",
+} as const;
+
+function showAudioPrompt(reason: keyof typeof AUDIO_PROMPT_TEXT): void {
+  ui.audioPromptText.textContent = AUDIO_PROMPT_TEXT[reason];
+  ui.audioPrompt.hidden = false;
+}
+
+/** Send `track` to every peer, replacing whatever audio was going before. */
+async function useAudioTrack(track: MediaStreamTrack | null): Promise<void> {
+  if (!capture) return;
+  // Stop the audio being replaced so nothing keeps capturing it in the background.
+  // The screen's own track goes too: once replaced there is no way back to it
+  // without a new pick anyway.
+  const previous = capture.audio;
+  if (previous && previous !== track) previous.stop();
+  if (track) track.enabled = !audioMuted;
+  capture.audio = track;
+  audioLost = false;
+  if (mesh) await mesh.setAudioTrack(track);
+  if (track) watchAudioEnded(track);
+  renderAudioControls();
+}
+
+function watchAudioEnded(track: MediaStreamTrack): void {
+  // "ended" fires only when the source goes away (the window closes, or the user
+  // hits Chrome's own stop button for that capture), never for our own stop().
+  track.addEventListener("ended", () => {
+    if (capture?.audio !== track) return;
+    audioLost = true;
+    capture.audio = null;
+    void mesh?.setAudioTrack(null);
+    if (audioSource?.track === track) {
+      stopAudioSource(audioSource);
+      audioSource = null;
+    }
+    renderAudioControls();
+    showAudioPrompt("lost");
+  });
+}
+
+let audioPickPending = false;
+
+/** Picker #2. Must run straight from a click: Chrome needs a fresh gesture for it. */
+async function pickAudio(kind: "window" | "system"): Promise<void> {
+  if (!capture || audioPickPending) return;
+  audioPickPending = true;
+  try {
+    let source: AudioSource | null;
+    try {
+      source = await captureAudioOnly(kind);
+    } catch (err) {
+      // Usually the user cancelling the picker. Leave everything as it was.
+      console.warn("[main] audio pick cancelled or failed", err);
+      return;
+    }
+    if (!capture) {
+      // Sharing stopped while the picker was open.
+      if (source) stopAudioSource(source);
+      return;
+    }
+    if (!source) {
+      showAudioPrompt("empty");
+      return;
+    }
+    const old = audioSource;
+    audioSource = source;
+    await useAudioTrack(source.track);
+    if (old) stopAudioSource(old);
+    ui.audioPrompt.hidden = true;
+  } finally {
+    audioPickPending = false;
+  }
+}
+
+async function chooseNoAudio(): Promise<void> {
+  const old = audioSource;
+  audioSource = null;
+  await useAudioTrack(null);
+  if (old) stopAudioSource(old);
+  ui.audioPrompt.hidden = true;
+}
+
 /** Set for the whole of startSharing, including the await on the OS picker. */
 let sharingPending = false;
 
@@ -292,11 +450,14 @@ async function startSharingInner(): Promise<void> {
     return;
   }
 
-  const audio = systemAudioSupport();
-  if (!audio.supported && audio.reason) setStatus(audio.reason, "warn");
+  const mode = currentAudioMode();
+  if (mode !== "none") {
+    const audio = mode === "app" ? windowAudioSupport() : systemAudioSupport();
+    if (!audio.supported && audio.reason) setStatus(audio.reason, "warn");
+  }
 
   try {
-    capture = await captureScreen(QUALITY_PRESETS[currentPreset()], true);
+    capture = await captureScreen(QUALITY_PRESETS[currentPreset()], mode);
   } catch (err) {
     // Includes the user simply cancelling the picker, which isn't an error.
     console.warn("[main] capture cancelled or failed", err);
@@ -304,6 +465,7 @@ async function startSharingInner(): Promise<void> {
   }
 
   stopCaptureListener = onCaptureEnded(capture, () => void stopSharing());
+  if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
   try {
@@ -319,9 +481,15 @@ async function startSharingInner(): Promise<void> {
 
   client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
-  if (capture.audio) {
-    ui.muteAudioBtn.style.display = "inline-block";
-    ui.muteAudioBtn.textContent = "Mute audio";
+  audioMuted = false;
+  audioLost = false;
+  renderAudioControls();
+
+  // A whole-screen pick in "Game only" mode comes back silent on purpose; any other
+  // pick that should have had audio but didn't (unticked, or the window has none)
+  // gets the same offer, including the fallback to all system audio.
+  if (mode !== "none" && !capture.audio) {
+    showAudioPrompt(capture.surface === "monitor" && mode === "app" ? "screen" : "missing");
   }
 }
 
@@ -332,10 +500,13 @@ async function stopSharing(): Promise<void> {
   await mesh?.setCapture(null);
   stopCapture(capture);
   capture = null;
+  if (audioSource) stopAudioSource(audioSource);
+  audioSource = null;
+  audioLost = false;
   renderSelfPreview(null);
   client?.setSharing(false);
   ui.shareBtn.textContent = "Share screen";
-  ui.muteAudioBtn.style.display = "none";
+  renderAudioControls();
 }
 
 // ---- room ----------------------------------------------------------------
@@ -543,11 +714,21 @@ function initQualityControls(): void {
   // Mute audio button for active sharer
   ui.muteAudioBtn.addEventListener("click", () => {
     if (capture?.audio) {
-      capture.audio.enabled = !capture.audio.enabled;
-      ui.muteAudioBtn.textContent = capture.audio.enabled ? "Mute audio" : "Unmute audio";
-      setStatus(capture.audio.enabled ? "Game audio live" : "Game audio muted", "info");
+      audioMuted = !audioMuted;
+      capture.audio.enabled = !audioMuted;
+      renderAudioControls();
+      setStatus(audioMuted ? "Game audio muted" : "Game audio live", "info");
     }
   });
+
+  ui.audioMode.value = currentAudioMode();
+  ui.audioMode.addEventListener("change", () => {
+    if (isAudioMode(ui.audioMode.value)) localStorage.setItem("audio_mode", ui.audioMode.value);
+  });
+  ui.audioChangeBtn.addEventListener("click", () => showAudioPrompt(audioLost ? "lost" : "change"));
+  ui.audioPickAppBtn.addEventListener("click", () => void pickAudio("window"));
+  ui.audioPickSystemBtn.addEventListener("click", () => void pickAudio("system"));
+  ui.audioPickNoneBtn.addEventListener("click", () => void chooseNoAudio());
 }
 
 initQualityControls();
