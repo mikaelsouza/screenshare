@@ -220,7 +220,11 @@ automatically on `npm install` (`postinstall`) and is safe to re-run.
 
 `.npmrc` sets `legacy-peer-deps=true`: `@cloudflare/vitest-pool-workers` declares an
 optional peer on `@vitest/browser-playwright` that makes npm's peer resolver crash.
-Exact versions are pinned in `package.json` instead.
+`package-lock.json` plus `npm ci` pins exact versions instead.
+
+`package.json` overrides `sharp` to `^0.35.4`: `@cloudflare/vitest-pool-workers` pins an
+older miniflare whose `sharp` carries a libheif advisory. It is dev tooling only and
+never ships to a browser; drop the override once the pool's own pin moves past it.
 
 ## Layout
 

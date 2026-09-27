@@ -39,6 +39,44 @@ export interface MeshCallbacks {
 /** Peer-to-peer control traffic. Deliberately NOT routed through the server. */
 type ControlMessage = { c: "view"; want: boolean };
 
+/** Real control messages are ~25 bytes. Anything far larger is not ours. */
+const MAX_CONTROL_MESSAGE_LENGTH = 256;
+
+/**
+ * Parse a control message from the far end, or null if it is not one.
+ *
+ * The far end is another browser in the room, not something we control, so the shape
+ * is checked rather than cast: a `want` that is not a boolean would otherwise flow
+ * straight into `encodings[0].active`.
+ */
+export function parseControlMessage(data: unknown): ControlMessage | null {
+  if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
+  let msg: unknown;
+  try {
+    msg = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof msg !== "object" || msg === null) return null;
+  const rec = msg as Record<string, unknown>;
+  if (rec.c !== "view" || typeof rec.want !== "boolean") return null;
+  return { c: "view", want: rec.want };
+}
+
+/**
+ * Drop every ICE candidate line that is not a relay candidate.
+ *
+ * Relay-only mode already sets iceTransportPolicy "relay", which stops the browser
+ * gathering anything else. This is the second lock on the same door: the SDP is what
+ * the far end actually receives, so it is checked on the way out rather than trusted.
+ */
+export function keepRelayCandidatesOnly(sdp: string): string {
+  return sdp
+    .split("\r\n")
+    .filter((line) => !line.startsWith("a=candidate:") || / typ relay(?: |$)/.test(line))
+    .join("\r\n");
+}
+
 class PeerLink {
   readonly pc: RTCPeerConnection;
   /**
@@ -80,8 +118,9 @@ class PeerLink {
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
         if (this.opts.relayOnly) {
+          // Fail closed: a candidate we cannot classify is not sent.
           const parsed = parseCandidate(candidate);
-          if (parsed && parsed.type !== "relay") return;
+          if (!parsed || parsed.type !== "relay") return;
         }
         this.send({
           k: "ice",
@@ -99,7 +138,9 @@ class PeerLink {
     };
     this.pc.ontrack = (ev) => this.onTrack(ev);
     this.pc.ondatachannel = (ev) => {
+      // Only the one channel this app opens. Anything else the far end offers is closed.
       if (ev.channel.label === "control") this.bindControl(ev.channel);
+      else ev.channel.close();
     };
 
     // Exactly one side creates the control channel, or we'd get two.
@@ -121,7 +162,7 @@ class PeerLink {
       offer.sdp = mungeOpusSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
-      if (sdp) this.send({ k: "offer", sdp });
+      if (sdp) this.send({ k: "offer", sdp: this.outgoingSdp(sdp) });
     } catch (err) {
       console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
@@ -155,12 +196,17 @@ class PeerLink {
         answer.sdp = mungeOpusSdp(answer.sdp ?? "");
         await this.pc.setLocalDescription(answer);
         const out = this.pc.localDescription?.sdp;
-        if (out) this.send({ k: "answer", sdp: out });
+        if (out) this.send({ k: "answer", sdp: this.outgoingSdp(out) });
       }
     } catch (err) {
       this.isSettingRemoteAnswerPending = false;
       console.error(`[mesh] setDescription(${kind}) failed for ${this.peerId}`, err);
     }
+  }
+
+  /** The SDP as it leaves this browser: relay candidates only in relay-only mode. */
+  private outgoingSdp(sdp: string): string {
+    return this.opts.relayOnly ? keepRelayCandidatesOnly(sdp) : sdp;
   }
 
   private async addIce(candidate: IceCandidateInit): Promise<void> {
@@ -287,16 +333,10 @@ class PeerLink {
     // The receiving side binds an already-open channel, so onopen will not fire.
     if (ch.readyState === "open") this.flushViewRequest();
     ch.onmessage = (ev) => {
-      let msg: ControlMessage;
-      try {
-        msg = JSON.parse(String(ev.data)) as ControlMessage;
-      } catch {
-        return;
-      }
-      if (msg.c === "view") {
-        this.remoteWantsVideo = msg.want;
-        void this.setSenderActive(msg.want);
-      }
+      const msg = parseControlMessage(ev.data);
+      if (!msg) return;
+      this.remoteWantsVideo = msg.want;
+      void this.setSenderActive(msg.want);
     };
   }
 

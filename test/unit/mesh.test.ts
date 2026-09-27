@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignalData } from "@shared/protocol";
 import type { CaptureResult } from "@src/capture";
-import { Mesh, type MeshCallbacks, type MeshOptions } from "@src/mesh";
+import {
+  Mesh,
+  type MeshCallbacks,
+  type MeshOptions,
+  keepRelayCandidatesOnly,
+  parseControlMessage,
+} from "@src/mesh";
 
 class FakeDataChannel {
   readyState = "open";
@@ -436,5 +442,103 @@ describe("Mesh and PeerLink", () => {
     pc.createOffer = vi.fn().mockRejectedValue(new Error("offer creation failed"));
     pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 20));
+  });
+});
+
+describe("relay-only hardening", () => {
+  const SDP_WITH_CANDIDATES = [
+    "v=0",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=candidate:1 1 udp 2122260223 192.168.1.100 54321 typ host generation 0",
+    "a=candidate:2 1 udp 1686052607 203.0.113.7 61000 typ srflx raddr 192.168.1.100 rport 54321",
+    "a=candidate:3 1 udp 41885439 198.51.100.9 60000 typ relay raddr 203.0.113.7 rport 61000",
+    "a=rtpmap:111 opus/48000/2",
+    "",
+  ].join("\r\n");
+
+  it("strips every non-relay candidate line from SDP and keeps everything else", () => {
+    const out = keepRelayCandidatesOnly(SDP_WITH_CANDIDATES);
+    expect(out).not.toContain("192.168.1.100 54321 typ host");
+    expect(out).not.toContain("typ srflx");
+    expect(out).toContain("typ relay");
+    expect(out).toContain("a=rtpmap:111 opus/48000/2");
+    expect(out.endsWith("\r\n")).toBe(true);
+  });
+
+  let sent: SignalData[];
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    sent = [];
+  });
+
+  function relayMesh(relayOnly: boolean): FakeRTCPeerConnection {
+    const opts: MeshOptions = {
+      iceServers: [{ urls: "turn:turn.example.com" }],
+      preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+      codec: "h264",
+      jitterBufferTargetMs: 0,
+      relayOnly,
+    };
+    const mesh = new Mesh("alice", opts, (_to, data) => sent.push(data), {
+      onRemoteStream: vi.fn(),
+      onRemoteStreamGone: vi.fn(),
+      onConnectionState: vi.fn(),
+    });
+    mesh.addPeer("bob");
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.createOffer = async () => ({ type: "offer", sdp: SDP_WITH_CANDIDATES });
+    pc.createAnswer = async () => ({ type: "answer", sdp: SDP_WITH_CANDIDATES });
+    return pc;
+  }
+
+  it("sends only relay candidates inside offers and answers in relay-only mode", async () => {
+    const pc = relayMesh(true);
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 10));
+    const offer = sent.find((d) => d.k === "offer");
+    expect(offer && "sdp" in offer ? offer.sdp : "").not.toMatch(/typ (host|srflx)/);
+  });
+
+  it("leaves SDP untouched when relay-only is off", async () => {
+    const pc = relayMesh(false);
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 10));
+    const offer = sent.find((d) => d.k === "offer");
+    expect(offer && "sdp" in offer ? offer.sdp : "").toContain("typ srflx");
+  });
+
+  it("drops a candidate it cannot classify instead of sending it", () => {
+    const pc = relayMesh(true);
+    pc.onicecandidate?.({ candidate: { candidate: "", sdpMid: "0", sdpMLineIndex: 0 } as unknown as RTCIceCandidate });
+    expect(sent.filter((d) => d.k === "ice")).toHaveLength(0);
+  });
+
+  it("closes data channels other than the control channel", () => {
+    const pc = relayMesh(false);
+    const stray = new FakeDataChannel("exfil");
+    pc.ondatachannel?.({ channel: stray as unknown as RTCDataChannel });
+    expect(stray.readyState).toBe("closed");
+  });
+});
+
+describe("parseControlMessage", () => {
+  it("accepts a well-formed view message", () => {
+    expect(parseControlMessage('{"c":"view","want":false}')).toEqual({ c: "view", want: false });
+  });
+
+  it.each([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a non-boolean want", '{"c":"view","want":"x"}'],
+    ["an unknown type", '{"c":"other","want":true}'],
+    ["invalid JSON", "not json"],
+    ["an oversized payload", JSON.stringify({ c: "view", want: true, pad: "x".repeat(10_000) })],
+  ])("rejects %s", (_name, raw) => {
+    expect(parseControlMessage(raw)).toBeNull();
+  });
+
+  it("rejects binary payloads", () => {
+    expect(parseControlMessage(new ArrayBuffer(8))).toBeNull();
   });
 });

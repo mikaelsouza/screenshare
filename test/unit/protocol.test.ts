@@ -9,6 +9,8 @@ import {
   parseClientMessage,
 } from "@shared/protocol";
 
+const P1 = "3f2c1a9e-8b4d-4c1e-9a7f-0e5d6c4b3a21";
+
 describe("generateRoomCode", () => {
   it("produces codes of the declared length from the declared alphabet", () => {
     for (let i = 0; i < 200; i++) {
@@ -74,19 +76,19 @@ describe("parseClientMessage", () => {
   });
 
   it("accepts offer and answer signals", () => {
-    const offer = parseClientMessage(JSON.stringify({ t: "signal", to: "p1", data: { k: "offer", sdp: "v=0" } }));
-    expect(offer).toEqual({ t: "signal", to: "p1", data: { k: "offer", sdp: "v=0" } });
-    const answer = parseClientMessage(JSON.stringify({ t: "signal", to: "p1", data: { k: "answer", sdp: "v=0" } }));
-    expect(answer).toEqual({ t: "signal", to: "p1", data: { k: "answer", sdp: "v=0" } });
+    const offer = parseClientMessage(JSON.stringify({ t: "signal", to: P1, data: { k: "offer", sdp: "v=0" } }));
+    expect(offer).toEqual({ t: "signal", to: P1, data: { k: "offer", sdp: "v=0" } });
+    const answer = parseClientMessage(JSON.stringify({ t: "signal", to: P1, data: { k: "answer", sdp: "v=0" } }));
+    expect(answer).toEqual({ t: "signal", to: P1, data: { k: "answer", sdp: "v=0" } });
   });
 
   it("accepts an ICE candidate and normalises absent fields to null", () => {
     const msg = parseClientMessage(
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "candidate:1 1 udp" } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { candidate: "candidate:1 1 udp" } } }),
     );
     expect(msg).toEqual({
       t: "signal",
-      to: "p1",
+      to: P1,
       data: { k: "ice", candidate: { candidate: "candidate:1 1 udp", sdpMid: null, sdpMLineIndex: null } },
     });
   });
@@ -95,7 +97,7 @@ describe("parseClientMessage", () => {
     const msg = parseClientMessage(
       JSON.stringify({
         t: "signal",
-        to: "p1",
+        to: P1,
         data: { k: "ice", candidate: { candidate: "c", sdpMid: "0", sdpMLineIndex: 0, usernameFragment: "abc" } },
       }),
     );
@@ -130,7 +132,7 @@ describe("parseClientMessage", () => {
     const msg = parseClientMessage(
       JSON.stringify({
         t: "signal",
-        to: "p1",
+        to: P1,
         data: { k: "ice", candidate: { candidate: "c", usernameFragment: null } },
       }),
     );
@@ -147,19 +149,19 @@ describe("parseClientMessage", () => {
       JSON.stringify({ t: "join", room: 5, displayName: "x" }),
       JSON.stringify({ t: "join", room: "ABCDEFGH" }),
       JSON.stringify({ t: "state", sharing: "yes" }),
-      JSON.stringify({ t: "signal", to: "p1" }),
+      JSON.stringify({ t: "signal", to: P1 }),
       JSON.stringify({ t: "signal", to: 1, data: { k: "offer", sdp: "v=0" } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "offer" } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "offer", sdp: 123 } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "answer", sdp: 123 } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "nope", sdp: "v=0" } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { sdpMid: "0" } } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: 123 } } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", sdpMid: 123 } } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", sdpMLineIndex: "0" } } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: { candidate: "c", usernameFragment: 123 } } }),
-      JSON.stringify({ t: "signal", to: "p1", data: { k: "ice", candidate: null } }),
-      JSON.stringify({ t: "signal", to: "p1", data: [] }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "offer" } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "offer", sdp: 123 } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "answer", sdp: 123 } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "nope", sdp: "v=0" } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { sdpMid: "0" } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { candidate: 123 } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { candidate: "c", sdpMid: 123 } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { candidate: "c", sdpMLineIndex: "0" } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: { candidate: "c", usernameFragment: 123 } } }),
+      JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: null } }),
+      JSON.stringify({ t: "signal", to: P1, data: [] }),
     ];
     for (const raw of bad) expect(parseClientMessage(raw), raw).toBeNull();
   });
@@ -170,7 +172,7 @@ describe("signal size limits", () => {
   // the Durable Object and is forwarded verbatim to the victim's socket — amplification
   // against a peer, plus unbounded object CPU and wall-clock billing.
   const sig = (data: unknown): unknown =>
-    parseClientMessage(JSON.stringify({ t: "signal", to: "peer-1", data }));
+    parseClientMessage(JSON.stringify({ t: "signal", to: P1, data }));
 
   it("accepts an SDP right at the limit and rejects one byte more", () => {
     expect(sig({ k: "offer", sdp: "v".repeat(MAX_SDP_LENGTH) })).not.toBeNull();
@@ -197,5 +199,16 @@ describe("signal size limits", () => {
     expect(sig({ k: "offer", sdp: "" })).not.toBeNull();
     expect(sig({ k: "offer" })).toBeNull();
     expect(sig({ k: "offer", sdp: 123 })).toBeNull();
+  });
+});
+
+describe("parseClientMessage peer ids", () => {
+  it.each([
+    ["an arbitrary string", "p1"],
+    ["an uppercase uuid", P1.toUpperCase()],
+    ["a very long string", "a".repeat(10_000)],
+    ["an empty string", ""],
+  ])("rejects a signal addressed to %s", (_name, to) => {
+    expect(parseClientMessage(JSON.stringify({ t: "signal", to, data: { k: "offer", sdp: "v=0" } }))).toBeNull();
   });
 });

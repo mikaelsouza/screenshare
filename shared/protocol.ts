@@ -25,6 +25,12 @@ export const MAX_SDP_LENGTH = 64 * 1024;
 /** Largest ICE candidate line accepted. Real ones are a couple of hundred bytes. */
 export const MAX_CANDIDATE_LENGTH = 1024;
 
+/**
+ * Peer ids are server-issued crypto.randomUUID() values. Anything else in a `to` field
+ * cannot name a peer, so it is rejected at parse time rather than carried further.
+ */
+export const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export const PING = "ping";
 export const PONG = "pong";
 
@@ -152,6 +158,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       case "signal": {
         if (
           typeof record.to !== "string" ||
+          !PEER_ID.test(record.to) ||
           typeof record.data !== "object" ||
           record.data === null ||
           Array.isArray(record.data)

@@ -64,6 +64,20 @@ async function refusal(res: Response): Promise<{ code: string; closeCode: number
   });
 }
 
+/** A well-formed peer id that no socket holds. */
+const UNKNOWN_PEER = "00000000-0000-4000-8000-000000000000";
+
+/** Resolve with the close code the server closes this socket with. */
+function closeCodeOf(ws: WebSocket, timeoutMs = 3000): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("socket was not closed")), timeoutMs);
+    ws.addEventListener("close", (ev) => {
+      clearTimeout(timer);
+      resolve((ev as CloseEvent).code);
+    });
+  });
+}
+
 /** How many sockets one IP may hold in a room; mirrors MAX_SOCKETS_PER_IP. */
 const PER_IP_CAP = MAX_ROOM_SIZE * 2;
 
@@ -281,7 +295,10 @@ describe("HTTP routing", () => {
     const res = await SELF.fetch("https://example.com/");
     expect(res.headers.get("X-Frame-Options")).toBe("DENY");
     expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
-    expect(res.headers.get("Referrer-Policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(res.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+    expect(res.headers.get("Cross-Origin-Resource-Policy")).toBe("same-origin");
+    expect(res.headers.get("Strict-Transport-Security")).toContain("max-age=63072000");
     const csp = res.headers.get("Content-Security-Policy") ?? "";
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("frame-ancestors 'none'");
@@ -299,6 +316,22 @@ describe("HTTP routing", () => {
     expect(csp).toContain("base-uri 'none'");
     expect(csp).toContain("form-action 'none'");
     expect(res.headers.get("Permissions-Policy")).toContain("display-capture=(self)");
+    // No HTML sink exists in the app; Trusted Types keeps it that way.
+    expect(csp).toContain("require-trusted-types-for 'script'");
+    expect(csp).toContain("trusted-types 'none'");
+  });
+
+  it("applies the security headers to API responses too, and never caches a room code", async () => {
+    const res = await SELF.fetch("https://example.com/api/room");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("does not send HSTS on plain-HTTP localhost", async () => {
+    const res = await SELF.fetch("http://localhost/");
+    expect(res.headers.get("Strict-Transport-Security")).toBeNull();
   });
 });
 
@@ -677,8 +710,10 @@ describe("RoomDO membership", () => {
     // A Durable Object value tops out at 128 KiB while a WebSocket frame may be 1 MiB,
     // so an unclamped password made storage.put reject; the rejection escaped
     // webSocketMessage, the peer never got `welcome`, and the socket died with 1006 —
-    // which the client then retried, reproducing the same failure forever.
-    const huge = "x".repeat(200_000);
+    // which the client then retried, reproducing the same failure forever. Frames are
+    // now capped well below that too, so this uses the largest password that still fits
+    // in one: the clamp is what keeps it to 128 characters.
+    const huge = "x".repeat(70_000);
     const a = await Client.connect();
     a.send({ t: "join", room: CODE, displayName: "alice", password: huge });
     const wa = await a.nextOf("welcome");
@@ -853,15 +888,16 @@ describe("RoomDO signalling", () => {
   it("errors on a signal to an unknown peer", async () => {
     const a = await Client.connect();
     await a.join("alice");
-    a.send({ t: "signal", to: "does-not-exist", data: { k: "offer", sdp: "v=0" } });
+    a.send({ t: "signal", to: UNKNOWN_PEER, data: { k: "offer", sdp: "v=0" } });
     const err = await a.nextOf("error");
     expect(err.code).toBe("unknown-peer");
+    expect(err.message).not.toContain(UNKNOWN_PEER);
     a.close();
   });
 
   it("refuses signals from a socket that has not joined", async () => {
     const a = await Client.connect();
-    a.send({ t: "signal", to: "anyone", data: { k: "offer", sdp: "v=0" } });
+    a.send({ t: "signal", to: UNKNOWN_PEER, data: { k: "offer", sdp: "v=0" } });
     const err = await a.nextOf("error");
     expect(err.code).toBe("unknown-peer");
     a.close();
@@ -945,5 +981,90 @@ describe("RoomDO signalling", () => {
     a.send({ t: "state", sharing: true });
     expect(await a.silentFor(200)).toBe(true);
     a.close();
+  });
+});
+
+describe("RoomDO message limits", () => {
+  it("rejects a signal whose target is not a peer id", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    a.send({ t: "signal", to: "x".repeat(10_000), data: { k: "offer", sdp: "v=0" } });
+    const err = await a.nextOf("error");
+    expect(err.code).toBe("bad-message");
+    expect(err.message.length).toBeLessThan(200);
+    a.close();
+  });
+
+  it("closes a socket that sends an oversized frame with 1009", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    a.ws.send("x".repeat(100 * 1024));
+    expect(await closed).toBe(1009);
+  });
+
+  it("closes a socket that floods messages", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    for (let i = 0; i < 400; i++) a.send({ t: "state", sharing: i % 2 === 0 });
+    expect(await closed).toBe(1008);
+  });
+
+  it("lets an honest burst through: join, then 150 ICE candidates", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    for (let i = 0; i < 150; i++) {
+      a.send({
+        t: "signal",
+        to: wb.selfId,
+        data: { k: "ice", candidate: { candidate: `candidate:${i} 1 udp 1 198.51.100.9 ${1000 + i} typ relay`, sdpMid: "0", sdpMLineIndex: 0 } },
+      });
+    }
+    let received = 0;
+    while (received < 150) {
+      const m = await b.next();
+      if (m.t === "signal") received++;
+    }
+    expect(received).toBe(150);
+    a.close();
+    b.close();
+  });
+});
+
+describe("RoomDO room claim", () => {
+  // This does not reliably reproduce the interleaving that the fix in the join handler
+  // removes (it passes against the old code too): whether a crypto.subtle await lets
+  // another event in depends on timing the test cannot control. It pins the invariant
+  // instead: whichever join wins, no one ends up inside a room whose stored password
+  // they never supplied.
+  it("keeps password state consistent when two joins race on a fresh room", async () => {
+    const a = await Client.connect();
+    const b = await Client.connect();
+    // Sent back to back, so the second join arrives while the first is mid-flight.
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "race-password" });
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+
+    const ra = await a.next();
+    const rb = await b.nextOf(ra.t === "welcome" ? "error" : "welcome").catch(() => null);
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const stored = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get<string>("passwordHash"),
+    );
+
+    if (stored === undefined) {
+      // Bob claimed an open room first; Alice was told her password was ignored.
+      expect(ra.t === "error" && ra.code === "password-ignored" || ra.t === "welcome").toBe(true);
+    } else {
+      // Alice claimed it with a password: Bob, who sent none, must not be in.
+      expect(stored).toBe(await passwordHash(CODE, "race-password"));
+      expect(rb?.t).toBe("error");
+      if (rb?.t === "error") expect(rb.code).toBe("bad-password");
+    }
+    a.close();
+    b.close();
   });
 });

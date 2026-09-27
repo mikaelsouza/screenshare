@@ -76,6 +76,24 @@ const PW_FAIL_MAX_DELAY_MS = 2_000;
  */
 const EMPTY_ROOM_TTL_MS = 12 * 60 * 60 * 1000;
 
+/**
+ * Largest raw frame accepted, checked before JSON.parse. A legitimate frame is at most
+ * a 64 KB SDP plus a little JSON around it; the platform itself would accept far more.
+ */
+const MAX_FRAME_LENGTH = 80 * 1024;
+
+/**
+ * Per-socket message budget: a token bucket of MESSAGE_BURST, refilled at
+ * MESSAGE_REFILL_PER_SEC.
+ *
+ * The burst has to cover the worst honest case, which is joining a full room with
+ * TURN: seven links, each an offer or answer plus a dozen trickled candidates, all
+ * within a second or two. Sustained traffic after that is a handful of messages per
+ * renegotiation. A flood well past both is not a browser doing WebRTC.
+ */
+const MESSAGE_BURST = 200;
+const MESSAGE_REFILL_PER_SEC = 20;
+
 interface PeerAttachment {
   id: string;
   name: string;
@@ -132,7 +150,39 @@ function timingSafeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+/**
+ * Token bucket for one socket.
+ *
+ * Held in memory, not in the attachment: hibernation resets it, which is harmless
+ * because a hibernating object is by definition not being flooded.
+ */
+interface MessageBudget {
+  tokens: number;
+  updatedAt: number;
+}
+
 export class RoomDO extends DurableObject<Env> {
+  private readonly budgets = new Map<string, MessageBudget>();
+
+  /** Spend one message from this socket's budget. False when it is exhausted. */
+  private spendMessage(peerId: string, now: number = Date.now()): boolean {
+    const b = this.budgets.get(peerId) ?? { tokens: MESSAGE_BURST, updatedAt: now };
+    b.tokens = Math.min(MESSAGE_BURST, b.tokens + ((now - b.updatedAt) / 1000) * MESSAGE_REFILL_PER_SEC);
+    b.updatedAt = now;
+    this.budgets.set(peerId, b);
+    if (b.tokens < 1) return false;
+    b.tokens -= 1;
+    return true;
+  }
+
+  /** Refuse a socket that broke the protocol's limits. 1008: the client should not retry. */
+  private refuse(ws: WebSocket, code: "rate-limited" | "bad-message", message: string, closeCode = 1008): void {
+    sendSafe(ws, { t: "error", code, message });
+    try {
+      ws.close(closeCode, message);
+    } catch {}
+  }
+
   /** TURN credentials are identical for everyone here, so mint once per room. */
   private readonly iceCache: { current: { iceServers: IceServerConfig[]; expiresAt: number } | null } = {
     current: null,
@@ -287,6 +337,18 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
 
+    const size = typeof message === "string" ? message.length : message.byteLength;
+    if (size > MAX_FRAME_LENGTH) {
+      // 1009: "message too big".
+      this.refuse(ws, "bad-message", "Message too large", 1009);
+      return;
+    }
+
+    if (!this.spendMessage(attachment.id)) {
+      this.refuse(ws, "rate-limited", "Too many messages");
+      return;
+    }
+
     const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     const clientMsg = parseClientMessage(raw);
     if (!clientMsg) {
@@ -311,10 +373,17 @@ export class RoomDO extends DurableObject<Env> {
         // and kill the socket with 1006 — which the client then retries forever.
         const offered = clientMsg.password?.slice(0, MAX_PASSWORD_LENGTH);
 
+        // Hash before touching storage, and never between a storage read and the write
+        // that depends on it. Durable Object input gates only hold across storage
+        // operations; a crypto.subtle await lets another join run in the middle. With
+        // the hash computed between reading `claimed` and writing it, two joins racing
+        // on a fresh room could both see it unclaimed, so one could slip in without
+        // the password the other was setting, or a stranger's password could win.
+        const offeredHash = offered ? await this.hashPassword(offered) : null;
+
         // Verify room password if one has been set
         const roomPasswordHash = await this.getRoomPasswordHash();
         if (roomPasswordHash !== null) {
-          const offeredHash = offered ? await this.hashPassword(offered) : null;
           if (offeredHash === null) {
             // No password supplied at all. This is the ordinary first contact — a
             // shared /#CODE link, or a refresh — not an attempt at the password, so it
@@ -383,8 +452,8 @@ export class RoomDO extends DurableObject<Env> {
         // else's room and lock them out of it.
         const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
         if (!claimed) {
-          if (offered) {
-            await this.ctx.storage.put(PASSWORD_KEY, await this.hashPassword(offered));
+          if (offeredHash !== null) {
+            await this.ctx.storage.put(PASSWORD_KEY, offeredHash);
           }
           await this.ctx.storage.put(CLAIMED_KEY, true);
         } else if (offered && roomPasswordHash === null) {
@@ -484,7 +553,8 @@ export class RoomDO extends DurableObject<Env> {
           sendSafe(ws, {
             t: "error",
             code: "unknown-peer",
-            message: `Peer not found: ${clientMsg.to}`,
+            // Not echoing `to`: it is whatever the client sent.
+            message: "Peer not found",
           });
           return;
         }
@@ -528,6 +598,7 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+    this.forgetBudget(ws);
     await this.handleLeave(ws);
     // Cloudflare's hibernation contract requires the server to complete the closing
     // handshake. Without this the socket stays in getWebSockets() forever, so every
@@ -542,12 +613,18 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+    this.forgetBudget(ws);
     await this.handleLeave(ws);
     try {
       ws.close(1011, "socket error");
     } catch {
       // Already fully closed.
     }
+  }
+
+  private forgetBudget(ws: WebSocket): void {
+    const att = getAttachment(ws);
+    if (att) this.budgets.delete(att.id);
   }
 
   private async handleLeave(ws: WebSocket): Promise<void> {

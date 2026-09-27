@@ -5,15 +5,30 @@ on:
     branches:
       - main
 
+# Least privilege for the built-in token: this job only reads the repository. The
+# Cloudflare deploy uses its own API token, not GITHUB_TOKEN.
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Deploys go through the "production" environment, so its secrets and any
+    # protection rules (required reviewers, branch restrictions) apply here. GitHub
+    # creates the environment on first use if it does not exist yet.
+    environment: production
     steps:
+      # Every action is pinned to a full commit SHA, not a tag. A tag can be moved to
+      # different code after the fact (the tj-actions/changed-files compromise did
+      # exactly that), and whatever runs here holds the Cloudflare deploy token.
+      # Dependabot keeps these SHAs current; the version is in the trailing comment.
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -35,7 +50,7 @@ jobs:
         run: npm run build
 
       - name: Deploy to Cloudflare
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
