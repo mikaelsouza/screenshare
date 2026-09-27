@@ -158,7 +158,7 @@ async function fetchIceViaRoom(timeoutMs = 10_000): Promise<RTCIceServer[]> {
     return await new Promise<RTCIceServer[]>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("timed out waiting for welcome")), timeoutMs);
       // `diagnostics` asks for a five-minute credential and leaves the room unclaimed,
-      // rather than creating a real room with a two-hour one on every run.
+      // rather than creating a real room with a 12-hour one on every run.
       ws.onopen = () =>
         ws.send(JSON.stringify({ t: "join", room: code, displayName: "diagnostics", diagnostics: true }));
       ws.onerror = () => {

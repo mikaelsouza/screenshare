@@ -77,6 +77,14 @@ export async function launchBrowser() {
  */
 export const INSTRUMENT = () => {
   window.__pcs = [];
+  // Every CSP or Trusted Types violation, so a suite can fail on one instead of the
+  // page quietly losing a script or a style.
+  window.__csp = [];
+  document.addEventListener("securitypolicyviolation", (e) => {
+    window.__csp.push(`${e.violatedDirective} ${e.blockedURI}`);
+  });
+  // What the app asks the screen picker for; the privacy defaults live there.
+  window.__gdmOpts = [];
   const Native = window.RTCPeerConnection;
   window.RTCPeerConnection = function (...args) {
     const pc = new Native(...args);
@@ -86,7 +94,8 @@ export const INSTRUMENT = () => {
   window.RTCPeerConnection.prototype = Native.prototype;
   Object.setPrototypeOf(window.RTCPeerConnection, Native);
 
-  navigator.mediaDevices.getDisplayMedia = async () => {
+  navigator.mediaDevices.getDisplayMedia = async (options) => {
+    window.__gdmOpts.push(JSON.parse(JSON.stringify(options ?? {})));
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
@@ -110,6 +119,7 @@ export const INSTRUMENT = () => {
     osc.connect(dest);
     osc.start();
     for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
+    (window.__gdmStreams ??= []).push(stream);
     return stream;
   };
 };

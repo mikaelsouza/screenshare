@@ -65,10 +65,18 @@ class FakeRTCPeerConnection {
 
   async setLocalDescription(desc: RTCSessionDescriptionInit): Promise<void> {
     this.localDescription = { type: desc.type ?? "offer", sdp: desc.sdp ?? "" };
+    this.signalingState = this.localDescription.type === "offer" ? "have-local-offer" : "stable";
   }
 
   async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = { type: desc.type ?? "answer", sdp: desc.sdp ?? "" };
+    // An offer in have-local-offer is Chrome's implicit rollback: ours is dropped.
+    this.signalingState = this.remoteDescription.type === "offer" ? "have-remote-offer" : "stable";
+  }
+
+  restartIceCalls = 0;
+  restartIce(): void {
+    this.restartIceCalls++;
   }
 
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
@@ -95,8 +103,8 @@ class FakeRTCPeerConnection {
     return sender;
   }
 
-  addTransceiver(_kind: string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
-    const sender = this.addTrack(null);
+  addTransceiver(trackOrKind: MediaStreamTrack | string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
+    const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
     return this.transceivers.find((t) => t.sender === sender)!;
   }
 
@@ -613,14 +621,35 @@ describe("Mesh connects only where someone is sharing", () => {
     expect(mesh.peers()).toEqual(["carol"]);
   });
 
-  it("accepts a sharer's offer that arrives before its peer-state", async () => {
+  it("ignores an offer from someone who is not sharing", async () => {
+    // The server refuses these too; a viewer must never be able to make another
+    // viewer connect to it and reveal their address.
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);
     await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+  });
+
+  it("does not bring a closed link back for a late candidate or answer", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
+    expect(mesh.peers()).toEqual([]);
+    await mesh.handleSignal("bob", { k: "ice", candidate: { candidate: "candidate:1 1 udp 1 1.2.3.4 5 typ host", sdpMid: "0", sdpMLineIndex: 0 } });
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual([]);
+  });
+
+  it("keeps the link to a sharer when we stop sharing ourselves", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
     expect(mesh.peers()).toEqual(["bob"]);
-    // The peer-state then confirms it; the link is kept, not rebuilt.
-    mesh.setMemberSharing("bob", true);
-    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+    expect(FakeRTCPeerConnection.instances[0]?.closed).toBe(false);
   });
 
   it("removes a member's link when they leave", () => {
@@ -628,5 +657,63 @@ describe("Mesh connects only where someone is sharing", () => {
     mesh.addMember("bob", true);
     mesh.removeMember("bob");
     expect(mesh.peers()).toEqual([]);
+  });
+});
+
+describe("negotiation recovery", () => {
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+    relayOnly: false,
+  };
+  const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
+  const capture = (): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    return { stream: { getTracks: () => [video] } as unknown as MediaStream, video, audio: null };
+  };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }] }),
+    };
+  });
+
+  it("offers again after losing a glare as the polite side", async () => {
+    // "me" < "zed", so we are polite: their offer wins and ours is rolled back. What
+    // ours carried still has to be offered, or our video to them never arrives.
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    mesh.addMember("zed", true);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.signalingState = "have-local-offer"; // our offer is out
+    await mesh.handleSignal("zed", { k: "offer", sdp: "v=0\r\n" });
+    await flush();
+    const kinds = sent.map((d) => d.k);
+    expect(kinds).toContain("answer");
+    expect(kinds.lastIndexOf("offer")).toBeGreaterThan(kinds.indexOf("answer"));
+  });
+
+  it("restarts ICE from the sharing side when a link fails, and only there", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+    const sharerPc = FakeRTCPeerConnection.instances[0]!;
+    sharerPc.connectionState = "failed";
+    sharerPc.onconnectionstatechange?.();
+    expect(sharerPc.restartIceCalls).toBe(1);
+
+    const viewer = new Mesh("v", opts, () => {}, cb());
+    viewer.addMember("s", true);
+    await viewer.handleSignal("s", { k: "offer", sdp: "v=0\r\n" });
+    const viewerPc = FakeRTCPeerConnection.instances[1]!;
+    viewerPc.connectionState = "failed";
+    viewerPc.onconnectionstatechange?.();
+    expect(viewerPc.restartIceCalls).toBe(0);
   });
 });

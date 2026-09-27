@@ -16,10 +16,20 @@ const CF_STUN_SERVER: IceServerConfig = {
   urls: "stun:stun.cloudflare.com:3478",
 };
 
-export const TURN_TTL_SECONDS = 2 * 60 * 60;
+/**
+ * Twelve hours: longer than any evening of play. A relay has to renew its allocation
+ * every few minutes with these same credentials, so once they expire a relayed
+ * connection (Hide my IP, or a strict NAT) drops mid-session; at two hours, a long
+ * session did. The blast radius a short TTL used to buy now comes from revoking each
+ * credential when its holder leaves (revokeCredential).
+ */
+export const TURN_TTL_SECONDS = 12 * 60 * 60;
 
 /** TTL for the credentials the diagnostics page gets: enough to allocate one relay. */
 export const DIAGNOSTICS_TURN_TTL_SECONDS = 5 * 60;
+
+/** Longest wait for Cloudflare's TURN API before giving up (STUN only, or no revoke). */
+const TURN_API_TIMEOUT_MS = 5_000;
 
 /** How long a failed mint is remembered. Short enough that a blip is not an outage. */
 export const FAILED_MINT_CACHE_MS = 30 * 1000;
@@ -92,10 +102,9 @@ export async function mintIceServers(
         Authorization: `Bearer ${env.TURN_API_TOKEN}`,
         "Content-Type": "application/json",
       },
-      // Two hours, not the 24 that used to be minted here. These credentials let the
-      // bearer relay traffic through our Cloudflare allocation on our bandwidth, so
-      // the blast radius of a leaked set should be a session, not a day.
       body: JSON.stringify({ ttl: ttlSeconds }),
+      // A join waits on this. A hung API must cost a few seconds, not the join.
+      signal: AbortSignal.timeout(TURN_API_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -132,7 +141,11 @@ export async function revokeCredential(env: TurnEnv, username: string): Promise<
   try {
     const res = await fetch(
       `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/${encodeURIComponent(username)}/revoke`,
-      { method: "POST", headers: { Authorization: `Bearer ${env.TURN_API_TOKEN}` } },
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.TURN_API_TOKEN}` },
+        signal: AbortSignal.timeout(TURN_API_TIMEOUT_MS),
+      },
     );
     if (!res.ok) console.warn(`Cloudflare TURN revoke returned ${res.status}`);
     return res.ok;

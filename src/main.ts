@@ -183,7 +183,12 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.muted = true;
     void video.play().then(
       () => showUnmutePrompt(video, peerId),
-      () => setStatus("The browser blocked video playback. Click the tile to start it.", "warn"),
+      () => {
+        // play() rejects when the tile is torn down mid-attempt, e.g. on being
+        // removed from the room; that must not overwrite the status saying so.
+        if (tiles.get(peerId) !== video) return;
+        setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
+      },
     );
   });
 }
@@ -283,6 +288,24 @@ function hostTokenFor(code: string): string | undefined {
     return sessionStorage.getItem(`host:${code}`) ?? undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** The rejoin ticket from this tab's last welcome in a room; see RoomInfo.rejoinToken. */
+function rejoinTokenFor(code: string): string | undefined {
+  try {
+    return sessionStorage.getItem(`rejoin:${code}`) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveRejoinToken(code: string, token: string | undefined): void {
+  try {
+    if (token) sessionStorage.setItem(`rejoin:${code}`, token);
+    else sessionStorage.removeItem(`rejoin:${code}`);
+  } catch {
+    // Storage blocked: a reconnect into a locked room will be refused, nothing worse.
   }
 }
 
@@ -569,6 +592,9 @@ async function startSharingInner(): Promise<void> {
   if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
+  // Announced before any offer goes out: viewers connect only to sharers, and the
+  // server refuses an offer when neither side is sharing.
+  client?.setSharing(true);
   try {
     await mesh.setCapture(capture);
   } catch (err) {
@@ -580,7 +606,6 @@ async function startSharingInner(): Promise<void> {
     return;
   }
 
-  client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
   // A whole-screen share shows notifications, chat pop-ups and every other window.
   ui.surfaceWarning.hidden = capture.surface !== "monitor";
@@ -639,6 +664,8 @@ async function joinRoom(code: string, password?: string): Promise<void> {
   }
 
   const codeToJoin = code;
+  // A share carries over a reconnect to the same room, never into a different one.
+  if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
   const generation = ++joinGeneration;
   leaveRoom();
   if (generation !== joinGeneration) return;
@@ -667,6 +694,10 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         members.clear();
         selfId = null;
         if (room.hostToken) saveHostToken(code, room.hostToken);
+        saveRejoinToken(code, room.rejoinToken);
+        // Tiles from before a reconnect belong to links that no longer exist; anyone
+        // still sharing is connected afresh and gets a new tile.
+        for (const id of [...tiles.keys()]) removeTile(id);
         isHost = room.host;
         roomLocked = room.locked;
 
@@ -730,7 +761,13 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         setStatus(
           `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
         );
-        if (capture) void mesh.setCapture(capture);
+        if (capture) {
+          // Still sharing across a reconnect or a Hide my IP switch. The server has
+          // this socket down as not sharing, so say so first: others connect only to
+          // sharers, and the server relays an offer only when one side shares.
+          client?.setSharing(true);
+          void mesh.setCapture(capture);
+        }
         startHealthPolling();
         renderRoster();
       },
@@ -765,11 +802,18 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // Both close the socket for good. Tear the room down too: a kicked peer's
         // connections to others would otherwise linger until they time out.
         if (code === "kicked") {
+          // Stop the capture too. Left running, the browser kept sharing the screen
+          // and the next room joined would have been sent it without asking.
+          void stopSharing();
+          saveRejoinToken(codeToJoin, undefined);
+          lastJoin = null;
           leaveRoom();
           setStatus("You were removed from this room by its host.", "error");
           return;
         }
         if (code === "room-locked") {
+          void stopSharing();
+          lastJoin = null;
           leaveRoom();
           setStatus(`Room ${codeToJoin} is locked. Ask its host to unlock it.`, "error");
           return;
@@ -803,7 +847,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       },
     },
     password,
-    () => hostTokenFor(code),
+    () => ({ hostToken: hostTokenFor(code), rejoinToken: rejoinTokenFor(code) }),
   );
 
   client.connect();
@@ -875,7 +919,9 @@ function initQualityControls(): void {
     localStorage.setItem("relay_only", String(ui.relayOnly.checked));
     // Apply it now by reconnecting, not "next time": every new connection made until
     // then would hand out the address the user just asked to hide.
-    if (client && lastJoin) {
+    // lastJoin, not client: after Hide my IP refused to connect there is no client,
+    // and unticking it is exactly how the status line says to get in.
+    if (lastJoin) {
       void joinRoom(lastJoin.code, lastJoin.password);
       setStatus(ui.relayOnly.checked ? "Reconnecting with your IP hidden…" : "Reconnecting…", "info");
     }

@@ -142,6 +142,11 @@ class PeerLink {
       }
     };
     this.pc.onconnectionstatechange = () => {
+      // A network change (Wi-Fi to Ethernet, a VPN) can kill the path a link chose.
+      // The sharing side restarts ICE, which renegotiates through the usual offer
+      // path; left alone, the viewer's picture just froze until someone rejoined.
+      // Only the sender, so both sides do not restart into a glare.
+      if (this.pc.connectionState === "failed" && this.videoSender) this.pc.restartIce();
       this.cb.onConnectionState(this.peerId, this.pc.connectionState);
     };
     this.pc.ontrack = (ev) => this.onTrack(ev);
@@ -225,6 +230,10 @@ class PeerLink {
 
     this.ignoreOffer = !this.polite && offerCollision;
     if (this.ignoreOffer) return;
+    // We are polite and theirs wins: setRemoteDescription rolls ours back. Whatever
+    // ours carried (our video, say) still needs an offer, so make one after answering
+    // rather than trusting Chrome to fire negotiationneeded again.
+    if (offerCollision) this.offerPending = true;
 
     if (kind === "offer") {
       this.remoteOffers++;
@@ -305,20 +314,18 @@ class PeerLink {
   async attachCapture(capture: CaptureResult): Promise<void> {
     await this.detachCapture();
 
-    this.videoSender = this.pc.addTrack(capture.video, capture.stream);
+    // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
+    // addTrack reuses the receive-only transceiver its offer created, and that
+    // sender has no send encodings yet: setting ours is "Read-only field modified",
+    // which stopped the whole share. So a viewer could not share back to a sharer.
+    const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
+    this.videoSender = this.pc.addTransceiver(capture.video, send).sender;
     // Always open an audio sender, even while silent. A whole-screen share starts
     // with no audio and gets the game's audio from a second pick moments later, and
     // the user can swap sources mid-share. With the sender already negotiated, each
     // of those is a replaceTrack with no renegotiation. Tagging it with the video's
     // stream keeps the two in one MediaStream on the far end, so they play in sync.
-    if (capture.audio) {
-      this.audioSender = this.pc.addTrack(capture.audio, capture.stream);
-    } else {
-      this.audioSender = this.pc.addTransceiver("audio", {
-        direction: "sendonly",
-        streams: [capture.stream],
-      }).sender;
-    }
+    this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
     await applyAudioEncoding(this.audioSender);
 
     const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
@@ -508,10 +515,18 @@ export class Mesh {
   }
 
   async handleSignal(from: PeerId, data: SignalData): Promise<void> {
-    // A sharer's offer can arrive before its peer-state says it is sharing (it
-    // attaches the capture first, then announces), so a signal creates the link on
-    // demand. The server only relays signals from peers joined to this room.
-    if (!this.links.has(from)) this.addPeer(from, true);
+    // The sharer's link on this side is created by its first offer. A sharer
+    // announces sharing before it offers, and the server relays in order, so its
+    // peer-state is already here. The server only relays signals from peers joined
+    // to this room.
+    if (!this.links.has(from)) {
+      // Only an offer starts a link, and only from someone sharing (or to us while we
+      // share). A late candidate or answer for a link we already closed would
+      // otherwise bring it back as a zombie with no control channel.
+      if (data.k !== "offer") return;
+      if (!this.capture && this.members.get(from)?.sharing !== true) return;
+      this.addPeer(from, true);
+    }
     await this.links.get(from)?.handleSignal(data);
   }
 

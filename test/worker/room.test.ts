@@ -856,6 +856,9 @@ describe("RoomDO signalling", () => {
     const wb = await b.join("bob");
     await a.nextOf("peer-joined");
 
+    // An offer needs one side sharing; see "refuses an offer between two viewers".
+    a.send({ t: "state", sharing: true });
+    await b.nextOf("peer-state");
     const data = { k: "offer", sdp: "v=0\r\na=rtpmap:111 opus/48000/2\r\n" };
     a.send({ t: "signal", to: wb.selfId, data });
 
@@ -1347,5 +1350,220 @@ describe("RoomDO diagnostics joins (batch D)", () => {
     expect((await d.nextOf("error")).code).toBe("bad-message");
     expect(await a.silentFor()).toBe(true);
     a.close();
+  });
+});
+
+describe("RoomDO final review fixes", () => {
+  /**
+   * Replace the room's TURN mint with a slow fake, and record revocations. The real
+   * mint is a fetch to Cloudflare, which is where joins interleave; under test TURN
+   * is unconfigured and the mint returns at once, so the races never show.
+   */
+  async function slowMint(
+    room: string,
+    delayMs: number | number[],
+  ): Promise<{ revoked: () => Promise<string[]>; mints: () => Promise<number> }> {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
+    await runInDurableObject(stub, (instance) => {
+      const o = instance as unknown as {
+        mintFor: () => Promise<unknown>;
+        revokeLater: (u?: string) => void;
+        __revoked: string[];
+        __mints: number;
+      };
+      o.__revoked = [];
+      o.__mints = 0;
+      o.mintFor = async () => {
+        o.__mints++;
+        const n = o.__mints;
+        await scheduler.wait(Array.isArray(delayMs) ? (delayMs[n - 1] ?? 0) : delayMs);
+        return { iceServers: [], username: `user-${n}` };
+      };
+      o.revokeLater = (u?: string) => {
+        if (u) o.__revoked.push(u);
+      };
+    });
+    const read = <T>(k: "__revoked" | "__mints") =>
+      runInDurableObject(stub, (instance) => (instance as unknown as Record<string, T>)[k]);
+    return { revoked: () => read<string[]>("__revoked"), mints: () => read<number>("__mints") };
+  }
+
+  it("never tells a joiner about someone before its own welcome, even when joins overlap", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    // Bob's mint is slow and carol's is not, so carol commits while bob is mid-join.
+    await slowMint(CODE, [400, 0]);
+    const b = await Client.connect();
+    const c = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+    await new Promise((r) => setTimeout(r, 50));
+    c.send({ t: "join", room: CODE, displayName: "carol" });
+    const firstB = await b.next(3000);
+    const firstC = await c.next(3000);
+    expect(firstB.t).toBe("welcome");
+    expect(firstC.t).toBe("welcome");
+    // Whichever committed second lists the other; the first hears peer-joined later.
+    const wb = firstB as Extract<ServerMessage, { t: "welcome" }>;
+    const wc = firstC as Extract<ServerMessage, { t: "welcome" }>;
+    const bKnowsC = wb.peers.some((p) => p.id === wc.selfId) || (await b.nextOf("peer-joined")).peer.id === wc.selfId;
+    const cKnowsB = wc.peers.some((p) => p.id === wb.selfId) || (await c.nextOf("peer-joined")).peer.id === wb.selfId;
+    expect(bKnowsC && cKnowsB).toBe(true);
+    for (const s of [a, b, c]) s.close();
+  });
+
+  it("does not announce, and revokes the credential of, a joiner that left mid-join", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const spy = await slowMint(CODE, 300);
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+    await new Promise((r) => setTimeout(r, 50));
+    b.close();
+    // Nothing about bob reaches alice: no peer-joined for someone already gone.
+    expect(await a.silentFor(700)).toBe(true);
+    expect(await spy.revoked()).toEqual(["user-1"]);
+    a.close();
+  });
+
+  it("leaves the room unclaimed when its creator disconnects mid-join", async () => {
+    await slowMint(CODE, 300);
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
+    await new Promise((r) => setTimeout(r, 50));
+    a.close();
+    await new Promise((r) => setTimeout(r, 500));
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"))).toBeUndefined();
+  });
+
+  it("revokes a peer's own credential when it leaves or is removed", async () => {
+    const spy = await slowMint(CODE, 0);
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.1" });
+    await h.join("host");
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.6" });
+    await c.join("carol");
+    expect(await spy.mints()).toBe(3);
+
+    h.send({ t: "kick", id: wb.selfId });
+    await h.nextOf("peer-left");
+    c.close();
+    await h.nextOf("peer-left");
+    expect((await spy.revoked()).sort()).toEqual(["user-2", "user-3"]);
+    h.close();
+  });
+
+  it("mints once per diagnostics socket, however many joins it sends", async () => {
+    const spy = await slowMint(CODE, 100);
+    const d = await Client.connect();
+    for (let i = 0; i < 5; i++) d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    await d.nextOf("welcome");
+    expect(await spy.mints()).toBe(1);
+  });
+
+  it("lets a member back into a locked room with its rejoin ticket, and nobody else", async () => {
+    const h = await Client.connect();
+    const wh = await h.join("host");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    expect(typeof wb.rejoinToken).toBe("string");
+    await h.nextOf("peer-joined");
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+
+    // Bob's connection blips.
+    b.close();
+    await h.nextOf("peer-left");
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
+    const again = await back.nextOf("welcome");
+    expect(again.locked).toBe(true);
+    // A ticket is good once: each welcome issues a fresh one.
+    expect(again.rejoinToken).not.toBe(wb.rejoinToken);
+
+    const reuse = await Client.connect();
+    reuse.send({ t: "join", room: CODE, displayName: "copycat", rejoinToken: wb.rejoinToken });
+    expect((await reuse.nextOf("error")).code).toBe("room-locked");
+    const stranger = await Client.connect();
+    stranger.send({ t: "join", room: CODE, displayName: "eve", rejoinToken: "made-up" });
+    expect((await stranger.nextOf("error")).code).toBe("room-locked");
+    expect(wh.host).toBe(true);
+    h.close();
+    back.close();
+  });
+
+  it("does not let a removed member's ticket carry them past the ban", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.1" });
+    await h.join("host");
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    const housemate = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wm = await housemate.join("housemate");
+    await h.nextOf("peer-joined");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "kick", id: wb.selfId });
+    await h.nextOf("peer-left");
+    const retry = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    retry.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
+    expect((await retry.nextOf("error")).code).toBe("kicked");
+
+    // The housemate shares the banned address, but was already in: their ticket works.
+    housemate.close();
+    await h.nextOf("peer-left");
+    const hmBack = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    hmBack.send({ t: "join", room: CODE, displayName: "housemate", rejoinToken: wm.rejoinToken });
+    expect((await hmBack.nextOf("welcome")).selfId).toBeTruthy();
+    h.close();
+    hmBack.close();
+  });
+
+  it("unlocks a room its host has left for good, but not across a refresh", async () => {
+    const h = await Client.connect();
+    const wh = await h.join("host");
+    const b = await Client.connect();
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b.nextOf("room-state");
+
+    // The host refreshes: still locked for strangers meanwhile.
+    h.close();
+    await b.nextOf("peer-left");
+    const early = await Client.connect();
+    early.send({ t: "join", room: CODE, displayName: "eve" });
+    expect((await early.nextOf("error")).code).toBe("room-locked");
+
+    // Five minutes pass with no host.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    const late = await Client.connect();
+    late.send({ t: "join", room: CODE, displayName: "dave" });
+    expect((await late.nextOf("welcome")).locked).toBe(false);
+    expect(await b.nextOf("room-state")).toEqual({ t: "room-state", locked: false });
+
+    // And the host coming back is still host.
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: wh.hostToken });
+    expect((await back.nextOf("welcome")).host).toBe(true);
+    for (const s of [b, late, back]) s.close();
+  });
+
+  it("refuses an offer between two people who are not sharing", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    await a.nextOf("peer-joined");
+    a.send({ t: "signal", to: wb.selfId, data: { k: "offer", sdp: "v=0\r\n" } });
+    expect((await a.nextOf("error")).code).toBe("not-sharing");
+    expect(await b.silentFor()).toBe(true);
+    // Answers and candidates are not offers: they pass, as part of a link a sharer started.
+    a.send({ t: "signal", to: wb.selfId, data: { k: "ice", candidate: { candidate: "" } } });
+    expect((await b.nextOf("signal")).data.k).toBe("ice");
+    a.close();
+    b.close();
   });
 });

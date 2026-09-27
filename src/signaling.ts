@@ -22,6 +22,8 @@ export interface RoomInfo {
   host: boolean;
   /** Present only on the welcome that created the room. Keep it to stay host. */
   hostToken?: string;
+  /** Fresh on every welcome. Present it on the next join to get back in if locked. */
+  rejoinToken?: string;
   locked: boolean;
 }
 
@@ -67,8 +69,8 @@ export class SignalingClient {
     private readonly displayName: string,
     private readonly handlers: SignalingHandlers,
     private readonly password?: string,
-    /** Read on every (re)connect, so a token issued by the first welcome is sent on the next. */
-    private readonly hostToken?: () => string | undefined,
+    /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
+    private readonly tokens?: () => { hostToken?: string; rejoinToken?: string },
   ) {}
 
   connect(): void {
@@ -97,10 +99,9 @@ export class SignalingClient {
       if (this.password) {
         joinMsg.password = this.password;
       }
-      const hostToken = this.hostToken?.();
-      if (hostToken) {
-        joinMsg.hostToken = hostToken;
-      }
+      const { hostToken, rejoinToken } = this.tokens?.() ?? {};
+      if (hostToken) joinMsg.hostToken = hostToken;
+      if (rejoinToken) joinMsg.rejoinToken = rejoinToken;
       this.send(joinMsg);
       this.startPing();
     };
@@ -121,9 +122,11 @@ export class SignalingClient {
     ws.onclose = (ev) => {
       this.stopPing();
       // Closed on purpose: whoever closed it has already said what happened, e.g. that
-      // the host removed us, and "Connection closed" would overwrite it.
+      // the host removed us, and "Connection closed" would overwrite it. The same goes
+      // for 1008, below: the server sent its reason (wrong password, room full) as an
+      // error just before closing, and that is what the user needs to read.
       if (this.closedByUs) return;
-      this.handlers.onStatus("closed");
+      if (ev.code !== 1008) this.handlers.onStatus("closed");
       // 1008 (policy violation) is how the server says "do not come back" — room
       // full, or a bad room code. Reconnecting re-triggers the same rejection
       // forever at the backoff cap, burning a Worker request and a Durable Object
@@ -158,6 +161,7 @@ export class SignalingClient {
         this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? [], {
           host: msg.host === true,
           ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
+          ...(typeof msg.rejoinToken === "string" ? { rejoinToken: msg.rejoinToken } : {}),
           locked: msg.locked === true,
         });
         break;

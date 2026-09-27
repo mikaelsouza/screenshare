@@ -98,7 +98,16 @@ as a friend with an invisible character.
 host sees **Remove** beside each person and a **Lock room** button. A removed person is
 disconnected at once and their address cannot rejoin for 15 minutes; a locked room
 refuses everyone new except the host. The ban is by address, so on a shared connection it
-also shuts out whoever shares it; for anything lasting, lock the room.
+also shuts out newcomers who share it; for anything lasting, lock the room.
+
+People already inside are not shut out by either. Every welcome carries a one-use rejoin
+ticket (kept in `sessionStorage` like the host token), and a join presenting it gets past
+the lock and the ban, so a refresh, a network blip or switching Hide my IP does not eject
+anyone. Removing someone deletes their ticket. If the host leaves a locked room and does
+not come back within five minutes, the room unlocks itself, since nobody else could.
+
+The relay refuses an **offer** unless the sender or the receiver is sharing, so a modified
+client cannot make another viewer connect to it and learn their address.
 
 ### Abuse limits
 
@@ -205,14 +214,17 @@ fallback is unavailable.
 npm run check        # typecheck client + worker
 npm run test:unit    # pure logic (protocol, SDP munging, stats)
 npm run test:worker  # RoomDO inside real workerd via vitest-pool-workers
-npm run test:e2e     # two real Chromium peers establishing an actual P2P connection
+npm run test:e2e     # real Chromium peers: p2p, edge cases, diagnostics
 npm test             # check + unit + worker
 npm run test:all     # everything, including the browser tests
 ```
 
-The end-to-end tests launch two Chromium browsers, join them to one room, share a
-synthetic stream, and assert that frames actually decode on the far side and that the
-selected ICE candidate pair is not a relay. `getDisplayMedia` is stubbed with a canvas
+The end-to-end tests launch Chromium pages, join them to one room, share a synthetic
+stream, and assert that frames actually decode on the far side and that the selected ICE
+candidate pair is not a relay. `edge.test.mjs` walks the less travelled paths: a password
+room made with Create, joining mid-share, stopping and sharing again, two people sharing
+at once, the host refreshing, Hide my IP with no relay, removal and locking, a member
+refreshing into a locked room, and no CSP violation anywhere. `getDisplayMedia` is stubbed with a canvas
 stream because headless Chrome has no screen picker; everything downstream of the
 picker is real.
 
@@ -317,7 +329,7 @@ Open defects, in rough order of how likely you are to hit them:
   twenty times in an evening and a 7-peer mesh is carrying 40 m-lines per connection.
   The fix is one persistent transceiver per link plus `replaceTrack`.
 - **TURN credentials are cheap to obtain.** Anyone can create a room, join it, and
-  receive two-hour relay credentials on our Cloudflare allocation. They are now per
+  receive 12-hour relay credentials on our Cloudflare allocation. They are now per
   person, revoked on leave, and capped at 20 a minute per address, which blunts this
   without preventing it. Cloudflare does not say whether revoking also ends a relay
   already in use. If relay traffic ever runs away, switch TURN off without a deploy:

@@ -7,6 +7,7 @@ import {
   type PeerInfo,
   type ErrorCode,
   type ServerMessage,
+  type ClientMessage,
   parseClientMessage,
 } from "@shared/protocol";
 import type { Env } from "./index";
@@ -50,6 +51,18 @@ const CLAIMED_KEY = "claimed";
  * to the creating join only; whoever presents it later is the host again.
  */
 const HOST_KEY = "hostTokenHash";
+
+/**
+ * Storage key: rejoin tickets, as salted hash to expiry. Every welcome hands out a
+ * fresh one; presenting it gets a returning member past the lock and a kick ban.
+ */
+const MEMBERS_KEY = "members";
+
+/** Storage key: when the last host socket left, for dropping an orphaned lock. */
+const HOST_GONE_KEY = "hostGoneAt";
+
+/** How long a locked room waits for its host to come back before it unlocks. */
+const HOST_GRACE_MS = 5 * 60 * 1000;
 
 /** Storage key: true while the host has locked the room to new joins. */
 const LOCKED_KEY = "locked";
@@ -151,6 +164,8 @@ interface PeerAttachment {
    * than in memory so a hibernation between join and leave does not lose it.
    */
   turnUser?: string;
+  /** Hash of the rejoin ticket this socket was issued, deleted if it is kicked. */
+  rejoinHash?: string;
 }
 
 function getAttachment(ws: WebSocket): PeerAttachment | null {
@@ -235,6 +250,10 @@ export class RoomDO extends DurableObject<Env> {
   private readonly budgets = new Map<string, MessageBudget>();
   /** Unparseable messages per socket. In memory, like the budgets, for the same reason. */
   private readonly badMessages = new Map<string, number>();
+  /** Sockets with a join in flight, so a second join on the same socket is ignored. */
+  private readonly joining = new Set<string>();
+  /** Sockets that closed, so a join still in flight knows not to commit. */
+  private readonly gone = new Set<string>();
 
   /**
    * Close every socket that has been open longer than the join deadline without
@@ -302,7 +321,9 @@ export class RoomDO extends DurableObject<Env> {
   /** Revoke a TURN credential without holding up whatever is closing. */
   private revokeLater(username: string | undefined): void {
     if (!username) return;
-    this.ctx.waitUntil(revokeCredential(this.env, username));
+    // Not ctx.waitUntil, which does nothing in a Durable Object: an outstanding fetch
+    // keeps the object alive by itself.
+    void revokeCredential(this.env, username);
   }
 
   /** Joined sockets other than `except`, with their attachments. */
@@ -358,7 +379,7 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /** Salted SHA-256, hex. The host token gets its own prefix so it never equals a password hash. */
-  private async hashSecret(secret: string, kind?: "host"): Promise<string> {
+  private async hashSecret(secret: string, kind?: "host" | "rejoin"): Promise<string> {
     const prefix = kind ? `${this.ctx.id.toString()}:${kind}` : this.ctx.id.toString();
     const data = new TextEncoder().encode(`${prefix}:${secret}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
@@ -523,245 +544,18 @@ export class RoomDO extends DurableObject<Env> {
 
     switch (clientMsg.t) {
       case "join": {
-        // A second "join" on the same socket must be ignored, not duplicated.
-        if (attachment.joined) {
+        // A second "join" on the same socket must be ignored, not duplicated — also
+        // while the first is still in flight, since it awaits hashing and a fetch, and
+        // after a diagnostics join, which never marks the socket joined.
+        if (attachment.joined || this.joining.has(attachment.id) || this.gone.has(attachment.id)) {
           return;
         }
-
-        // Diagnostics: a throwaway join that only wants short-lived TURN to test with.
-        // It claims nothing, stores nothing and never shows up in the room, and it is
-        // only accepted on a room nobody has created, so it cannot peek into a real one.
-        if (clientMsg.diagnostics) {
-          if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true) {
-            this.refuse(ws, "bad-message", "Diagnostics need a fresh room");
-            return;
-          }
-          const minted = await this.mintFor(attachment.ip, DIAGNOSTICS_TURN_TTL_SECONDS);
-          // Not revoked on close: the page tests the relay after it has hung up, and
-          // the credential expires within minutes anyway.
-          sendSafe(ws, {
-            t: "welcome",
-            selfId: attachment.id,
-            peers: [],
-            iceServers: minted.iceServers,
-            host: false,
-            locked: false,
-          });
-          try {
-            ws.close(1000, "Diagnostics done");
-          } catch {}
-          return;
-        }
-
-        // Clamp before anything touches storage. displayName is clamped below for the
-        // same reason; an unbounded password would exceed the 128 KiB Durable Object
-        // value limit, and the rejected put would propagate out of webSocketMessage
-        // and kill the socket with 1006 — which the client then retries forever.
-        const offered = clientMsg.password?.slice(0, MAX_PASSWORD_LENGTH);
-
-        // Hash before touching storage, and never between a storage read and the write
-        // that depends on it. Durable Object input gates only hold across storage
-        // operations; a crypto.subtle await lets another join run in the middle. With
-        // the hash computed between reading `claimed` and writing it, two joins racing
-        // on a fresh room could both see it unclaimed, so one could slip in without
-        // the password the other was setting, or a stranger's password could win.
-        // The same goes for the host token: both the one offered and the one this join
-        // would be issued if it turns out to create the room.
-        const offeredHash = offered ? await this.hashPassword(offered) : null;
-        const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
-        const newHostToken = crypto.randomUUID();
-        const newHostHash = await this.hashSecret(newHostToken, "host");
-
-        // Verify room password if one has been set
-        const roomPasswordHash = await this.getRoomPasswordHash();
-        if (roomPasswordHash !== null) {
-          if (offeredHash === null) {
-            // No password supplied at all. This is the ordinary first contact — a
-            // shared /#CODE link, or a refresh — not an attempt at the password, so it
-            // must not feed the brute-force counter or pay its delay. Counting it made
-            // eight friends reloading a few times each throttle their own room.
-            sendSafe(ws, {
-              t: "error",
-              code: "bad-password",
-              message: "This room needs a password",
-            });
-            try {
-              ws.close(1008, "Password required");
-            } catch {}
-            return;
-          }
-          if (!timingSafeEqual(offeredHash, roomPasswordHash)) {
-            const delayMs = await this.notePasswordFailure();
-            if (delayMs === null) {
-              // Past the hard limit: refuse without delay and without hashing, so the
-              // throttle cannot be turned into a way to hold this object awake. 1013,
-              // not 1008, because the window expires and someone with the real
-              // password must be able to get in afterwards.
-              sendSafe(ws, {
-                t: "error",
-                code: "rate-limited",
-                message: "Too many password attempts. Try again later.",
-              });
-              try {
-                ws.close(TRY_AGAIN_LATER, "Too many password attempts");
-              } catch {}
-              return;
-            }
-            await scheduler.wait(delayMs);
-            sendSafe(ws, {
-              t: "error",
-              code: "bad-password",
-              message: "Incorrect or missing room password",
-            });
-            try {
-              ws.close(1008, "Incorrect password");
-            } catch {}
-            return;
-          }
-        }
-
-        // Only the join that creates the room may set its password. An empty room is
-        // NOT enough: an unprotected room is empty for the length of every reconnect,
-        // and permanently once the session ends while its code lives on in a shared
-        // link — so "first peer in an empty room" would let a stranger claim someone
-        // else's room and lock them out of it.
-        const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
-        let isHost = false;
-        let issuedHostToken: string | undefined;
-        let locked = false;
-        if (!claimed) {
-          // Only a new room's password is checked: rooms created before this rule keep
-          // working with whatever they were given. Refused before anything is stored,
-          // so the room stays unclaimed and the creator can simply try again.
-          if (offered && offered.length < MIN_PASSWORD_LENGTH) {
-            this.refuse(
-              ws,
-              "weak-password",
-              `Room passwords need at least ${MIN_PASSWORD_LENGTH} characters.`,
-            );
-            return;
-          }
-          await this.ctx.storage.put({
-            ...(offeredHash !== null ? { [PASSWORD_KEY]: offeredHash } : {}),
-            [HOST_KEY]: newHostHash,
-            [CLAIMED_KEY]: true,
-          });
-          isHost = true;
-          issuedHostToken = newHostToken;
-        } else {
-          const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
-          isHost = offeredHostHash !== null && hostHash !== null && timingSafeEqual(offeredHostHash, hostHash);
-          locked = (await this.ctx.storage.get<boolean>(LOCKED_KEY)) === true;
-
-          // The host is never shut out of their own room, by the lock or by a ban.
-          if (!isHost) {
-            if (locked) {
-              this.refuse(ws, "room-locked", "This room is locked. Ask the host to unlock it.");
-              return;
-            }
-            if (attachment.ip) {
-              const deny = await this.getDenyList(Date.now());
-              if (deny[attachment.ip] !== undefined) {
-                this.refuse(ws, "kicked", "You were removed from this room.");
-                return;
-              }
-            }
-          }
-
-          if (offered && roomPasswordHash === null) {
-            // The room already exists and has no password, and this peer supplied one.
-            // Silently dropping it let someone believe they had protected a room that
-            // was in fact open to anyone with the code — the worst possible outcome for
-            // a security control. Say so instead; the join itself still succeeds.
-            sendSafe(ws, {
-              t: "error",
-              code: "password-ignored",
-              message: "This room has no password. Yours was ignored — create a new room to set one.",
-            });
-          }
-        }
-
-        // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
-        await this.ctx.storage.deleteAlarm();
-
-        // Collected after the last storage await, so a join that landed meanwhile is
-        // counted rather than missed.
-        const others = this.joinedPeers(ws);
-        const otherPeers: PeerInfo[] = others.map(({ att }) => ({
-          id: att.id,
-          name: att.name,
-          sharing: att.sharing,
-          ...(att.host ? { host: true } : {}),
-        }));
-
-        // Reject with "room-full" and close(1008) if the count of ALREADY-JOINED sockets is >= MAX_ROOM_SIZE
-        if (otherPeers.length >= MAX_ROOM_SIZE) {
-          sendSafe(ws, {
-            t: "error",
-            code: "room-full",
-            message: "Room is full",
-          });
-          try {
-            ws.close(1008, "Room full");
-          } catch {}
-          return;
-        }
-
-        const sanitisedName = sanitiseName(clientMsg.displayName);
-
-        attachment.name = sanitisedName;
-        attachment.joined = true;
-        attachment.sharing = false;
-        attachment.host = isHost;
+        this.joining.add(attachment.id);
         try {
-          ws.serializeAttachment(attachment);
-        } catch {
-          return;
+          await this.handleJoin(ws, attachment, clientMsg);
+        } finally {
+          this.joining.delete(attachment.id);
         }
-
-        // Mint TURN credentials here rather than from a public HTTP endpoint: reaching
-        // this line requires a live WebSocket that has been accepted into the room, so
-        // the socket itself is the authorisation. A failure must not block the join —
-        // direct P2P is the common path and needs no TURN at all.
-        const minted = await this.mintFor(attachment.ip);
-        if (minted.username) {
-          // The mint is a fetch, so the socket may have left or been kicked meanwhile.
-          // Its leave could not revoke a credential it did not have yet; do it here.
-          const current = getAttachment(ws);
-          if (!current?.joined) {
-            this.revokeLater(minted.username);
-            return;
-          }
-          current.turnUser = minted.username;
-          try {
-            ws.serializeAttachment(current);
-          } catch {}
-        }
-
-        sendSafe(ws, {
-          t: "welcome",
-          selfId: attachment.id,
-          peers: otherPeers,
-          iceServers: minted.iceServers,
-          host: isHost,
-          ...(issuedHostToken ? { hostToken: issuedHostToken } : {}),
-          locked,
-        });
-
-        // After the welcome, so the newcomer is set up before anyone signals it.
-        const joinedMsg: ServerMessage = {
-          t: "peer-joined",
-          peer: {
-            id: attachment.id,
-            name: attachment.name,
-            sharing: false,
-            ...(isHost ? { host: true } : {}),
-          },
-        };
-        for (const { ws: s } of others) {
-          sendSafe(s, joinedMsg);
-        }
-
         return;
       }
 
@@ -776,12 +570,19 @@ export class RoomDO extends DurableObject<Env> {
           sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
           return;
         }
-        if (target.att.ip) {
-          // Written before the close, so a rejoin racing the close meets the ban.
+        {
+          // Written before the close, so a rejoin racing the close meets the ban. The
+          // ticket goes too, or it would carry them straight past the ban.
           const now = Date.now();
-          const deny = await this.getDenyList(now);
-          deny[target.att.ip] = now + KICK_BAN_MS;
-          await this.ctx.storage.put(DENY_KEY, deny);
+          const members = await this.getMembers(now);
+          if (target.att.rejoinHash) delete members[target.att.rejoinHash];
+          const writes: Record<string, unknown> = { [MEMBERS_KEY]: members };
+          if (target.att.ip) {
+            const deny = await this.getDenyList(now);
+            deny[target.att.ip] = now + KICK_BAN_MS;
+            writes[DENY_KEY] = deny;
+          }
+          await this.ctx.storage.put(writes);
         }
         sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
         // Leave first, so everyone hears peer-left and the credential is revoked even
@@ -817,10 +618,12 @@ export class RoomDO extends DurableObject<Env> {
 
         // Look up the target socket by attachment id among getWebSockets()
         let targetSocket: WebSocket | null = null;
+        let targetSharing = false;
         for (const s of this.ctx.getWebSockets()) {
           const att = getAttachment(s);
           if (att && att.joined && att.id === clientMsg.to) {
             targetSocket = s;
+            targetSharing = att.sharing;
             break;
           }
         }
@@ -833,6 +636,16 @@ export class RoomDO extends DurableObject<Env> {
             // Not echoing `to`: it is whatever the client sent.
             message: "Peer not found",
           });
+          return;
+        }
+
+        // A connection starts with an offer, and there is a connection only when one
+        // side shares: viewers never connect to each other. The client enforces that,
+        // but a modified client could offer to another viewer to learn their address
+        // from the answer, so the relay enforces it too. Clients announce sharing
+        // before they offer, so an honest offer always passes.
+        if (clientMsg.data.k === "offer" && !attachment.sharing && !targetSharing) {
+          sendSafe(ws, { t: "error", code: "not-sharing", message: "Neither of you is sharing" });
           return;
         }
 
@@ -874,6 +687,314 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
+  /** The join handshake, split out of webSocketMessage; see the call site. */
+  private async handleJoin(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "join" }>,
+  ): Promise<void> {
+    // Diagnostics: a throwaway join that only wants short-lived TURN to test with.
+    // It claims nothing, stores nothing and never shows up in the room, and it is
+    // only accepted on a room nobody has created, so it cannot peek into a real one.
+    if (clientMsg.diagnostics) {
+      if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true) {
+        this.refuse(ws, "bad-message", "Diagnostics need a fresh room");
+        return;
+      }
+      // One credential per socket: marked done now, before the mint's await.
+      this.gone.add(attachment.id);
+      const minted = await this.mintFor(attachment.ip, DIAGNOSTICS_TURN_TTL_SECONDS);
+      // Not revoked on close: the page tests the relay after it has hung up, and
+      // the credential expires within minutes anyway.
+      sendSafe(ws, {
+        t: "welcome",
+        selfId: attachment.id,
+        peers: [],
+        iceServers: minted.iceServers,
+        host: false,
+        locked: false,
+      });
+      try {
+        ws.close(1000, "Diagnostics done");
+      } catch {}
+      return;
+    }
+
+    // Clamp before anything touches storage. displayName is clamped below for the
+    // same reason; an unbounded password would exceed the 128 KiB Durable Object
+    // value limit, and the rejected put would propagate out of webSocketMessage
+    // and kill the socket with 1006 — which the client then retries forever.
+    const offered = clientMsg.password?.slice(0, MAX_PASSWORD_LENGTH);
+
+    // Hash before touching storage, and never between a storage read and the write
+    // that depends on it. Durable Object input gates only hold across storage
+    // operations; a crypto.subtle await lets another join run in the middle. With
+    // the hash computed between reading `claimed` and writing it, two joins racing
+    // on a fresh room could both see it unclaimed, so one could slip in without
+    // the password the other was setting, or a stranger's password could win.
+    // The same goes for the host and rejoin tokens: those offered, and those this
+    // join would be issued.
+    const offeredHash = offered ? await this.hashPassword(offered) : null;
+    const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
+    const offeredRejoinHash = clientMsg.rejoinToken
+      ? await this.hashSecret(clientMsg.rejoinToken, "rejoin")
+      : null;
+    const newHostToken = crypto.randomUUID();
+    const newHostHash = await this.hashSecret(newHostToken, "host");
+    const newRejoinToken = crypto.randomUUID();
+    const newRejoinHash = await this.hashSecret(newRejoinToken, "rejoin");
+
+    // Verify room password if one has been set
+    const roomPasswordHash = await this.getRoomPasswordHash();
+    if (roomPasswordHash !== null) {
+      if (offeredHash === null) {
+        // No password supplied at all. This is the ordinary first contact — a
+        // shared /#CODE link, or a refresh — not an attempt at the password, so it
+        // must not feed the brute-force counter or pay its delay. Counting it made
+        // eight friends reloading a few times each throttle their own room.
+        sendSafe(ws, {
+          t: "error",
+          code: "bad-password",
+          message: "This room needs a password",
+        });
+        try {
+          ws.close(1008, "Password required");
+        } catch {}
+        return;
+      }
+      if (!timingSafeEqual(offeredHash, roomPasswordHash)) {
+        const delayMs = await this.notePasswordFailure();
+        if (delayMs === null) {
+          // Past the hard limit: refuse without delay and without hashing, so the
+          // throttle cannot be turned into a way to hold this object awake. 1013,
+          // not 1008, because the window expires and someone with the real
+          // password must be able to get in afterwards.
+          sendSafe(ws, {
+            t: "error",
+            code: "rate-limited",
+            message: "Too many password attempts. Try again later.",
+          });
+          try {
+            ws.close(TRY_AGAIN_LATER, "Too many password attempts");
+          } catch {}
+          return;
+        }
+        await scheduler.wait(delayMs);
+        sendSafe(ws, {
+          t: "error",
+          code: "bad-password",
+          message: "Incorrect or missing room password",
+        });
+        try {
+          ws.close(1008, "Incorrect password");
+        } catch {}
+        return;
+      }
+    }
+
+    const tokens = { offered, offeredHostHash, offeredRejoinHash, ip: attachment.ip };
+
+    // Checked once before the TURN mint, so a refused join does not cost a
+    // credential, and again after it: the mint is a fetch, and anything can happen
+    // in the room meanwhile (the host locks it, someone kicks, another join creates
+    // the room).
+    const early = await this.admit(tokens);
+    if (!early.ok) {
+      this.refuse(ws, early.code, early.message);
+      return;
+    }
+
+    // Mint TURN credentials here rather than from a public HTTP endpoint: reaching
+    // this line requires a live WebSocket that has been accepted into the room, so
+    // the socket itself is the authorisation. A failure must not block the join —
+    // direct P2P is the common path and needs no TURN at all.
+    //
+    // Before the join is committed, not after. With the mint between marking this
+    // socket joined and sending its welcome, a second join finishing first sent
+    // this peer peer-joined ahead of its own welcome, which lists nobody — so the
+    // peer never learned the newcomer existed. And a kick or close during the mint
+    // produced a peer-joined for someone already gone, with no peer-left after.
+    const minted = await this.mintFor(attachment.ip);
+    const revokeMinted = (): void => this.revokeLater(minted.username ?? undefined);
+
+    // ---- commit. From here to the broadcast, only storage awaits: input gates
+    // hold across those, so nothing else in the room runs in between.
+    if (this.gone.has(attachment.id)) {
+      revokeMinted();
+      return;
+    }
+    const admission = await this.admit(tokens);
+    if (!admission.ok) {
+      revokeMinted();
+      this.refuse(ws, admission.code, admission.message);
+      return;
+    }
+    const others = this.joinedPeers(ws);
+    if (others.length >= MAX_ROOM_SIZE) {
+      revokeMinted();
+      this.refuse(ws, "room-full", "Room is full");
+      return;
+    }
+
+    const now = Date.now();
+    const members = await this.getMembers(now);
+    if (offeredRejoinHash) delete members[offeredRejoinHash];
+    members[newRejoinHash] = now + EMPTY_ROOM_TTL_MS;
+    await this.ctx.storage.put({
+      [MEMBERS_KEY]: members,
+      // Only the join that creates the room may set its password (see CLAIMED_KEY).
+      ...(admission.creates
+        ? {
+            ...(offeredHash !== null ? { [PASSWORD_KEY]: offeredHash } : {}),
+            [HOST_KEY]: newHostHash,
+            [CLAIMED_KEY]: true,
+          }
+        : {}),
+    });
+    if (admission.isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
+    // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
+    await this.ctx.storage.deleteAlarm();
+
+    if (!admission.creates && offered && roomPasswordHash === null) {
+      // The room already exists and has no password, and this peer supplied one.
+      // Silently dropping it let someone believe they had protected a room that
+      // was in fact open to anyone with the code — the worst possible outcome for
+      // a security control. Say so instead; the join itself still succeeds.
+      sendSafe(ws, {
+        t: "error",
+        code: "password-ignored",
+        message: "This room has no password. Yours was ignored — create a new room to set one.",
+      });
+    }
+
+    attachment.name = sanitiseName(clientMsg.displayName);
+    attachment.joined = true;
+    attachment.sharing = false;
+    attachment.host = admission.isHost;
+    attachment.rejoinHash = newRejoinHash;
+    if (minted.username) attachment.turnUser = minted.username;
+    try {
+      ws.serializeAttachment(attachment);
+    } catch {
+      revokeMinted();
+      return;
+    }
+
+    sendSafe(ws, {
+      t: "welcome",
+      selfId: attachment.id,
+      peers: others.map(({ att }) => ({
+        id: att.id,
+        name: att.name,
+        sharing: att.sharing,
+        ...(att.host ? { host: true } : {}),
+      })),
+      iceServers: minted.iceServers,
+      host: admission.isHost,
+      ...(admission.creates ? { hostToken: newHostToken } : {}),
+      rejoinToken: newRejoinToken,
+      locked: admission.locked,
+    });
+
+    // After the welcome, so the newcomer is set up before anyone signals it.
+    const joinedMsg: ServerMessage = {
+      t: "peer-joined",
+      peer: {
+        id: attachment.id,
+        name: attachment.name,
+        sharing: false,
+        ...(admission.isHost ? { host: true } : {}),
+      },
+    };
+    for (const { ws: s } of others) {
+      sendSafe(s, joinedMsg);
+    }
+    return;
+  }
+
+  /**
+   * Whether a join may enter, from storage alone, so it can be asked again after an
+   * await. Storage reads hold the input gate, so the answer and the commit that
+   * follows it see the same room.
+   */
+  private async admit(tokens: {
+    offered: string | undefined;
+    offeredHostHash: string | null;
+    offeredRejoinHash: string | null;
+    ip: string | undefined;
+  }): Promise<
+    | { ok: true; creates: boolean; isHost: boolean; locked: boolean }
+    | { ok: false; code: ErrorCode; message: string }
+  > {
+    const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
+    if (!claimed) {
+      // Only a new room's password is checked: rooms created before this rule keep
+      // working with whatever they were given. Refused before anything is stored,
+      // so the room stays unclaimed and the creator can simply try again.
+      if (tokens.offered && tokens.offered.length < MIN_PASSWORD_LENGTH) {
+        return {
+          ok: false,
+          code: "weak-password",
+          message: `Room passwords need at least ${MIN_PASSWORD_LENGTH} characters.`,
+        };
+      }
+      return { ok: true, creates: true, isHost: true, locked: false };
+    }
+
+    const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
+    const isHost =
+      tokens.offeredHostHash !== null && hostHash !== null && timingSafeEqual(tokens.offeredHostHash, hostHash);
+    const now = Date.now();
+    const locked = await this.lockedNow(now);
+    if (isHost) return { ok: true, creates: false, isHost, locked };
+
+    // Someone already in the room coming back after a blip (a refresh, a network
+    // change, Hide my IP) presents the ticket their last welcome gave them. Without
+    // it a locked room shut out its own members on their first reconnect, and a
+    // kick shut out everyone behind the kicked person's address. A kick deletes the
+    // kicked person's ticket, so it does not let them back.
+    const members = await this.getMembers(now);
+    const returning = tokens.offeredRejoinHash !== null && members[tokens.offeredRejoinHash] !== undefined;
+    if (returning) return { ok: true, creates: false, isHost, locked };
+
+    if (locked) return { ok: false, code: "room-locked", message: "This room is locked. Ask the host to unlock it." };
+    if (tokens.ip) {
+      const deny = await this.getDenyList(now);
+      if (deny[tokens.ip] !== undefined) {
+        return { ok: false, code: "kicked", message: "You were removed from this room." };
+      }
+    }
+    return { ok: true, creates: false, isHost, locked };
+  }
+
+  /**
+   * The lock flag, dropping a lock the host has left behind. The host token lives in
+   * one browser tab, so a host who closes it leaves a locked room nobody can open.
+   * A refresh must not unlock it, so only a host absence past HOST_GRACE_MS does.
+   */
+  private async lockedNow(now: number): Promise<boolean> {
+    if ((await this.ctx.storage.get<boolean>(LOCKED_KEY)) !== true) return false;
+    if (this.joinedPeers().some(({ att }) => att.host)) return true;
+    const goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
+    if (goneAt === undefined) {
+      await this.ctx.storage.put(HOST_GONE_KEY, now);
+      return true;
+    }
+    if (now - goneAt < HOST_GRACE_MS) return true;
+    await this.ctx.storage.put(LOCKED_KEY, false);
+    const unlocked: ServerMessage = { t: "room-state", locked: false };
+    for (const { ws } of this.joinedPeers()) sendSafe(ws, unlocked);
+    return false;
+  }
+
+  /** Live rejoin tickets, hash to expiry, with expired ones dropped. */
+  private async getMembers(now: number): Promise<Record<string, number>> {
+    const all = (await this.ctx.storage.get<Record<string, number>>(MEMBERS_KEY)) ?? {};
+    const live: Record<string, number> = {};
+    for (const [k, until] of Object.entries(all)) if (until > now) live[k] = until;
+    return live;
+  }
+
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.forgetBudget(ws);
     await this.handleLeave(ws);
@@ -904,6 +1025,9 @@ export class RoomDO extends DurableObject<Env> {
     if (!att) return;
     this.budgets.delete(att.id);
     this.badMessages.delete(att.id);
+    // Remembered so a join mid-mint does not commit a socket that is already closed.
+    // Ids are UUIDs and never reused, so this only needs to outlive that one join.
+    this.gone.add(att.id);
   }
 
   private async handleLeave(ws: WebSocket): Promise<void> {
@@ -942,6 +1066,10 @@ export class RoomDO extends DurableObject<Env> {
     // out that only a genuinely abandoned room reaches it.
     if (remainingJoined === 0) {
       await this.ctx.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS);
+    }
+    // The clock for an orphaned lock (see lockedNow) starts when the last host leaves.
+    if (attachment.host && !this.joinedPeers(ws).some(({ att }) => att.host)) {
+      await this.ctx.storage.put(HOST_GONE_KEY, Date.now());
     }
   }
 }

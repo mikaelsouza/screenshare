@@ -68,6 +68,8 @@ export type ClientMessage =
       password?: string;
       /** Proof of being the room's creator, from an earlier welcome. */
       hostToken?: string;
+      /** Proof of having been in this room, from the last welcome: rejoin past a lock. */
+      rejoinToken?: string;
       /** The diagnostics page: a throwaway join that claims nothing and gets short-lived TURN. */
       diagnostics?: boolean;
     }
@@ -90,6 +92,8 @@ export type ServerMessage =
       host: boolean;
       /** Issued once, to the join that creates the room. Keep it to stay host on reconnect. */
       hostToken?: string;
+      /** Present it on the next join to get back in even if the room is locked. */
+      rejoinToken?: string;
       locked: boolean;
     }
   | { t: "peer-joined"; peer: PeerInfo }
@@ -112,7 +116,8 @@ export type ErrorCode =
   | "weak-password"
   | "kicked"
   | "room-locked"
-  | "not-host";
+  | "not-host"
+  | "not-sharing";
 
 /** Longest host token accepted. Real ones are UUIDs, 36 characters. */
 export const MAX_HOST_TOKEN_LENGTH = 64;
@@ -189,6 +194,9 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           }
           if (typeof record.hostToken === "string" && record.hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
             joinMsg.hostToken = record.hostToken;
+          }
+          if (typeof record.rejoinToken === "string" && record.rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.rejoinToken = record.rejoinToken;
           }
           if (record.diagnostics === true) {
             joinMsg.diagnostics = true;
