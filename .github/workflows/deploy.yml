@@ -13,10 +13,9 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    # Deploys go through the "production" environment, so its secrets and any
-    # protection rules (required reviewers, branch restrictions) apply here. GitHub
-    # creates the environment on first use if it does not exist yet.
-    environment: production
+    # No `environment:` here. Environments (scoped secrets, branch restrictions) need
+    # GitHub Pro for a private repository; on the Free plan they cannot be configured,
+    # so referencing one would buy nothing and risk the deploy job itself.
     steps:
       # Every action is pinned to a full commit SHA, not a tag. A tag can be moved to
       # different code after the fact (the tj-actions/changed-files compromise did
