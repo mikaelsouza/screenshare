@@ -1,4 +1,5 @@
 import { generateRoomCode, isValidRoomCode } from "@shared/protocol";
+import { ipKey } from "./ipkey";
 import { RateLimiter } from "./ratelimit";
 import { RoomDO } from "./room";
 import { TRY_AGAIN_LATER, isUpgrade, rejectUpgrade } from "./upgrade";
@@ -8,6 +9,14 @@ export interface Env {
   ROOMS: DurableObjectNamespace<RoomDO>;
   TURN_KEY_ID: string;        // wrangler secret
   TURN_API_TOKEN: string;     // wrangler secret
+  /**
+   * Cloudflare's rate-limiting bindings (wrangler.jsonc `ratelimits`). Unlike the
+   * in-memory RateLimiter these are shared across isolates in a location, so a client
+   * cannot dodge them by landing on a fresh isolate. Optional so a missing binding
+   * degrades to the in-memory limiter rather than taking the Worker down.
+   */
+  WS_LIMITER?: RateLimit;
+  ROOM_LIMITER?: RateLimit;
 }
 
 export { RoomDO };
@@ -31,8 +40,21 @@ const roomCreationLimit = new RateLimiter(20, 60_000, 10_000);
  */
 const wsUpgradeLimit = new RateLimiter(60, 60_000, 10_000);
 
-function checkRoomRateLimit(ip: string): boolean {
-  return roomCreationLimit.check(ip);
+/**
+ * Both limits must pass: the platform binding (shared, approximate) and the in-memory
+ * one (exact within this isolate, and the only one present where the binding is not
+ * configured).
+ */
+async function allowed(binding: RateLimit | undefined, local: RateLimiter, key: string): Promise<boolean> {
+  if (!local.check(key)) return false;
+  if (!binding) return true;
+  try {
+    return (await binding.limit({ key })).success;
+  } catch (err) {
+    // A limiter outage must not become a site outage.
+    console.warn("[index] rate limit binding failed", err);
+    return true;
+  }
 }
 
 function applySecurityHeaders(res: Response, url: URL): Response {
@@ -124,7 +146,7 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
           });
     }
     const clientIp = request.headers.get("CF-Connecting-IP");
-    if (clientIp && !wsUpgradeLimit.check(clientIp)) {
+    if (clientIp && !(await allowed(env.WS_LIMITER, wsUpgradeLimit, ipKey(clientIp)))) {
       return isUpgrade(request)
         ? rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER)
         : new Response(JSON.stringify({ error: "Too many connection attempts" }), {
@@ -140,7 +162,7 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
   // GET /api/room -> { code: generateRoomCode() } as JSON.
   if (request.method === "GET" && url.pathname === "/api/room") {
     const clientIp = request.headers.get("CF-Connecting-IP");
-    if (clientIp && !checkRoomRateLimit(clientIp)) {
+    if (clientIp && !(await allowed(env.ROOM_LIMITER, roomCreationLimit, ipKey(clientIp)))) {
       return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
         status: 429,
         headers: { "Content-Type": "application/json", "Retry-After": "60" },

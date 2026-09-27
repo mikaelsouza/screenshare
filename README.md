@@ -76,7 +76,10 @@ connection that would leak the very thing the checkbox promises to hide.
 
 ### Abuse limits
 
-Per-IP, and all of them chosen to be invisible in normal use:
+Per-IP, and all of them chosen to be invisible in normal use. "IP" means the IPv4 address, or
+the /64 prefix for IPv6, since one IPv6 subscriber can use any address in their /64. The
+per-IP request limits run twice: in memory, and through Cloudflare's rate-limiting binding
+(`ratelimits` in `wrangler.jsonc`), which is shared across isolates.
 
 | Limit | Value | Why it is where it is |
 | ----- | ----- | --------------------- |
@@ -85,6 +88,12 @@ Per-IP, and all of them chosen to be invisible in normal use:
 | Sockets per IP per room | 16 (`MAX_ROOM_SIZE * 2`) | A household or CGNAT block shares one address, so this must exceed the room cap, with headroom for half-open sockets |
 | Sockets per room | 32 (`MAX_ROOM_SIZE * 4`) | Unjoined sockets do not count against the room cap and would otherwise pile up |
 | SDP / ICE candidate size | 64 KB / 1 KB | Unbounded, a joined peer could loop 1 MB blobs at another peer through the object |
+| Frame size | 80 KB | Checked before parsing; closes with 1009 |
+| Messages per socket | burst 200, then 20/s | Covers joining a full room with TURN; a flood past it closes with 1008 |
+| Time to join | 10 s | A socket that never sends `join` is closed when the next one arrives, so idle sockets cannot fill a room |
+| Unparseable messages | 5 per socket | Then the socket is closed |
+| Wrong room passwords | 50 per 15 min, 200 per day | Per room. The right password always gets in, so guessing cannot lock the owners out |
+| New room password | at least 8 characters | Checked when the room is created; **Generate** fills in a 12-character one |
 
 A refusal **completes the WebSocket handshake and then closes**, rather than answering
 with a 4xx. This is not incidental: a non-101 answer reaches the browser as a bare close

@@ -24,7 +24,15 @@
   "durable_objects": {
     "bindings": [{ "name": "ROOMS", "class_name": "RoomDO" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomDO"] }]
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomDO"] }],
+
+  // Per-client limits shared across isolates (worker/index.ts keys them by IPv4
+  // address or IPv6 /64). Same budgets as the in-memory limiters beside them, which
+  // only see one isolate each. namespace_id just has to be unique in the account.
+  "ratelimits": [
+    { "name": "WS_LIMITER", "namespace_id": "3101", "simple": { "limit": 60, "period": 60 } },
+    { "name": "ROOM_LIMITER", "namespace_id": "3102", "simple": { "limit": 20, "period": 60 } }
+  ]
 
   // Attach the custom domain once DNS is ready:
   // "routes": [{ "pattern": "screenshare.webmikas.<tld>", "custom_domain": true }]

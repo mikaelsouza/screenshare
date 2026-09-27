@@ -81,7 +81,12 @@ export type ErrorCode =
   | "bad-password"
   | "password-ignored"
   | "forbidden-origin"
-  | "rate-limited";
+  | "rate-limited"
+  | "join-timeout"
+  | "weak-password";
+
+/** Shortest password a new room accepts. Enforced by the server on the claiming join. */
+export const MIN_PASSWORD_LENGTH = 8;
 
 /**
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.

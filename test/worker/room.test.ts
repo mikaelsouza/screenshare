@@ -767,7 +767,7 @@ describe("RoomDO membership", () => {
     c.send({ t: "join", room: CODE, displayName: "mallory", password: "wrong" });
     const err = await c.nextOf("error");
     expect(err.code).toBe("rate-limited");
-    // Refused outright: no delay served, and no hashing done.
+    // Refused outright: no delay served.
     expect(Date.now() - started).toBeLessThan(1_000);
     c.close();
 
@@ -1066,5 +1066,99 @@ describe("RoomDO room claim", () => {
     }
     a.close();
     b.close();
+  });
+});
+
+describe("RoomDO abuse limits (batch B)", () => {
+  it("frees the slot of a socket that never joined once the deadline passes", async () => {
+    const idle = await Client.connect();
+    const closed = closeCodeOf(idle.ws);
+
+    // Age the idle socket past the join deadline without waiting ten real seconds.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { openedAt?: number };
+        ws.serializeAttachment({ ...att, openedAt: Date.now() - 60_000 });
+      }
+    });
+
+    const fresh = await Client.connect();
+    expect(await closed).toBe(1008);
+    expect((await fresh.join("alice")).selfId).toBeTruthy();
+    fresh.close();
+  });
+
+  it("does not close a socket that joined, however old", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { openedAt?: number };
+        ws.serializeAttachment({ ...att, openedAt: Date.now() - 60_000 });
+      }
+    });
+    const b = await Client.connect();
+    await b.join("bob");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("bob");
+    a.close();
+    b.close();
+  });
+
+  it("closes a socket after too many unparseable messages", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    for (let i = 0; i < 6; i++) a.ws.send("{nope");
+    expect(await closed).toBe(1008);
+  });
+
+  it("counts every address in one IPv6 /64 against the same per-IP cap", async () => {
+    const sockets: Client[] = [];
+    for (let i = 0; i < PER_IP_CAP; i++) {
+      sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": `2001:db8:aa:bb::${(i + 1).toString(16)}` }));
+    }
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "2001:db8:aa:bb:ffff::99" },
+    });
+    expect(await refusal(res)).toEqual({ code: "rate-limited", closeCode: 1013 });
+    for (const s of sockets) s.close();
+  });
+
+  it("refuses a new room with a short password and leaves it unclaimed", async () => {
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "1234" });
+    expect((await a.nextOf("error")).code).toBe("weak-password");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
+    expect(claimed).toBeUndefined();
+
+    // A second try with a proper password creates the room.
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
+    expect((await b.nextOf("welcome")).selfId).toBeTruthy();
+    b.close();
+  });
+
+  it("caps wrong guesses per day, and the real password still gets in", async () => {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const hash = await passwordHash(CODE, "the-real-one");
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put("passwordHash", hash);
+      await state.storage.put("claimed", true);
+      // Under the 15-minute limit, at the daily one.
+      await state.storage.put("pwFailDay", { count: 200, resetAt: Date.now() + 3_600_000 });
+    });
+
+    const m = await Client.connect();
+    m.send({ t: "join", room: CODE, displayName: "mallory", password: "guess-201" });
+    expect((await m.nextOf("error")).code).toBe("rate-limited");
+
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "the-real-one" });
+    expect((await a.nextOf("welcome")).selfId).toBeTruthy();
+    a.close();
   });
 });

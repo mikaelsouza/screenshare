@@ -5,7 +5,14 @@
  */
 
 import { hasTurnServer } from "@shared/ice";
-import { MAX_ROOM_SIZE, isValidRoomCode, type PeerId, type PeerInfo } from "@shared/protocol";
+import {
+  MAX_ROOM_SIZE,
+  MIN_PASSWORD_LENGTH,
+  ROOM_CODE_ALPHABET,
+  isValidRoomCode,
+  type PeerId,
+  type PeerInfo,
+} from "@shared/protocol";
 import {
   captureAudioOnly,
   captureScreen,
@@ -37,6 +44,7 @@ function el<T extends HTMLElement>(id: string): T {
 const ui = {
   roomInput: el<HTMLInputElement>("room-code"),
   passInput: el<HTMLInputElement>("room-pass"),
+  genPassBtn: el<HTMLButtonElement>("gen-pass"),
   relayOnly: el<HTMLInputElement>("relay-only"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
@@ -630,6 +638,11 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           setStatus(message, "warn");
           return;
         }
+        if (code === "weak-password") {
+          setStatus(message, "warn");
+          ui.passInput.focus();
+          return;
+        }
         if (code === "bad-password") {
           setStatus(`Room ${codeToJoin} needs a password. Enter it and press Join.`, "warn");
           // Do NOT clear the field. The rejection can arrive while the user is already
@@ -763,7 +776,40 @@ for (const input of [ui.roomInput, ui.passInput]) {
   });
 }
 
+/**
+ * A random password friends can read out: 12 characters from the room-code alphabet,
+ * which has no look-alikes, in groups of four. About 59 bits.
+ */
+function generatePassword(): string {
+  const out: string[] = [];
+  const limit = Math.floor(256 / ROOM_CODE_ALPHABET.length) * ROOM_CODE_ALPHABET.length;
+  const buf = new Uint8Array(32);
+  while (out.length < 12) {
+    crypto.getRandomValues(buf);
+    for (const b of buf) {
+      if (b < limit && out.length < 12) out.push(ROOM_CODE_ALPHABET.charAt(b % ROOM_CODE_ALPHABET.length));
+    }
+  }
+  return [out.slice(0, 4), out.slice(4, 8), out.slice(8)].map((g) => g.join("")).join("-");
+}
+
+ui.genPassBtn.addEventListener("click", () => {
+  ui.passInput.value = generatePassword();
+  // Shown, not masked: the point is to copy it to friends.
+  ui.passInput.type = "text";
+  ui.passInput.select();
+});
+ui.passInput.addEventListener("input", () => {
+  if (ui.passInput.value === "") ui.passInput.type = "password";
+});
+
 ui.createBtn.addEventListener("click", () => {
+  const pass = ui.passInput.value.trim();
+  if (pass && pass.length < MIN_PASSWORD_LENGTH) {
+    setStatus(`Room passwords need at least ${MIN_PASSWORD_LENGTH} characters. Or press Generate.`, "warn");
+    ui.passInput.focus();
+    return;
+  }
   void (async () => {
     // Without the ok check a 500 or an HTML error page throws inside this voided
     // IIFE, so the button looks completely inert with the stale status still shown.

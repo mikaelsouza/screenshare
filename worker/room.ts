@@ -2,13 +2,16 @@ import { DurableObject } from "cloudflare:workers";
 import {
   type IceServerConfig,
   MAX_ROOM_SIZE,
+  MIN_PASSWORD_LENGTH,
   PING,
   PONG,
   type PeerInfo,
+  type ErrorCode,
   type ServerMessage,
   parseClientMessage,
 } from "@shared/protocol";
 import type { Env } from "./index";
+import { ipKey } from "./ipkey";
 import { getIceServers } from "./turn";
 import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
@@ -61,6 +64,15 @@ const PW_FAIL_WINDOW_MS = 15 * 60 * 1000;
  */
 const PW_FAIL_HARD_LIMIT = 50;
 
+/** Storage key and ceiling for wrong guesses per day, on top of the 15-minute window. */
+const PW_FAIL_DAY_KEY = "pwFailDay";
+const PW_FAIL_DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * 50 per 15 minutes alone allows ~4,800 guesses a day, enough to walk through every
+ * 4-digit PIN in two days. 200 a day is still far past anyone mistyping.
+ */
+const PW_FAIL_DAY_LIMIT = 200;
+
 /** Ceiling on the per-attempt delay, for the same billing reason. */
 const PW_FAIL_MAX_DELAY_MS = 2_000;
 
@@ -94,12 +106,26 @@ const MAX_FRAME_LENGTH = 80 * 1024;
 const MESSAGE_BURST = 200;
 const MESSAGE_REFILL_PER_SEC = 20;
 
+/**
+ * How long a socket may stay open without joining. A real client sends `join` the
+ * moment the socket opens; one that has not after this long is holding a slot.
+ * Keepalive pings are answered without waking the object, so an idle unjoined
+ * socket costs its holder nothing and would otherwise count against the room forever.
+ */
+const JOIN_DEADLINE_MS = 10_000;
+
+/** Unparseable messages a socket may send before it is closed. */
+const MAX_BAD_MESSAGES = 5;
+
 interface PeerAttachment {
   id: string;
   name: string;
   sharing: boolean;
   joined: boolean;
+  /** Rate-limit key for the client address: IPv4 as is, IPv6 as its /64. */
   ip?: string;
+  /** When the socket was accepted, for the join deadline. */
+  openedAt?: number;
 }
 
 function getAttachment(ws: WebSocket): PeerAttachment | null {
@@ -163,6 +189,25 @@ interface MessageBudget {
 
 export class RoomDO extends DurableObject<Env> {
   private readonly budgets = new Map<string, MessageBudget>();
+  /** Unparseable messages per socket. In memory, like the budgets, for the same reason. */
+  private readonly badMessages = new Map<string, number>();
+
+  /**
+   * Close every socket that has been open longer than the join deadline without
+   * joining. Returns the ones it closed, which may still be listed by getWebSockets()
+   * until their close completes and must not be counted.
+   */
+  private closeStaleUnjoined(now: number): Set<WebSocket> {
+    const closed = new Set<WebSocket>();
+    for (const s of this.ctx.getWebSockets()) {
+      const att = getAttachment(s);
+      if (!att || att.joined || att.openedAt === undefined) continue;
+      if (now - att.openedAt < JOIN_DEADLINE_MS) continue;
+      this.refuse(s, "join-timeout", "Did not join in time");
+      closed.add(s);
+    }
+    return closed;
+  }
 
   /** Spend one message from this socket's budget. False when it is exhausted. */
   private spendMessage(peerId: string, now: number = Date.now()): boolean {
@@ -176,7 +221,7 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /** Refuse a socket that broke the protocol's limits. 1008: the client should not retry. */
-  private refuse(ws: WebSocket, code: "rate-limited" | "bad-message", message: string, closeCode = 1008): void {
+  private refuse(ws: WebSocket, code: ErrorCode, message: string, closeCode = 1008): void {
     sendSafe(ws, { t: "error", code, message });
     try {
       ws.close(closeCode, message);
@@ -244,8 +289,13 @@ export class RoomDO extends DurableObject<Env> {
       entry && entry.resetAt > now
         ? { count: entry.count + 1, resetAt: entry.resetAt }
         : { count: 1, resetAt: now + PW_FAIL_WINDOW_MS };
-    await this.ctx.storage.put(PW_FAIL_KEY, next);
-    if (next.count > PW_FAIL_HARD_LIMIT) return null;
+    const day = (await this.ctx.storage.get<{ count: number; resetAt: number }>(PW_FAIL_DAY_KEY)) ?? null;
+    const nextDay =
+      day && day.resetAt > now
+        ? { count: day.count + 1, resetAt: day.resetAt }
+        : { count: 1, resetAt: now + PW_FAIL_DAY_WINDOW_MS };
+    await this.ctx.storage.put({ [PW_FAIL_KEY]: next, [PW_FAIL_DAY_KEY]: nextDay });
+    if (next.count > PW_FAIL_HARD_LIMIT || nextDay.count > PW_FAIL_DAY_LIMIT) return null;
     return Math.min(next.count * 250, PW_FAIL_MAX_DELAY_MS);
   }
 
@@ -285,11 +335,18 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
-    // Limit sockets per IP if connecting from Cloudflare (prevents single-IP uplink/mesh DoS)
-    const clientIp = request.headers.get("CF-Connecting-IP");
+    // Free the slots held by sockets that never joined before counting anything.
+    const now = Date.now();
+    const justClosed = this.closeStaleUnjoined(now);
+    const live = this.ctx.getWebSockets().filter((s) => !justClosed.has(s));
+
+    // Limit sockets per IP if connecting from Cloudflare (prevents single-IP uplink/mesh DoS).
+    // Keyed by ipKey, so an IPv6 client cannot sidestep it by rotating within its /64.
+    const rawIp = request.headers.get("CF-Connecting-IP");
+    const clientIp = rawIp ? ipKey(rawIp) : null;
     if (clientIp) {
       let ipCount = 0;
-      for (const s of this.ctx.getWebSockets()) {
+      for (const s of live) {
         const att = getAttachment(s);
         if (att && att.ip === clientIp) {
           ipCount++;
@@ -308,7 +365,7 @@ export class RoomDO extends DurableObject<Env> {
     // could open unbounded sockets that never send `join`. They would never be
     // rejected, and every subsequent signalling message in the room would have to
     // walk all of them. Allow headroom for sockets mid-handshake or mid-reconnect.
-    if (this.ctx.getWebSockets().length >= MAX_SOCKETS) {
+    if (live.length >= MAX_SOCKETS) {
       return rejectUpgrade("rate-limited", "Too many connections to this room", TRY_AGAIN_LATER);
     }
 
@@ -325,6 +382,7 @@ export class RoomDO extends DurableObject<Env> {
       sharing: false,
       joined: false,
       ip: clientIp ?? undefined,
+      openedAt: now,
     };
     server.serializeAttachment(attachment);
 
@@ -352,6 +410,12 @@ export class RoomDO extends DurableObject<Env> {
     const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     const clientMsg = parseClientMessage(raw);
     if (!clientMsg) {
+      const bad = (this.badMessages.get(attachment.id) ?? 0) + 1;
+      this.badMessages.set(attachment.id, bad);
+      if (bad > MAX_BAD_MESSAGES) {
+        this.refuse(ws, "bad-message", "Too many invalid messages");
+        return;
+      }
       sendSafe(ws, {
         t: "error",
         code: "bad-message",
@@ -452,6 +516,17 @@ export class RoomDO extends DurableObject<Env> {
         // else's room and lock them out of it.
         const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
         if (!claimed) {
+          // Only a new room's password is checked: rooms created before this rule keep
+          // working with whatever they were given. Refused before anything is stored,
+          // so the room stays unclaimed and the creator can simply try again.
+          if (offered && offered.length < MIN_PASSWORD_LENGTH) {
+            this.refuse(
+              ws,
+              "weak-password",
+              `Room passwords need at least ${MIN_PASSWORD_LENGTH} characters.`,
+            );
+            return;
+          }
           if (offeredHash !== null) {
             await this.ctx.storage.put(PASSWORD_KEY, offeredHash);
           }
@@ -624,7 +699,9 @@ export class RoomDO extends DurableObject<Env> {
 
   private forgetBudget(ws: WebSocket): void {
     const att = getAttachment(ws);
-    if (att) this.budgets.delete(att.id);
+    if (!att) return;
+    this.budgets.delete(att.id);
+    this.badMessages.delete(att.id);
   }
 
   private async handleLeave(ws: WebSocket): Promise<void> {
