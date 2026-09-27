@@ -92,6 +92,8 @@ async function gather(config: RTCConfiguration, timeoutMs = 15000): Promise<Cand
 // including stun.cloudflare.com:53 produced srflx=0 across the whole gathering, so
 // this check reported "UDP to STUN is blocked" on a connection where STUN worked fine.
 // Two distinct hosts are still enough for the symmetric-NAT comparison below.
+// Google's server is the second one, so this page (and only this page) shows Google
+// your IP address; the page says so. The app itself only ever uses Cloudflare's.
 const STUN_PROBES: RTCIceServer[] = [
   { urls: "stun:stun.cloudflare.com:3478" },
   { urls: "stun:stun.l.google.com:19302" },
@@ -155,7 +157,10 @@ async function fetchIceViaRoom(timeoutMs = 10_000): Promise<RTCIceServer[]> {
   try {
     return await new Promise<RTCIceServer[]>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("timed out waiting for welcome")), timeoutMs);
-      ws.onopen = () => ws.send(JSON.stringify({ t: "join", room: code, displayName: "diagnostics" }));
+      // `diagnostics` asks for a five-minute credential and leaves the room unclaimed,
+      // rather than creating a real room with a two-hour one on every run.
+      ws.onopen = () =>
+        ws.send(JSON.stringify({ t: "join", room: code, displayName: "diagnostics", diagnostics: true }));
       ws.onerror = () => {
         clearTimeout(timer);
         reject(new Error("signalling socket failed"));

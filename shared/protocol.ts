@@ -46,6 +46,8 @@ export interface PeerInfo {
   id: PeerId;
   name: string;
   sharing: boolean;
+  /** The room's creator, who can remove people and lock the room. */
+  host?: boolean;
 }
 export interface IceCandidateInit {
   candidate: string;
@@ -59,18 +61,42 @@ export type SignalData =
   | { k: "ice"; candidate: IceCandidateInit };
 
 export type ClientMessage =
-  | { t: "join"; room: string; displayName: string; password?: string }
+  | {
+      t: "join";
+      room: string;
+      displayName: string;
+      password?: string;
+      /** Proof of being the room's creator, from an earlier welcome. */
+      hostToken?: string;
+      /** The diagnostics page: a throwaway join that claims nothing and gets short-lived TURN. */
+      diagnostics?: boolean;
+    }
   | { t: "signal"; to: PeerId; data: SignalData }
-  | { t: "state"; sharing: boolean };
+  | { t: "state"; sharing: boolean }
+  /** Host only: remove a peer from the room. */
+  | { t: "kick"; id: PeerId }
+  /** Host only: refuse (or allow again) new joins. */
+  | { t: "lock"; locked: boolean };
 
 export type ServerMessage =
   // iceServers ride along with the welcome rather than being served from a public
   // endpoint: possession of a joined WebSocket is what authorises TURN credentials.
-  | { t: "welcome"; selfId: PeerId; peers: PeerInfo[]; iceServers: IceServerConfig[] }
+  | {
+      t: "welcome";
+      selfId: PeerId;
+      peers: PeerInfo[];
+      iceServers: IceServerConfig[];
+      /** Whether this socket is the room's host. */
+      host: boolean;
+      /** Issued once, to the join that creates the room. Keep it to stay host on reconnect. */
+      hostToken?: string;
+      locked: boolean;
+    }
   | { t: "peer-joined"; peer: PeerInfo }
   | { t: "peer-left"; id: PeerId }
   | { t: "signal"; from: PeerId; data: SignalData }
   | { t: "peer-state"; id: PeerId; sharing: boolean }
+  | { t: "room-state"; locked: boolean }
   | { t: "error"; code: ErrorCode; message: string };
 
 export type ErrorCode =
@@ -83,7 +109,13 @@ export type ErrorCode =
   | "forbidden-origin"
   | "rate-limited"
   | "join-timeout"
-  | "weak-password";
+  | "weak-password"
+  | "kicked"
+  | "room-locked"
+  | "not-host";
+
+/** Longest host token accepted. Real ones are UUIDs, 36 characters. */
+export const MAX_HOST_TOKEN_LENGTH = 64;
 
 /** Shortest password a new room accepts. Enforced by the server on the claiming join. */
 export const MIN_PASSWORD_LENGTH = 8;
@@ -154,6 +186,12 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           };
           if (typeof record.password === "string") {
             joinMsg.password = record.password;
+          }
+          if (typeof record.hostToken === "string" && record.hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.hostToken = record.hostToken;
+          }
+          if (record.diagnostics === true) {
+            joinMsg.diagnostics = true;
           }
           return joinMsg;
         }
@@ -234,6 +272,20 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           };
         }
 
+        return null;
+      }
+
+      case "kick": {
+        if (typeof record.id === "string" && PEER_ID.test(record.id)) {
+          return { t: "kick", id: record.id };
+        }
+        return null;
+      }
+
+      case "lock": {
+        if (typeof record.locked === "boolean") {
+          return { t: "lock", locked: record.locked };
+        }
         return null;
       }
 

@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 import {
-  type IceServerConfig,
   MAX_ROOM_SIZE,
   MIN_PASSWORD_LENGTH,
   PING,
@@ -12,7 +11,7 @@ import {
 } from "@shared/protocol";
 import type { Env } from "./index";
 import { ipKey } from "./ipkey";
-import { getIceServers } from "./turn";
+import { DIAGNOSTICS_TURN_TTL_SECONDS, type MintedIce, getIceServers, revokeCredential } from "./turn";
 import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
 /**
@@ -45,6 +44,25 @@ const PASSWORD_KEY = "passwordHash";
  * could join first, set a password, and lock the real occupants out.
  */
 const CLAIMED_KEY = "claimed";
+
+/**
+ * Storage key holding the salted hash of the host token. The token itself is handed
+ * to the creating join only; whoever presents it later is the host again.
+ */
+const HOST_KEY = "hostTokenHash";
+
+/** Storage key: true while the host has locked the room to new joins. */
+const LOCKED_KEY = "locked";
+
+/** Storage key: rate-limit keys of kicked peers, each mapped to when its ban ends. */
+const DENY_KEY = "deny";
+
+/**
+ * How long a kicked address is refused. Short on purpose: it is by address, so on a
+ * shared connection (a household, CGNAT) it also shuts out whoever sits behind the
+ * same one. Locking the room is the lasting answer.
+ */
+const KICK_BAN_MS = 15 * 60 * 1000;
 
 /** Storage key holding the room's failed-password-attempt counter. */
 const PW_FAIL_KEY = "pwFail";
@@ -126,6 +144,13 @@ interface PeerAttachment {
   ip?: string;
   /** When the socket was accepted, for the join deadline. */
   openedAt?: number;
+  /** Presented the room's host token. */
+  host?: boolean;
+  /**
+   * This peer's own TURN username, revoked when it leaves. In the attachment rather
+   * than in memory so a hibernation between join and leave does not lose it.
+   */
+  turnUser?: string;
 }
 
 function getAttachment(ws: WebSocket): PeerAttachment | null {
@@ -247,10 +272,57 @@ export class RoomDO extends DurableObject<Env> {
     } catch {}
   }
 
-  /** TURN credentials are identical for everyone here, so mint once per room. */
-  private readonly iceCache: { current: { iceServers: IceServerConfig[]; expiresAt: number } | null } = {
-    current: null,
-  };
+  /** Remembers a failed TURN mint for a short while, so an outage is not hammered. */
+  private readonly turnBackoff = { failedUntil: 0 };
+
+  /**
+   * TURN credentials for one join, or STUN only when this address has minted too many
+   * lately. Every join mints its own credential, so without a per-address cap anyone
+   * could harvest relay access by joining in a loop. Never throws: a join must not
+   * fail because TURN did.
+   */
+  private async mintFor(ip: string | undefined, ttlSeconds?: number): Promise<MintedIce> {
+    try {
+      if (ip && this.env.TURN_LIMITER) {
+        let ok = true;
+        try {
+          ({ success: ok } = await this.env.TURN_LIMITER.limit({ key: ip }));
+        } catch {
+          // Fail open, like the other limiters: the binding is a guard, not a gate.
+        }
+        if (!ok) return await getIceServers({ ...this.env, TURN_DISABLED: "true" }, this.turnBackoff);
+      }
+      return await getIceServers(this.env, this.turnBackoff, ttlSeconds);
+    } catch (err) {
+      console.error("[room] could not mint ICE servers", err);
+      return { iceServers: [], username: null };
+    }
+  }
+
+  /** Revoke a TURN credential without holding up whatever is closing. */
+  private revokeLater(username: string | undefined): void {
+    if (!username) return;
+    this.ctx.waitUntil(revokeCredential(this.env, username));
+  }
+
+  /** Joined sockets other than `except`, with their attachments. */
+  private joinedPeers(except?: WebSocket): { ws: WebSocket; att: PeerAttachment }[] {
+    const out: { ws: WebSocket; att: PeerAttachment }[] = [];
+    for (const s of this.ctx.getWebSockets()) {
+      if (s === except) continue;
+      const att = getAttachment(s);
+      if (att?.joined) out.push({ ws: s, att });
+    }
+    return out;
+  }
+
+  /** Addresses currently banned by a kick, with expired entries dropped. */
+  private async getDenyList(now: number): Promise<Record<string, number>> {
+    const all = (await this.ctx.storage.get<Record<string, number>>(DENY_KEY)) ?? {};
+    const live: Record<string, number> = {};
+    for (const [k, until] of Object.entries(all)) if (until > now) live[k] = until;
+    return live;
+  }
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -282,7 +354,13 @@ export class RoomDO extends DurableObject<Env> {
    * not produce the same hash.
    */
   private async hashPassword(password: string): Promise<string> {
-    const data = new TextEncoder().encode(`${this.ctx.id.toString()}:${password}`);
+    return this.hashSecret(password);
+  }
+
+  /** Salted SHA-256, hex. The host token gets its own prefix so it never equals a password hash. */
+  private async hashSecret(secret: string, kind?: "host"): Promise<string> {
+    const prefix = kind ? `${this.ctx.id.toString()}:${kind}` : this.ctx.id.toString();
+    const data = new TextEncoder().encode(`${prefix}:${secret}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
@@ -450,6 +528,31 @@ export class RoomDO extends DurableObject<Env> {
           return;
         }
 
+        // Diagnostics: a throwaway join that only wants short-lived TURN to test with.
+        // It claims nothing, stores nothing and never shows up in the room, and it is
+        // only accepted on a room nobody has created, so it cannot peek into a real one.
+        if (clientMsg.diagnostics) {
+          if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true) {
+            this.refuse(ws, "bad-message", "Diagnostics need a fresh room");
+            return;
+          }
+          const minted = await this.mintFor(attachment.ip, DIAGNOSTICS_TURN_TTL_SECONDS);
+          // Not revoked on close: the page tests the relay after it has hung up, and
+          // the credential expires within minutes anyway.
+          sendSafe(ws, {
+            t: "welcome",
+            selfId: attachment.id,
+            peers: [],
+            iceServers: minted.iceServers,
+            host: false,
+            locked: false,
+          });
+          try {
+            ws.close(1000, "Diagnostics done");
+          } catch {}
+          return;
+        }
+
         // Clamp before anything touches storage. displayName is clamped below for the
         // same reason; an unbounded password would exceed the 128 KiB Durable Object
         // value limit, and the rejected put would propagate out of webSocketMessage
@@ -462,7 +565,12 @@ export class RoomDO extends DurableObject<Env> {
         // the hash computed between reading `claimed` and writing it, two joins racing
         // on a fresh room could both see it unclaimed, so one could slip in without
         // the password the other was setting, or a stranger's password could win.
+        // The same goes for the host token: both the one offered and the one this join
+        // would be issued if it turns out to create the room.
         const offeredHash = offered ? await this.hashPassword(offered) : null;
+        const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
+        const newHostToken = crypto.randomUUID();
+        const newHostHash = await this.hashSecret(newHostToken, "host");
 
         // Verify room password if one has been set
         const roomPasswordHash = await this.getRoomPasswordHash();
@@ -512,28 +620,15 @@ export class RoomDO extends DurableObject<Env> {
           }
         }
 
-        const otherPeers: PeerInfo[] = [];
-        const otherSockets: WebSocket[] = [];
-
-        for (const s of this.ctx.getWebSockets()) {
-          if (s === ws) continue;
-          const att = getAttachment(s);
-          if (att && att.joined) {
-            otherPeers.push({
-              id: att.id,
-              name: att.name,
-              sharing: att.sharing,
-            });
-            otherSockets.push(s);
-          }
-        }
-
         // Only the join that creates the room may set its password. An empty room is
         // NOT enough: an unprotected room is empty for the length of every reconnect,
         // and permanently once the session ends while its code lives on in a shared
         // link — so "first peer in an empty room" would let a stranger claim someone
         // else's room and lock them out of it.
         const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
+        let isHost = false;
+        let issuedHostToken: string | undefined;
+        let locked = false;
         if (!claimed) {
           // Only a new room's password is checked: rooms created before this rule keep
           // working with whatever they were given. Refused before anything is stored,
@@ -546,24 +641,58 @@ export class RoomDO extends DurableObject<Env> {
             );
             return;
           }
-          if (offeredHash !== null) {
-            await this.ctx.storage.put(PASSWORD_KEY, offeredHash);
-          }
-          await this.ctx.storage.put(CLAIMED_KEY, true);
-        } else if (offered && roomPasswordHash === null) {
-          // The room already exists and has no password, and this peer supplied one.
-          // Silently dropping it let someone believe they had protected a room that
-          // was in fact open to anyone with the code — the worst possible outcome for
-          // a security control. Say so instead; the join itself still succeeds.
-          sendSafe(ws, {
-            t: "error",
-            code: "password-ignored",
-            message: "This room has no password. Yours was ignored — create a new room to set one.",
+          await this.ctx.storage.put({
+            ...(offeredHash !== null ? { [PASSWORD_KEY]: offeredHash } : {}),
+            [HOST_KEY]: newHostHash,
+            [CLAIMED_KEY]: true,
           });
+          isHost = true;
+          issuedHostToken = newHostToken;
+        } else {
+          const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
+          isHost = offeredHostHash !== null && hostHash !== null && timingSafeEqual(offeredHostHash, hostHash);
+          locked = (await this.ctx.storage.get<boolean>(LOCKED_KEY)) === true;
+
+          // The host is never shut out of their own room, by the lock or by a ban.
+          if (!isHost) {
+            if (locked) {
+              this.refuse(ws, "room-locked", "This room is locked. Ask the host to unlock it.");
+              return;
+            }
+            if (attachment.ip) {
+              const deny = await this.getDenyList(Date.now());
+              if (deny[attachment.ip] !== undefined) {
+                this.refuse(ws, "kicked", "You were removed from this room.");
+                return;
+              }
+            }
+          }
+
+          if (offered && roomPasswordHash === null) {
+            // The room already exists and has no password, and this peer supplied one.
+            // Silently dropping it let someone believe they had protected a room that
+            // was in fact open to anyone with the code — the worst possible outcome for
+            // a security control. Say so instead; the join itself still succeeds.
+            sendSafe(ws, {
+              t: "error",
+              code: "password-ignored",
+              message: "This room has no password. Yours was ignored — create a new room to set one.",
+            });
+          }
         }
 
         // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
         await this.ctx.storage.deleteAlarm();
+
+        // Collected after the last storage await, so a join that landed meanwhile is
+        // counted rather than missed.
+        const others = this.joinedPeers(ws);
+        const otherPeers: PeerInfo[] = others.map(({ att }) => ({
+          id: att.id,
+          name: att.name,
+          sharing: att.sharing,
+          ...(att.host ? { host: true } : {}),
+        }));
 
         // Reject with "room-full" and close(1008) if the count of ALREADY-JOINED sockets is >= MAX_ROOM_SIZE
         if (otherPeers.length >= MAX_ROOM_SIZE) {
@@ -583,6 +712,7 @@ export class RoomDO extends DurableObject<Env> {
         attachment.name = sanitisedName;
         attachment.joined = true;
         attachment.sharing = false;
+        attachment.host = isHost;
         try {
           ws.serializeAttachment(attachment);
         } catch {
@@ -593,32 +723,85 @@ export class RoomDO extends DurableObject<Env> {
         // this line requires a live WebSocket that has been accepted into the room, so
         // the socket itself is the authorisation. A failure must not block the join —
         // direct P2P is the common path and needs no TURN at all.
-        let iceServers: IceServerConfig[] = [];
-        try {
-          iceServers = await getIceServers(this.env, this.iceCache);
-        } catch (err) {
-          console.error("[room] could not mint ICE servers", err);
+        const minted = await this.mintFor(attachment.ip);
+        if (minted.username) {
+          // The mint is a fetch, so the socket may have left or been kicked meanwhile.
+          // Its leave could not revoke a credential it did not have yet; do it here.
+          const current = getAttachment(ws);
+          if (!current?.joined) {
+            this.revokeLater(minted.username);
+            return;
+          }
+          current.turnUser = minted.username;
+          try {
+            ws.serializeAttachment(current);
+          } catch {}
         }
 
         sendSafe(ws, {
           t: "welcome",
           selfId: attachment.id,
           peers: otherPeers,
-          iceServers,
+          iceServers: minted.iceServers,
+          host: isHost,
+          ...(issuedHostToken ? { hostToken: issuedHostToken } : {}),
+          locked,
         });
 
-        // Broadcast to others: { t:"peer-joined", peer: { id, name, sharing:false } }
+        // After the welcome, so the newcomer is set up before anyone signals it.
         const joinedMsg: ServerMessage = {
           t: "peer-joined",
           peer: {
             id: attachment.id,
             name: attachment.name,
             sharing: false,
+            ...(isHost ? { host: true } : {}),
           },
         };
-        for (const s of otherSockets) {
+        for (const { ws: s } of others) {
           sendSafe(s, joinedMsg);
         }
+
+        return;
+      }
+
+      case "kick": {
+        if (!attachment.joined || !attachment.host) {
+          sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can remove people" });
+          return;
+        }
+        if (clientMsg.id === attachment.id) return;
+        const target = this.joinedPeers(ws).find(({ att }) => att.id === clientMsg.id);
+        if (!target) {
+          sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
+          return;
+        }
+        if (target.att.ip) {
+          // Written before the close, so a rejoin racing the close meets the ban.
+          const now = Date.now();
+          const deny = await this.getDenyList(now);
+          deny[target.att.ip] = now + KICK_BAN_MS;
+          await this.ctx.storage.put(DENY_KEY, deny);
+        }
+        sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
+        // Leave first, so everyone hears peer-left and the credential is revoked even
+        // if the close never completes.
+        await this.handleLeave(target.ws);
+        try {
+          target.ws.close(1008, "Kicked");
+        } catch {}
+        return;
+      }
+
+      case "lock": {
+        if (!attachment.joined || !attachment.host) {
+          sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can lock the room" });
+          return;
+        }
+        await this.ctx.storage.put(LOCKED_KEY, clientMsg.locked);
+        const stateMsg: ServerMessage = { t: "room-state", locked: clientMsg.locked };
+        sendSafe(ws, stateMsg);
+        for (const { ws: s } of this.joinedPeers(ws)) sendSafe(s, stateMsg);
         return;
       }
 
@@ -731,6 +914,9 @@ export class RoomDO extends DurableObject<Env> {
 
     // Mark not joined to prevent duplicate peer-left broadcasts on close after error
     attachment.joined = false;
+    // Best effort: a credential that fails to revoke simply lives out its TTL.
+    this.revokeLater(attachment.turnUser);
+    attachment.turnUser = undefined;
     try {
       ws.serializeAttachment(attachment);
     } catch {}

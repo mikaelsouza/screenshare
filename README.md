@@ -30,7 +30,8 @@ Browser A ═══════════ SRTP media, direct P2P ════�
   are client-forgeable, so anyone could mint relay credentials on our Cloudflare
   allocation. The Durable Object now issues them inside the `welcome` message, so
   holding a WebSocket that has been accepted into a room is the authorisation. (That
-  bar is still low — see Known issues.)
+  bar is still low — see Known issues.) Each person gets their own credential, which the
+  room revokes when they leave or are removed.
 - **RoomDO** (`worker/room.ts`) — one Durable Object per room code, holding the
   WebSocket connections and routing signalling between peers. It forwards `data`
   verbatim and never parses SDP. Uses the WebSocket Hibernation API, so idle rooms
@@ -92,6 +93,13 @@ not tell they were there. Names are cleaned on the server (NFKC, then control an
 characters such as bidi overrides and zero-width spaces are removed) so nobody can pose
 as a friend with an invisible character.
 
+**The room's creator is its host.** Their browser tab keeps a host token (in
+`sessionStorage`, so a refresh keeps it and a new tab or a forwarded link does not). The
+host sees **Remove** beside each person and a **Lock room** button. A removed person is
+disconnected at once and their address cannot rejoin for 15 minutes; a locked room
+refuses everyone new except the host. The ban is by address, so on a shared connection it
+also shuts out whoever shares it; for anything lasting, lock the room.
+
 ### Abuse limits
 
 Per-IP, and all of them chosen to be invisible in normal use. "IP" means the IPv4 address, or
@@ -112,6 +120,7 @@ per-IP request limits run twice: in memory, and through Cloudflare's rate-limiti
 | Unparseable messages | 5 per socket | Then the socket is closed |
 | Wrong room passwords | 50 per 15 min, 200 per day | Per room. The right password always gets in, so guessing cannot lock the owners out |
 | New room password | at least 8 characters | Checked when the room is created; **Generate** fills in a 12-character one |
+| TURN credentials | 20/min | Each join mints its own; past the limit a join still succeeds, with STUN only |
 
 A refusal **completes the WebSocket handshake and then closes**, rather than answering
 with a 4xx. This is not incidental: a non-101 answer reaches the browser as a bare close
@@ -221,8 +230,10 @@ answer that, and `/diagnostics` is the tool for it.
    npx wrangler secret put TURN_KEY_ID
    npx wrangler secret put TURN_API_TOKEN
    ```
-3. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
-4. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
+3. Optionally, in the Cloudflare dashboard, add a billing notification for Realtime
+   usage, so a surprise in relay traffic reaches you before the invoice does.
+4. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
+5. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
    the workerd suite, builds, and deploys with `cloudflare/wrangler-action`. `npm run
    deploy` does the same thing by hand.
 
@@ -306,8 +317,13 @@ Open defects, in rough order of how likely you are to hit them:
   twenty times in an evening and a 7-peer mesh is carrying 40 m-lines per connection.
   The fix is one persistent transceiver per link plus `replaceTrack`.
 - **TURN credentials are cheap to obtain.** Anyone can create a room, join it, and
-  receive two-hour relay credentials on our Cloudflare allocation. The rate limits blunt
-  this; they do not prevent it.
+  receive two-hour relay credentials on our Cloudflare allocation. They are now per
+  person, revoked on leave, and capped at 20 a minute per address, which blunts this
+  without preventing it. Cloudflare does not say whether revoking also ends a relay
+  already in use. If relay traffic ever runs away, switch TURN off without a deploy:
+  `echo true | npx wrangler secret put TURN_DISABLED` (delete the secret to switch it
+  back on). Direct connections keep working; Hide my IP then refuses to connect, as it
+  must.
 - **`/diagnostics` reports symmetric NAT falsely on multi-homed machines.** It compares
   srflx ports across all local interfaces rather than across STUN servers, so a laptop
   with Wi-Fi and Ethernet both up, or any VPN adapter, looks symmetric even behind a

@@ -17,6 +17,10 @@ export interface Env {
    */
   WS_LIMITER?: RateLimit;
   ROOM_LIMITER?: RateLimit;
+  /** TURN mints per client, checked by the room on each join (worker/room.ts). */
+  TURN_LIMITER?: RateLimit;
+  /** Kill switch for TURN; see worker/turn.ts. */
+  TURN_DISABLED?: string;
 }
 
 export { RoomDO };

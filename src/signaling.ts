@@ -16,12 +16,22 @@ import {
   type SignalData,
 } from "@shared/protocol";
 
+/** Room control state carried by the welcome. */
+export interface RoomInfo {
+  /** Whether we are the room's host. */
+  host: boolean;
+  /** Present only on the welcome that created the room. Keep it to stay host. */
+  hostToken?: string;
+  locked: boolean;
+}
+
 export interface SignalingHandlers {
-  onWelcome(selfId: PeerId, peers: PeerInfo[], iceServers: IceServerConfig[]): void;
+  onWelcome(selfId: PeerId, peers: PeerInfo[], iceServers: IceServerConfig[], room: RoomInfo): void;
   onPeerJoined(peer: PeerInfo): void;
   onPeerLeft(id: PeerId): void;
   onSignal(from: PeerId, data: SignalData): void;
   onPeerState(id: PeerId, sharing: boolean): void;
+  onRoomState?(locked: boolean): void;
   onError(code: string, message: string): void;
   onStatus(status: "connecting" | "open" | "closed"): void;
 }
@@ -57,6 +67,8 @@ export class SignalingClient {
     private readonly displayName: string,
     private readonly handlers: SignalingHandlers,
     private readonly password?: string,
+    /** Read on every (re)connect, so a token issued by the first welcome is sent on the next. */
+    private readonly hostToken?: () => string | undefined,
   ) {}
 
   connect(): void {
@@ -85,6 +97,10 @@ export class SignalingClient {
       if (this.password) {
         joinMsg.password = this.password;
       }
+      const hostToken = this.hostToken?.();
+      if (hostToken) {
+        joinMsg.hostToken = hostToken;
+      }
       this.send(joinMsg);
       this.startPing();
     };
@@ -104,6 +120,9 @@ export class SignalingClient {
 
     ws.onclose = (ev) => {
       this.stopPing();
+      // Closed on purpose: whoever closed it has already said what happened, e.g. that
+      // the host removed us, and "Connection closed" would overwrite it.
+      if (this.closedByUs) return;
       this.handlers.onStatus("closed");
       // 1008 (policy violation) is how the server says "do not come back" — room
       // full, or a bad room code. Reconnecting re-triggers the same rejection
@@ -136,7 +155,11 @@ export class SignalingClient {
         // Proof the connection actually worked, which is what clears the counters.
         this.attempts = 0;
         this.capacityRefusals = 0;
-        this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? []);
+        this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? [], {
+          host: msg.host === true,
+          ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
+          locked: msg.locked === true,
+        });
         break;
       case "peer-joined":
         this.handlers.onPeerJoined(msg.peer);
@@ -149,6 +172,9 @@ export class SignalingClient {
         break;
       case "peer-state":
         this.handlers.onPeerState(msg.id, msg.sharing);
+        break;
+      case "room-state":
+        this.handlers.onRoomState?.(msg.locked);
         break;
       case "error":
         this.handlers.onError(msg.code, msg.message);
@@ -166,6 +192,16 @@ export class SignalingClient {
 
   setSharing(sharing: boolean): void {
     this.send({ t: "state", sharing });
+  }
+
+  /** Host only: remove someone from the room. */
+  kick(id: PeerId): void {
+    this.send({ t: "kick", id });
+  }
+
+  /** Host only: refuse or allow new joins. */
+  setLocked(locked: boolean): void {
+    this.send({ t: "lock", locked });
   }
 
   private startPing(): void {

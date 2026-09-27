@@ -88,6 +88,12 @@ class PeerLink {
   private makingOffer = false;
   private ignoreOffer = false;
   private isSettingRemoteAnswerPending = false;
+  /** Our offer lost a glare to theirs; offer again once their offer is answered. */
+  private offerPending = false;
+  /** Bumped whenever a remote offer arrives, so an offer built before it is known stale. */
+  private remoteOffers = 0;
+  /** A remote offer is being applied and answered. */
+  private applyingOffer = false;
 
   private control: RTCDataChannel | null = null;
   private remoteWantsVideo = true;
@@ -105,6 +111,8 @@ class PeerLink {
     private readonly opts: MeshOptions,
     private readonly send: (data: SignalData) => void,
     private readonly cb: MeshCallbacks,
+    /** Whether this side opens the control channel; see Mesh.addPeer. */
+    createsControl: boolean = selfId >= peerId,
   ) {
     this.polite = selfId < peerId;
     this.pc = new RTCPeerConnection({
@@ -146,7 +154,7 @@ class PeerLink {
     // Exactly one side creates the control channel, or we'd get two.
     // Creating it also gives negotiation something to do, so the ICE connection
     // establishes immediately rather than waiting for someone to start sharing.
-    if (!this.polite) {
+    if (createsControl) {
       this.bindControl(this.pc.createDataChannel("control", { ordered: true }));
     }
   }
@@ -154,20 +162,52 @@ class PeerLink {
   // ---- negotiation -------------------------------------------------------
 
   private async negotiate(): Promise<void> {
+    if (this.pc.signalingState === "closed") return;
+    // Counted when their offer arrives, not once it is applied: RTCPeerConnection
+    // queues its operations, so our createOffer can resolve, and our
+    // setLocalDescription be queued, while their offer is still being applied.
+    const seen = this.remoteOffers;
     try {
       this.makingOffer = true;
       // Explicit createOffer (rather than the arg-less setLocalDescription) because
       // the Opus fmtp line has to be munged before the description is applied.
       const offer = await this.pc.createOffer();
+      // Their offer landed while ours was being built. As the polite side we answer
+      // theirs, and ours, built on the old state, no longer applies: Chrome rejects it
+      // ("wrong state", or m-lines out of order). Nothing else will offer again,
+      // because Chrome does not reliably re-fire negotiationneeded for what our
+      // dropped offer carried. Without the retry a sharer's video to that peer was
+      // simply never negotiated.
+      if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") {
+        this.retryOffer();
+        return;
+      }
       offer.sdp = mungeOpusSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
       if (sdp) this.send({ k: "offer", sdp: this.outgoingSdp(sdp) });
     } catch (err) {
-      console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
+      // The same race, lost a step later.
+      if (seen !== this.remoteOffers || this.pc.signalingState === "have-remote-offer") this.retryOffer();
+      else console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  /** Offer again once their offer has been answered (see negotiate). */
+  private retryOffer(): void {
+    this.offerPending = true;
+    // Mid-answer: applyDescription picks the flag up when it is done. Otherwise the
+    // answer is already out, so go now (after negotiate's finally has run).
+    if (this.applyingOffer || this.pc.signalingState !== "stable") return;
+    setTimeout(() => this.flushPendingOffer(), 0);
+  }
+
+  private flushPendingOffer(): void {
+    if (!this.offerPending || this.pc.signalingState === "closed") return;
+    this.offerPending = false;
+    void this.negotiate();
   }
 
   async handleSignal(data: SignalData): Promise<void> {
@@ -186,6 +226,10 @@ class PeerLink {
     this.ignoreOffer = !this.polite && offerCollision;
     if (this.ignoreOffer) return;
 
+    if (kind === "offer") {
+      this.remoteOffers++;
+      this.applyingOffer = true;
+    }
     try {
       this.isSettingRemoteAnswerPending = kind === "answer";
       await this.pc.setRemoteDescription({ type: kind, sdp });
@@ -201,6 +245,11 @@ class PeerLink {
     } catch (err) {
       this.isSettingRemoteAnswerPending = false;
       console.error(`[mesh] setDescription(${kind}) failed for ${this.peerId}`, err);
+    } finally {
+      if (kind === "offer") {
+        this.applyingOffer = false;
+        this.flushPendingOffer();
+      }
     }
   }
 
@@ -395,14 +444,28 @@ export class Mesh {
     private readonly cb: MeshCallbacks,
   ) {}
 
-  addPeer(peerId: PeerId): void {
+  /**
+   * Open a link to a peer. Only the side that is sharing does this; the other side's
+   * link is created by the sharer's first offer (handleSignal, `answering`).
+   *
+   * One initiator per link is the point. When the viewer also started a link on
+   * seeing "sharing", both sides offered at once, and in that glare Chrome
+   * sometimes left the sharer's video never negotiated: a viewer that joined fine
+   * and simply never saw anything.
+   */
+  addPeer(peerId: PeerId, answering = false): void {
     if (peerId === this.selfId || this.links.has(peerId)) return;
+    // The initiator opens the control channel, unless the other side is sharing
+    // too and may be initiating as well; then the id order picks one of us.
+    const createsControl =
+      !answering && (this.members.get(peerId)?.sharing !== true || this.selfId >= peerId);
     const link = new PeerLink(
       this.selfId,
       peerId,
       this.opts,
       (data) => this.sendSignal(peerId, data),
       this.cb,
+      createsControl,
     );
     this.links.set(peerId, link);
     if (this.capture) void link.attachCapture(this.capture);
@@ -420,7 +483,7 @@ export class Mesh {
   addMember(peerId: PeerId, sharing: boolean): void {
     if (peerId === this.selfId) return;
     this.members.set(peerId, { sharing });
-    if (this.wantsLink(peerId)) this.addPeer(peerId);
+    if (this.capture) this.addPeer(peerId);
   }
 
   removeMember(peerId: PeerId): void {
@@ -436,8 +499,8 @@ export class Mesh {
       return;
     }
     m.sharing = sharing;
-    if (this.wantsLink(peerId)) this.addPeer(peerId);
-    else this.removePeer(peerId);
+    // Starting to share is not a reason to connect from here: their offer does that.
+    if (!this.wantsLink(peerId)) this.removePeer(peerId);
   }
 
   private wantsLink(peerId: PeerId): boolean {
@@ -448,7 +511,7 @@ export class Mesh {
     // A sharer's offer can arrive before its peer-state says it is sharing (it
     // attaches the capture first, then announces), so a signal creates the link on
     // demand. The server only relays signals from peers joined to this room.
-    if (!this.links.has(from)) this.addPeer(from);
+    if (!this.links.has(from)) this.addPeer(from, true);
     await this.links.get(from)?.handleSignal(data);
   }
 

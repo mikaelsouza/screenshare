@@ -354,7 +354,8 @@
         font-size: 0.7rem;
         font-weight: 600;
       }
-      #roster-list button {
+      #roster-list button,
+      #lock-btn {
         padding: 0.05rem 0.45rem;
         font-size: 0.7rem;
       }
@@ -400,6 +401,7 @@
     <section id="roster" hidden aria-labelledby="roster-title">
       <h2 id="roster-title">In this room</h2>
       <ul id="roster-list"></ul>
+      <button type="button" id="lock-btn" hidden title="A locked room refuses anyone new. People already in it stay.">Lock room</button>
     </section>
 
     <main id="stage"></main>

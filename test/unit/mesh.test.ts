@@ -141,20 +141,25 @@ describe("Mesh and PeerLink", () => {
     };
   });
 
-  it("determines polite role based on peer IDs (selfId < peerId)", () => {
+  it("lets the initiator open the control channel, by id order only when both share", () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
 
-    // alice < bob -> alice is polite, bob is impolite.
-    // The impolite side creates the control channel.
+    // The initiator opens it whatever its politeness (alice < bob: alice is polite).
     mesh.addPeer("bob");
     const pc1 = FakeRTCPeerConnection.instances[0]!;
-    expect(pc1.dataChannels.length).toBe(0); // polite side did not create
+    expect(pc1.dataChannels.map((c) => c.label)).toEqual(["control"]);
 
-    // alice > aaron -> alice is impolite, creates control channel
+    // Both sharing, so both may be initiating: only the impolite (larger id) side opens it.
+    mesh.addMember("carol", true);
+    mesh.addPeer("carol");
+    expect(FakeRTCPeerConnection.instances[1]!.dataChannels).toHaveLength(0);
+    mesh.addMember("aaron", true);
     mesh.addPeer("aaron");
-    const pc2 = FakeRTCPeerConnection.instances[1]!;
-    expect(pc2.dataChannels.length).toBe(1);
-    expect(pc2.dataChannels[0]?.label).toBe("control");
+    expect(FakeRTCPeerConnection.instances[2]!.dataChannels).toHaveLength(1);
+
+    // The answering side never opens one.
+    mesh.addPeer("zed", true);
+    expect(FakeRTCPeerConnection.instances[3]!.dataChannels).toHaveLength(0);
   });
 
   it("applies iceTransportPolicy 'relay' when relayOnly is true and filters non-relay candidates", () => {
@@ -572,17 +577,19 @@ describe("Mesh connects only where someone is sharing", () => {
     expect(FakeRTCPeerConnection.instances).toHaveLength(0);
   });
 
-  it("connects to a member who is sharing, and drops the link when they stop", () => {
+  it("leaves connecting to the sharer, and drops the link when they stop", async () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", true);
     mesh.addMember("carol", false);
+    // The sharer offers; a viewer starting its own link as well is what caused glare.
+    expect(mesh.peers()).toEqual([]);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
     expect(mesh.peers()).toEqual(["bob"]);
-
-    mesh.setMemberSharing("carol", true);
-    expect(mesh.peers()).toEqual(["bob", "carol"]);
+    // The answering side never opens the control channel; the sharer did.
+    expect(FakeRTCPeerConnection.instances[0]?.dataChannels).toHaveLength(0);
 
     mesh.setMemberSharing("bob", false);
-    expect(mesh.peers()).toEqual(["carol"]);
+    expect(mesh.peers()).toEqual([]);
     expect(FakeRTCPeerConnection.instances[0]?.closed).toBe(true);
   });
 
@@ -590,6 +597,7 @@ describe("Mesh connects only where someone is sharing", () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);
     mesh.addMember("carol", true);
+    await mesh.handleSignal("carol", { k: "offer", sdp: "v=0\r\n" });
     expect(mesh.peers()).toEqual(["carol"]);
 
     await mesh.setCapture(capture());

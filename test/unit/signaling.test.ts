@@ -121,7 +121,10 @@ describe("SignalingClient reconnection", () => {
         iceServers: [{ urls: "stun:example.com" }],
       }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }]);
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }], {
+      host: false,
+      locked: false,
+    });
 
     // peer-joined
     ws.onmessage?.({
@@ -223,7 +226,7 @@ describe("SignalingClient reconnection", () => {
         peers: [],
       }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], []);
+    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], [], { host: false, locked: false });
     c.close();
   });
 });
@@ -290,5 +293,31 @@ describe("SignalingClient capacity refusals", () => {
     const afterWelcome = FakeWebSocket.instances.length;
     for (let i = 0; i < 4; i++) refuse();
     expect(FakeWebSocket.instances.length).toBe(afterWelcome + 4);
+  });
+
+  it("sends the host token on every connect and passes the room state on", () => {
+    const h = { ...handlers(), onRoomState: vi.fn() };
+    let token: string | undefined;
+    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => token);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    expect(JSON.parse(ws.sent[0]!)).not.toHaveProperty("hostToken");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], iceServers: [], host: true, hostToken: "tok", locked: false }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], [], { host: true, hostToken: "tok", locked: false });
+    token = "tok";
+
+    ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
+    expect(h.onRoomState).toHaveBeenCalledWith(true);
+
+    ws.serverClose(1006);
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    expect(JSON.parse(ws2.sent[0]!).hostToken).toBe("tok");
+    c.close();
   });
 });

@@ -64,6 +64,7 @@ const ui = {
   roster: el<HTMLElement>("roster"),
   rosterTitle: el<HTMLElement>("roster-title"),
   rosterList: el<HTMLUListElement>("roster-list"),
+  lockBtn: el<HTMLButtonElement>("lock-btn"),
   surfaceWarning: el<HTMLElement>("surface-warning"),
   status: el<HTMLElement>("status"),
   preset: el<HTMLSelectElement>("preset"),
@@ -92,7 +93,10 @@ let audioLost = false;
 
 const names = new Map<PeerId, string>();
 /** Everyone else in the room and whether they are sharing, for the participant list. */
-const members = new Map<PeerId, { name: string; sharing: boolean }>();
+const members = new Map<PeerId, { name: string; sharing: boolean; host: boolean }>();
+/** Whether we are this room's host, and whether the room refuses new joins. */
+let isHost = false;
+let roomLocked = false;
 /** Our own id in the current room, once welcomed. */
 let selfId: PeerId | null = null;
 /** The room and password of the current connection, so it can be redone in place. */
@@ -269,6 +273,27 @@ function renderSelfPreview(stream: MediaStream | null): void {
 
 // ---- participants --------------------------------------------------------
 
+/**
+ * The host token for a room, kept per tab. sessionStorage survives a refresh, so the
+ * host stays host; a new tab or a friend's browser does not have it, so a forwarded
+ * link never makes anyone else the host.
+ */
+function hostTokenFor(code: string): string | undefined {
+  try {
+    return sessionStorage.getItem(`host:${code}`) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveHostToken(code: string, token: string): void {
+  try {
+    sessionStorage.setItem(`host:${code}`, token);
+  } catch {
+    // Storage blocked: still host for this connection, just not after a refresh.
+  }
+}
+
 /** First four characters of a peer id, so two people with the same name can be told apart. */
 function shortId(id: PeerId): string {
   return id.slice(0, 4);
@@ -287,15 +312,18 @@ function renderRoster(): void {
   }
   ui.roster.hidden = false;
   const others = [...members.entries()];
-  ui.rosterTitle.textContent = capture
-    ? `Sharing to ${others.length} ${others.length === 1 ? "person" : "people"}:`
-    : `In this room (${others.length + 1}):`;
+  const title = capture
+    ? `Sharing to ${others.length} ${others.length === 1 ? "person" : "people"}`
+    : `In this room (${others.length + 1})`;
+  ui.rosterTitle.textContent = `${title}${roomLocked ? ", locked" : ""}:`;
+  ui.lockBtn.hidden = !isHost;
+  ui.lockBtn.textContent = roomLocked ? "Unlock room" : "Lock room";
 
   const items: HTMLLIElement[] = [];
-  const add = (id: PeerId, name: string, sharing: boolean, self: boolean): void => {
+  const add = (id: PeerId, name: string, sharing: boolean, self: boolean, host: boolean): void => {
     const li = document.createElement("li");
     const label = document.createElement("span");
-    label.textContent = self ? `${name} (you)` : name;
+    label.textContent = `${name}${self ? " (you)" : ""}${host ? " (host)" : ""}`;
     const idEl = document.createElement("span");
     idEl.className = "peer-id";
     idEl.textContent = shortId(id);
@@ -306,10 +334,18 @@ function renderRoster(): void {
       badge.textContent = "sharing";
       li.append(badge);
     }
+    if (isHost && !self) {
+      const kick = document.createElement("button");
+      kick.type = "button";
+      kick.textContent = "Remove";
+      kick.title = `Remove ${name} from the room. They can't rejoin for 15 minutes.`;
+      kick.addEventListener("click", () => client?.kick(id));
+      li.append(kick);
+    }
     items.push(li);
   };
-  add(selfId, currentName(), capture !== null, true);
-  for (const [id, m] of others) add(id, m.name, m.sharing, false);
+  add(selfId, currentName(), capture !== null, true, isHost);
+  for (const [id, m] of others) add(id, m.name, m.sharing, false, m.host);
   ui.rosterList.replaceChildren(...items);
 }
 
@@ -620,7 +656,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             : `Connection ${s}…`,
         ),
 
-      onWelcome: (selfIdFromServer, peers, iceServers) => {
+      onWelcome: (selfIdFromServer, peers, iceServers, room) => {
         // The signalling socket reconnects on any network blip, and the server issues
         // a fresh peer id each time, so onWelcome fires again. Without closing the old
         // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
@@ -630,6 +666,9 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         monitors.clear();
         members.clear();
         selfId = null;
+        if (room.hostToken) saveHostToken(code, room.hostToken);
+        isHost = room.host;
+        roomLocked = room.locked;
 
         // Minted by the Durable Object and delivered with the welcome, so holding a
         // joined WebSocket is what authorises them.
@@ -685,7 +724,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         selfId = selfIdFromServer;
         for (const p of peers) {
           names.set(p.id, p.name);
-          members.set(p.id, { name: p.name, sharing: p.sharing });
+          members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
           mesh.addMember(p.id, p.sharing);
         }
         setStatus(
@@ -698,7 +737,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 
       onPeerJoined: (peer: PeerInfo) => {
         names.set(peer.id, peer.name);
-        members.set(peer.id, { name: peer.name, sharing: peer.sharing });
+        members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
         mesh?.addMember(peer.id, peer.sharing);
         setStatus(`${peer.name} joined room ${code}`, "info");
         renderRoster();
@@ -718,7 +757,27 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         mesh?.setMemberSharing(id, sharing);
         renderRoster();
       },
+      onRoomState: (locked) => {
+        roomLocked = locked;
+        renderRoster();
+      },
       onError: (code, message) => {
+        // Both close the socket for good. Tear the room down too: a kicked peer's
+        // connections to others would otherwise linger until they time out.
+        if (code === "kicked") {
+          leaveRoom();
+          setStatus("You were removed from this room by its host.", "error");
+          return;
+        }
+        if (code === "room-locked") {
+          leaveRoom();
+          setStatus(`Room ${codeToJoin} is locked. Ask its host to unlock it.`, "error");
+          return;
+        }
+        if (code === "not-host") {
+          setStatus(message, "warn");
+          return;
+        }
         // A wrong password is the one error the user can actually fix from here, so
         // say so in plain language and put the cursor where the fix goes. The socket
         // is closed with 1008 and will not retry by itself, but joinRoom() builds a
@@ -744,6 +803,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       },
     },
     password,
+    () => hostTokenFor(code),
   );
 
   client.connect();
@@ -762,6 +822,8 @@ function leaveRoom(): void {
   names.clear();
   members.clear();
   selfId = null;
+  isHost = false;
+  roomLocked = false;
   renderRoster();
   ui.muteAudioBtn.style.display = "none";
 }
@@ -840,6 +902,11 @@ function initQualityControls(): void {
 }
 
 initQualityControls();
+
+ui.lockBtn.addEventListener("click", () => {
+  // The button flips when the server confirms with room-state, not before.
+  client?.setLocked(!roomLocked);
+});
 
 ui.nameInput.value = localStorage.getItem("name") ?? "";
 ui.nameInput.addEventListener("change", () => {

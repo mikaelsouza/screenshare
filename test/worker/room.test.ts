@@ -1191,3 +1191,161 @@ describe("display names", () => {
     c.close();
   });
 });
+
+describe("RoomDO host controls (batch D)", () => {
+  /** The creator of a fresh room, with the host token its welcome carried. */
+  async function host(name = "host", ip = "198.51.100.1"): Promise<{ c: Client; token: string }> {
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": ip });
+    const w = await c.join(name);
+    expect(w.host).toBe(true);
+    expect(typeof w.hostToken).toBe("string");
+    return { c, token: w.hostToken! };
+  }
+
+  it("makes the creator host and nobody else, and says who the host is", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    expect(wb.host).toBe(false);
+    expect(wb.hostToken).toBeUndefined();
+    expect(wb.locked).toBe(false);
+    expect(wb.peers[0]?.host).toBe(true);
+    h.close();
+    b.close();
+  });
+
+  it("gives host back to whoever presents the token, even after the object hibernates", async () => {
+    const { c: h, token } = await host();
+    h.close();
+    // The token is checked against storage, not memory: prove it by looking there.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const stored = await runInDurableObject(stub, (_i, state) => state.storage.get("hostTokenHash"));
+    expect(typeof stored).toBe("string");
+    expect(stored).not.toContain(token);
+
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: token });
+    const w = await back.nextOf("welcome");
+    expect(w.host).toBe(true);
+    // Issued once, to the creating join only.
+    expect(w.hostToken).toBeUndefined();
+
+    const fake = await Client.connect();
+    fake.send({ t: "join", room: CODE, displayName: "mallory", hostToken: "not-the-token" });
+    expect((await fake.nextOf("welcome")).host).toBe(false);
+    back.close();
+    fake.close();
+  });
+
+  it("lets only the host remove people", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    b.send({ t: "kick", id: wb.peers[0]!.id });
+    expect((await b.nextOf("error")).code).toBe("not-host");
+    b.close();
+    h.close();
+  });
+
+  it("removes a kicked peer, tells the room, and refuses its rejoin", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    await b.join("bob");
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.9" });
+    await c.join("carol");
+    const bobId = (await h.nextOf("peer-joined")).peer.id;
+    await h.nextOf("peer-joined");
+
+    const closed = closeCodeOf(b.ws);
+    h.send({ t: "kick", id: bobId });
+    expect((await b.nextOf("error")).code).toBe("kicked");
+    expect(await closed).toBe(1008);
+    expect((await h.nextOf("peer-left")).id).toBe(bobId);
+    expect((await c.nextOf("peer-left")).id).toBe(bobId);
+
+    const again = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "203.0.113.5" },
+    });
+    const ws = again.webSocket!;
+    ws.accept();
+    const rejoin = closeCodeOf(ws);
+    ws.send(JSON.stringify({ t: "join", room: CODE, displayName: "bob" }));
+    expect(await rejoin).toBe(1008);
+    h.close();
+    c.close();
+  });
+
+  it("refuses new joins while locked, lets the host back in, and tells the room", async () => {
+    const { c: h, token } = await host();
+    const b = await Client.connect();
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    expect(await h.nextOf("room-state")).toEqual({ t: "room-state", locked: true });
+    expect(await b.nextOf("room-state")).toEqual({ t: "room-state", locked: true });
+
+    const c = await Client.connect();
+    const refused = closeCodeOf(c.ws);
+    c.send({ t: "join", room: CODE, displayName: "carol" });
+    expect((await c.nextOf("error")).code).toBe("room-locked");
+    expect(await refused).toBe(1008);
+
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: token });
+    const w = await back.nextOf("welcome");
+    expect(w.host).toBe(true);
+    expect(w.locked).toBe(true);
+
+    h.send({ t: "lock", locked: false });
+    await h.nextOf("room-state");
+    const d = await Client.connect();
+    expect((await d.join("dave")).locked).toBe(false);
+    for (const s of [h, b, back, d]) s.close();
+  });
+
+  it("refuses lock from anyone but the host", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect();
+    await b.join("bob");
+    b.send({ t: "lock", locked: true });
+    expect((await b.nextOf("error")).code).toBe("not-host");
+    h.close();
+    b.close();
+  });
+});
+
+describe("RoomDO diagnostics joins (batch D)", () => {
+  it("hands over ICE servers without claiming the room or appearing in it", async () => {
+    const d = await Client.connect();
+    const closed = closeCodeOf(d.ws);
+    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    const w = await d.nextOf("welcome");
+    expect(Array.isArray(w.iceServers)).toBe(true);
+    expect(w.host).toBe(false);
+    expect(await closed).toBe(1000);
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
+    expect(claimed).toBeUndefined();
+
+    // Whoever comes next still creates the room.
+    const a = await Client.connect();
+    const wa = await a.join("alice");
+    expect(wa.host).toBe(true);
+    expect(wa.peers).toEqual([]);
+    a.close();
+  });
+
+  it("is refused on a room somebody created", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const d = await Client.connect();
+    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    expect((await d.nextOf("error")).code).toBe("bad-message");
+    expect(await a.silentFor()).toBe(true);
+    a.close();
+  });
+});

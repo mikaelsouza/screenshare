@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { baseUrl, INSTRUMENT, launchBrowser, startServer, stopServer, waitFor } from "./helpers.mjs";
 
-const ROOM = "ABCDEFGH";
+// Fresh per run: wrangler dev keeps Durable Object storage between runs, and a room
+// claimed by an earlier run has a host this run cannot be.
+const ROOM = Array.from(
+  crypto.getRandomValues(new Uint8Array(8)),
+  (b) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[b % 31],
+).join("");
 const PORT = 8890;
 const BASE_URL = baseUrl(PORT);
 
@@ -228,5 +233,31 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
       () => window.__pcs.every((pc) => pc.connectionState === "closed"),
       { label: "sharer links to close after stopping", timeout: 10_000 },
     );
+  });
+
+  it("lets only the room's creator remove people and lock the room", async () => {
+    // The sharer joined first, so it created the room and is its host.
+    const removeButtons = (page) => page.evaluate(() => document.querySelectorAll("#roster-list button").length);
+    assert.equal(await removeButtons(sharer), 2, "host should see a Remove button per other person");
+    assert.equal(await removeButtons(viewer), 0);
+    assert.equal(await viewer.isVisible("#lock-btn"), false);
+
+    await sharer.click("#roster-list li:has-text('viewer2') button");
+    await waitFor(viewer2, () => document.getElementById("status")?.textContent?.includes("removed"), {
+      label: "viewer2 to be told it was removed",
+    });
+    for (const page of [sharer, viewer]) {
+      await waitFor(page, () => document.querySelectorAll("#roster-list li").length === 2, {
+        label: "viewer2 to leave the participant list",
+      });
+    }
+
+    await sharer.click("#lock-btn");
+    await waitFor(viewer, () => document.getElementById("roster-title")?.textContent?.includes("locked"), {
+      label: "viewer to see the room locked",
+    });
+    await waitFor(sharer, () => document.getElementById("lock-btn")?.textContent === "Unlock room", {
+      label: "host's button to offer unlocking",
+    });
   });
 });
