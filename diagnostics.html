@@ -90,6 +90,11 @@
       button:hover {
         background-color: var(--accent-hover);
       }
+      .privacy-note {
+        font-size: 0.8rem;
+        color: var(--text-secondary, #8e8e99);
+        margin: 0 0 1rem;
+      }
       .table-container {
         border: 1px solid var(--border-color);
         border-radius: 8px;
@@ -140,6 +145,10 @@
         <h2>Connection Diagnostics</h2>
         <button type="button" id="run-btn">Run test</button>
       </div>
+      <p class="privacy-note">
+        The test contacts Cloudflare's and Google's public STUN servers, so both see your IP
+        address. The app itself only uses Cloudflare's.
+      </p>
 
       <div class="table-container">
         <table>

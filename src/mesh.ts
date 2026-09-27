@@ -39,6 +39,44 @@ export interface MeshCallbacks {
 /** Peer-to-peer control traffic. Deliberately NOT routed through the server. */
 type ControlMessage = { c: "view"; want: boolean };
 
+/** Real control messages are ~25 bytes. Anything far larger is not ours. */
+const MAX_CONTROL_MESSAGE_LENGTH = 256;
+
+/**
+ * Parse a control message from the far end, or null if it is not one.
+ *
+ * The far end is another browser in the room, not something we control, so the shape
+ * is checked rather than cast: a `want` that is not a boolean would otherwise flow
+ * straight into `encodings[0].active`.
+ */
+export function parseControlMessage(data: unknown): ControlMessage | null {
+  if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
+  let msg: unknown;
+  try {
+    msg = JSON.parse(data);
+  } catch {
+    return null;
+  }
+  if (typeof msg !== "object" || msg === null) return null;
+  const rec = msg as Record<string, unknown>;
+  if (rec.c !== "view" || typeof rec.want !== "boolean") return null;
+  return { c: "view", want: rec.want };
+}
+
+/**
+ * Drop every ICE candidate line that is not a relay candidate.
+ *
+ * Relay-only mode already sets iceTransportPolicy "relay", which stops the browser
+ * gathering anything else. This is the second lock on the same door: the SDP is what
+ * the far end actually receives, so it is checked on the way out rather than trusted.
+ */
+export function keepRelayCandidatesOnly(sdp: string): string {
+  return sdp
+    .split("\r\n")
+    .filter((line) => !line.startsWith("a=candidate:") || / typ relay(?: |$)/.test(line))
+    .join("\r\n");
+}
+
 class PeerLink {
   readonly pc: RTCPeerConnection;
   /**
@@ -50,6 +88,12 @@ class PeerLink {
   private makingOffer = false;
   private ignoreOffer = false;
   private isSettingRemoteAnswerPending = false;
+  /** Our offer lost a glare to theirs; offer again once their offer is answered. */
+  private offerPending = false;
+  /** Bumped whenever a remote offer arrives, so an offer built before it is known stale. */
+  private remoteOffers = 0;
+  /** A remote offer is being applied and answered. */
+  private applyingOffer = false;
 
   private control: RTCDataChannel | null = null;
   private remoteWantsVideo = true;
@@ -67,6 +111,8 @@ class PeerLink {
     private readonly opts: MeshOptions,
     private readonly send: (data: SignalData) => void,
     private readonly cb: MeshCallbacks,
+    /** Whether this side opens the control channel; see Mesh.addPeer. */
+    createsControl: boolean = selfId >= peerId,
   ) {
     this.polite = selfId < peerId;
     this.pc = new RTCPeerConnection({
@@ -80,8 +126,9 @@ class PeerLink {
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
         if (this.opts.relayOnly) {
+          // Fail closed: a candidate we cannot classify is not sent.
           const parsed = parseCandidate(candidate);
-          if (parsed && parsed.type !== "relay") return;
+          if (!parsed || parsed.type !== "relay") return;
         }
         this.send({
           k: "ice",
@@ -95,17 +142,24 @@ class PeerLink {
       }
     };
     this.pc.onconnectionstatechange = () => {
+      // A network change (Wi-Fi to Ethernet, a VPN) can kill the path a link chose.
+      // The sharing side restarts ICE, which renegotiates through the usual offer
+      // path; left alone, the viewer's picture just froze until someone rejoined.
+      // Only the sender, so both sides do not restart into a glare.
+      if (this.pc.connectionState === "failed" && this.videoSender) this.pc.restartIce();
       this.cb.onConnectionState(this.peerId, this.pc.connectionState);
     };
     this.pc.ontrack = (ev) => this.onTrack(ev);
     this.pc.ondatachannel = (ev) => {
+      // Only the one channel this app opens. Anything else the far end offers is closed.
       if (ev.channel.label === "control") this.bindControl(ev.channel);
+      else ev.channel.close();
     };
 
     // Exactly one side creates the control channel, or we'd get two.
     // Creating it also gives negotiation something to do, so the ICE connection
     // establishes immediately rather than waiting for someone to start sharing.
-    if (!this.polite) {
+    if (createsControl) {
       this.bindControl(this.pc.createDataChannel("control", { ordered: true }));
     }
   }
@@ -113,20 +167,52 @@ class PeerLink {
   // ---- negotiation -------------------------------------------------------
 
   private async negotiate(): Promise<void> {
+    if (this.pc.signalingState === "closed") return;
+    // Counted when their offer arrives, not once it is applied: RTCPeerConnection
+    // queues its operations, so our createOffer can resolve, and our
+    // setLocalDescription be queued, while their offer is still being applied.
+    const seen = this.remoteOffers;
     try {
       this.makingOffer = true;
       // Explicit createOffer (rather than the arg-less setLocalDescription) because
       // the Opus fmtp line has to be munged before the description is applied.
       const offer = await this.pc.createOffer();
+      // Their offer landed while ours was being built. As the polite side we answer
+      // theirs, and ours, built on the old state, no longer applies: Chrome rejects it
+      // ("wrong state", or m-lines out of order). Nothing else will offer again,
+      // because Chrome does not reliably re-fire negotiationneeded for what our
+      // dropped offer carried. Without the retry a sharer's video to that peer was
+      // simply never negotiated.
+      if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") {
+        this.retryOffer();
+        return;
+      }
       offer.sdp = mungeOpusSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
-      if (sdp) this.send({ k: "offer", sdp });
+      if (sdp) this.send({ k: "offer", sdp: this.outgoingSdp(sdp) });
     } catch (err) {
-      console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
+      // The same race, lost a step later.
+      if (seen !== this.remoteOffers || this.pc.signalingState === "have-remote-offer") this.retryOffer();
+      else console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
       this.makingOffer = false;
     }
+  }
+
+  /** Offer again once their offer has been answered (see negotiate). */
+  private retryOffer(): void {
+    this.offerPending = true;
+    // Mid-answer: applyDescription picks the flag up when it is done. Otherwise the
+    // answer is already out, so go now (after negotiate's finally has run).
+    if (this.applyingOffer || this.pc.signalingState !== "stable") return;
+    setTimeout(() => this.flushPendingOffer(), 0);
+  }
+
+  private flushPendingOffer(): void {
+    if (!this.offerPending || this.pc.signalingState === "closed") return;
+    this.offerPending = false;
+    void this.negotiate();
   }
 
   async handleSignal(data: SignalData): Promise<void> {
@@ -144,7 +230,15 @@ class PeerLink {
 
     this.ignoreOffer = !this.polite && offerCollision;
     if (this.ignoreOffer) return;
+    // We are polite and theirs wins: setRemoteDescription rolls ours back. Whatever
+    // ours carried (our video, say) still needs an offer, so make one after answering
+    // rather than trusting Chrome to fire negotiationneeded again.
+    if (offerCollision) this.offerPending = true;
 
+    if (kind === "offer") {
+      this.remoteOffers++;
+      this.applyingOffer = true;
+    }
     try {
       this.isSettingRemoteAnswerPending = kind === "answer";
       await this.pc.setRemoteDescription({ type: kind, sdp });
@@ -155,12 +249,22 @@ class PeerLink {
         answer.sdp = mungeOpusSdp(answer.sdp ?? "");
         await this.pc.setLocalDescription(answer);
         const out = this.pc.localDescription?.sdp;
-        if (out) this.send({ k: "answer", sdp: out });
+        if (out) this.send({ k: "answer", sdp: this.outgoingSdp(out) });
       }
     } catch (err) {
       this.isSettingRemoteAnswerPending = false;
       console.error(`[mesh] setDescription(${kind}) failed for ${this.peerId}`, err);
+    } finally {
+      if (kind === "offer") {
+        this.applyingOffer = false;
+        this.flushPendingOffer();
+      }
     }
+  }
+
+  /** The SDP as it leaves this browser: relay candidates only in relay-only mode. */
+  private outgoingSdp(sdp: string): string {
+    return this.opts.relayOnly ? keepRelayCandidatesOnly(sdp) : sdp;
   }
 
   private async addIce(candidate: IceCandidateInit): Promise<void> {
@@ -210,20 +314,18 @@ class PeerLink {
   async attachCapture(capture: CaptureResult): Promise<void> {
     await this.detachCapture();
 
-    this.videoSender = this.pc.addTrack(capture.video, capture.stream);
+    // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
+    // addTrack reuses the receive-only transceiver its offer created, and that
+    // sender has no send encodings yet: setting ours is "Read-only field modified",
+    // which stopped the whole share. So a viewer could not share back to a sharer.
+    const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
+    this.videoSender = this.pc.addTransceiver(capture.video, send).sender;
     // Always open an audio sender, even while silent. A whole-screen share starts
     // with no audio and gets the game's audio from a second pick moments later, and
     // the user can swap sources mid-share. With the sender already negotiated, each
     // of those is a replaceTrack with no renegotiation. Tagging it with the video's
     // stream keeps the two in one MediaStream on the far end, so they play in sync.
-    if (capture.audio) {
-      this.audioSender = this.pc.addTrack(capture.audio, capture.stream);
-    } else {
-      this.audioSender = this.pc.addTransceiver("audio", {
-        direction: "sendonly",
-        streams: [capture.stream],
-      }).sender;
-    }
+    this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
     await applyAudioEncoding(this.audioSender);
 
     const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
@@ -287,16 +389,10 @@ class PeerLink {
     // The receiving side binds an already-open channel, so onopen will not fire.
     if (ch.readyState === "open") this.flushViewRequest();
     ch.onmessage = (ev) => {
-      let msg: ControlMessage;
-      try {
-        msg = JSON.parse(String(ev.data)) as ControlMessage;
-      } catch {
-        return;
-      }
-      if (msg.c === "view") {
-        this.remoteWantsVideo = msg.want;
-        void this.setSenderActive(msg.want);
-      }
+      const msg = parseControlMessage(ev.data);
+      if (!msg) return;
+      this.remoteWantsVideo = msg.want;
+      void this.setSenderActive(msg.want);
     };
   }
 
@@ -337,6 +433,16 @@ class PeerLink {
 export class Mesh {
   private readonly links = new Map<PeerId, PeerLink>();
   private capture: CaptureResult | null = null;
+  /**
+   * Everyone else in the room, and whether they are sharing.
+   *
+   * Kept apart from `links` because a member is not necessarily connected. A peer
+   * connection runs ICE, and ICE hands the far end your public address, so two
+   * people are connected only while at least one of them is sharing. Two viewers
+   * never connect to each other: there is nothing to send, and they would learn each
+   * other's IP for no reason.
+   */
+  private readonly members = new Map<PeerId, { sharing: boolean }>();
 
   constructor(
     private readonly selfId: PeerId,
@@ -345,14 +451,28 @@ export class Mesh {
     private readonly cb: MeshCallbacks,
   ) {}
 
-  addPeer(peerId: PeerId): void {
+  /**
+   * Open a link to a peer. Only the side that is sharing does this; the other side's
+   * link is created by the sharer's first offer (handleSignal, `answering`).
+   *
+   * One initiator per link is the point. When the viewer also started a link on
+   * seeing "sharing", both sides offered at once, and in that glare Chrome
+   * sometimes left the sharer's video never negotiated: a viewer that joined fine
+   * and simply never saw anything.
+   */
+  addPeer(peerId: PeerId, answering = false): void {
     if (peerId === this.selfId || this.links.has(peerId)) return;
+    // The initiator opens the control channel, unless the other side is sharing
+    // too and may be initiating as well; then the id order picks one of us.
+    const createsControl =
+      !answering && (this.members.get(peerId)?.sharing !== true || this.selfId >= peerId);
     const link = new PeerLink(
       this.selfId,
       peerId,
       this.opts,
       (data) => this.sendSignal(peerId, data),
       this.cb,
+      createsControl,
     );
     this.links.set(peerId, link);
     if (this.capture) void link.attachCapture(this.capture);
@@ -366,19 +486,71 @@ export class Mesh {
     this.cb.onRemoteStreamGone(peerId);
   }
 
+  /** A member of the room, connected to only if one of us is sharing. */
+  addMember(peerId: PeerId, sharing: boolean): void {
+    if (peerId === this.selfId) return;
+    this.members.set(peerId, { sharing });
+    if (this.capture) this.addPeer(peerId);
+  }
+
+  removeMember(peerId: PeerId): void {
+    this.members.delete(peerId);
+    this.removePeer(peerId);
+  }
+
+  /** A member started or stopped sharing: connect, or drop a link nobody needs now. */
+  setMemberSharing(peerId: PeerId, sharing: boolean): void {
+    const m = this.members.get(peerId);
+    if (!m) {
+      this.addMember(peerId, sharing);
+      return;
+    }
+    m.sharing = sharing;
+    // Starting to share is not a reason to connect from here: their offer does that.
+    if (!this.wantsLink(peerId)) this.removePeer(peerId);
+  }
+
+  private wantsLink(peerId: PeerId): boolean {
+    return this.capture !== null || this.members.get(peerId)?.sharing === true;
+  }
+
   async handleSignal(from: PeerId, data: SignalData): Promise<void> {
-    // A peer can signal before we've been told they joined; create on demand.
-    if (!this.links.has(from)) this.addPeer(from);
+    // The sharer's link on this side is created by its first offer. A sharer
+    // announces sharing before it offers, and the server relays in order, so its
+    // peer-state is already here. The server only relays signals from peers joined
+    // to this room.
+    if (!this.links.has(from)) {
+      // Only an offer starts a link, and only from someone sharing (or to us while we
+      // share). A late candidate or answer for a link we already closed would
+      // otherwise bring it back as a zombie with no control channel.
+      if (data.k !== "offer") return;
+      if (!this.capture && this.members.get(from)?.sharing !== true) return;
+      this.addPeer(from, true);
+    }
     await this.links.get(from)?.handleSignal(data);
   }
 
-  /** Start sharing to every peer, or pass null to stop. */
+  /**
+   * Start sharing to every member, or pass null to stop.
+   *
+   * Starting connects to every member; stopping drops the links to members who are
+   * not sharing themselves, since those existed only to carry our stream.
+   */
   async setCapture(capture: CaptureResult | null): Promise<void> {
+    // Links that already exist get the capture attached (or detached) here; links
+    // created below attach it themselves in addPeer, and attaching twice would leave
+    // an extra pair of transceivers behind.
+    const existing = [...this.links.values()];
     this.capture = capture;
+    if (capture) {
+      for (const id of this.members.keys()) this.addPeer(id);
+    } else {
+      for (const [id, m] of this.members) if (!m.sharing) this.removePeer(id);
+    }
     await Promise.all(
-      [...this.links.values()].map((l) =>
-        capture ? l.attachCapture(capture) : l.detachCapture(),
-      ),
+      existing
+        .filter((l) => this.links.get(l.peerId) === l)
+        .map((l) => (capture ? l.attachCapture(capture) : l.detachCapture())),
     );
   }
 

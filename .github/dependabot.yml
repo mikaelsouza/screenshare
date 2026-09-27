@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keeps the SHA-pinned actions in deploy.yml current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    # Dev tooling only; group it so an update is one PR, not one per package.
+    groups:
+      dev-dependencies:
+        dependency-type: development

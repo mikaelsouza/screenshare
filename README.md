@@ -30,13 +30,14 @@ Browser A ═══════════ SRTP media, direct P2P ════�
   are client-forgeable, so anyone could mint relay credentials on our Cloudflare
   allocation. The Durable Object now issues them inside the `welcome` message, so
   holding a WebSocket that has been accepted into a room is the authorisation. (That
-  bar is still low — see Known issues.)
+  bar is still low — see Known issues.) Each person gets their own credential, which the
+  room revokes when they leave or are removed.
 - **RoomDO** (`worker/room.ts`) — one Durable Object per room code, holding the
   WebSocket connections and routing signalling between peers. It forwards `data`
   verbatim and never parses SDP. Uses the WebSocket Hibernation API, so idle rooms
   cost nothing — which is also the source of the subtlest bug this project has had
   (see Room passwords below).
-- **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, full-mesh peer
+- **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, mesh peer
   management, and per-peer bitrate adaptation.
 
 Roughly 10% of peer pairs sit behind CGNAT or a symmetric NAT and cannot connect
@@ -74,9 +75,46 @@ TURN relay's address, never yours. It **fails closed**: if no TURN server is ava
 the app refuses to connect and says so, rather than quietly downgrading to a direct
 connection that would leak the very thing the checkbox promises to hide.
 
+Its checkbox reads **Hide my IP**, because it hides only your own address; others in the
+room who leave it off are still visible to you. Changing it inside a room reconnects at
+once rather than on the next join, and in relay mode every outgoing SDP is also stripped
+of non-relay candidate lines, so the policy is checked on the way out rather than trusted.
+
+**Who connects to whom.** A peer connection runs ICE, and ICE gives the far end your
+public address, so the mesh is not a full mesh: two people are connected only while at
+least one of them is sharing. Viewers never connect to each other. A room link (`/#CODE`)
+fills in the code and waits for **Join**, so a first-time visitor sees the Hide my IP
+option, and the short "what others can see" note under it, before anything connects.
+
+**Everyone is listed.** The participant list above the video shows every member, with
+the first four characters of their id so two people with the same name can be told
+apart. People who only watch never get a tile, so before the list existed a sharer could
+not tell they were there. Names are cleaned on the server (NFKC, then control and format
+characters such as bidi overrides and zero-width spaces are removed) so nobody can pose
+as a friend with an invisible character.
+
+**The room's creator is its host.** Their browser tab keeps a host token (in
+`sessionStorage`, so a refresh keeps it and a new tab or a forwarded link does not). The
+host sees **Remove** beside each person and a **Lock room** button. A removed person is
+disconnected at once and their address cannot rejoin for 15 minutes; a locked room
+refuses everyone new except the host. The ban is by address, so on a shared connection it
+also shuts out newcomers who share it; for anything lasting, lock the room.
+
+People already inside are not shut out by either. Every welcome carries a one-use rejoin
+ticket (kept in `sessionStorage` like the host token), and a join presenting it gets past
+the lock and the ban, so a refresh, a network blip or switching Hide my IP does not eject
+anyone. Removing someone deletes their ticket. If the host leaves a locked room and does
+not come back within five minutes, the room unlocks itself, since nobody else could.
+
+The relay refuses an **offer** unless the sender or the receiver is sharing, so a modified
+client cannot make another viewer connect to it and learn their address.
+
 ### Abuse limits
 
-Per-IP, and all of them chosen to be invisible in normal use:
+Per-IP, and all of them chosen to be invisible in normal use. "IP" means the IPv4 address, or
+the /64 prefix for IPv6, since one IPv6 subscriber can use any address in their /64. The
+per-IP request limits run twice: in memory, and through Cloudflare's rate-limiting binding
+(`ratelimits` in `wrangler.jsonc`), which is shared across isolates.
 
 | Limit | Value | Why it is where it is |
 | ----- | ----- | --------------------- |
@@ -85,6 +123,13 @@ Per-IP, and all of them chosen to be invisible in normal use:
 | Sockets per IP per room | 16 (`MAX_ROOM_SIZE * 2`) | A household or CGNAT block shares one address, so this must exceed the room cap, with headroom for half-open sockets |
 | Sockets per room | 32 (`MAX_ROOM_SIZE * 4`) | Unjoined sockets do not count against the room cap and would otherwise pile up |
 | SDP / ICE candidate size | 64 KB / 1 KB | Unbounded, a joined peer could loop 1 MB blobs at another peer through the object |
+| Frame size | 80 KB | Checked before parsing; closes with 1009 |
+| Messages per socket | burst 200, then 20/s | Covers joining a full room with TURN; a flood past it closes with 1008 |
+| Time to join | 10 s | A socket that never sends `join` is closed when the next one arrives, so idle sockets cannot fill a room |
+| Unparseable messages | 5 per socket | Then the socket is closed |
+| Wrong room passwords | 50 per 15 min, 200 per day | Per room. The right password always gets in, so guessing cannot lock the owners out |
+| New room password | at least 8 characters | Checked when the room is created; **Generate** fills in a 12-character one |
+| TURN credentials | 20/min | Each join mints its own; past the limit a join still succeeds, with STUN only |
 
 A refusal **completes the WebSocket handshake and then closes**, rather than answering
 with a 4xx. This is not incidental: a non-101 answer reaches the browser as a bare close
@@ -169,14 +214,17 @@ fallback is unavailable.
 npm run check        # typecheck client + worker
 npm run test:unit    # pure logic (protocol, SDP munging, stats)
 npm run test:worker  # RoomDO inside real workerd via vitest-pool-workers
-npm run test:e2e     # two real Chromium peers establishing an actual P2P connection
+npm run test:e2e     # real Chromium peers: p2p, edge cases, diagnostics
 npm test             # check + unit + worker
 npm run test:all     # everything, including the browser tests
 ```
 
-The end-to-end tests launch two Chromium browsers, join them to one room, share a
-synthetic stream, and assert that frames actually decode on the far side and that the
-selected ICE candidate pair is not a relay. `getDisplayMedia` is stubbed with a canvas
+The end-to-end tests launch Chromium pages, join them to one room, share a synthetic
+stream, and assert that frames actually decode on the far side and that the selected ICE
+candidate pair is not a relay. `edge.test.mjs` walks the less travelled paths: a password
+room made with Create, joining mid-share, stopping and sharing again, two people sharing
+at once, the host refreshing, Hide my IP with no relay, removal and locking, a member
+refreshing into a locked room, and no CSP violation anywhere. `getDisplayMedia` is stubbed with a canvas
 stream because headless Chrome has no screen picker; everything downstream of the
 picker is real.
 
@@ -194,8 +242,10 @@ answer that, and `/diagnostics` is the tool for it.
    npx wrangler secret put TURN_KEY_ID
    npx wrangler secret put TURN_API_TOKEN
    ```
-3. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
-4. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
+3. Optionally, in the Cloudflare dashboard, add a billing notification for Realtime
+   usage, so a surprise in relay traffic reaches you before the invoice does.
+4. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
+5. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
    the workerd suite, builds, and deploys with `cloudflare/wrangler-action`. `npm run
    deploy` does the same thing by hand.
 
@@ -220,7 +270,11 @@ automatically on `npm install` (`postinstall`) and is safe to re-run.
 
 `.npmrc` sets `legacy-peer-deps=true`: `@cloudflare/vitest-pool-workers` declares an
 optional peer on `@vitest/browser-playwright` that makes npm's peer resolver crash.
-Exact versions are pinned in `package.json` instead.
+`package-lock.json` plus `npm ci` pins exact versions instead.
+
+`package.json` overrides `sharp` to `^0.35.4`: `@cloudflare/vitest-pool-workers` pins an
+older miniflare whose `sharp` carries a libheif advisory. It is dev tooling only and
+never ships to a browser; drop the override once the pool's own pin moves past it.
 
 ## Layout
 
@@ -235,7 +289,7 @@ worker/upgrade.ts              WebSocket refusals that a browser can actually re
 worker/ratelimit.ts            bounded fixed-window per-key throttle
 src/capture.ts                 getDisplayMedia + track configuration
 src/quality.ts                 encoder params, codec choice, Opus SDP, bitrate adaptation
-src/mesh.ts                    full-mesh peer connections, perfect negotiation
+src/mesh.ts                    peer connections (sharer to everyone, never viewer to viewer), perfect negotiation
 src/signaling.ts               WebSocket client with reconnect and keepalive
 src/stats.ts                   getStats extraction and ICE candidate parsing
 src/diagnostics.ts             connection test page
@@ -275,8 +329,13 @@ Open defects, in rough order of how likely you are to hit them:
   twenty times in an evening and a 7-peer mesh is carrying 40 m-lines per connection.
   The fix is one persistent transceiver per link plus `replaceTrack`.
 - **TURN credentials are cheap to obtain.** Anyone can create a room, join it, and
-  receive two-hour relay credentials on our Cloudflare allocation. The rate limits blunt
-  this; they do not prevent it.
+  receive 12-hour relay credentials on our Cloudflare allocation. They are now per
+  person, revoked on leave, and capped at 20 a minute per address, which blunts this
+  without preventing it. Cloudflare does not say whether revoking also ends a relay
+  already in use. If relay traffic ever runs away, switch TURN off without a deploy:
+  `echo true | npx wrangler secret put TURN_DISABLED` (delete the secret to switch it
+  back on). Direct connections keep working; Hide my IP then refuses to connect, as it
+  must.
 - **`/diagnostics` reports symmetric NAT falsely on multi-homed machines.** It compares
   srflx ports across all local interfaces rather than across STUN servers, so a laptop
   with Wi-Fi and Ethernet both up, or any VPN adapter, looks symmetric even behind a

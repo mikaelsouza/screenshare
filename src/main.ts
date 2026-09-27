@@ -5,7 +5,14 @@
  */
 
 import { hasTurnServer } from "@shared/ice";
-import { MAX_ROOM_SIZE, isValidRoomCode, type PeerId, type PeerInfo } from "@shared/protocol";
+import {
+  MAX_ROOM_SIZE,
+  MIN_PASSWORD_LENGTH,
+  ROOM_CODE_ALPHABET,
+  isValidRoomCode,
+  type PeerId,
+  type PeerInfo,
+} from "@shared/protocol";
 import {
   captureAudioOnly,
   captureScreen,
@@ -35,8 +42,10 @@ function el<T extends HTMLElement>(id: string): T {
 }
 
 const ui = {
+  nameInput: el<HTMLInputElement>("display-name"),
   roomInput: el<HTMLInputElement>("room-code"),
   passInput: el<HTMLInputElement>("room-pass"),
+  genPassBtn: el<HTMLButtonElement>("gen-pass"),
   relayOnly: el<HTMLInputElement>("relay-only"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
@@ -52,6 +61,11 @@ const ui = {
   audioPickSystemBtn: el<HTMLButtonElement>("audio-pick-system"),
   audioPickNoneBtn: el<HTMLButtonElement>("audio-pick-none"),
   stage: el<HTMLDivElement>("stage"),
+  roster: el<HTMLElement>("roster"),
+  rosterTitle: el<HTMLElement>("roster-title"),
+  rosterList: el<HTMLUListElement>("roster-list"),
+  lockBtn: el<HTMLButtonElement>("lock-btn"),
+  surfaceWarning: el<HTMLElement>("surface-warning"),
   status: el<HTMLElement>("status"),
   preset: el<HTMLSelectElement>("preset"),
   codec: el<HTMLSelectElement>("codec"),
@@ -78,6 +92,15 @@ let audioMuted = false;
 let audioLost = false;
 
 const names = new Map<PeerId, string>();
+/** Everyone else in the room and whether they are sharing, for the participant list. */
+const members = new Map<PeerId, { name: string; sharing: boolean; host: boolean }>();
+/** Whether we are this room's host, and whether the room refuses new joins. */
+let isHost = false;
+let roomLocked = false;
+/** Our own id in the current room, once welcomed. */
+let selfId: PeerId | null = null;
+/** The room and password of the current connection, so it can be redone in place. */
+let lastJoin: { code: string; password: string | undefined } | null = null;
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
 const monitors = new Map<PeerId, LinkMonitor>();
@@ -160,7 +183,12 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.muted = true;
     void video.play().then(
       () => showUnmutePrompt(video, peerId),
-      () => setStatus("The browser blocked video playback. Click the tile to start it.", "warn"),
+      () => {
+        // play() rejects when the tile is torn down mid-attempt, e.g. on being
+        // removed from the room; that must not overwrite the status saying so.
+        if (tiles.get(peerId) !== video) return;
+        setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
+      },
     );
   });
 }
@@ -246,6 +274,102 @@ function renderSelfPreview(stream: MediaStream | null): void {
   // Muted playback is always permitted by the autoplay policy, but call play()
   // explicitly so the preview does not depend on the attribute alone.
   void v.play().catch(() => {});
+}
+
+// ---- participants --------------------------------------------------------
+
+/**
+ * The host token for a room, kept per tab. sessionStorage survives a refresh, so the
+ * host stays host; a new tab or a friend's browser does not have it, so a forwarded
+ * link never makes anyone else the host.
+ */
+function hostTokenFor(code: string): string | undefined {
+  try {
+    return sessionStorage.getItem(`host:${code}`) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The rejoin ticket from this tab's last welcome in a room; see RoomInfo.rejoinToken. */
+function rejoinTokenFor(code: string): string | undefined {
+  try {
+    return sessionStorage.getItem(`rejoin:${code}`) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveRejoinToken(code: string, token: string | undefined): void {
+  try {
+    if (token) sessionStorage.setItem(`rejoin:${code}`, token);
+    else sessionStorage.removeItem(`rejoin:${code}`);
+  } catch {
+    // Storage blocked: a reconnect into a locked room will be refused, nothing worse.
+  }
+}
+
+function saveHostToken(code: string, token: string): void {
+  try {
+    sessionStorage.setItem(`host:${code}`, token);
+  } catch {
+    // Storage blocked: still host for this connection, just not after a refresh.
+  }
+}
+
+/** First four characters of a peer id, so two people with the same name can be told apart. */
+function shortId(id: PeerId): string {
+  return id.slice(0, 4);
+}
+
+/**
+ * The participant list. Everyone in the room is on it, including people who only
+ * watch: they never get a video tile, and before this list existed a sharer had no
+ * way to know they were there.
+ */
+function renderRoster(): void {
+  if (!client || selfId === null) {
+    ui.roster.hidden = true;
+    ui.rosterList.replaceChildren();
+    return;
+  }
+  ui.roster.hidden = false;
+  const others = [...members.entries()];
+  const title = capture
+    ? `Sharing to ${others.length} ${others.length === 1 ? "person" : "people"}`
+    : `In this room (${others.length + 1})`;
+  ui.rosterTitle.textContent = `${title}${roomLocked ? ", locked" : ""}:`;
+  ui.lockBtn.hidden = !isHost;
+  ui.lockBtn.textContent = roomLocked ? "Unlock room" : "Lock room";
+
+  const items: HTMLLIElement[] = [];
+  const add = (id: PeerId, name: string, sharing: boolean, self: boolean, host: boolean): void => {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = `${name}${self ? " (you)" : ""}${host ? " (host)" : ""}`;
+    const idEl = document.createElement("span");
+    idEl.className = "peer-id";
+    idEl.textContent = shortId(id);
+    li.append(label, idEl);
+    if (sharing) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "sharing";
+      li.append(badge);
+    }
+    if (isHost && !self) {
+      const kick = document.createElement("button");
+      kick.type = "button";
+      kick.textContent = "Remove";
+      kick.title = `Remove ${name} from the room. They can't rejoin for 15 minutes.`;
+      kick.addEventListener("click", () => client?.kick(id));
+      li.append(kick);
+    }
+    items.push(li);
+  };
+  add(selfId, currentName(), capture !== null, true, isHost);
+  for (const [id, m] of others) add(id, m.name, m.sharing, false, m.host);
+  ui.rosterList.replaceChildren(...items);
 }
 
 // ---- sharing -------------------------------------------------------------
@@ -468,6 +592,9 @@ async function startSharingInner(): Promise<void> {
   if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
+  // Announced before any offer goes out: viewers connect only to sharers, and the
+  // server refuses an offer when neither side is sharing.
+  client?.setSharing(true);
   try {
     await mesh.setCapture(capture);
   } catch (err) {
@@ -479,8 +606,10 @@ async function startSharingInner(): Promise<void> {
     return;
   }
 
-  client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
+  // A whole-screen share shows notifications, chat pop-ups and every other window.
+  ui.surfaceWarning.hidden = capture.surface !== "monitor";
+  renderRoster();
   audioMuted = false;
   audioLost = false;
   renderAudioControls();
@@ -506,10 +635,24 @@ async function stopSharing(): Promise<void> {
   renderSelfPreview(null);
   client?.setSharing(false);
   ui.shareBtn.textContent = "Share screen";
+  ui.surfaceWarning.hidden = true;
+  renderRoster();
   renderAudioControls();
 }
 
 // ---- room ----------------------------------------------------------------
+
+/** The display name to join with: what the user typed, else a remembered or random one. */
+function currentName(): string {
+  const typed = ui.nameInput.value.trim().slice(0, 32);
+  if (typed) return typed;
+  let stored = localStorage.getItem("name");
+  if (!stored) {
+    stored = `guest-${Math.random().toString(36).slice(2, 6)}`;
+    localStorage.setItem("name", stored);
+  }
+  return stored;
+}
 
 /** Incremented per join so a superseded in-flight join can detect it lost the race. */
 let joinGeneration = 0;
@@ -521,11 +664,13 @@ async function joinRoom(code: string, password?: string): Promise<void> {
   }
 
   const codeToJoin = code;
+  // A share carries over a reconnect to the same room, never into a different one.
+  if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
   const generation = ++joinGeneration;
   leaveRoom();
   if (generation !== joinGeneration) return;
-  const displayName = localStorage.getItem("name") ?? `guest-${Math.random().toString(36).slice(2, 6)}`;
-  localStorage.setItem("name", displayName);
+  const displayName = currentName();
+  lastJoin = { code, password };
 
   client = new SignalingClient(
     code,
@@ -538,7 +683,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             : `Connection ${s}…`,
         ),
 
-      onWelcome: (selfId, peers, iceServers) => {
+      onWelcome: (selfIdFromServer, peers, iceServers, room) => {
         // The signalling socket reconnects on any network blip, and the server issues
         // a fresh peer id each time, so onWelcome fires again. Without closing the old
         // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
@@ -546,6 +691,15 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // with every reconnect.
         mesh?.close();
         monitors.clear();
+        members.clear();
+        selfId = null;
+        if (room.hostToken) saveHostToken(code, room.hostToken);
+        saveRejoinToken(code, room.rejoinToken);
+        // Tiles from before a reconnect belong to links that no longer exist; anyone
+        // still sharing is connected afresh and gets a new tile.
+        for (const id of [...tiles.keys()]) removeTile(id);
+        isHost = room.host;
+        roomLocked = room.locked;
 
         // Minted by the Durable Object and delivered with the welcome, so holding a
         // joined WebSocket is what authorises them.
@@ -573,7 +727,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 
         relayActive = relayOnly;
         mesh = new Mesh(
-          selfId,
+          selfIdFromServer,
           {
             iceServers: servers,
             preset: QUALITY_PRESETS[currentPreset()],
@@ -596,38 +750,89 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             },
           },
         );
+        // Connect only to the people who are sharing (and to everyone once we share);
+        // see Mesh.members for why viewers never connect to each other.
+        selfId = selfIdFromServer;
         for (const p of peers) {
           names.set(p.id, p.name);
-          mesh.addPeer(p.id);
+          members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
+          mesh.addMember(p.id, p.sharing);
         }
         setStatus(
           `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
         );
-        if (capture) void mesh.setCapture(capture);
+        if (capture) {
+          // Still sharing across a reconnect or a Hide my IP switch. The server has
+          // this socket down as not sharing, so say so first: others connect only to
+          // sharers, and the server relays an offer only when one side shares.
+          client?.setSharing(true);
+          void mesh.setCapture(capture);
+        }
         startHealthPolling();
+        renderRoster();
       },
 
       onPeerJoined: (peer: PeerInfo) => {
         names.set(peer.id, peer.name);
-        mesh?.addPeer(peer.id);
+        members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
+        mesh?.addMember(peer.id, peer.sharing);
         setStatus(`${peer.name} joined room ${code}`, "info");
+        renderRoster();
       },
       onPeerLeft: (id) => {
-        mesh?.removePeer(id);
+        mesh?.removeMember(id);
         names.delete(id);
+        members.delete(id);
         removeTile(id);
+        renderRoster();
       },
       onSignal: (from, data) => void mesh?.handleSignal(from, data),
       onPeerState: (id, sharing) => {
         if (!sharing) removeTile(id);
+        const m = members.get(id);
+        if (m) m.sharing = sharing;
+        mesh?.setMemberSharing(id, sharing);
+        renderRoster();
+      },
+      onRoomState: (locked) => {
+        roomLocked = locked;
+        renderRoster();
       },
       onError: (code, message) => {
+        // Both close the socket for good. Tear the room down too: a kicked peer's
+        // connections to others would otherwise linger until they time out.
+        if (code === "kicked") {
+          // Stop the capture too. Left running, the browser kept sharing the screen
+          // and the next room joined would have been sent it without asking.
+          void stopSharing();
+          saveRejoinToken(codeToJoin, undefined);
+          lastJoin = null;
+          leaveRoom();
+          setStatus("You were removed from this room by its host.", "error");
+          return;
+        }
+        if (code === "room-locked") {
+          void stopSharing();
+          lastJoin = null;
+          leaveRoom();
+          setStatus(`Room ${codeToJoin} is locked. Ask its host to unlock it.`, "error");
+          return;
+        }
+        if (code === "not-host") {
+          setStatus(message, "warn");
+          return;
+        }
         // A wrong password is the one error the user can actually fix from here, so
         // say so in plain language and put the cursor where the fix goes. The socket
         // is closed with 1008 and will not retry by itself, but joinRoom() builds a
         // fresh SignalingClient, so pressing Join (or Enter) genuinely retries.
         if (code === "password-ignored") {
           setStatus(message, "warn");
+          return;
+        }
+        if (code === "weak-password") {
+          setStatus(message, "warn");
+          ui.passInput.focus();
           return;
         }
         if (code === "bad-password") {
@@ -642,6 +847,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       },
     },
     password,
+    () => ({ hostToken: hostTokenFor(code), rejoinToken: rejoinTokenFor(code) }),
   );
 
   client.connect();
@@ -658,6 +864,11 @@ function leaveRoom(): void {
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
   names.clear();
+  members.clear();
+  selfId = null;
+  isHost = false;
+  roomLocked = false;
+  renderRoster();
   ui.muteAudioBtn.style.display = "none";
 }
 
@@ -706,8 +917,13 @@ function initQualityControls(): void {
   ui.relayOnly.checked = localStorage.getItem("relay_only") === "true";
   ui.relayOnly.addEventListener("change", () => {
     localStorage.setItem("relay_only", String(ui.relayOnly.checked));
-    if (mesh) {
-      setStatus("Privacy mode change will apply on next room connection.", "info");
+    // Apply it now by reconnecting, not "next time": every new connection made until
+    // then would hand out the address the user just asked to hide.
+    // lastJoin, not client: after Hide my IP refused to connect there is no client,
+    // and unticking it is exactly how the status line says to get in.
+    if (lastJoin) {
+      void joinRoom(lastJoin.code, lastJoin.password);
+      setStatus(ui.relayOnly.checked ? "Reconnecting with your IP hidden…" : "Reconnecting…", "info");
     }
   });
 
@@ -732,6 +948,19 @@ function initQualityControls(): void {
 }
 
 initQualityControls();
+
+ui.lockBtn.addEventListener("click", () => {
+  // The button flips when the server confirms with room-state, not before.
+  client?.setLocked(!roomLocked);
+});
+
+ui.nameInput.value = localStorage.getItem("name") ?? "";
+ui.nameInput.addEventListener("change", () => {
+  const name = ui.nameInput.value.trim().slice(0, 32);
+  if (name) localStorage.setItem("name", name);
+  // Takes effect on the next join: the server learns a name only from `join`.
+  if (client) setStatus("Your new name shows the next time you join.", "info");
+});
 
 // Warn on load rather than only on click — a disabled-looking Share button with no
 // explanation is the worst version of this.
@@ -763,7 +992,40 @@ for (const input of [ui.roomInput, ui.passInput]) {
   });
 }
 
+/**
+ * A random password friends can read out: 12 characters from the room-code alphabet,
+ * which has no look-alikes, in groups of four. About 59 bits.
+ */
+function generatePassword(): string {
+  const out: string[] = [];
+  const limit = Math.floor(256 / ROOM_CODE_ALPHABET.length) * ROOM_CODE_ALPHABET.length;
+  const buf = new Uint8Array(32);
+  while (out.length < 12) {
+    crypto.getRandomValues(buf);
+    for (const b of buf) {
+      if (b < limit && out.length < 12) out.push(ROOM_CODE_ALPHABET.charAt(b % ROOM_CODE_ALPHABET.length));
+    }
+  }
+  return [out.slice(0, 4), out.slice(4, 8), out.slice(8)].map((g) => g.join("")).join("-");
+}
+
+ui.genPassBtn.addEventListener("click", () => {
+  ui.passInput.value = generatePassword();
+  // Shown, not masked: the point is to copy it to friends.
+  ui.passInput.type = "text";
+  ui.passInput.select();
+});
+ui.passInput.addEventListener("input", () => {
+  if (ui.passInput.value === "") ui.passInput.type = "password";
+});
+
 ui.createBtn.addEventListener("click", () => {
+  const pass = ui.passInput.value.trim();
+  if (pass && pass.length < MIN_PASSWORD_LENGTH) {
+    setStatus(`Room passwords need at least ${MIN_PASSWORD_LENGTH} characters. Or press Generate.`, "warn");
+    ui.passInput.focus();
+    return;
+  }
   void (async () => {
     // Without the ok check a 500 or an HTML error page throws inside this voided
     // IIFE, so the button looks completely inert with the stale status still shown.
@@ -787,15 +1049,17 @@ ui.shareBtn.addEventListener("click", () => {
 
 window.addEventListener("beforeunload", () => leaveRoom());
 
-// Deep link: /#ROOMCODE joins straight away.
+// Deep link: /#ROOMCODE fills in the room, and waits for Join.
 //
-// The password box is necessarily empty this early, so a link to a protected room
-// gets rejected on this first attempt. That is fine, and better than not trying at
-// all: the overwhelmingly common case is an unprotected room, and `bad-password` is
-// handled as a recoverable prompt rather than a dead end, so the protected case turns
-// into "enter the password and press Enter" instead of a silent failure.
+// It used to join straight away. Joining connects you to whoever is sharing, which
+// hands them your IP address, and a first-time visitor on a forwarded link had not
+// even seen the Hide my IP option yet. Now they see it, and the note under it, first.
 const fromHash = location.hash.replace(/^#/, "").toUpperCase();
-if (fromHash) {
+if (isValidRoomCode(fromHash)) {
   ui.roomInput.value = fromHash;
-  void joinRoom(fromHash, ui.passInput.value.trim() || undefined);
+  setStatus(
+    `Room ${fromHash}: choose your name and whether to hide your IP, then press Join.`,
+    "info",
+  );
+  ui.joinBtn.focus();
 }

@@ -1,7 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignalData } from "@shared/protocol";
 import type { CaptureResult } from "@src/capture";
-import { Mesh, type MeshCallbacks, type MeshOptions } from "@src/mesh";
+import {
+  Mesh,
+  type MeshCallbacks,
+  type MeshOptions,
+  keepRelayCandidatesOnly,
+  parseControlMessage,
+} from "@src/mesh";
 
 class FakeDataChannel {
   readyState = "open";
@@ -59,10 +65,18 @@ class FakeRTCPeerConnection {
 
   async setLocalDescription(desc: RTCSessionDescriptionInit): Promise<void> {
     this.localDescription = { type: desc.type ?? "offer", sdp: desc.sdp ?? "" };
+    this.signalingState = this.localDescription.type === "offer" ? "have-local-offer" : "stable";
   }
 
   async setRemoteDescription(desc: RTCSessionDescriptionInit): Promise<void> {
     this.remoteDescription = { type: desc.type ?? "answer", sdp: desc.sdp ?? "" };
+    // An offer in have-local-offer is Chrome's implicit rollback: ours is dropped.
+    this.signalingState = this.remoteDescription.type === "offer" ? "have-remote-offer" : "stable";
+  }
+
+  restartIceCalls = 0;
+  restartIce(): void {
+    this.restartIceCalls++;
   }
 
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
@@ -89,8 +103,8 @@ class FakeRTCPeerConnection {
     return sender;
   }
 
-  addTransceiver(_kind: string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
-    const sender = this.addTrack(null);
+  addTransceiver(trackOrKind: MediaStreamTrack | string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
+    const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
     return this.transceivers.find((t) => t.sender === sender)!;
   }
 
@@ -135,20 +149,25 @@ describe("Mesh and PeerLink", () => {
     };
   });
 
-  it("determines polite role based on peer IDs (selfId < peerId)", () => {
+  it("lets the initiator open the control channel, by id order only when both share", () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
 
-    // alice < bob -> alice is polite, bob is impolite.
-    // The impolite side creates the control channel.
+    // The initiator opens it whatever its politeness (alice < bob: alice is polite).
     mesh.addPeer("bob");
     const pc1 = FakeRTCPeerConnection.instances[0]!;
-    expect(pc1.dataChannels.length).toBe(0); // polite side did not create
+    expect(pc1.dataChannels.map((c) => c.label)).toEqual(["control"]);
 
-    // alice > aaron -> alice is impolite, creates control channel
+    // Both sharing, so both may be initiating: only the impolite (larger id) side opens it.
+    mesh.addMember("carol", true);
+    mesh.addPeer("carol");
+    expect(FakeRTCPeerConnection.instances[1]!.dataChannels).toHaveLength(0);
+    mesh.addMember("aaron", true);
     mesh.addPeer("aaron");
-    const pc2 = FakeRTCPeerConnection.instances[1]!;
-    expect(pc2.dataChannels.length).toBe(1);
-    expect(pc2.dataChannels[0]?.label).toBe("control");
+    expect(FakeRTCPeerConnection.instances[2]!.dataChannels).toHaveLength(1);
+
+    // The answering side never opens one.
+    mesh.addPeer("zed", true);
+    expect(FakeRTCPeerConnection.instances[3]!.dataChannels).toHaveLength(0);
   });
 
   it("applies iceTransportPolicy 'relay' when relayOnly is true and filters non-relay candidates", () => {
@@ -436,5 +455,265 @@ describe("Mesh and PeerLink", () => {
     pc.createOffer = vi.fn().mockRejectedValue(new Error("offer creation failed"));
     pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 20));
+  });
+});
+
+describe("relay-only hardening", () => {
+  const SDP_WITH_CANDIDATES = [
+    "v=0",
+    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+    "a=candidate:1 1 udp 2122260223 192.168.1.100 54321 typ host generation 0",
+    "a=candidate:2 1 udp 1686052607 203.0.113.7 61000 typ srflx raddr 192.168.1.100 rport 54321",
+    "a=candidate:3 1 udp 41885439 198.51.100.9 60000 typ relay raddr 203.0.113.7 rport 61000",
+    "a=rtpmap:111 opus/48000/2",
+    "",
+  ].join("\r\n");
+
+  it("strips every non-relay candidate line from SDP and keeps everything else", () => {
+    const out = keepRelayCandidatesOnly(SDP_WITH_CANDIDATES);
+    expect(out).not.toContain("192.168.1.100 54321 typ host");
+    expect(out).not.toContain("typ srflx");
+    expect(out).toContain("typ relay");
+    expect(out).toContain("a=rtpmap:111 opus/48000/2");
+    expect(out.endsWith("\r\n")).toBe(true);
+  });
+
+  let sent: SignalData[];
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    sent = [];
+  });
+
+  function relayMesh(relayOnly: boolean): FakeRTCPeerConnection {
+    const opts: MeshOptions = {
+      iceServers: [{ urls: "turn:turn.example.com" }],
+      preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+      codec: "h264",
+      jitterBufferTargetMs: 0,
+      relayOnly,
+    };
+    const mesh = new Mesh("alice", opts, (_to, data) => sent.push(data), {
+      onRemoteStream: vi.fn(),
+      onRemoteStreamGone: vi.fn(),
+      onConnectionState: vi.fn(),
+    });
+    mesh.addPeer("bob");
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.createOffer = async () => ({ type: "offer", sdp: SDP_WITH_CANDIDATES });
+    pc.createAnswer = async () => ({ type: "answer", sdp: SDP_WITH_CANDIDATES });
+    return pc;
+  }
+
+  it("sends only relay candidates inside offers and answers in relay-only mode", async () => {
+    const pc = relayMesh(true);
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 10));
+    const offer = sent.find((d) => d.k === "offer");
+    expect(offer && "sdp" in offer ? offer.sdp : "").not.toMatch(/typ (host|srflx)/);
+  });
+
+  it("leaves SDP untouched when relay-only is off", async () => {
+    const pc = relayMesh(false);
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 10));
+    const offer = sent.find((d) => d.k === "offer");
+    expect(offer && "sdp" in offer ? offer.sdp : "").toContain("typ srflx");
+  });
+
+  it("drops a candidate it cannot classify instead of sending it", () => {
+    const pc = relayMesh(true);
+    pc.onicecandidate?.({ candidate: { candidate: "", sdpMid: "0", sdpMLineIndex: 0 } as unknown as RTCIceCandidate });
+    expect(sent.filter((d) => d.k === "ice")).toHaveLength(0);
+  });
+
+  it("closes data channels other than the control channel", () => {
+    const pc = relayMesh(false);
+    const stray = new FakeDataChannel("exfil");
+    pc.ondatachannel?.({ channel: stray as unknown as RTCDataChannel });
+    expect(stray.readyState).toBe("closed");
+  });
+});
+
+describe("parseControlMessage", () => {
+  it("accepts a well-formed view message", () => {
+    expect(parseControlMessage('{"c":"view","want":false}')).toEqual({ c: "view", want: false });
+  });
+
+  it.each([
+    ["null", "null"],
+    ["an array", "[]"],
+    ["a non-boolean want", '{"c":"view","want":"x"}'],
+    ["an unknown type", '{"c":"other","want":true}'],
+    ["invalid JSON", "not json"],
+    ["an oversized payload", JSON.stringify({ c: "view", want: true, pad: "x".repeat(10_000) })],
+  ])("rejects %s", (_name, raw) => {
+    expect(parseControlMessage(raw)).toBeNull();
+  });
+
+  it("rejects binary payloads", () => {
+    expect(parseControlMessage(new ArrayBuffer(8))).toBeNull();
+  });
+});
+
+describe("Mesh connects only where someone is sharing", () => {
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }] }),
+    };
+  });
+
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+  };
+  const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
+  const capture = (): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    return { stream: { getTracks: () => [video] } as unknown as MediaStream, video, audio: null };
+  };
+
+  it("creates no connection to members who are not sharing", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", false);
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+  });
+
+  it("leaves connecting to the sharer, and drops the link when they stop", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    mesh.addMember("carol", false);
+    // The sharer offers; a viewer starting its own link as well is what caused glare.
+    expect(mesh.peers()).toEqual([]);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual(["bob"]);
+    // The answering side never opens the control channel; the sharer did.
+    expect(FakeRTCPeerConnection.instances[0]?.dataChannels).toHaveLength(0);
+
+    mesh.setMemberSharing("bob", false);
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances[0]?.closed).toBe(true);
+  });
+
+  it("connects to everyone while we share, and back to sharers only afterwards", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", true);
+    await mesh.handleSignal("carol", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual(["carol"]);
+
+    await mesh.setCapture(capture());
+    expect(mesh.peers().sort()).toEqual(["bob", "carol"]);
+    // Every link carries exactly one video and one audio sender: no double attach.
+    for (const pc of FakeRTCPeerConnection.instances) expect(pc.senders).toHaveLength(2);
+
+    // A member joining mid-share is connected at once.
+    mesh.addMember("dave", false);
+    expect(mesh.peers()).toContain("dave");
+
+    await mesh.setCapture(null);
+    expect(mesh.peers()).toEqual(["carol"]);
+  });
+
+  it("ignores an offer from someone who is not sharing", async () => {
+    // The server refuses these too; a viewer must never be able to make another
+    // viewer connect to it and reveal their address.
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+  });
+
+  it("does not bring a closed link back for a late candidate or answer", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
+    expect(mesh.peers()).toEqual([]);
+    await mesh.handleSignal("bob", { k: "ice", candidate: { candidate: "candidate:1 1 udp 1 1.2.3.4 5 typ host", sdpMid: "0", sdpMLineIndex: 0 } });
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual([]);
+  });
+
+  it("keeps the link to a sharer when we stop sharing ourselves", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
+    expect(mesh.peers()).toEqual(["bob"]);
+    expect(FakeRTCPeerConnection.instances[0]?.closed).toBe(false);
+  });
+
+  it("removes a member's link when they leave", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    mesh.removeMember("bob");
+    expect(mesh.peers()).toEqual([]);
+  });
+});
+
+describe("negotiation recovery", () => {
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+    relayOnly: false,
+  };
+  const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
+  const capture = (): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    return { stream: { getTracks: () => [video] } as unknown as MediaStream, video, audio: null };
+  };
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }] }),
+    };
+  });
+
+  it("offers again after losing a glare as the polite side", async () => {
+    // "me" < "zed", so we are polite: their offer wins and ours is rolled back. What
+    // ours carried still has to be offered, or our video to them never arrives.
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    mesh.addMember("zed", true);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.signalingState = "have-local-offer"; // our offer is out
+    await mesh.handleSignal("zed", { k: "offer", sdp: "v=0\r\n" });
+    await flush();
+    const kinds = sent.map((d) => d.k);
+    expect(kinds).toContain("answer");
+    expect(kinds.lastIndexOf("offer")).toBeGreaterThan(kinds.indexOf("answer"));
+  });
+
+  it("restarts ICE from the sharing side when a link fails, and only there", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+    const sharerPc = FakeRTCPeerConnection.instances[0]!;
+    sharerPc.connectionState = "failed";
+    sharerPc.onconnectionstatechange?.();
+    expect(sharerPc.restartIceCalls).toBe(1);
+
+    const viewer = new Mesh("v", opts, () => {}, cb());
+    viewer.addMember("s", true);
+    await viewer.handleSignal("s", { k: "offer", sdp: "v=0\r\n" });
+    const viewerPc = FakeRTCPeerConnection.instances[1]!;
+    viewerPc.connectionState = "failed";
+    viewerPc.onconnectionstatechange?.();
+    expect(viewerPc.restartIceCalls).toBe(0);
   });
 });

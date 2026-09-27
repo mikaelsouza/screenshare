@@ -121,7 +121,10 @@ describe("SignalingClient reconnection", () => {
         iceServers: [{ urls: "stun:example.com" }],
       }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }]);
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }], {
+      host: false,
+      locked: false,
+    });
 
     // peer-joined
     ws.onmessage?.({
@@ -223,7 +226,7 @@ describe("SignalingClient reconnection", () => {
         peers: [],
       }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], []);
+    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], [], { host: false, locked: false });
     c.close();
   });
 });
@@ -291,4 +294,64 @@ describe("SignalingClient capacity refusals", () => {
     for (let i = 0; i < 4; i++) refuse();
     expect(FakeWebSocket.instances.length).toBe(afterWelcome + 4);
   });
+
+  it("sends the host token on every connect and passes the room state on", () => {
+    const h = { ...handlers(), onRoomState: vi.fn() };
+    let token: string | undefined;
+    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ hostToken: token }));
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    expect(JSON.parse(ws.sent[0]!)).not.toHaveProperty("hostToken");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], iceServers: [], host: true, hostToken: "tok", locked: false }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], [], { host: true, hostToken: "tok", locked: false });
+    token = "tok";
+
+    ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
+    expect(h.onRoomState).toHaveBeenCalledWith(true);
+
+    ws.serverClose(1006);
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    expect(JSON.parse(ws2.sent[0]!).hostToken).toBe("tok");
+    c.close();
+  });
+
+  it("leaves the server's reason on screen when it refuses us", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "bad-password", message: "This room needs a password" }) });
+    ws.serverClose(1008);
+    expect(h.onError).toHaveBeenCalledWith("bad-password", "This room needs a password");
+    // Reporting "closed" after the error replaced the explanation with "Connection closed…".
+    expect(h.onStatus).not.toHaveBeenCalledWith("closed");
+  });
+
+  it("sends the rejoin ticket from the last welcome on the next join", () => {
+    const h = handlers();
+    let rejoin: string | undefined;
+    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ rejoinToken: rejoin }));
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], iceServers: [], host: false, rejoinToken: "r1", locked: true }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], [], { host: false, rejoinToken: "r1", locked: true });
+    rejoin = "r1";
+    ws.serverClose(1006);
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    expect(JSON.parse(ws2.sent[0]!).rejoinToken).toBe("r1");
+    c.close();
+  });
 });
+

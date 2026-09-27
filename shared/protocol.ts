@@ -25,6 +25,12 @@ export const MAX_SDP_LENGTH = 64 * 1024;
 /** Largest ICE candidate line accepted. Real ones are a couple of hundred bytes. */
 export const MAX_CANDIDATE_LENGTH = 1024;
 
+/**
+ * Peer ids are server-issued crypto.randomUUID() values. Anything else in a `to` field
+ * cannot name a peer, so it is rejected at parse time rather than carried further.
+ */
+export const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export const PING = "ping";
 export const PONG = "pong";
 
@@ -40,6 +46,8 @@ export interface PeerInfo {
   id: PeerId;
   name: string;
   sharing: boolean;
+  /** The room's creator, who can remove people and lock the room. */
+  host?: boolean;
 }
 export interface IceCandidateInit {
   candidate: string;
@@ -53,18 +61,46 @@ export type SignalData =
   | { k: "ice"; candidate: IceCandidateInit };
 
 export type ClientMessage =
-  | { t: "join"; room: string; displayName: string; password?: string }
+  | {
+      t: "join";
+      room: string;
+      displayName: string;
+      password?: string;
+      /** Proof of being the room's creator, from an earlier welcome. */
+      hostToken?: string;
+      /** Proof of having been in this room, from the last welcome: rejoin past a lock. */
+      rejoinToken?: string;
+      /** The diagnostics page: a throwaway join that claims nothing and gets short-lived TURN. */
+      diagnostics?: boolean;
+    }
   | { t: "signal"; to: PeerId; data: SignalData }
-  | { t: "state"; sharing: boolean };
+  | { t: "state"; sharing: boolean }
+  /** Host only: remove a peer from the room. */
+  | { t: "kick"; id: PeerId }
+  /** Host only: refuse (or allow again) new joins. */
+  | { t: "lock"; locked: boolean };
 
 export type ServerMessage =
   // iceServers ride along with the welcome rather than being served from a public
   // endpoint: possession of a joined WebSocket is what authorises TURN credentials.
-  | { t: "welcome"; selfId: PeerId; peers: PeerInfo[]; iceServers: IceServerConfig[] }
+  | {
+      t: "welcome";
+      selfId: PeerId;
+      peers: PeerInfo[];
+      iceServers: IceServerConfig[];
+      /** Whether this socket is the room's host. */
+      host: boolean;
+      /** Issued once, to the join that creates the room. Keep it to stay host on reconnect. */
+      hostToken?: string;
+      /** Present it on the next join to get back in even if the room is locked. */
+      rejoinToken?: string;
+      locked: boolean;
+    }
   | { t: "peer-joined"; peer: PeerInfo }
   | { t: "peer-left"; id: PeerId }
   | { t: "signal"; from: PeerId; data: SignalData }
   | { t: "peer-state"; id: PeerId; sharing: boolean }
+  | { t: "room-state"; locked: boolean }
   | { t: "error"; code: ErrorCode; message: string };
 
 export type ErrorCode =
@@ -75,7 +111,19 @@ export type ErrorCode =
   | "bad-password"
   | "password-ignored"
   | "forbidden-origin"
-  | "rate-limited";
+  | "rate-limited"
+  | "join-timeout"
+  | "weak-password"
+  | "kicked"
+  | "room-locked"
+  | "not-host"
+  | "not-sharing";
+
+/** Longest host token accepted. Real ones are UUIDs, 36 characters. */
+export const MAX_HOST_TOKEN_LENGTH = 64;
+
+/** Shortest password a new room accepts. Enforced by the server on the claiming join. */
+export const MIN_PASSWORD_LENGTH = 8;
 
 /**
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.
@@ -144,6 +192,15 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           if (typeof record.password === "string") {
             joinMsg.password = record.password;
           }
+          if (typeof record.hostToken === "string" && record.hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.hostToken = record.hostToken;
+          }
+          if (typeof record.rejoinToken === "string" && record.rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.rejoinToken = record.rejoinToken;
+          }
+          if (record.diagnostics === true) {
+            joinMsg.diagnostics = true;
+          }
           return joinMsg;
         }
         return null;
@@ -152,6 +209,7 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       case "signal": {
         if (
           typeof record.to !== "string" ||
+          !PEER_ID.test(record.to) ||
           typeof record.data !== "object" ||
           record.data === null ||
           Array.isArray(record.data)
@@ -222,6 +280,20 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           };
         }
 
+        return null;
+      }
+
+      case "kick": {
+        if (typeof record.id === "string" && PEER_ID.test(record.id)) {
+          return { t: "kick", id: record.id };
+        }
+        return null;
+      }
+
+      case "lock": {
+        if (typeof record.locked === "boolean") {
+          return { t: "lock", locked: record.locked };
+        }
         return null;
       }
 

@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PORT_53, dropPort53, hasTurnServer, hasUrls } from "@shared/ice";
-import type { IceServerConfig } from "@shared/protocol";
-import { FAILED_MINT_CACHE_MS, TURN_TTL_SECONDS, getIceServers } from "../../worker/turn";
+import {
+  DIAGNOSTICS_TURN_TTL_SECONDS,
+  FAILED_MINT_CACHE_MS,
+  TURN_TTL_SECONDS,
+  getIceServers,
+  revokeCredential,
+} from "../../worker/turn";
 
 
 describe("PORT_53", () => {
@@ -161,33 +166,31 @@ describe("worker turn credentials", () => {
     }
   });
 
-  it("getIceServers returns cached servers when valid", async () => {
-    const { getIceServers } = await import("@worker/turn");
-    const env = { TURN_KEY_ID: "", TURN_API_TOKEN: "" } as unknown as import("@worker/turn").TurnEnv;
-    const cache = {
-      current: {
-        iceServers: [{ urls: "stun:cached.com" }],
-        expiresAt: Date.now() + 100_000,
-      },
-    };
-
-    const servers = await getIceServers(env, cache);
-    expect(servers).toEqual([{ urls: "stun:cached.com" }]);
+  it("mintIceServers returns the TURN username so it can be revoked", async () => {
+    const { mintIceServers } = await import("@worker/turn");
+    vi.stubGlobal("fetch", async () =>
+      Response.json({ iceServers: [{ urls: ["turn:h:3478"], username: "user-1", credential: "c" }] }),
+    );
+    try {
+      const res = await mintIceServers({ TURN_KEY_ID: "k", TURN_API_TOKEN: "t" });
+      expect(res.username).toBe("user-1");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
-  it("getIceServers refreshes cache when expired", async () => {
-    const { getIceServers } = await import("@worker/turn");
-    const env = { TURN_KEY_ID: "", TURN_API_TOKEN: "" } as unknown as import("@worker/turn").TurnEnv;
-    const cache = {
-      current: {
-        iceServers: [{ urls: "stun:expired.com" }],
-        expiresAt: Date.now() - 1000,
-      },
-    };
-
-    const servers = await getIceServers(env, cache);
-    expect(servers).toEqual([{ urls: "stun:stun.cloudflare.com:3478" }]);
-    expect(cache.current?.expiresAt).toBeGreaterThan(Date.now());
+  it("mintIceServers makes no API call with the kill switch on", async () => {
+    const { mintIceServers } = await import("@worker/turn");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    try {
+      const res = await mintIceServers({ TURN_KEY_ID: "k", TURN_API_TOKEN: "t", TURN_DISABLED: "true" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(hasTurnServer(res.iceServers)).toBe(false);
+      expect(res.username).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -215,62 +218,89 @@ describe("hasTurnServer", () => {
   });
 });
 
-describe("getIceServers caching", () => {
-  const OK_RESPONSE = {
-    iceServers: [
-      { urls: ["turn:turn.cloudflare.com:3478?transport=udp"], username: "u", credential: "c" },
-    ],
-  };
-
-  function fakeFetch(queue: Array<Response | Error>): { calls: number } {
-    const state = { calls: 0 };
-    vi.stubGlobal("fetch", async () => {
-      const next = queue[Math.min(state.calls, queue.length - 1)];
-      state.calls++;
+describe("getIceServers per peer", () => {
+  function fakeFetch(queue: Array<Response | Error>): { calls: { url: string; body: unknown }[] } {
+    const state = { calls: [] as { url: string; body: unknown }[] };
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      const next = queue[Math.min(state.calls.length, queue.length - 1)];
+      state.calls.push({ url, body: init?.body ? JSON.parse(String(init.body)) : undefined });
       if (next instanceof Error) throw next;
       return next!.clone();
     });
     return state;
   }
 
+  const ok = (username: string) =>
+    Response.json({ iceServers: [{ urls: ["turn:turn.cloudflare.com:3478?transport=udp"], username, credential: "c" }] });
+
   afterEach(() => vi.unstubAllGlobals());
 
   const env = { TURN_KEY_ID: "k", TURN_API_TOKEN: "t" };
 
-  it("serves a successful mint from cache instead of re-minting", async () => {
-    const calls = fakeFetch([Response.json(OK_RESPONSE)]);
-    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
-    await getIceServers(env, cache);
-    await getIceServers(env, cache);
-    expect(calls.calls).toBe(1);
+  it("mints a fresh credential for every join", async () => {
+    const state = fakeFetch([ok("a"), ok("b")]);
+    const backoff = { failedUntil: 0 };
+    const first = await getIceServers(env, backoff);
+    const second = await getIceServers(env, backoff);
+    expect(state.calls.length).toBe(2);
+    expect([first.username, second.username]).toEqual(["a", "b"]);
   });
 
-  it("retries a failed mint in seconds, not after the credential TTL", async () => {
-    // A mint that fails falls back to STUN only. Caching that for the full TTL left the
-    // room with no relay for nearly two hours on one transient error: every pair behind
-    // a symmetric NAT silently fails, and relay-only is unavailable to everyone.
-    const calls = fakeFetch([new Error("network down"), Response.json(OK_RESPONSE)]);
-    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
-
-    const first = await getIceServers(env, cache);
-    expect(hasTurnServer(first)).toBe(false);
-
-    const ttl = cache.current!.expiresAt - Date.now();
-    expect(ttl).toBeLessThanOrEqual(FAILED_MINT_CACHE_MS);
-    // Emphatically shorter than the success TTL, which is close to two hours.
-    expect(ttl).toBeLessThan(TURN_TTL_SECONDS * 1000 / 10);
-
-    // Once that short window lapses the next join mints again, and now succeeds.
-    cache.current!.expiresAt = Date.now() - 1;
-    const second = await getIceServers(env, cache);
-    expect(hasTurnServer(second)).toBe(true);
-    expect(calls.calls).toBe(2);
+  it("asks for the TTL it is given", async () => {
+    const state = fakeFetch([ok("a")]);
+    await getIceServers(env, { failedUntil: 0 }, DIAGNOSTICS_TURN_TTL_SECONDS);
+    expect(state.calls[0]?.body).toEqual({ ttl: DIAGNOSTICS_TURN_TTL_SECONDS });
   });
 
-  it("gives a successful mint the long TTL", async () => {
-    fakeFetch([Response.json(OK_RESPONSE)]);
-    const cache: { current: null | { iceServers: IceServerConfig[]; expiresAt: number } } = { current: null };
-    await getIceServers(env, cache);
-    expect(cache.current!.expiresAt - Date.now()).toBeGreaterThan(TURN_TTL_SECONDS * 1000 / 2);
+  it("backs off for seconds, not the credential TTL, after a failed mint", async () => {
+    // A mint that fails falls back to STUN only. The backoff spares Cloudflare one call
+    // per join during an outage, but must be short: while it lasts nobody gets a relay.
+    const state = fakeFetch([new Error("network down"), ok("a")]);
+    const backoff = { failedUntil: 0 };
+
+    const first = await getIceServers(env, backoff);
+    expect(hasTurnServer(first.iceServers)).toBe(false);
+    const wait = backoff.failedUntil - Date.now();
+    expect(wait).toBeLessThanOrEqual(FAILED_MINT_CACHE_MS);
+    expect(wait).toBeLessThan((TURN_TTL_SECONDS * 1000) / 10);
+
+    // Inside the window: STUN only, no API call.
+    const during = await getIceServers(env, backoff);
+    expect(hasTurnServer(during.iceServers)).toBe(false);
+    expect(state.calls.length).toBe(1);
+
+    backoff.failedUntil = Date.now() - 1;
+    const after = await getIceServers(env, backoff);
+    expect(hasTurnServer(after.iceServers)).toBe(true);
+    expect(state.calls.length).toBe(2);
+  });
+
+  it("does not back off when TURN is simply not configured", async () => {
+    const backoff = { failedUntil: 0 };
+    await getIceServers({ TURN_KEY_ID: "", TURN_API_TOKEN: "" }, backoff);
+    expect(backoff.failedUntil).toBe(0);
+  });
+});
+
+describe("revokeCredential", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("POSTs to the revoke endpoint for that username", async () => {
+    const calls: { url: string; method?: string }[] = [];
+    vi.stubGlobal("fetch", async (url: string, init?: RequestInit) => {
+      calls.push({ url, method: init?.method });
+      return new Response(null, { status: 204 });
+    });
+    expect(await revokeCredential({ TURN_KEY_ID: "k", TURN_API_TOKEN: "t" }, "u/1")).toBe(true);
+    expect(calls).toEqual([
+      { url: "https://rtc.live.cloudflare.com/v1/turn/keys/k/credentials/u%2F1/revoke", method: "POST" },
+    ]);
+  });
+
+  it("reports failure without throwing", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new Error("down");
+    });
+    expect(await revokeCredential({ TURN_KEY_ID: "k", TURN_API_TOKEN: "t" }, "u")).toBe(false);
   });
 });

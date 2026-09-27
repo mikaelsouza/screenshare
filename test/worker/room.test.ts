@@ -64,6 +64,20 @@ async function refusal(res: Response): Promise<{ code: string; closeCode: number
   });
 }
 
+/** A well-formed peer id that no socket holds. */
+const UNKNOWN_PEER = "00000000-0000-4000-8000-000000000000";
+
+/** Resolve with the close code the server closes this socket with. */
+function closeCodeOf(ws: WebSocket, timeoutMs = 3000): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("socket was not closed")), timeoutMs);
+    ws.addEventListener("close", (ev) => {
+      clearTimeout(timer);
+      resolve((ev as CloseEvent).code);
+    });
+  });
+}
+
 /** How many sockets one IP may hold in a room; mirrors MAX_SOCKETS_PER_IP. */
 const PER_IP_CAP = MAX_ROOM_SIZE * 2;
 
@@ -281,7 +295,10 @@ describe("HTTP routing", () => {
     const res = await SELF.fetch("https://example.com/");
     expect(res.headers.get("X-Frame-Options")).toBe("DENY");
     expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
-    expect(res.headers.get("Referrer-Policy")).toBe("strict-origin-when-cross-origin");
+    expect(res.headers.get("Referrer-Policy")).toBe("no-referrer");
+    expect(res.headers.get("Cross-Origin-Opener-Policy")).toBe("same-origin");
+    expect(res.headers.get("Cross-Origin-Resource-Policy")).toBe("same-origin");
+    expect(res.headers.get("Strict-Transport-Security")).toContain("max-age=63072000");
     const csp = res.headers.get("Content-Security-Policy") ?? "";
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("frame-ancestors 'none'");
@@ -299,6 +316,22 @@ describe("HTTP routing", () => {
     expect(csp).toContain("base-uri 'none'");
     expect(csp).toContain("form-action 'none'");
     expect(res.headers.get("Permissions-Policy")).toContain("display-capture=(self)");
+    // No HTML sink exists in the app; Trusted Types keeps it that way.
+    expect(csp).toContain("require-trusted-types-for 'script'");
+    expect(csp).toContain("trusted-types 'none'");
+  });
+
+  it("applies the security headers to API responses too, and never caches a room code", async () => {
+    const res = await SELF.fetch("https://example.com/api/room");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+    expect(res.headers.get("Content-Security-Policy")).toContain("default-src 'self'");
+    expect(res.headers.get("Cache-Control")).toBe("no-store");
+  });
+
+  it("does not send HSTS on plain-HTTP localhost", async () => {
+    const res = await SELF.fetch("http://localhost/");
+    expect(res.headers.get("Strict-Transport-Security")).toBeNull();
   });
 });
 
@@ -677,8 +710,10 @@ describe("RoomDO membership", () => {
     // A Durable Object value tops out at 128 KiB while a WebSocket frame may be 1 MiB,
     // so an unclamped password made storage.put reject; the rejection escaped
     // webSocketMessage, the peer never got `welcome`, and the socket died with 1006 —
-    // which the client then retried, reproducing the same failure forever.
-    const huge = "x".repeat(200_000);
+    // which the client then retried, reproducing the same failure forever. Frames are
+    // now capped well below that too, so this uses the largest password that still fits
+    // in one: the clamp is what keeps it to 128 characters.
+    const huge = "x".repeat(70_000);
     const a = await Client.connect();
     a.send({ t: "join", room: CODE, displayName: "alice", password: huge });
     const wa = await a.nextOf("welcome");
@@ -732,7 +767,7 @@ describe("RoomDO membership", () => {
     c.send({ t: "join", room: CODE, displayName: "mallory", password: "wrong" });
     const err = await c.nextOf("error");
     expect(err.code).toBe("rate-limited");
-    // Refused outright: no delay served, and no hashing done.
+    // Refused outright: no delay served.
     expect(Date.now() - started).toBeLessThan(1_000);
     c.close();
 
@@ -821,6 +856,9 @@ describe("RoomDO signalling", () => {
     const wb = await b.join("bob");
     await a.nextOf("peer-joined");
 
+    // An offer needs one side sharing; see "refuses an offer between two viewers".
+    a.send({ t: "state", sharing: true });
+    await b.nextOf("peer-state");
     const data = { k: "offer", sdp: "v=0\r\na=rtpmap:111 opus/48000/2\r\n" };
     a.send({ t: "signal", to: wb.selfId, data });
 
@@ -853,15 +891,16 @@ describe("RoomDO signalling", () => {
   it("errors on a signal to an unknown peer", async () => {
     const a = await Client.connect();
     await a.join("alice");
-    a.send({ t: "signal", to: "does-not-exist", data: { k: "offer", sdp: "v=0" } });
+    a.send({ t: "signal", to: UNKNOWN_PEER, data: { k: "offer", sdp: "v=0" } });
     const err = await a.nextOf("error");
     expect(err.code).toBe("unknown-peer");
+    expect(err.message).not.toContain(UNKNOWN_PEER);
     a.close();
   });
 
   it("refuses signals from a socket that has not joined", async () => {
     const a = await Client.connect();
-    a.send({ t: "signal", to: "anyone", data: { k: "offer", sdp: "v=0" } });
+    a.send({ t: "signal", to: UNKNOWN_PEER, data: { k: "offer", sdp: "v=0" } });
     const err = await a.nextOf("error");
     expect(err.code).toBe("unknown-peer");
     a.close();
@@ -945,5 +984,586 @@ describe("RoomDO signalling", () => {
     a.send({ t: "state", sharing: true });
     expect(await a.silentFor(200)).toBe(true);
     a.close();
+  });
+});
+
+describe("RoomDO message limits", () => {
+  it("rejects a signal whose target is not a peer id", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    a.send({ t: "signal", to: "x".repeat(10_000), data: { k: "offer", sdp: "v=0" } });
+    const err = await a.nextOf("error");
+    expect(err.code).toBe("bad-message");
+    expect(err.message.length).toBeLessThan(200);
+    a.close();
+  });
+
+  it("closes a socket that sends an oversized frame with 1009", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    a.ws.send("x".repeat(100 * 1024));
+    expect(await closed).toBe(1009);
+  });
+
+  it("closes a socket that floods messages", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    for (let i = 0; i < 400; i++) a.send({ t: "state", sharing: i % 2 === 0 });
+    expect(await closed).toBe(1008);
+  });
+
+  it("lets an honest burst through: join, then 150 ICE candidates", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    for (let i = 0; i < 150; i++) {
+      a.send({
+        t: "signal",
+        to: wb.selfId,
+        data: { k: "ice", candidate: { candidate: `candidate:${i} 1 udp 1 198.51.100.9 ${1000 + i} typ relay`, sdpMid: "0", sdpMLineIndex: 0 } },
+      });
+    }
+    let received = 0;
+    while (received < 150) {
+      const m = await b.next();
+      if (m.t === "signal") received++;
+    }
+    expect(received).toBe(150);
+    a.close();
+    b.close();
+  });
+});
+
+describe("RoomDO room claim", () => {
+  // This does not reliably reproduce the interleaving that the fix in the join handler
+  // removes (it passes against the old code too): whether a crypto.subtle await lets
+  // another event in depends on timing the test cannot control. It pins the invariant
+  // instead: whichever join wins, no one ends up inside a room whose stored password
+  // they never supplied.
+  it("keeps password state consistent when two joins race on a fresh room", async () => {
+    const a = await Client.connect();
+    const b = await Client.connect();
+    // Sent back to back, so the second join arrives while the first is mid-flight.
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "race-password" });
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+
+    const ra = await a.next();
+    const rb = await b.nextOf(ra.t === "welcome" ? "error" : "welcome").catch(() => null);
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const stored = await runInDurableObject(stub, (_instance, state) =>
+      state.storage.get<string>("passwordHash"),
+    );
+
+    if (stored === undefined) {
+      // Bob claimed an open room first; Alice was told her password was ignored.
+      expect(ra.t === "error" && ra.code === "password-ignored" || ra.t === "welcome").toBe(true);
+    } else {
+      // Alice claimed it with a password: Bob, who sent none, must not be in.
+      expect(stored).toBe(await passwordHash(CODE, "race-password"));
+      expect(rb?.t).toBe("error");
+      if (rb?.t === "error") expect(rb.code).toBe("bad-password");
+    }
+    a.close();
+    b.close();
+  });
+});
+
+describe("RoomDO abuse limits (batch B)", () => {
+  it("frees the slot of a socket that never joined once the deadline passes", async () => {
+    const idle = await Client.connect();
+    const closed = closeCodeOf(idle.ws);
+
+    // Age the idle socket past the join deadline without waiting ten real seconds.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { openedAt?: number };
+        ws.serializeAttachment({ ...att, openedAt: Date.now() - 60_000 });
+      }
+    });
+
+    const fresh = await Client.connect();
+    expect(await closed).toBe(1008);
+    expect((await fresh.join("alice")).selfId).toBeTruthy();
+    fresh.close();
+  });
+
+  it("does not close a socket that joined, however old", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { openedAt?: number };
+        ws.serializeAttachment({ ...att, openedAt: Date.now() - 60_000 });
+      }
+    });
+    const b = await Client.connect();
+    await b.join("bob");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("bob");
+    a.close();
+    b.close();
+  });
+
+  it("closes a socket after too many unparseable messages", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const closed = closeCodeOf(a.ws);
+    for (let i = 0; i < 6; i++) a.ws.send("{nope");
+    expect(await closed).toBe(1008);
+  });
+
+  it("counts every address in one IPv6 /64 against the same per-IP cap", async () => {
+    const sockets: Client[] = [];
+    for (let i = 0; i < PER_IP_CAP; i++) {
+      sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": `2001:db8:aa:bb::${(i + 1).toString(16)}` }));
+    }
+    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "2001:db8:aa:bb:ffff::99" },
+    });
+    expect(await refusal(res)).toEqual({ code: "rate-limited", closeCode: 1013 });
+    for (const s of sockets) s.close();
+  });
+
+  it("refuses a new room with a short password and leaves it unclaimed", async () => {
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "1234" });
+    expect((await a.nextOf("error")).code).toBe("weak-password");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
+    expect(claimed).toBeUndefined();
+
+    // A second try with a proper password creates the room.
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
+    expect((await b.nextOf("welcome")).selfId).toBeTruthy();
+    b.close();
+  });
+
+  it("caps wrong guesses per day, and the real password still gets in", async () => {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const hash = await passwordHash(CODE, "the-real-one");
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put("passwordHash", hash);
+      await state.storage.put("claimed", true);
+      // Under the 15-minute limit, at the daily one.
+      await state.storage.put("pwFailDay", { count: 200, resetAt: Date.now() + 3_600_000 });
+    });
+
+    const m = await Client.connect();
+    m.send({ t: "join", room: CODE, displayName: "mallory", password: "guess-201" });
+    expect((await m.nextOf("error")).code).toBe("rate-limited");
+
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "the-real-one" });
+    expect((await a.nextOf("welcome")).selfId).toBeTruthy();
+    a.close();
+  });
+});
+
+describe("display names", () => {
+  it("strips invisible and direction-changing characters before others see a name", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "al​i‮ce\u0007" });
+    await b.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("alice");
+    a.close();
+    b.close();
+  });
+
+  it("folds full-width look-alikes and falls back when nothing is left", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "ｂｏｂ" });
+    await b.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("bob");
+    const c = await Client.connect();
+    c.send({ t: "join", room: CODE, displayName: "​​" });
+    await c.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("Anonymous");
+    a.close();
+    b.close();
+    c.close();
+  });
+});
+
+describe("RoomDO host controls (batch D)", () => {
+  /** The creator of a fresh room, with the host token its welcome carried. */
+  async function host(name = "host", ip = "198.51.100.1"): Promise<{ c: Client; token: string }> {
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": ip });
+    const w = await c.join(name);
+    expect(w.host).toBe(true);
+    expect(typeof w.hostToken).toBe("string");
+    return { c, token: w.hostToken! };
+  }
+
+  it("makes the creator host and nobody else, and says who the host is", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    expect(wb.host).toBe(false);
+    expect(wb.hostToken).toBeUndefined();
+    expect(wb.locked).toBe(false);
+    expect(wb.peers[0]?.host).toBe(true);
+    h.close();
+    b.close();
+  });
+
+  it("gives host back to whoever presents the token, even after the object hibernates", async () => {
+    const { c: h, token } = await host();
+    h.close();
+    // The token is checked against storage, not memory: prove it by looking there.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const stored = await runInDurableObject(stub, (_i, state) => state.storage.get("hostTokenHash"));
+    expect(typeof stored).toBe("string");
+    expect(stored).not.toContain(token);
+
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: token });
+    const w = await back.nextOf("welcome");
+    expect(w.host).toBe(true);
+    // Issued once, to the creating join only.
+    expect(w.hostToken).toBeUndefined();
+
+    const fake = await Client.connect();
+    fake.send({ t: "join", room: CODE, displayName: "mallory", hostToken: "not-the-token" });
+    expect((await fake.nextOf("welcome")).host).toBe(false);
+    back.close();
+    fake.close();
+  });
+
+  it("lets only the host remove people", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    b.send({ t: "kick", id: wb.peers[0]!.id });
+    expect((await b.nextOf("error")).code).toBe("not-host");
+    b.close();
+    h.close();
+  });
+
+  it("removes a kicked peer, tells the room, and refuses its rejoin", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    await b.join("bob");
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.9" });
+    await c.join("carol");
+    const bobId = (await h.nextOf("peer-joined")).peer.id;
+    await h.nextOf("peer-joined");
+
+    const closed = closeCodeOf(b.ws);
+    h.send({ t: "kick", id: bobId });
+    expect((await b.nextOf("error")).code).toBe("kicked");
+    expect(await closed).toBe(1008);
+    expect((await h.nextOf("peer-left")).id).toBe(bobId);
+    expect((await c.nextOf("peer-left")).id).toBe(bobId);
+
+    const again = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "203.0.113.5" },
+    });
+    const ws = again.webSocket!;
+    ws.accept();
+    const rejoin = closeCodeOf(ws);
+    ws.send(JSON.stringify({ t: "join", room: CODE, displayName: "bob" }));
+    expect(await rejoin).toBe(1008);
+    h.close();
+    c.close();
+  });
+
+  it("refuses new joins while locked, lets the host back in, and tells the room", async () => {
+    const { c: h, token } = await host();
+    const b = await Client.connect();
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    expect(await h.nextOf("room-state")).toEqual({ t: "room-state", locked: true });
+    expect(await b.nextOf("room-state")).toEqual({ t: "room-state", locked: true });
+
+    const c = await Client.connect();
+    const refused = closeCodeOf(c.ws);
+    c.send({ t: "join", room: CODE, displayName: "carol" });
+    expect((await c.nextOf("error")).code).toBe("room-locked");
+    expect(await refused).toBe(1008);
+
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: token });
+    const w = await back.nextOf("welcome");
+    expect(w.host).toBe(true);
+    expect(w.locked).toBe(true);
+
+    h.send({ t: "lock", locked: false });
+    await h.nextOf("room-state");
+    const d = await Client.connect();
+    expect((await d.join("dave")).locked).toBe(false);
+    for (const s of [h, b, back, d]) s.close();
+  });
+
+  it("refuses lock from anyone but the host", async () => {
+    const { c: h } = await host();
+    const b = await Client.connect();
+    await b.join("bob");
+    b.send({ t: "lock", locked: true });
+    expect((await b.nextOf("error")).code).toBe("not-host");
+    h.close();
+    b.close();
+  });
+});
+
+describe("RoomDO diagnostics joins (batch D)", () => {
+  it("hands over ICE servers without claiming the room or appearing in it", async () => {
+    const d = await Client.connect();
+    const closed = closeCodeOf(d.ws);
+    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    const w = await d.nextOf("welcome");
+    expect(Array.isArray(w.iceServers)).toBe(true);
+    expect(w.host).toBe(false);
+    expect(await closed).toBe(1000);
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
+    expect(claimed).toBeUndefined();
+
+    // Whoever comes next still creates the room.
+    const a = await Client.connect();
+    const wa = await a.join("alice");
+    expect(wa.host).toBe(true);
+    expect(wa.peers).toEqual([]);
+    a.close();
+  });
+
+  it("is refused on a room somebody created", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const d = await Client.connect();
+    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    expect((await d.nextOf("error")).code).toBe("bad-message");
+    expect(await a.silentFor()).toBe(true);
+    a.close();
+  });
+});
+
+describe("RoomDO final review fixes", () => {
+  /**
+   * Replace the room's TURN mint with a slow fake, and record revocations. The real
+   * mint is a fetch to Cloudflare, which is where joins interleave; under test TURN
+   * is unconfigured and the mint returns at once, so the races never show.
+   */
+  async function slowMint(
+    room: string,
+    delayMs: number | number[],
+  ): Promise<{ revoked: () => Promise<string[]>; mints: () => Promise<number> }> {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
+    await runInDurableObject(stub, (instance) => {
+      const o = instance as unknown as {
+        mintFor: () => Promise<unknown>;
+        revokeLater: (u?: string) => void;
+        __revoked: string[];
+        __mints: number;
+      };
+      o.__revoked = [];
+      o.__mints = 0;
+      o.mintFor = async () => {
+        o.__mints++;
+        const n = o.__mints;
+        await scheduler.wait(Array.isArray(delayMs) ? (delayMs[n - 1] ?? 0) : delayMs);
+        return { iceServers: [], username: `user-${n}` };
+      };
+      o.revokeLater = (u?: string) => {
+        if (u) o.__revoked.push(u);
+      };
+    });
+    const read = <T>(k: "__revoked" | "__mints") =>
+      runInDurableObject(stub, (instance) => (instance as unknown as Record<string, T>)[k]);
+    return { revoked: () => read<string[]>("__revoked"), mints: () => read<number>("__mints") };
+  }
+
+  it("never tells a joiner about someone before its own welcome, even when joins overlap", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    // Bob's mint is slow and carol's is not, so carol commits while bob is mid-join.
+    await slowMint(CODE, [400, 0]);
+    const b = await Client.connect();
+    const c = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+    await new Promise((r) => setTimeout(r, 50));
+    c.send({ t: "join", room: CODE, displayName: "carol" });
+    const firstB = await b.next(3000);
+    const firstC = await c.next(3000);
+    expect(firstB.t).toBe("welcome");
+    expect(firstC.t).toBe("welcome");
+    // Whichever committed second lists the other; the first hears peer-joined later.
+    const wb = firstB as Extract<ServerMessage, { t: "welcome" }>;
+    const wc = firstC as Extract<ServerMessage, { t: "welcome" }>;
+    const bKnowsC = wb.peers.some((p) => p.id === wc.selfId) || (await b.nextOf("peer-joined")).peer.id === wc.selfId;
+    const cKnowsB = wc.peers.some((p) => p.id === wb.selfId) || (await c.nextOf("peer-joined")).peer.id === wb.selfId;
+    expect(bKnowsC && cKnowsB).toBe(true);
+    for (const s of [a, b, c]) s.close();
+  });
+
+  it("does not announce, and revokes the credential of, a joiner that left mid-join", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const spy = await slowMint(CODE, 300);
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "bob" });
+    await new Promise((r) => setTimeout(r, 50));
+    b.close();
+    // Nothing about bob reaches alice: no peer-joined for someone already gone.
+    expect(await a.silentFor(700)).toBe(true);
+    expect(await spy.revoked()).toEqual(["user-1"]);
+    a.close();
+  });
+
+  it("leaves the room unclaimed when its creator disconnects mid-join", async () => {
+    await slowMint(CODE, 300);
+    const a = await Client.connect();
+    a.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
+    await new Promise((r) => setTimeout(r, 50));
+    a.close();
+    await new Promise((r) => setTimeout(r, 500));
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"))).toBeUndefined();
+  });
+
+  it("revokes a peer's own credential when it leaves or is removed", async () => {
+    const spy = await slowMint(CODE, 0);
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.1" });
+    await h.join("host");
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.6" });
+    await c.join("carol");
+    expect(await spy.mints()).toBe(3);
+
+    h.send({ t: "kick", id: wb.selfId });
+    await h.nextOf("peer-left");
+    c.close();
+    await h.nextOf("peer-left");
+    expect((await spy.revoked()).sort()).toEqual(["user-2", "user-3"]);
+    h.close();
+  });
+
+  it("mints once per diagnostics socket, however many joins it sends", async () => {
+    const spy = await slowMint(CODE, 100);
+    const d = await Client.connect();
+    for (let i = 0; i < 5; i++) d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
+    await d.nextOf("welcome");
+    expect(await spy.mints()).toBe(1);
+  });
+
+  it("lets a member back into a locked room with its rejoin ticket, and nobody else", async () => {
+    const h = await Client.connect();
+    const wh = await h.join("host");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    expect(typeof wb.rejoinToken).toBe("string");
+    await h.nextOf("peer-joined");
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+
+    // Bob's connection blips.
+    b.close();
+    await h.nextOf("peer-left");
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
+    const again = await back.nextOf("welcome");
+    expect(again.locked).toBe(true);
+    // A ticket is good once: each welcome issues a fresh one.
+    expect(again.rejoinToken).not.toBe(wb.rejoinToken);
+
+    const reuse = await Client.connect();
+    reuse.send({ t: "join", room: CODE, displayName: "copycat", rejoinToken: wb.rejoinToken });
+    expect((await reuse.nextOf("error")).code).toBe("room-locked");
+    const stranger = await Client.connect();
+    stranger.send({ t: "join", room: CODE, displayName: "eve", rejoinToken: "made-up" });
+    expect((await stranger.nextOf("error")).code).toBe("room-locked");
+    expect(wh.host).toBe(true);
+    h.close();
+    back.close();
+  });
+
+  it("does not let a removed member's ticket carry them past the ban", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.1" });
+    await h.join("host");
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wb = await b.join("bob");
+    const housemate = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    const wm = await housemate.join("housemate");
+    await h.nextOf("peer-joined");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "kick", id: wb.selfId });
+    await h.nextOf("peer-left");
+    const retry = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    retry.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
+    expect((await retry.nextOf("error")).code).toBe("kicked");
+
+    // The housemate shares the banned address, but was already in: their ticket works.
+    housemate.close();
+    await h.nextOf("peer-left");
+    const hmBack = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
+    hmBack.send({ t: "join", room: CODE, displayName: "housemate", rejoinToken: wm.rejoinToken });
+    expect((await hmBack.nextOf("welcome")).selfId).toBeTruthy();
+    h.close();
+    hmBack.close();
+  });
+
+  it("unlocks a room its host has left for good, but not across a refresh", async () => {
+    const h = await Client.connect();
+    const wh = await h.join("host");
+    const b = await Client.connect();
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b.nextOf("room-state");
+
+    // The host refreshes: still locked for strangers meanwhile.
+    h.close();
+    await b.nextOf("peer-left");
+    const early = await Client.connect();
+    early.send({ t: "join", room: CODE, displayName: "eve" });
+    expect((await early.nextOf("error")).code).toBe("room-locked");
+
+    // Five minutes pass with no host.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    const late = await Client.connect();
+    late.send({ t: "join", room: CODE, displayName: "dave" });
+    expect((await late.nextOf("welcome")).locked).toBe(false);
+    expect(await b.nextOf("room-state")).toEqual({ t: "room-state", locked: false });
+
+    // And the host coming back is still host.
+    const back = await Client.connect();
+    back.send({ t: "join", room: CODE, displayName: "host", hostToken: wh.hostToken });
+    expect((await back.nextOf("welcome")).host).toBe(true);
+    for (const s of [b, late, back]) s.close();
+  });
+
+  it("refuses an offer between two people who are not sharing", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    await a.nextOf("peer-joined");
+    a.send({ t: "signal", to: wb.selfId, data: { k: "offer", sdp: "v=0\r\n" } });
+    expect((await a.nextOf("error")).code).toBe("not-sharing");
+    expect(await b.silentFor()).toBe(true);
+    // Answers and candidates are not offers: they pass, as part of a link a sharer started.
+    a.send({ t: "signal", to: wb.selfId, data: { k: "ice", candidate: { candidate: "" } } });
+    expect((await b.nextOf("signal")).data.k).toBe("ice");
+    a.close();
+    b.close();
   });
 });
