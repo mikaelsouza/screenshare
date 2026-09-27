@@ -36,7 +36,7 @@ Browser A ═══════════ SRTP media, direct P2P ════�
   verbatim and never parses SDP. Uses the WebSocket Hibernation API, so idle rooms
   cost nothing — which is also the source of the subtlest bug this project has had
   (see Room passwords below).
-- **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, full-mesh peer
+- **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, mesh peer
   management, and per-peer bitrate adaptation.
 
 Roughly 10% of peer pairs sit behind CGNAT or a symmetric NAT and cannot connect
@@ -73,6 +73,24 @@ arrives without one.
 TURN relay's address, never yours. It **fails closed**: if no TURN server is available
 the app refuses to connect and says so, rather than quietly downgrading to a direct
 connection that would leak the very thing the checkbox promises to hide.
+
+Its checkbox reads **Hide my IP**, because it hides only your own address; others in the
+room who leave it off are still visible to you. Changing it inside a room reconnects at
+once rather than on the next join, and in relay mode every outgoing SDP is also stripped
+of non-relay candidate lines, so the policy is checked on the way out rather than trusted.
+
+**Who connects to whom.** A peer connection runs ICE, and ICE gives the far end your
+public address, so the mesh is not a full mesh: two people are connected only while at
+least one of them is sharing. Viewers never connect to each other. A room link (`/#CODE`)
+fills in the code and waits for **Join**, so a first-time visitor sees the Hide my IP
+option, and the short "what others can see" note under it, before anything connects.
+
+**Everyone is listed.** The participant list above the video shows every member, with
+the first four characters of their id so two people with the same name can be told
+apart. People who only watch never get a tile, so before the list existed a sharer could
+not tell they were there. Names are cleaned on the server (NFKC, then control and format
+characters such as bidi overrides and zero-width spaces are removed) so nobody can pose
+as a friend with an invisible character.
 
 ### Abuse limits
 
@@ -248,7 +266,7 @@ worker/upgrade.ts              WebSocket refusals that a browser can actually re
 worker/ratelimit.ts            bounded fixed-window per-key throttle
 src/capture.ts                 getDisplayMedia + track configuration
 src/quality.ts                 encoder params, codec choice, Opus SDP, bitrate adaptation
-src/mesh.ts                    full-mesh peer connections, perfect negotiation
+src/mesh.ts                    peer connections (sharer to everyone, never viewer to viewer), perfect negotiation
 src/signaling.ts               WebSocket client with reconnect and keepalive
 src/stats.ts                   getStats extraction and ICE candidate parsing
 src/diagnostics.ts             connection test page

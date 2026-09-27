@@ -377,6 +377,16 @@ class PeerLink {
 export class Mesh {
   private readonly links = new Map<PeerId, PeerLink>();
   private capture: CaptureResult | null = null;
+  /**
+   * Everyone else in the room, and whether they are sharing.
+   *
+   * Kept apart from `links` because a member is not necessarily connected. A peer
+   * connection runs ICE, and ICE hands the far end your public address, so two
+   * people are connected only while at least one of them is sharing. Two viewers
+   * never connect to each other: there is nothing to send, and they would learn each
+   * other's IP for no reason.
+   */
+  private readonly members = new Map<PeerId, { sharing: boolean }>();
 
   constructor(
     private readonly selfId: PeerId,
@@ -406,19 +416,63 @@ export class Mesh {
     this.cb.onRemoteStreamGone(peerId);
   }
 
+  /** A member of the room, connected to only if one of us is sharing. */
+  addMember(peerId: PeerId, sharing: boolean): void {
+    if (peerId === this.selfId) return;
+    this.members.set(peerId, { sharing });
+    if (this.wantsLink(peerId)) this.addPeer(peerId);
+  }
+
+  removeMember(peerId: PeerId): void {
+    this.members.delete(peerId);
+    this.removePeer(peerId);
+  }
+
+  /** A member started or stopped sharing: connect, or drop a link nobody needs now. */
+  setMemberSharing(peerId: PeerId, sharing: boolean): void {
+    const m = this.members.get(peerId);
+    if (!m) {
+      this.addMember(peerId, sharing);
+      return;
+    }
+    m.sharing = sharing;
+    if (this.wantsLink(peerId)) this.addPeer(peerId);
+    else this.removePeer(peerId);
+  }
+
+  private wantsLink(peerId: PeerId): boolean {
+    return this.capture !== null || this.members.get(peerId)?.sharing === true;
+  }
+
   async handleSignal(from: PeerId, data: SignalData): Promise<void> {
-    // A peer can signal before we've been told they joined; create on demand.
+    // A sharer's offer can arrive before its peer-state says it is sharing (it
+    // attaches the capture first, then announces), so a signal creates the link on
+    // demand. The server only relays signals from peers joined to this room.
     if (!this.links.has(from)) this.addPeer(from);
     await this.links.get(from)?.handleSignal(data);
   }
 
-  /** Start sharing to every peer, or pass null to stop. */
+  /**
+   * Start sharing to every member, or pass null to stop.
+   *
+   * Starting connects to every member; stopping drops the links to members who are
+   * not sharing themselves, since those existed only to carry our stream.
+   */
   async setCapture(capture: CaptureResult | null): Promise<void> {
+    // Links that already exist get the capture attached (or detached) here; links
+    // created below attach it themselves in addPeer, and attaching twice would leave
+    // an extra pair of transceivers behind.
+    const existing = [...this.links.values()];
     this.capture = capture;
+    if (capture) {
+      for (const id of this.members.keys()) this.addPeer(id);
+    } else {
+      for (const [id, m] of this.members) if (!m.sharing) this.removePeer(id);
+    }
     await Promise.all(
-      [...this.links.values()].map((l) =>
-        capture ? l.attachCapture(capture) : l.detachCapture(),
-      ),
+      existing
+        .filter((l) => this.links.get(l.peerId) === l)
+        .map((l) => (capture ? l.attachCapture(capture) : l.detachCapture())),
     );
   }
 

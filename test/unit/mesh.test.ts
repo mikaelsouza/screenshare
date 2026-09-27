@@ -542,3 +542,83 @@ describe("parseControlMessage", () => {
     expect(parseControlMessage(new ArrayBuffer(8))).toBeNull();
   });
 });
+
+describe("Mesh connects only where someone is sharing", () => {
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }] }),
+    };
+  });
+
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+  };
+  const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
+  const capture = (): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    return { stream: { getTracks: () => [video] } as unknown as MediaStream, video, audio: null };
+  };
+
+  it("creates no connection to members who are not sharing", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", false);
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+  });
+
+  it("connects to a member who is sharing, and drops the link when they stop", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    mesh.addMember("carol", false);
+    expect(mesh.peers()).toEqual(["bob"]);
+
+    mesh.setMemberSharing("carol", true);
+    expect(mesh.peers()).toEqual(["bob", "carol"]);
+
+    mesh.setMemberSharing("bob", false);
+    expect(mesh.peers()).toEqual(["carol"]);
+    expect(FakeRTCPeerConnection.instances[0]?.closed).toBe(true);
+  });
+
+  it("connects to everyone while we share, and back to sharers only afterwards", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", true);
+    expect(mesh.peers()).toEqual(["carol"]);
+
+    await mesh.setCapture(capture());
+    expect(mesh.peers().sort()).toEqual(["bob", "carol"]);
+    // Every link carries exactly one video and one audio sender: no double attach.
+    for (const pc of FakeRTCPeerConnection.instances) expect(pc.senders).toHaveLength(2);
+
+    // A member joining mid-share is connected at once.
+    mesh.addMember("dave", false);
+    expect(mesh.peers()).toContain("dave");
+
+    await mesh.setCapture(null);
+    expect(mesh.peers()).toEqual(["carol"]);
+  });
+
+  it("accepts a sharer's offer that arrives before its peer-state", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual(["bob"]);
+    // The peer-state then confirms it; the link is kept, not rebuilt.
+    mesh.setMemberSharing("bob", true);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(1);
+  });
+
+  it("removes a member's link when they leave", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", true);
+    mesh.removeMember("bob");
+    expect(mesh.peers()).toEqual([]);
+  });
+});

@@ -42,6 +42,7 @@ function el<T extends HTMLElement>(id: string): T {
 }
 
 const ui = {
+  nameInput: el<HTMLInputElement>("display-name"),
   roomInput: el<HTMLInputElement>("room-code"),
   passInput: el<HTMLInputElement>("room-pass"),
   genPassBtn: el<HTMLButtonElement>("gen-pass"),
@@ -60,6 +61,10 @@ const ui = {
   audioPickSystemBtn: el<HTMLButtonElement>("audio-pick-system"),
   audioPickNoneBtn: el<HTMLButtonElement>("audio-pick-none"),
   stage: el<HTMLDivElement>("stage"),
+  roster: el<HTMLElement>("roster"),
+  rosterTitle: el<HTMLElement>("roster-title"),
+  rosterList: el<HTMLUListElement>("roster-list"),
+  surfaceWarning: el<HTMLElement>("surface-warning"),
   status: el<HTMLElement>("status"),
   preset: el<HTMLSelectElement>("preset"),
   codec: el<HTMLSelectElement>("codec"),
@@ -86,6 +91,12 @@ let audioMuted = false;
 let audioLost = false;
 
 const names = new Map<PeerId, string>();
+/** Everyone else in the room and whether they are sharing, for the participant list. */
+const members = new Map<PeerId, { name: string; sharing: boolean }>();
+/** Our own id in the current room, once welcomed. */
+let selfId: PeerId | null = null;
+/** The room and password of the current connection, so it can be redone in place. */
+let lastJoin: { code: string; password: string | undefined } | null = null;
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
 const monitors = new Map<PeerId, LinkMonitor>();
@@ -254,6 +265,52 @@ function renderSelfPreview(stream: MediaStream | null): void {
   // Muted playback is always permitted by the autoplay policy, but call play()
   // explicitly so the preview does not depend on the attribute alone.
   void v.play().catch(() => {});
+}
+
+// ---- participants --------------------------------------------------------
+
+/** First four characters of a peer id, so two people with the same name can be told apart. */
+function shortId(id: PeerId): string {
+  return id.slice(0, 4);
+}
+
+/**
+ * The participant list. Everyone in the room is on it, including people who only
+ * watch: they never get a video tile, and before this list existed a sharer had no
+ * way to know they were there.
+ */
+function renderRoster(): void {
+  if (!client || selfId === null) {
+    ui.roster.hidden = true;
+    ui.rosterList.replaceChildren();
+    return;
+  }
+  ui.roster.hidden = false;
+  const others = [...members.entries()];
+  ui.rosterTitle.textContent = capture
+    ? `Sharing to ${others.length} ${others.length === 1 ? "person" : "people"}:`
+    : `In this room (${others.length + 1}):`;
+
+  const items: HTMLLIElement[] = [];
+  const add = (id: PeerId, name: string, sharing: boolean, self: boolean): void => {
+    const li = document.createElement("li");
+    const label = document.createElement("span");
+    label.textContent = self ? `${name} (you)` : name;
+    const idEl = document.createElement("span");
+    idEl.className = "peer-id";
+    idEl.textContent = shortId(id);
+    li.append(label, idEl);
+    if (sharing) {
+      const badge = document.createElement("span");
+      badge.className = "badge";
+      badge.textContent = "sharing";
+      li.append(badge);
+    }
+    items.push(li);
+  };
+  add(selfId, currentName(), capture !== null, true);
+  for (const [id, m] of others) add(id, m.name, m.sharing, false);
+  ui.rosterList.replaceChildren(...items);
 }
 
 // ---- sharing -------------------------------------------------------------
@@ -489,6 +546,9 @@ async function startSharingInner(): Promise<void> {
 
   client?.setSharing(true);
   ui.shareBtn.textContent = "Stop sharing";
+  // A whole-screen share shows notifications, chat pop-ups and every other window.
+  ui.surfaceWarning.hidden = capture.surface !== "monitor";
+  renderRoster();
   audioMuted = false;
   audioLost = false;
   renderAudioControls();
@@ -514,10 +574,24 @@ async function stopSharing(): Promise<void> {
   renderSelfPreview(null);
   client?.setSharing(false);
   ui.shareBtn.textContent = "Share screen";
+  ui.surfaceWarning.hidden = true;
+  renderRoster();
   renderAudioControls();
 }
 
 // ---- room ----------------------------------------------------------------
+
+/** The display name to join with: what the user typed, else a remembered or random one. */
+function currentName(): string {
+  const typed = ui.nameInput.value.trim().slice(0, 32);
+  if (typed) return typed;
+  let stored = localStorage.getItem("name");
+  if (!stored) {
+    stored = `guest-${Math.random().toString(36).slice(2, 6)}`;
+    localStorage.setItem("name", stored);
+  }
+  return stored;
+}
 
 /** Incremented per join so a superseded in-flight join can detect it lost the race. */
 let joinGeneration = 0;
@@ -532,8 +606,8 @@ async function joinRoom(code: string, password?: string): Promise<void> {
   const generation = ++joinGeneration;
   leaveRoom();
   if (generation !== joinGeneration) return;
-  const displayName = localStorage.getItem("name") ?? `guest-${Math.random().toString(36).slice(2, 6)}`;
-  localStorage.setItem("name", displayName);
+  const displayName = currentName();
+  lastJoin = { code, password };
 
   client = new SignalingClient(
     code,
@@ -546,7 +620,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             : `Connection ${s}…`,
         ),
 
-      onWelcome: (selfId, peers, iceServers) => {
+      onWelcome: (selfIdFromServer, peers, iceServers) => {
         // The signalling socket reconnects on any network blip, and the server issues
         // a fresh peer id each time, so onWelcome fires again. Without closing the old
         // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
@@ -554,6 +628,8 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         // with every reconnect.
         mesh?.close();
         monitors.clear();
+        members.clear();
+        selfId = null;
 
         // Minted by the Durable Object and delivered with the welcome, so holding a
         // joined WebSocket is what authorises them.
@@ -581,7 +657,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 
         relayActive = relayOnly;
         mesh = new Mesh(
-          selfId,
+          selfIdFromServer,
           {
             iceServers: servers,
             preset: QUALITY_PRESETS[currentPreset()],
@@ -604,30 +680,43 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             },
           },
         );
+        // Connect only to the people who are sharing (and to everyone once we share);
+        // see Mesh.members for why viewers never connect to each other.
+        selfId = selfIdFromServer;
         for (const p of peers) {
           names.set(p.id, p.name);
-          mesh.addPeer(p.id);
+          members.set(p.id, { name: p.name, sharing: p.sharing });
+          mesh.addMember(p.id, p.sharing);
         }
         setStatus(
           `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
         );
         if (capture) void mesh.setCapture(capture);
         startHealthPolling();
+        renderRoster();
       },
 
       onPeerJoined: (peer: PeerInfo) => {
         names.set(peer.id, peer.name);
-        mesh?.addPeer(peer.id);
+        members.set(peer.id, { name: peer.name, sharing: peer.sharing });
+        mesh?.addMember(peer.id, peer.sharing);
         setStatus(`${peer.name} joined room ${code}`, "info");
+        renderRoster();
       },
       onPeerLeft: (id) => {
-        mesh?.removePeer(id);
+        mesh?.removeMember(id);
         names.delete(id);
+        members.delete(id);
         removeTile(id);
+        renderRoster();
       },
       onSignal: (from, data) => void mesh?.handleSignal(from, data),
       onPeerState: (id, sharing) => {
         if (!sharing) removeTile(id);
+        const m = members.get(id);
+        if (m) m.sharing = sharing;
+        mesh?.setMemberSharing(id, sharing);
+        renderRoster();
       },
       onError: (code, message) => {
         // A wrong password is the one error the user can actually fix from here, so
@@ -671,6 +760,9 @@ function leaveRoom(): void {
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
   names.clear();
+  members.clear();
+  selfId = null;
+  renderRoster();
   ui.muteAudioBtn.style.display = "none";
 }
 
@@ -719,8 +811,11 @@ function initQualityControls(): void {
   ui.relayOnly.checked = localStorage.getItem("relay_only") === "true";
   ui.relayOnly.addEventListener("change", () => {
     localStorage.setItem("relay_only", String(ui.relayOnly.checked));
-    if (mesh) {
-      setStatus("Privacy mode change will apply on next room connection.", "info");
+    // Apply it now by reconnecting, not "next time": every new connection made until
+    // then would hand out the address the user just asked to hide.
+    if (client && lastJoin) {
+      void joinRoom(lastJoin.code, lastJoin.password);
+      setStatus(ui.relayOnly.checked ? "Reconnecting with your IP hidden…" : "Reconnecting…", "info");
     }
   });
 
@@ -745,6 +840,14 @@ function initQualityControls(): void {
 }
 
 initQualityControls();
+
+ui.nameInput.value = localStorage.getItem("name") ?? "";
+ui.nameInput.addEventListener("change", () => {
+  const name = ui.nameInput.value.trim().slice(0, 32);
+  if (name) localStorage.setItem("name", name);
+  // Takes effect on the next join: the server learns a name only from `join`.
+  if (client) setStatus("Your new name shows the next time you join.", "info");
+});
 
 // Warn on load rather than only on click — a disabled-looking Share button with no
 // explanation is the worst version of this.
@@ -833,15 +936,17 @@ ui.shareBtn.addEventListener("click", () => {
 
 window.addEventListener("beforeunload", () => leaveRoom());
 
-// Deep link: /#ROOMCODE joins straight away.
+// Deep link: /#ROOMCODE fills in the room, and waits for Join.
 //
-// The password box is necessarily empty this early, so a link to a protected room
-// gets rejected on this first attempt. That is fine, and better than not trying at
-// all: the overwhelmingly common case is an unprotected room, and `bad-password` is
-// handled as a recoverable prompt rather than a dead end, so the protected case turns
-// into "enter the password and press Enter" instead of a silent failure.
+// It used to join straight away. Joining connects you to whoever is sharing, which
+// hands them your IP address, and a first-time visitor on a forwarded link had not
+// even seen the Hide my IP option yet. Now they see it, and the note under it, first.
 const fromHash = location.hash.replace(/^#/, "").toUpperCase();
-if (fromHash) {
+if (isValidRoomCode(fromHash)) {
   ui.roomInput.value = fromHash;
-  void joinRoom(fromHash, ui.passInput.value.trim() || undefined);
+  setStatus(
+    `Room ${fromHash}: choose your name and whether to hide your IP, then press Join.`,
+    "info",
+  );
+  ui.joinBtn.focus();
 }

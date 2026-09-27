@@ -228,6 +228,8 @@ describe("captureScreen and track helpers", () => {
       noiseSuppression: false,
       autoGainControl: false,
     });
+    // The picker opens on windows, not the whole screen.
+    expect(callArgs.video).toMatchObject({ displaySurface: "window" });
   });
 
   it("supports capture without audio when requested", async () => {
@@ -312,7 +314,7 @@ describe("captureScreen and track helpers", () => {
 
     const source = await captureAudioOnly("window");
     expect(mock.mock.calls[0]?.[0]).toMatchObject({
-      displaySurface: "window",
+      video: { displaySurface: "window" },
       monitorTypeSurfaces: "exclude",
       windowAudio: "window",
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
@@ -338,7 +340,7 @@ describe("captureScreen and track helpers", () => {
   it("asks for a screen with system audio for the system fallback", async () => {
     const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), makeTrack("audio")));
     const source = await captureAudioOnly("system");
-    expect(mock.mock.calls[0]?.[0]).toMatchObject({ displaySurface: "monitor", systemAudio: "include" });
+    expect(mock.mock.calls[0]?.[0]).toMatchObject({ video: { displaySurface: "monitor" }, systemAudio: "include" });
     expect(source?.kind).toBe("system");
   });
 

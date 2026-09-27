@@ -10,6 +10,8 @@ let server;
 let browser;
 let sharer;
 let viewer;
+/** A second viewer: viewers must never connect to each other, only to the sharer. */
+let viewer2;
 
 /** Read link stats out of the page's recorded RTCPeerConnections. */
 const readStats = async () => {
@@ -48,12 +50,13 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     // Separate contexts so the two peers get separate localStorage identities.
     const ctxA = await browser.newContext();
     const ctxB = await browser.newContext();
-    await ctxA.addInitScript(INSTRUMENT);
-    await ctxB.addInitScript(INSTRUMENT);
+    const ctxC = await browser.newContext();
+    for (const ctx of [ctxA, ctxB, ctxC]) await ctx.addInitScript(INSTRUMENT);
     sharer = await ctxA.newPage();
     viewer = await ctxB.newPage();
-    for (const p of [sharer, viewer]) {
-      p.on("console", (m) => { if (m.type() === "error") console.error(`[${p === sharer ? "sharer" : "viewer"}]`, m.text()); });
+    viewer2 = await ctxC.newPage();
+    for (const [name, p] of [["sharer", sharer], ["viewer", viewer], ["viewer2", viewer2]]) {
+      p.on("console", (m) => { if (m.type() === "error") console.error(`[${name}]`, m.text()); });
     }
   });
 
@@ -81,25 +84,46 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.notEqual(ice.status, 200, "/api/ice should no longer mint credentials");
   });
 
-  it("loads the app for both peers and joins them to one room", async () => {
-    await sharer.goto(`${BASE_URL}/#${ROOM}`);
-    await viewer.goto(`${BASE_URL}/#${ROOM}`);
+  it("does not join from a room link until Join is pressed", async () => {
+    // Joining hands your IP to whoever is sharing, so a link only fills in the room:
+    // the visitor sees the Hide my IP option before anything connects.
+    for (const page of [sharer, viewer, viewer2]) await page.goto(`${BASE_URL}/#${ROOM}`);
+    await new Promise((r) => setTimeout(r, 1000));
+    for (const page of [sharer, viewer, viewer2]) {
+      assert.equal(await page.inputValue("#room-code"), ROOM);
+      assert.ok(!(await page.textContent("#status")).includes("In room"), "joined without pressing Join");
+    }
+  });
 
-    for (const [name, page] of [["sharer", sharer], ["viewer", viewer]]) {
+  it("joins all three to one room and lists everyone", async () => {
+    for (const [name, page] of [["sharer", sharer], ["viewer", viewer], ["viewer2", viewer2]]) {
+      await page.fill("#display-name", name);
+      await page.click("#join");
       await waitFor(page, () => document.getElementById("status")?.textContent?.includes("In room"), {
         label: `${name} to join the room`,
       });
     }
+    // Viewers get no tile, so the participant list is the only place they show up.
+    for (const page of [sharer, viewer, viewer2]) {
+      await waitFor(page, () => document.querySelectorAll("#roster-list li").length === 3, {
+        label: "all three in the participant list",
+      });
+    }
   });
 
-  it("establishes a peer connection between the two browsers", async () => {
-    const check = () => window.__pcs.length > 0 && window.__pcs.some((pc) => pc.connectionState === "connected");
-    await waitFor(sharer, check, { label: "sharer peer connection" });
-    await waitFor(viewer, check, { label: "viewer peer connection" });
+  it("does not connect anyone while nobody is sharing", async () => {
+    await new Promise((r) => setTimeout(r, 1500));
+    for (const page of [sharer, viewer, viewer2]) {
+      assert.equal(await page.evaluate(() => window.__pcs.length), 0, "a peer connection exists with nobody sharing");
+    }
   });
 
   it("delivers video from the sharer to the viewer", async () => {
     await sharer.click("#share");
+
+    const check = () => window.__pcs.some((pc) => pc.connectionState === "connected");
+    await waitFor(sharer, check, { label: "sharer peer connection" });
+    await waitFor(viewer, check, { label: "viewer peer connection" });
 
     // A tile with a live remote stream is what a real viewer would see.
     await waitFor(
@@ -161,6 +185,16 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.ok(t1 > t0, `playback did not advance: ${t0} -> ${t1}`);
   });
 
+  it("connects each viewer to the sharer only, never to each other", async () => {
+    const live = () => window.__pcs.filter((pc) => pc.connectionState !== "closed").length;
+    await waitFor(viewer2, () => window.__pcs.some((pc) => pc.connectionState === "connected"), {
+      label: "second viewer connected to the sharer",
+    });
+    assert.equal(await sharer.evaluate(live), 2, "sharer should hold one link per viewer");
+    assert.equal(await viewer.evaluate(live), 1, "viewer should hold only the link to the sharer");
+    assert.equal(await viewer2.evaluate(live), 1, "second viewer should hold only the link to the sharer");
+  });
+
   it("connects directly rather than through a TURN relay", async () => {
     // The premise of the whole design: media must not pass through a server.
     // On loopback both ends are host candidates; the assertion that matters is
@@ -187,6 +221,12 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
       viewer,
       () => [...document.querySelectorAll(".tile video")].every((v) => !v.srcObject || v.srcObject.getVideoTracks().length === 0),
       { label: "viewer tile to clear", timeout: 30_000 },
+    );
+    // With nobody sharing, the links have no reason to exist: they are torn down.
+    await waitFor(
+      sharer,
+      () => window.__pcs.every((pc) => pc.connectionState === "closed"),
+      { label: "sharer links to close after stopping", timeout: 10_000 },
     );
   });
 });

@@ -1162,3 +1162,32 @@ describe("RoomDO abuse limits (batch B)", () => {
     a.close();
   });
 });
+
+describe("display names", () => {
+  it("strips invisible and direction-changing characters before others see a name", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "al​i‮ce\u0007" });
+    await b.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("alice");
+    a.close();
+    b.close();
+  });
+
+  it("folds full-width look-alikes and falls back when nothing is left", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    b.send({ t: "join", room: CODE, displayName: "ｂｏｂ" });
+    await b.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("bob");
+    const c = await Client.connect();
+    c.send({ t: "join", room: CODE, displayName: "​​" });
+    await c.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.name).toBe("Anonymous");
+    a.close();
+    b.close();
+    c.close();
+  });
+});

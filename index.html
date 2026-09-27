@@ -293,6 +293,75 @@
         padding: 0.2rem 0.6rem;
         font-size: 0.75rem;
       }
+      input.name-input {
+        text-transform: none;
+        letter-spacing: normal;
+      }
+      #privacy {
+        font-size: 0.8rem;
+        color: var(--text-secondary);
+        text-align: center;
+        padding: 0.4rem 1.5rem;
+        background-color: var(--surface-color);
+        border-bottom: 1px solid var(--border-color);
+      }
+      #privacy summary {
+        cursor: pointer;
+      }
+      #privacy ul {
+        text-align: left;
+        max-width: 42rem;
+        margin: 0.5rem auto 0.25rem;
+        padding-left: 1.25rem;
+        line-height: 1.5;
+      }
+      #roster {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: center;
+        gap: 0.4rem;
+        padding: 0.5rem 1.5rem;
+        font-size: 0.8rem;
+        border-bottom: 1px solid var(--border-color);
+      }
+      #roster-title {
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--text-secondary);
+        margin-right: 0.25rem;
+      }
+      #roster-list {
+        display: contents;
+        list-style: none;
+      }
+      #roster-list li {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.2rem 0.6rem;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        background-color: var(--surface-color);
+      }
+      #roster-list .peer-id {
+        color: var(--text-secondary);
+        font-family: ui-monospace, monospace;
+        font-size: 0.7rem;
+      }
+      #roster-list .badge {
+        color: #4ade80;
+        font-size: 0.7rem;
+        font-weight: 600;
+      }
+      #roster-list button {
+        padding: 0.05rem 0.45rem;
+        font-size: 0.7rem;
+      }
+      #surface-warning {
+        font-size: 0.8rem;
+        color: #fbbf24;
+      }
     </style>
   </head>
   <body>
@@ -306,16 +375,32 @@
     </header>
 
     <div class="toolbar">
+      <input type="text" id="display-name" class="name-input" placeholder="Your name" maxlength="32" autocomplete="nickname" spellcheck="false" />
       <input type="text" id="room-code" placeholder="Room code" maxlength="8" autocomplete="off" spellcheck="false" />
       <input type="password" id="room-pass" placeholder="Password (opt)" autocomplete="off" />
       <button type="button" id="gen-pass" title="Fill in a strong random password (share it with your friends)">Generate</button>
       <button type="button" id="join" class="primary">Join</button>
       <button type="button" id="create">Create</button>
-      <label class="privacy-label" title="Force media through TURN relay so peers never see your IP address">
+      <label class="privacy-label" title="Send your video and audio through a relay, so people in the room see the relay's address instead of yours. Adds some delay.">
         <input type="checkbox" id="relay-only" />
-        Hide IP (Relay only)
+        Hide my IP (relay, adds delay)
       </label>
     </div>
+
+    <details id="privacy">
+      <summary>People in the room can see your IP address unless Hide my IP is on. What else can others see?</summary>
+      <ul>
+        <li>You connect directly to whoever is sharing, and to everyone while you share. Each of them can see your IP address unless Hide my IP is on. People who are only watching do not connect to each other.</li>
+        <li>With Hide my IP on, your traffic goes through Cloudflare's relay. Cloudflare sees your IP instead; the video and audio stay encrypted end to end.</li>
+        <li>The server sees your IP, the room code and your name while you are connected. It keeps nothing about you afterwards; a room's password and settings are erased 12 hours after it empties.</li>
+        <li>Anyone watching can record what you share. Everyone in the room is listed above the video.</li>
+      </ul>
+    </details>
+
+    <section id="roster" hidden aria-labelledby="roster-title">
+      <h2 id="roster-title">In this room</h2>
+      <ul id="roster-list"></ul>
+    </section>
 
     <main id="stage"></main>
 
@@ -345,6 +430,7 @@
         <button type="button" id="audio-change">Change</button>
       </span>
       <button type="button" id="mute-audio" style="display: none;">Mute audio</button>
+      <span id="surface-warning" hidden>Sharing your whole screen: notifications and other windows are visible.</span>
       <label class="field" for="preset">Quality</label>
       <select id="preset" title="Applies immediately while sharing"></select>
       <label class="field" for="codec">Codec</label>

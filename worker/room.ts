@@ -147,6 +147,25 @@ function getAttachment(ws: WebSocket): PeerAttachment | null {
   return null;
 }
 
+/**
+ * A display name safe to show other people.
+ *
+ * Rendering already goes through textContent, so this is not about markup. It is
+ * about impersonation: control and format characters (bidi overrides such as U+202E,
+ * zero-width joiners and spaces) let "alice" and "al\u200Bice" look identical, or
+ * make a name render backwards. NFKC folds compatibility look-alikes such as
+ * full-width letters into their plain forms. Cut to 32 after cleaning, so invisible
+ * characters cannot eat the budget.
+ */
+export function sanitiseName(raw: string): string {
+  const cleaned = raw
+    .normalize("NFKC")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  return [...cleaned].slice(0, 32).join("").trim() || "Anonymous";
+}
+
 function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
   try {
     ws.send(JSON.stringify(msg));
@@ -559,7 +578,7 @@ export class RoomDO extends DurableObject<Env> {
           return;
         }
 
-        const sanitisedName = clientMsg.displayName.trim().slice(0, 32) || "Anonymous";
+        const sanitisedName = sanitiseName(clientMsg.displayName);
 
         attachment.name = sanitisedName;
         attachment.joined = true;

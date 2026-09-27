@@ -168,7 +168,11 @@ export async function captureScreen(
       width: { ideal: preset.width },
       height: { ideal: preset.height },
       frameRate: { ideal: preset.frameRate, max: preset.frameRate },
-    },
+      // Open the picker on the Window tab. The goal is sharing one game window, and a
+      // whole-screen share also shows notifications, chat pop-ups and every other
+      // app. Only a starting point: the other tabs stay one click away.
+      displaySurface: "window",
+    } as MediaTrackConstraints,
     audio: mode === "none" ? false : GAME_AUDIO,
     // In "app" mode a whole-screen pick must not offer system audio: that is exactly
     // the mix of Discord and music this mode exists to keep out. The app asks for the
@@ -224,20 +228,25 @@ function readableLabel(track: MediaStreamTrack | undefined): string | null {
  */
 export async function captureAudioOnly(kind: "window" | "system"): Promise<AudioSource | null> {
   const options: ChromeDisplayMediaOptions = {
-    video: { width: { ideal: 320 }, height: { ideal: 180 }, frameRate: { ideal: 1, max: 1 } },
+    video: {
+      width: { ideal: 320 },
+      height: { ideal: 180 },
+      frameRate: { ideal: 1, max: 1 },
+      // Which picker tab opens first. It is a video constraint: at the top level of
+      // the options, where it used to be, Chrome ignores it.
+      displaySurface: kind === "window" ? "window" : "monitor",
+    } as MediaTrackConstraints,
     audio: GAME_AUDIO,
     selfBrowserSurface: "exclude",
     surfaceSwitching: "exclude",
     ...(kind === "window"
       ? {
           // Windows only: a tab or screen here would bring the wrong audio.
-          displaySurface: "window" as const,
           monitorTypeSurfaces: "exclude" as const,
           windowAudio: "window" as const,
           systemAudio: "exclude" as const,
         }
       : {
-          displaySurface: "monitor" as const,
           monitorTypeSurfaces: "include" as const,
           systemAudio: "include" as const,
         }),
