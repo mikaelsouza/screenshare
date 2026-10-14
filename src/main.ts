@@ -49,6 +49,7 @@ const ui = {
   relayOnly: el<HTMLInputElement>("relay-only"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
+  copyLinkBtn: el<HTMLButtonElement>("copy-link"),
   shareBtn: el<HTMLButtonElement>("share"),
   muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
   audioMode: el<HTMLSelectElement>("audio-mode"),
@@ -1232,6 +1233,51 @@ ui.createBtn.addEventListener("click", () => {
     }
   })();
 });
+
+async function copyRoomLink(): Promise<void> {
+  const code = (lastJoin?.code ?? ui.roomInput.value.trim()).toUpperCase();
+  if (!isValidRoomCode(code)) {
+    setStatus("Enter or create a room first to copy its link.", "warn");
+    ui.roomInput.focus();
+    return;
+  }
+  const url = `${location.origin}/#${code}`;
+  let copied = false;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(url);
+      copied = true;
+    }
+  } catch (err) {
+    console.warn("[main] clipboard.writeText failed, using fallback", err);
+  }
+  if (!copied) {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = url;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      copied = document.execCommand("copy");
+      ta.remove();
+    } catch {}
+  }
+  if (copied) {
+    const originalText = ui.copyLinkBtn.textContent;
+    ui.copyLinkBtn.textContent = "Copied!";
+    ui.copyLinkBtn.classList.add("copied");
+    setStatus(`Copied room link: ${url}`, "info");
+    setTimeout(() => {
+      ui.copyLinkBtn.textContent = originalText;
+      ui.copyLinkBtn.classList.remove("copied");
+    }, 2000);
+  } else {
+    setStatus(`Could not copy link automatically. Room link: ${url}`, "warn");
+  }
+}
+
+ui.copyLinkBtn.addEventListener("click", () => void copyRoomLink());
 
 ui.shareBtn.addEventListener("click", () => {
   void (capture ? stopSharing() : startSharing());
