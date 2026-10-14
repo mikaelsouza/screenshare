@@ -256,15 +256,109 @@ function applyViewing(peerId: PeerId): void {
   mesh?.setViewing(peerId, (visible === true || isPip) && !paused.has(peerId));
 }
 
+interface BoostAudioPipe {
+  stream: MediaStream;
+  source: MediaStreamAudioSourceNode;
+  gain: GainNode;
+  compressor?: DynamicsCompressorNode;
+}
+const boostPipes = new Map<PeerId, BoostAudioPipe>();
+(window as any).__boostPipes = boostPipes;
+let sharedAudioCtx: AudioContext | null = null;
+
+function getSharedAudioContext(): AudioContext | null {
+  const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+  if (!AudioContextClass) return null;
+  if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
+    try {
+      sharedAudioCtx = new AudioContextClass({ latencyHint: "interactive" });
+    } catch {
+      sharedAudioCtx = new AudioContextClass();
+    }
+  }
+  if (sharedAudioCtx.state === "suspended") {
+    void sharedAudioCtx.resume().catch(() => {});
+  }
+  return sharedAudioCtx;
+}
+
+function setupBoostPipe(peerId: PeerId, stream: MediaStream): BoostAudioPipe | null {
+  const existing = boostPipes.get(peerId);
+  if (existing) {
+    if (existing.stream === stream) return existing;
+    teardownBoostPipe(peerId);
+  }
+
+  if (stream.getAudioTracks().length === 0) return null;
+
+  try {
+    const ctx = getSharedAudioContext();
+    if (!ctx) return null;
+    const source = ctx.createMediaStreamSource(stream);
+    const gain = ctx.createGain();
+    const compressor = ctx.createDynamicsCompressor();
+    compressor.threshold.value = -6;
+    compressor.knee.value = 6;
+    compressor.ratio.value = 12;
+    compressor.attack.value = 0.003;
+    compressor.release.value = 0.1;
+
+    source.connect(gain);
+    gain.connect(compressor);
+    compressor.connect(ctx.destination);
+
+    const pipe: BoostAudioPipe = { stream, source, gain, compressor };
+    boostPipes.set(peerId, pipe);
+    return pipe;
+  } catch (err) {
+    console.warn(`[main] Web Audio boost setup failed for ${peerId}`, err);
+    return null;
+  }
+}
+
+function teardownBoostPipe(peerId: PeerId): void {
+  const pipe = boostPipes.get(peerId);
+  if (!pipe) return;
+  try {
+    pipe.gain.disconnect();
+    pipe.source.disconnect();
+    pipe.compressor?.disconnect();
+  } catch {}
+  boostPipes.delete(peerId);
+}
+
 /** Put the tile's audio where the viewer left it: volume, mute, pause and autoplay. */
 function applyAudio(peerId: PeerId): void {
   if (peerId === SELF_TILE) return;
   const video = tiles.get(peerId);
   if (!video) return;
   const s = listeningFor(peerId);
-  video.volume = s.volume;
-  // The autoplay prompt means the browser only allows muted playback until a click.
-  video.muted = s.muted || paused.has(peerId) || unmutePrompts.has(peerId);
+  const isSilent = s.muted || paused.has(peerId) || unmutePrompts.has(peerId);
+  const stream = video.srcObject instanceof MediaStream ? video.srcObject : null;
+
+  // HTMLMediaElement volume is strictly clamped to [0, 1].
+  video.volume = Math.max(0, Math.min(1, s.volume));
+
+  if (s.volume > 1 && !isSilent && stream && stream.getAudioTracks().length > 0) {
+    const pipe = setupBoostPipe(peerId, stream);
+    if (pipe) {
+      // Mute the video element so Web Audio is the single output path (avoids comb filtering / echo).
+      video.muted = true;
+      pipe.gain.gain.value = s.volume;
+      const ctx = getSharedAudioContext();
+      if (ctx?.state === "suspended") {
+        void ctx.resume().catch(() => {});
+      }
+      return;
+    }
+  }
+
+  // Volume <= 1 or muted or paused: native video handles playback.
+  video.muted = isSilent;
+  const pipe = boostPipes.get(peerId);
+  if (pipe) {
+    pipe.gain.gain.value = 0;
+  }
 }
 
 function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
@@ -292,7 +386,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   volume.type = "range";
   volume.className = "tile-volume";
   volume.min = "0";
-  volume.max = "100";
+  volume.max = "200";
   volume.step = "1";
   volume.addEventListener("input", () => {
     const s = listeningFor(peerId);
@@ -393,7 +487,9 @@ function renderTileControls(peerId: PeerId): void {
   c.muteBtn.disabled = isPaused;
 
   c.volume.value = String(s.muted ? 0 : Math.round(s.volume * 100));
-  c.volume.title = `${name} volume: ${c.volume.value}%`;
+  const isBoosted = !s.muted && !isPaused && s.volume > 1;
+  c.volume.dataset["boosted"] = String(isBoosted);
+  c.volume.title = `${name} volume: ${c.volume.value}%${isBoosted ? " (boosted)" : ""}`;
   c.volume.setAttribute("aria-label", `${name} volume`);
   c.volume.disabled = isPaused;
 
@@ -516,6 +612,7 @@ function removeTile(peerId: PeerId): void {
   if (document.pictureInPictureElement === video) {
     void document.exitPictureInPicture().catch(() => {});
   }
+  teardownBoostPipe(peerId);
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
@@ -1051,6 +1148,9 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             onRemoteStream: (peerId, stream) => {
               const video = tileFor(peerId);
               video.srcObject = stream;
+              stream.addEventListener("addtrack", () => applyAudio(peerId));
+              stream.addEventListener("removetrack", () => applyAudio(peerId));
+              applyAudio(peerId);
               startPlayback(video, peerId);
             },
             onRemoteStreamGone: (peerId) => removeTile(peerId),
@@ -1175,6 +1275,7 @@ function leaveRoom(): void {
   relayActive = false;
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
+  for (const id of [...boostPipes.keys()]) teardownBoostPipe(id);
   names.clear();
   members.clear();
   listening.clear();
