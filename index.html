@@ -130,6 +130,11 @@
       button.primary:hover {
         background-color: var(--accent-hover);
       }
+      button.copied {
+        background-color: #047857;
+        border-color: #047857;
+        color: #ffffff;
+      }
       #stage {
         flex: 1;
         display: grid;
@@ -463,6 +468,7 @@
       <button type="button" id="gen-pass" title="Fill in a strong random password (share it with your friends)">Generate</button>
       <button type="button" id="join" class="primary">Join</button>
       <button type="button" id="create">Create</button>
+      <button type="button" id="copy-link" title="Copy room invite link to clipboard">Copy link</button>
       <label class="privacy-label" title="Send your video and audio through a relay, so people in the room see the relay's address instead of yours. Adds some delay.">
         <input type="checkbox" id="relay-only" />
         Hide my IP (relay, adds delay)
@@ -518,7 +524,7 @@
       <select id="preset" title="Applies immediately while sharing"></select>
       <label class="field" for="codec">Codec</label>
       <select id="codec" title="Applies the next time you start sharing"></select>
-      <span id="status" data-kind="info">Not connected</span>
+      <span id="status" data-kind="info" aria-live="polite">Not connected</span>
     </div>
 
     <script type="module" src="/src/main.ts"></script>
