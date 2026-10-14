@@ -124,11 +124,38 @@ const listening = new Map<PeerId, { volume: number; muted: boolean }>();
 const paused = new Set<PeerId>();
 /** Whether each tile is on screen, as last reported by its IntersectionObserver. */
 const onScreen = new Map<PeerId, boolean>();
+/** Stream currently pinned/focused by the viewer, if any. */
+let focusedPeerId: PeerId | null = null;
 /** The per-tile controls, so they can be redrawn when their state changes. */
 const tileControls = new Map<
   PeerId,
-  { wrap: HTMLElement; pauseBtn: HTMLButtonElement; muteBtn: HTMLButtonElement; volume: HTMLInputElement }
+  {
+    wrap: HTMLElement;
+    pauseBtn: HTMLButtonElement;
+    muteBtn: HTMLButtonElement;
+    volume: HTMLInputElement;
+    focusBtn: HTMLButtonElement;
+    fullscreenBtn: HTMLButtonElement;
+  }
 >();
+
+function setFocusedTile(peerId: PeerId | null): void {
+  if (focusedPeerId === peerId) focusedPeerId = null;
+  else focusedPeerId = peerId;
+
+  for (const [id, t] of tiles.entries()) {
+    const wrap = t.closest(".tile");
+    if (!wrap) continue;
+    if (focusedPeerId === id) wrap.classList.add("tile-focused");
+    else wrap.classList.remove("tile-focused");
+    renderTileControls(id);
+  }
+  if (focusedPeerId !== null) {
+    ui.stage.classList.add("has-focused");
+  } else {
+    ui.stage.classList.remove("has-focused");
+  }
+}
 
 function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void {
   ui.status.textContent = text;
@@ -171,6 +198,16 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   healthEls.set(peerId, health);
 
   wrap.append(video, label, health);
+  wrap.addEventListener("dblclick", (ev) => {
+    if ((ev.target as HTMLElement).closest("button, input")) return;
+    setFocusedTile(peerId);
+  });
+  wrap.addEventListener("click", (ev) => {
+    if (focusedPeerId !== null && focusedPeerId !== peerId) {
+      if ((ev.target as HTMLElement).closest("button, input")) return;
+      setFocusedTile(peerId);
+    }
+  });
   // Our own preview is always muted and never paused, so it gets no controls.
   if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
   ui.stage.append(wrap);
@@ -269,7 +306,30 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     renderTileControls(peerId);
   });
 
-  bar.append(pauseBtn, muteBtn, volume);
+  const focusBtn = document.createElement("button");
+  focusBtn.type = "button";
+  focusBtn.className = "tile-focus";
+  focusBtn.addEventListener("click", () => setFocusedTile(peerId));
+
+  const fullscreenBtn = document.createElement("button");
+  fullscreenBtn.type = "button";
+  fullscreenBtn.className = "tile-fullscreen";
+  fullscreenBtn.addEventListener("click", () => {
+    const isFs = document.fullscreenElement === wrap || (document as any).webkitFullscreenElement === wrap;
+    if (isFs) {
+      if (typeof document.exitFullscreen === "function") {
+        void document.exitFullscreen().catch(() => {});
+      } else if (typeof (document as any).webkitExitFullscreen === "function") {
+        (document as any).webkitExitFullscreen();
+      }
+    } else if (typeof wrap.requestFullscreen === "function") {
+      void wrap.requestFullscreen().catch(() => {});
+    } else if (typeof (wrap as any).webkitRequestFullscreen === "function") {
+      (wrap as any).webkitRequestFullscreen();
+    }
+  });
+
+  bar.append(pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn);
 
   // Over the frozen last frame while paused, so it is obvious why nothing moves.
   const resume = document.createElement("button");
@@ -279,7 +339,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   resume.addEventListener("click", () => setPaused(peerId, false));
 
   wrap.append(resume, bar);
-  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume });
+  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn });
   renderTileControls(peerId);
 }
 
@@ -305,6 +365,18 @@ function renderTileControls(peerId: PeerId): void {
   c.volume.title = `${name} volume: ${c.volume.value}%`;
   c.volume.setAttribute("aria-label", `${name} volume`);
   c.volume.disabled = isPaused;
+
+  const isFocused = focusedPeerId === peerId;
+  c.focusBtn.textContent = isFocused ? "🗕" : "📌";
+  c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
+  c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
+  c.focusBtn.setAttribute("aria-pressed", String(isFocused));
+
+  const isFs = document.fullscreenElement === c.wrap || (document as any).webkitFullscreenElement === c.wrap;
+  c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
+  c.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
+  c.fullscreenBtn.setAttribute("aria-label", c.fullscreenBtn.title);
+  c.fullscreenBtn.setAttribute("aria-pressed", String(isFs));
 }
 
 /**
@@ -409,6 +481,13 @@ function removeTile(peerId: PeerId): void {
   tileControls.delete(peerId);
   onScreen.delete(peerId);
   paused.delete(peerId);
+  if (focusedPeerId === peerId) setFocusedTile(null);
+}
+
+for (const evName of ["fullscreenchange", "webkitfullscreenchange"]) {
+  document.addEventListener(evName, () => {
+    for (const id of tileControls.keys()) renderTileControls(id);
+  });
 }
 
 /**
@@ -1059,6 +1138,7 @@ function leaveRoom(): void {
   selfId = null;
   isHost = false;
   roomLocked = false;
+  setFocusedTile(null);
   renderRoster();
   ui.muteAudioBtn.style.display = "none";
 }

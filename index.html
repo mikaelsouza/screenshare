@@ -179,6 +179,53 @@
         border-radius: 8px;
         overflow: hidden;
         aspect-ratio: 16 / 9;
+        touch-action: manipulation;
+      }
+      #stage.has-focused {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(214px, 1fr));
+        grid-template-rows: 1fr auto;
+        gap: 0.75rem;
+      }
+      #stage.has-focused .tile.tile-focused {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        height: 100%;
+        min-height: 0;
+        aspect-ratio: auto;
+        border-color: var(--accent-color);
+      }
+      #stage.has-focused .tile.tile-focused video {
+        height: 100%;
+        object-fit: contain;
+      }
+      #stage.has-focused .tile:not(.tile-focused) {
+        height: 120px;
+        width: auto;
+        max-width: 100%;
+        aspect-ratio: 16 / 9;
+        justify-self: center;
+        cursor: pointer;
+      }
+      #stage.has-focused .tile:not(.tile-focused) .tile-volume {
+        display: none;
+      }
+      .tile:fullscreen,
+      .tile:-webkit-full-screen {
+        width: 100% !important;
+        height: 100% !important;
+        max-width: none !important;
+        max-height: none !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        aspect-ratio: auto !important;
+        background: #000 !important;
+      }
+      .tile:fullscreen video,
+      .tile:-webkit-full-screen video {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: contain !important;
       }
       .tile video {
         width: 100%;
