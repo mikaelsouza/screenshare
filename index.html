@@ -191,12 +191,12 @@
         justify-self: center;
         align-self: center;
       }
-      .tile[data-fit="cover"] {
+      #stage:not(.has-focused) .tile[data-fit="cover"] {
         width: 100% !important;
         height: 100% !important;
         aspect-ratio: auto !important;
       }
-      .tile[data-fit="cover"] video {
+      #stage:not(.has-focused) .tile[data-fit="cover"] video {
         object-fit: cover !important;
       }
       #stage.has-focused {
@@ -232,12 +232,15 @@
         object-fit: cover !important;
       }
       #stage.has-focused .tile:not(.tile-focused) {
-        height: 120px;
-        width: auto;
-        max-width: 100%;
-        aspect-ratio: var(--tile-aspect, 16 / 9);
+        height: 120px !important;
+        width: auto !important;
+        max-width: 100% !important;
+        aspect-ratio: var(--tile-aspect, 16 / 9) !important;
         justify-self: center;
         cursor: pointer;
+      }
+      #stage.has-focused .tile:not(.tile-focused) video {
+        object-fit: contain !important;
       }
       #stage.has-focused .tile:not(.tile-focused) .tile-volume,
       #stage.has-focused .tile:not(.tile-focused) .tile-pip,
