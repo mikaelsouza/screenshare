@@ -136,6 +136,7 @@ const tileControls = new Map<
     volume: HTMLInputElement;
     focusBtn: HTMLButtonElement;
     fullscreenBtn: HTMLButtonElement;
+    pipBtn?: HTMLButtonElement;
   }
 >();
 
@@ -208,10 +209,10 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
       setFocusedTile(peerId);
     }
   });
+  tiles.set(peerId, video);
   // Our own preview is always muted and never paused, so it gets no controls.
   if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
   ui.stage.append(wrap);
-  tiles.set(peerId, video);
   applyAudio(peerId);
 
   // Send-side pausing: tell the sharer to stop encoding for us when their tile
@@ -248,10 +249,11 @@ function listeningFor(peerId: PeerId): { volume: number; muted: boolean } {
  * resuming a tile that is scrolled away doesn't start the upload either.
  */
 function applyViewing(peerId: PeerId): void {
+  const isPip = document.pictureInPictureElement === tiles.get(peerId);
   const visible = onScreen.get(peerId);
   // Before the first observer callback, leave the far end at its default (sending).
-  if (visible === undefined && !paused.has(peerId)) return;
-  mesh?.setViewing(peerId, visible === true && !paused.has(peerId));
+  if (visible === undefined && !isPip && !paused.has(peerId)) return;
+  mesh?.setViewing(peerId, (visible === true || isPip) && !paused.has(peerId));
 }
 
 /** Put the tile's audio where the viewer left it: volume, mute, pause and autoplay. */
@@ -329,7 +331,36 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     }
   });
 
-  bar.append(pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn);
+  let pipBtn: HTMLButtonElement | undefined;
+  if ("pictureInPictureEnabled" in document && (document as any).pictureInPictureEnabled) {
+    const video = tiles.get(peerId);
+    pipBtn = document.createElement("button");
+    pipBtn.type = "button";
+    pipBtn.className = "tile-pip";
+    pipBtn.addEventListener("click", () => {
+      const v = tiles.get(peerId);
+      if (!v) return;
+      if (document.pictureInPictureElement === v) {
+        void document.exitPictureInPicture().catch(() => {});
+      } else if (typeof v.requestPictureInPicture === "function") {
+        void v.requestPictureInPicture().catch((err) => {
+          console.warn(`[main] PiP request failed for ${peerId}`, err);
+        });
+      }
+    });
+    if (video) {
+      video.addEventListener("enterpictureinpicture", () => {
+        applyViewing(peerId);
+        renderTileControls(peerId);
+      });
+      video.addEventListener("leavepictureinpicture", () => {
+        applyViewing(peerId);
+        renderTileControls(peerId);
+      });
+    }
+  }
+
+  bar.append(pauseBtn, muteBtn, volume, focusBtn, ...(pipBtn ? [pipBtn] : []), fullscreenBtn);
 
   // Over the frozen last frame while paused, so it is obvious why nothing moves.
   const resume = document.createElement("button");
@@ -339,7 +370,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   resume.addEventListener("click", () => setPaused(peerId, false));
 
   wrap.append(resume, bar);
-  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn });
+  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn, pipBtn });
   renderTileControls(peerId);
 }
 
@@ -371,6 +402,15 @@ function renderTileControls(peerId: PeerId): void {
   c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
   c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
   c.focusBtn.setAttribute("aria-pressed", String(isFocused));
+
+  if (c.pipBtn) {
+    const v = tiles.get(peerId);
+    const isPip = document.pictureInPictureElement === v;
+    c.pipBtn.textContent = isPip ? "🗗" : "⧉";
+    c.pipBtn.title = isPip ? `Exit Picture-in-Picture for ${name}` : `Picture-in-Picture for ${name}`;
+    c.pipBtn.setAttribute("aria-label", c.pipBtn.title);
+    c.pipBtn.setAttribute("aria-pressed", String(isPip));
+  }
 
   const isFs = document.fullscreenElement === c.wrap || (document as any).webkitFullscreenElement === c.wrap;
   c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
@@ -473,6 +513,9 @@ function removeTile(peerId: PeerId): void {
   observers.get(peerId)?.disconnect();
   observers.delete(peerId);
   dismissUnmutePrompt(peerId);
+  if (document.pictureInPictureElement === video) {
+    void document.exitPictureInPicture().catch(() => {});
+  }
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
