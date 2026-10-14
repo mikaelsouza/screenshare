@@ -108,6 +108,27 @@ const observers = new Map<PeerId, IntersectionObserver>();
 const unmutePrompts = new Map<PeerId, HTMLElement>();
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 
+/**
+ * Per-stream volume and mute, chosen by the viewer. Kept per peer rather than per tile,
+ * so a sharer who stops and starts again comes back at the volume they were left at.
+ * `volume` is never 0: dragging the slider to 0 sets `muted` instead, so unmuting
+ * returns to where it was.
+ */
+const listening = new Map<PeerId, { volume: number; muted: boolean }>();
+/**
+ * Streams the viewer paused. The sharer is asked to stop sending us video (the same
+ * send-side pause an off-screen tile gets) and the audio is silenced locally. Cleared
+ * with the tile: a sharer who stops and shares again is a new stream.
+ */
+const paused = new Set<PeerId>();
+/** Whether each tile is on screen, as last reported by its IntersectionObserver. */
+const onScreen = new Map<PeerId, boolean>();
+/** The per-tile controls, so they can be redrawn when their state changes. */
+const tileControls = new Map<
+  PeerId,
+  { wrap: HTMLElement; pauseBtn: HTMLButtonElement; muteBtn: HTMLButtonElement; volume: HTMLInputElement }
+>();
+
 function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void {
   ui.status.textContent = text;
   ui.status.dataset["kind"] = kind;
@@ -121,6 +142,9 @@ const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }]
 
 
 // ---- tiles ---------------------------------------------------------------
+
+/** Tile id of our own screen preview. */
+const SELF_TILE = "__self";
 
 function tileFor(peerId: PeerId): HTMLVideoElement {
   const existing = tiles.get(peerId);
@@ -146,8 +170,11 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   healthEls.set(peerId, health);
 
   wrap.append(video, label, health);
+  // Our own preview is always muted and never paused, so it gets no controls.
+  if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
   ui.stage.append(wrap);
   tiles.set(peerId, video);
+  applyAudio(peerId);
 
   // Send-side pausing: tell the sharer to stop encoding for us when their tile
   // isn't on screen. This is the biggest bandwidth lever in a multi-sharer room.
@@ -157,7 +184,8 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   const io = new IntersectionObserver(
     (entries) => {
       if (observers.get(peerId) !== io) return;
-      for (const e of entries) mesh?.setViewing(peerId, e.isIntersecting);
+      for (const e of entries) onScreen.set(peerId, e.isIntersecting);
+      applyViewing(peerId);
     },
     { threshold: 0.1 },
   );
@@ -165,6 +193,143 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   observers.set(peerId, io);
 
   return video;
+}
+
+function listeningFor(peerId: PeerId): { volume: number; muted: boolean } {
+  let s = listening.get(peerId);
+  if (!s) {
+    s = { volume: 1, muted: false };
+    listening.set(peerId, s);
+  }
+  return s;
+}
+
+/**
+ * Ask the sharer for video only while the tile is both on screen and not paused.
+ * One place decides, so scrolling a paused tile into view can't resume it, and
+ * resuming a tile that is scrolled away doesn't start the upload either.
+ */
+function applyViewing(peerId: PeerId): void {
+  const visible = onScreen.get(peerId);
+  // Before the first observer callback, leave the far end at its default (sending).
+  if (visible === undefined && !paused.has(peerId)) return;
+  mesh?.setViewing(peerId, visible === true && !paused.has(peerId));
+}
+
+/** Put the tile's audio where the viewer left it: volume, mute, pause and autoplay. */
+function applyAudio(peerId: PeerId): void {
+  if (peerId === SELF_TILE) return;
+  const video = tiles.get(peerId);
+  if (!video) return;
+  const s = listeningFor(peerId);
+  video.volume = s.volume;
+  // The autoplay prompt means the browser only allows muted playback until a click.
+  video.muted = s.muted || paused.has(peerId) || unmutePrompts.has(peerId);
+}
+
+function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
+  const bar = document.createElement("div");
+  bar.className = "tile-controls";
+
+  const pauseBtn = document.createElement("button");
+  pauseBtn.type = "button";
+  pauseBtn.className = "tile-pause";
+  pauseBtn.addEventListener("click", () => setPaused(peerId, !paused.has(peerId)));
+
+  const muteBtn = document.createElement("button");
+  muteBtn.type = "button";
+  muteBtn.className = "tile-mute";
+  muteBtn.addEventListener("click", () => {
+    const s = listeningFor(peerId);
+    s.muted = !s.muted;
+    // Any click on the tile is the gesture the autoplay policy was waiting for.
+    dismissUnmutePrompt(peerId);
+    applyAudio(peerId);
+    renderTileControls(peerId);
+  });
+
+  const volume = document.createElement("input");
+  volume.type = "range";
+  volume.className = "tile-volume";
+  volume.min = "0";
+  volume.max = "100";
+  volume.step = "1";
+  volume.addEventListener("input", () => {
+    const s = listeningFor(peerId);
+    const v = Number(volume.value);
+    if (v === 0) {
+      s.muted = true;
+    } else {
+      s.volume = v / 100;
+      s.muted = false;
+    }
+    dismissUnmutePrompt(peerId);
+    applyAudio(peerId);
+    renderTileControls(peerId);
+  });
+
+  bar.append(pauseBtn, muteBtn, volume);
+
+  // Over the frozen last frame while paused, so it is obvious why nothing moves.
+  const resume = document.createElement("button");
+  resume.type = "button";
+  resume.className = "tile-paused";
+  resume.textContent = "Paused. Click to resume";
+  resume.addEventListener("click", () => setPaused(peerId, false));
+
+  wrap.append(resume, bar);
+  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume });
+  renderTileControls(peerId);
+}
+
+function renderTileControls(peerId: PeerId): void {
+  const c = tileControls.get(peerId);
+  if (!c) return;
+  const s = listeningFor(peerId);
+  const isPaused = paused.has(peerId);
+  const name = names.get(peerId) ?? "this stream";
+  c.wrap.dataset["paused"] = String(isPaused);
+
+  c.pauseBtn.textContent = isPaused ? "▶" : "⏸";
+  c.pauseBtn.title = isPaused ? `Resume ${name}` : `Pause ${name}. Stops their video being sent to you.`;
+  c.pauseBtn.setAttribute("aria-label", isPaused ? `Resume ${name}` : `Pause ${name}`);
+
+  const silent = s.muted || isPaused;
+  c.muteBtn.textContent = silent ? "🔇" : "🔊";
+  c.muteBtn.title = isPaused ? `${name} is paused` : s.muted ? `Unmute ${name}` : `Mute ${name}`;
+  c.muteBtn.setAttribute("aria-label", c.muteBtn.title);
+  c.muteBtn.disabled = isPaused;
+
+  c.volume.value = String(s.muted ? 0 : Math.round(s.volume * 100));
+  c.volume.title = `${name} volume: ${c.volume.value}%`;
+  c.volume.setAttribute("aria-label", `${name} volume`);
+  c.volume.disabled = isPaused;
+}
+
+/**
+ * Pause or resume one stream. Paused: the sharer stops encoding video for us, the
+ * audio goes silent and the frame freezes. Nothing changes for anyone else.
+ */
+function setPaused(peerId: PeerId, value: boolean): void {
+  if (value) paused.add(peerId);
+  else paused.delete(peerId);
+  const video = tiles.get(peerId);
+  const target = healthEls.get(peerId);
+  if (value && target) {
+    target.textContent = "paused";
+    delete target.dataset["direct"];
+  }
+  dismissUnmutePrompt(peerId);
+  applyAudio(peerId);
+  if (video) {
+    if (value) {
+      video.pause();
+    } else {
+      void video.play().catch(() => {});
+    }
+  }
+  applyViewing(peerId);
+  renderTileControls(peerId);
 }
 
 /**
@@ -179,6 +344,11 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
  * stats poller rewrites that badge every two seconds and would erase it.
  */
 function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
+  // A paused stream stays paused even if its tracks are renegotiated.
+  if (paused.has(peerId)) {
+    video.pause();
+    return;
+  }
   void video.play().catch(() => {
     video.muted = true;
     void video.play().then(
@@ -197,18 +367,28 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
 function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
   const wrap = video.closest(".tile");
   if (!wrap || wrap.querySelector(".tile-unmute")) return;
+  // The viewer muted this stream on purpose: there is nothing to unmute.
+  if (listeningFor(peerId).muted) return;
 
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
   btn.textContent = "Click to unmute";
   btn.addEventListener("click", () => {
-    video.muted = false;
+    dismissUnmutePrompt(peerId);
+    const s = listeningFor(peerId);
+    s.muted = false;
+    applyAudio(peerId);
+    renderTileControls(peerId);
     void video.play().catch(() => {});
-    btn.remove();
   });
   wrap.append(btn);
   unmutePrompts.set(peerId, btn);
+}
+
+function dismissUnmutePrompt(peerId: PeerId): void {
+  unmutePrompts.get(peerId)?.remove();
+  unmutePrompts.delete(peerId);
 }
 
 function removeTile(peerId: PeerId): void {
@@ -219,13 +399,15 @@ function removeTile(peerId: PeerId): void {
   // firing stale callbacks.
   observers.get(peerId)?.disconnect();
   observers.delete(peerId);
-  unmutePrompts.get(peerId)?.remove();
-  unmutePrompts.delete(peerId);
+  dismissUnmutePrompt(peerId);
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
   healthEls.delete(peerId);
   monitors.delete(peerId);
+  tileControls.delete(peerId);
+  onScreen.delete(peerId);
+  paused.delete(peerId);
 }
 
 /**
@@ -242,13 +424,18 @@ function startHealthPolling(): void {
       const pc = mesh.getConnection(peerId);
       const target = healthEls.get(peerId);
       if (!pc || !target) continue;
+      if (paused.has(peerId)) {
+        target.textContent = "paused";
+        delete target.dataset["direct"];
+        continue;
+      }
       let monitor = monitors.get(peerId);
       if (!monitor) {
         monitor = new LinkMonitor(pc);
         monitors.set(peerId, monitor);
       }
       void monitor.read().then((health) => {
-        if (!health) return;
+        if (!health || paused.has(peerId)) return;
         target.textContent = summarize(health);
         target.dataset["direct"] = String(isDirect(health));
       });
@@ -262,7 +449,7 @@ function stopHealthPolling(): void {
 }
 
 function renderSelfPreview(stream: MediaStream | null): void {
-  const id = "__self";
+  const id = SELF_TILE;
   if (!stream) {
     removeTile(id);
     return;
@@ -692,6 +879,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         mesh?.close();
         monitors.clear();
         members.clear();
+        listening.clear();
         selfId = null;
         if (room.hostToken) saveHostToken(code, room.hostToken);
         saveRejoinToken(code, room.rejoinToken);
@@ -783,6 +971,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         mesh?.removeMember(id);
         names.delete(id);
         members.delete(id);
+        listening.delete(id);
         removeTile(id);
         renderRoster();
       },
@@ -865,6 +1054,7 @@ function leaveRoom(): void {
   for (const id of [...tiles.keys()]) removeTile(id);
   names.clear();
   members.clear();
+  listening.clear();
   selfId = null;
   isHost = false;
   roomLocked = false;
@@ -1049,17 +1239,32 @@ ui.shareBtn.addEventListener("click", () => {
 
 window.addEventListener("beforeunload", () => leaveRoom());
 
-// Deep link: /#ROOMCODE fills in the room, and waits for Join.
+// Deep link: /#ROOMCODE joins the room straight away.
 //
-// It used to join straight away. Joining connects you to whoever is sharing, which
-// hands them your IP address, and a first-time visitor on a forwarded link had not
-// even seen the Hide my IP option yet. Now they see it, and the note under it, first.
-const fromHash = location.hash.replace(/^#/, "").toUpperCase();
-if (isValidRoomCode(fromHash)) {
+// It used to only fill in the code and wait for Join, so a first-time visitor saw the
+// Hide my IP option before anything connected. In practice nobody understood that
+// they had to press Join, so opening a link now joins. Hide my IP is remembered across
+// visits and is applied before this runs; ticking it once inside the room reconnects
+// through the relay at once (see the relay-only change handler above).
+//
+// A password-protected room cannot be entered from the link alone: the server answers
+// with bad-password, the status line asks for it, and Enter or Join retries.
+function joinFromHash(): void {
+  const fromHash = location.hash.replace(/^#/, "").toUpperCase();
+  if (!isValidRoomCode(fromHash)) return;
+  // joinRoom itself writes the hash, which fires hashchange; don't rejoin for that.
+  if (lastJoin?.code === fromHash && client) return;
+  // Any password in the field was typed for some other room. Sending it here would
+  // claim an empty room with it, or count as a wrong guess against a protected one.
+  if (ui.roomInput.value.trim().toUpperCase() !== fromHash) {
+    ui.passInput.value = "";
+    ui.passInput.type = "password";
+  }
   ui.roomInput.value = fromHash;
-  setStatus(
-    `Room ${fromHash}: choose your name and whether to hide your IP, then press Join.`,
-    "info",
-  );
-  ui.joinBtn.focus();
+  void joinRoom(fromHash, ui.passInput.value.trim() || undefined);
 }
+
+joinFromHash();
+// Pasting a different room link into an open tab changes only the hash, which does
+// not reload the page, so it would otherwise do nothing.
+window.addEventListener("hashchange", joinFromHash);

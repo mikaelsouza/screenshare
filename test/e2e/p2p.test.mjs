@@ -47,6 +47,19 @@ const readStats = async () => {
   return out;
 };
 
+/** Frames decoded so far across every live inbound video stream on the page. */
+const decodedFrames = async () => {
+  let total = 0;
+  for (const pc of window.__pcs) {
+    if (pc.connectionState === "closed") continue;
+    const report = await pc.getStats();
+    report.forEach((s) => {
+      if (s.type === "inbound-rtp" && s.kind === "video") total += s.framesDecoded ?? 0;
+    });
+  }
+  return total;
+};
+
 describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
   before(async () => {
     server = await startServer(PORT);
@@ -89,24 +102,18 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.notEqual(ice.status, 200, "/api/ice should no longer mint credentials");
   });
 
-  it("does not join from a room link until Join is pressed", async () => {
-    // Joining hands your IP to whoever is sharing, so a link only fills in the room:
-    // the visitor sees the Hide my IP option before anything connects.
-    for (const page of [sharer, viewer, viewer2]) await page.goto(`${BASE_URL}/#${ROOM}`);
-    await new Promise((r) => setTimeout(r, 1000));
-    for (const page of [sharer, viewer, viewer2]) {
-      assert.equal(await page.inputValue("#room-code"), ROOM);
-      assert.ok(!(await page.textContent("#status")).includes("In room"), "joined without pressing Join");
-    }
-  });
-
-  it("joins all three to one room and lists everyone", async () => {
+  it("joins straight from a room link, without pressing Join", async () => {
+    // One at a time, so the sharer is first in and becomes the room's host.
     for (const [name, page] of [["sharer", sharer], ["viewer", viewer], ["viewer2", viewer2]]) {
-      await page.fill("#display-name", name);
-      await page.click("#join");
+      await page.goto(BASE_URL);
+      await page.evaluate((n) => localStorage.setItem("name", n), name);
+      // A fresh load, not a same-document hash change: this is someone opening a link.
+      await page.goto(`${BASE_URL}/#${ROOM}`);
+      await page.reload();
       await waitFor(page, () => document.getElementById("status")?.textContent?.includes("In room"), {
-        label: `${name} to join the room`,
+        label: `${name} to join from the link`,
       });
+      assert.equal(await page.inputValue("#room-code"), ROOM);
     }
     // Viewers get no tile, so the participant list is the only place they show up.
     for (const page of [sharer, viewer, viewer2]) {
@@ -218,6 +225,63 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
         assert.ok(DIRECT.includes(s.remoteType), `${name} remote candidate was ${s.remoteType}, expected a direct type`);
       }
     }
+  });
+
+  it("lets a viewer turn a stream down, and pause it so the sharer stops sending", async () => {
+    const tile = ".tile:has(.tile-controls)";
+    // Whether each of the sharer's live video senders is encoding. Self-contained,
+    // because page.evaluate ships the function's source to the browser.
+    const videoSendsActive = () =>
+      window.__pcs
+        .filter((pc) => pc.connectionState !== "closed")
+        .flatMap((pc) => pc.getSenders())
+        .filter((s) => s.track?.kind === "video")
+        .map((s) => s.getParameters().encodings?.[0]?.active !== false);
+    const remote = () => {
+      const v = document.querySelector(".tile:has(.tile-controls) video");
+      return { paused: v.paused, muted: v.muted, volume: v.volume };
+    };
+
+    await viewer.hover(tile);
+    await viewer.fill(`${tile} .tile-volume`, "40");
+    assert.equal((await viewer.evaluate(remote)).volume, 0.4);
+
+    await viewer.click(`${tile} .tile-pause`);
+    const pausedState = await viewer.evaluate(remote);
+    assert.equal(pausedState.paused, true, "the video should be paused");
+    assert.equal(pausedState.muted, true, "a paused stream should be silent");
+    // Pausing is not just local: the sharer stops encoding for this viewer, and only this one.
+    const deadline = Date.now() + 15_000;
+    let active = [];
+    while (Date.now() < deadline) {
+      active = await sharer.evaluate(videoSendsActive);
+      if (active.length === 2 && active.filter((a) => !a).length === 1) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    assert.deepEqual([...active].sort(), [false, true], "sharer should stop sending to the paused viewer only");
+
+    const before = await viewer.evaluate(decodedFrames);
+    await viewer.click(`${tile} .tile-paused`);
+    const resumeDeadline = Date.now() + 15_000;
+    while (Date.now() < resumeDeadline) {
+      active = await sharer.evaluate(videoSendsActive);
+      if (active.length === 2 && active.every(Boolean)) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    assert.deepEqual(active, [true, true], "sharer should resume sending after the viewer resumes");
+
+    const framesDeadline = Date.now() + 30_000;
+    let now = before;
+    while (Date.now() < framesDeadline && now <= before + 10) {
+      await new Promise((r) => setTimeout(r, 1000));
+      now = await viewer.evaluate(decodedFrames);
+    }
+    assert.ok(now > before + 10, `frames did not flow again after resuming: ${before} -> ${now}`);
+
+    const resumed = await viewer.evaluate(remote);
+    assert.equal(resumed.paused, false);
+    assert.equal(resumed.muted, false);
+    assert.equal(resumed.volume, 0.4, "resuming should keep the chosen volume");
   });
 
   it("removes the viewer's tile when the sharer stops", async () => {

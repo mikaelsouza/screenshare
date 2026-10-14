@@ -82,9 +82,9 @@ of non-relay candidate lines, so the policy is checked on the way out rather tha
 
 **Who connects to whom.** A peer connection runs ICE, and ICE gives the far end your
 public address, so the mesh is not a full mesh: two people are connected only while at
-least one of them is sharing. Viewers never connect to each other. A room link (`/#CODE`)
-fills in the code and waits for **Join**, so a first-time visitor sees the Hide my IP
-option, and the short "what others can see" note under it, before anything connects.
+least one of them is sharing. Viewers never connect to each other. Opening a room link
+(`/#CODE`) joins the room immediately; a remembered Hide my IP setting is applied before
+it connects, and a password-protected room asks for its password first.
 
 **Everyone is listed.** The participant list above the video shows every member, with
 the first four characters of their id so two people with the same name can be told

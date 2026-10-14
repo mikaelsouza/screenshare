@@ -141,7 +141,7 @@
         min-height: 0;
       }
       #stage:empty::before {
-        content: "No active screen shares. Join or create a room to get started.";
+        content: "No active screen shares. Open a room link, or create a room to get started.";
         color: var(--text-secondary);
         font-size: 0.95rem;
         grid-column: 1 / -1;
@@ -183,6 +183,8 @@
       }
       .tile-label {
         position: absolute;
+        /* Above the paused overlay, so the name and state stay readable. */
+        z-index: 3;
         left: 0.5rem;
         bottom: 0.5rem;
         padding: 0.15rem 0.5rem;
@@ -193,6 +195,8 @@
       }
       .tile-health {
         position: absolute;
+        /* Above the paused overlay, so the name and state stay readable. */
+        z-index: 3;
         right: 0.5rem;
         bottom: 0.5rem;
         padding: 0.15rem 0.5rem;
@@ -210,6 +214,7 @@
       .tile-unmute {
         position: absolute;
         inset: 0;
+        z-index: 2;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -226,6 +231,82 @@
         content: "🔇";
         font-size: 1.4rem;
       }
+      /* Per-stream pause / mute / volume. Out of the way until the tile is hovered
+         or focused; always shown on touch screens, which have no hover. */
+      .tile-controls {
+        position: absolute;
+        top: 0.5rem;
+        right: 0.5rem;
+        z-index: 3;
+        display: flex;
+        align-items: center;
+        gap: 0.35rem;
+        padding: 0.25rem 0.5rem;
+        border-radius: 6px;
+        background: rgba(0, 0, 0, 0.65);
+        opacity: 0;
+        transition: opacity 0.15s;
+      }
+      .tile:hover .tile-controls,
+      .tile:focus-within .tile-controls,
+      .tile[data-paused="true"] .tile-controls {
+        opacity: 1;
+      }
+      @media (hover: none) {
+        .tile-controls {
+          opacity: 1;
+          gap: 0.5rem;
+          padding: 0.35rem 0.6rem;
+        }
+        .tile-controls button {
+          min-width: 28px;
+          min-height: 28px;
+        }
+      }
+      .tile-controls button {
+        background: transparent;
+        border: 0;
+        padding: 0.15rem 0.35rem;
+        font-size: 0.95rem;
+        line-height: 1;
+        color: #fff;
+      }
+      .tile-controls button:hover:not(:disabled) {
+        background-color: rgba(255, 255, 255, 0.15);
+      }
+      .tile-controls button:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .tile-volume {
+        width: 90px;
+        accent-color: var(--accent-color);
+        cursor: pointer;
+      }
+      .tile-volume:disabled {
+        opacity: 0.4;
+        cursor: default;
+      }
+      .tile-paused {
+        position: absolute;
+        inset: 0;
+        z-index: 2;
+        display: none;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        border: 0;
+        border-radius: 0;
+        background: rgba(0, 0, 0, 0.7);
+        color: #fff;
+        font-size: 0.95rem;
+      }
+      .tile-paused:hover {
+        background: rgba(0, 0, 0, 0.6);
+      }
+      .tile[data-paused="true"] .tile-paused { display: flex; }
+      /* Paused already silences the stream; the unmute offer would only confuse. */
+      .tile[data-paused="true"] .tile-unmute { display: none; }
       #controls .field {
         font-size: 0.8rem;
         color: var(--text-secondary);
