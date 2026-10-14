@@ -214,6 +214,7 @@
       .tile-unmute {
         position: absolute;
         inset: 0;
+        z-index: 2;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -252,7 +253,15 @@
         opacity: 1;
       }
       @media (hover: none) {
-        .tile-controls { opacity: 1; }
+        .tile-controls {
+          opacity: 1;
+          gap: 0.5rem;
+          padding: 0.35rem 0.6rem;
+        }
+        .tile-controls button {
+          min-width: 28px;
+          min-height: 28px;
+        }
       }
       .tile-controls button {
         background: transparent;

@@ -243,7 +243,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     const s = listeningFor(peerId);
     s.muted = !s.muted;
     // Any click on the tile is the gesture the autoplay policy was waiting for.
-    if (!s.muted) dismissUnmutePrompt(peerId);
+    dismissUnmutePrompt(peerId);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -262,8 +262,8 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     } else {
       s.volume = v / 100;
       s.muted = false;
-      dismissUnmutePrompt(peerId);
     }
+    dismissUnmutePrompt(peerId);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -296,7 +296,7 @@ function renderTileControls(peerId: PeerId): void {
 
   const silent = s.muted || isPaused;
   c.muteBtn.textContent = silent ? "🔇" : "🔊";
-  c.muteBtn.title = s.muted ? `Unmute ${name}` : `Mute ${name}`;
+  c.muteBtn.title = isPaused ? `${name} is paused` : s.muted ? `Unmute ${name}` : `Mute ${name}`;
   c.muteBtn.setAttribute("aria-label", c.muteBtn.title);
   c.muteBtn.disabled = isPaused;
 
@@ -314,16 +314,20 @@ function setPaused(peerId: PeerId, value: boolean): void {
   if (value) paused.add(peerId);
   else paused.delete(peerId);
   const video = tiles.get(peerId);
+  const target = healthEls.get(peerId);
+  if (value && target) {
+    target.textContent = "paused";
+    delete target.dataset["direct"];
+  }
+  dismissUnmutePrompt(peerId);
+  applyAudio(peerId);
   if (video) {
     if (value) {
       video.pause();
     } else {
-      // Resuming is a click, so unmuted playback is allowed now.
-      dismissUnmutePrompt(peerId);
       void video.play().catch(() => {});
     }
   }
-  applyAudio(peerId);
   applyViewing(peerId);
   renderTileControls(peerId);
 }
@@ -372,7 +376,10 @@ function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
   btn.textContent = "Click to unmute";
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
+    const s = listeningFor(peerId);
+    s.muted = false;
     applyAudio(peerId);
+    renderTileControls(peerId);
     void video.play().catch(() => {});
   });
   wrap.append(btn);
@@ -428,7 +435,7 @@ function startHealthPolling(): void {
         monitors.set(peerId, monitor);
       }
       void monitor.read().then((health) => {
-        if (!health) return;
+        if (!health || paused.has(peerId)) return;
         target.textContent = summarize(health);
         target.dataset["direct"] = String(isDirect(health));
       });
