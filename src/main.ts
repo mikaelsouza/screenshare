@@ -134,6 +134,7 @@ const tileControls = new Map<
     pauseBtn: HTMLButtonElement;
     muteBtn: HTMLButtonElement;
     volume: HTMLInputElement;
+    fitBtn: HTMLButtonElement;
     focusBtn: HTMLButtonElement;
     fullscreenBtn: HTMLButtonElement;
     pipBtn?: HTMLButtonElement;
@@ -199,6 +200,13 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   healthEls.set(peerId, health);
 
   wrap.append(video, label, health);
+  const updateAspect = () => {
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      wrap.style.setProperty("--tile-aspect", `${video.videoWidth} / ${video.videoHeight}`);
+    }
+  };
+  video.addEventListener("loadedmetadata", updateAspect);
+  video.addEventListener("resize", updateAspect);
   wrap.addEventListener("dblclick", (ev) => {
     if ((ev.target as HTMLElement).closest("button, input")) return;
     setFocusedTile(peerId);
@@ -402,6 +410,15 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     renderTileControls(peerId);
   });
 
+  const fitBtn = document.createElement("button");
+  fitBtn.type = "button";
+  fitBtn.className = "tile-fit";
+  fitBtn.addEventListener("click", () => {
+    const isCover = wrap.dataset["fit"] === "cover";
+    wrap.dataset["fit"] = isCover ? "contain" : "cover";
+    renderTileControls(peerId);
+  });
+
   const focusBtn = document.createElement("button");
   focusBtn.type = "button";
   focusBtn.className = "tile-focus";
@@ -454,7 +471,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     }
   }
 
-  bar.append(pauseBtn, muteBtn, volume, focusBtn, ...(pipBtn ? [pipBtn] : []), fullscreenBtn);
+  bar.append(pauseBtn, muteBtn, volume, fitBtn, focusBtn, ...(pipBtn ? [pipBtn] : []), fullscreenBtn);
 
   // Over the frozen last frame while paused, so it is obvious why nothing moves.
   const resume = document.createElement("button");
@@ -464,7 +481,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   resume.addEventListener("click", () => setPaused(peerId, false));
 
   wrap.append(resume, bar);
-  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn, pipBtn });
+  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, fitBtn, focusBtn, fullscreenBtn, pipBtn });
   renderTileControls(peerId);
 }
 
@@ -492,6 +509,12 @@ function renderTileControls(peerId: PeerId): void {
   c.volume.title = `${name} volume: ${c.volume.value}%${isBoosted ? " (boosted)" : ""}`;
   c.volume.setAttribute("aria-label", `${name} volume`);
   c.volume.disabled = isPaused;
+
+  const isCover = c.wrap.dataset["fit"] === "cover";
+  c.fitBtn.textContent = isCover ? "⊡" : "⤢";
+  c.fitBtn.title = isCover ? `Fit ${name} to window (show whole screen)` : `Fill window with ${name} (crop black bars)`;
+  c.fitBtn.setAttribute("aria-label", c.fitBtn.title);
+  c.fitBtn.setAttribute("aria-pressed", String(isCover));
 
   const isFocused = focusedPeerId === peerId;
   c.focusBtn.textContent = isFocused ? "🗕" : "📌";

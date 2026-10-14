@@ -320,6 +320,44 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(restored.volume, 0.75);
     assert.equal(restored.inputValue, "75");
     assert.equal(restored.boostedAttr, "false");
+
+    // Fits within the browser window bounds without page scrolling:
+    const windowFit = await viewer.evaluate(() => {
+      return {
+        pageScrolls: document.documentElement.scrollHeight > window.innerHeight,
+      };
+    });
+    assert.equal(windowFit.pageScrolls, false, "stream stage should not cause vertical page scroll");
+
+    // Fit vs. Fill toggle (Approach A):
+    const fitBtn = `${tile} .tile-fit`;
+    assert.equal(await viewer.getAttribute(fitBtn, "aria-pressed"), "false");
+    await viewer.click(fitBtn);
+    const coverState = await viewer.evaluate(() => {
+      const t = document.querySelector(".tile:has(.tile-controls)");
+      const v = t.querySelector("video");
+      return {
+        fitAttr: t.dataset.fit,
+        objectFit: window.getComputedStyle(v).objectFit,
+      };
+    });
+    assert.equal(coverState.fitAttr, "cover");
+    assert.equal(coverState.objectFit, "cover");
+    assert.equal(await viewer.getAttribute(fitBtn, "aria-pressed"), "true");
+
+    // Toggle back to contain (fit):
+    await viewer.click(fitBtn);
+    const containState = await viewer.evaluate(() => {
+      const t = document.querySelector(".tile:has(.tile-controls)");
+      const v = t.querySelector("video");
+      return {
+        fitAttr: t.dataset.fit,
+        objectFit: window.getComputedStyle(v).objectFit,
+      };
+    });
+    assert.equal(containState.fitAttr, "contain");
+    assert.equal(containState.objectFit, "contain");
+    assert.equal(await viewer.getAttribute(fitBtn, "aria-pressed"), "false");
   });
 
   it("removes the viewer's tile when the sharer stops", async () => {
