@@ -198,6 +198,16 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   healthEls.set(peerId, health);
 
   wrap.append(video, label, health);
+  wrap.addEventListener("dblclick", (ev) => {
+    if ((ev.target as HTMLElement).closest("button, input")) return;
+    setFocusedTile(peerId);
+  });
+  wrap.addEventListener("click", (ev) => {
+    if (focusedPeerId !== null && focusedPeerId !== peerId) {
+      if ((ev.target as HTMLElement).closest("button, input")) return;
+      setFocusedTile(peerId);
+    }
+  });
   // Our own preview is always muted and never paused, so it gets no controls.
   if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
   ui.stage.append(wrap);
@@ -305,16 +315,18 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   fullscreenBtn.type = "button";
   fullscreenBtn.className = "tile-fullscreen";
   fullscreenBtn.addEventListener("click", () => {
-    if (document.fullscreenElement === wrap) {
-      void document.exitFullscreen().catch(() => {});
-    } else {
+    const isFs = document.fullscreenElement === wrap || (document as any).webkitFullscreenElement === wrap;
+    if (isFs) {
+      if (typeof document.exitFullscreen === "function") {
+        void document.exitFullscreen().catch(() => {});
+      } else if (typeof (document as any).webkitExitFullscreen === "function") {
+        (document as any).webkitExitFullscreen();
+      }
+    } else if (typeof wrap.requestFullscreen === "function") {
       void wrap.requestFullscreen().catch(() => {});
+    } else if (typeof (wrap as any).webkitRequestFullscreen === "function") {
+      (wrap as any).webkitRequestFullscreen();
     }
-  });
-
-  wrap.addEventListener("dblclick", (ev) => {
-    if ((ev.target as HTMLElement).closest("button, input")) return;
-    setFocusedTile(peerId);
   });
 
   bar.append(pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn);
@@ -355,14 +367,16 @@ function renderTileControls(peerId: PeerId): void {
   c.volume.disabled = isPaused;
 
   const isFocused = focusedPeerId === peerId;
-  c.focusBtn.textContent = isFocused ? "🗗" : "📌";
-  c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click tile also focuses)`;
+  c.focusBtn.textContent = isFocused ? "🗕" : "📌";
+  c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
   c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
+  c.focusBtn.setAttribute("aria-pressed", String(isFocused));
 
-  const isFs = document.fullscreenElement === c.wrap;
+  const isFs = document.fullscreenElement === c.wrap || (document as any).webkitFullscreenElement === c.wrap;
   c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
   c.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
   c.fullscreenBtn.setAttribute("aria-label", c.fullscreenBtn.title);
+  c.fullscreenBtn.setAttribute("aria-pressed", String(isFs));
 }
 
 /**
@@ -470,9 +484,11 @@ function removeTile(peerId: PeerId): void {
   if (focusedPeerId === peerId) setFocusedTile(null);
 }
 
-document.addEventListener("fullscreenchange", () => {
-  for (const id of tileControls.keys()) renderTileControls(id);
-});
+for (const evName of ["fullscreenchange", "webkitfullscreenchange"]) {
+  document.addEventListener(evName, () => {
+    for (const id of tileControls.keys()) renderTileControls(id);
+  });
+}
 
 /**
  * Surface per-peer link health on each tile. The point is to make a relayed
