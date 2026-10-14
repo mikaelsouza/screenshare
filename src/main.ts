@@ -136,6 +136,7 @@ const tileControls = new Map<
     volume: HTMLInputElement;
     focusBtn: HTMLButtonElement;
     fullscreenBtn: HTMLButtonElement;
+    pipBtn?: HTMLButtonElement;
   }
 >();
 
@@ -329,7 +330,30 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     }
   });
 
-  bar.append(pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn);
+  let pipBtn: HTMLButtonElement | undefined;
+  if ("pictureInPictureEnabled" in document && (document as any).pictureInPictureEnabled) {
+    const video = tiles.get(peerId);
+    pipBtn = document.createElement("button");
+    pipBtn.type = "button";
+    pipBtn.className = "tile-pip";
+    pipBtn.addEventListener("click", () => {
+      const v = tiles.get(peerId);
+      if (!v) return;
+      if (document.pictureInPictureElement === v) {
+        void document.exitPictureInPicture().catch(() => {});
+      } else if (typeof v.requestPictureInPicture === "function") {
+        void v.requestPictureInPicture().catch((err) => {
+          console.warn(`[main] PiP request failed for ${peerId}`, err);
+        });
+      }
+    });
+    if (video) {
+      video.addEventListener("enterpictureinpicture", () => renderTileControls(peerId));
+      video.addEventListener("leavepictureinpicture", () => renderTileControls(peerId));
+    }
+  }
+
+  bar.append(pauseBtn, muteBtn, volume, focusBtn, ...(pipBtn ? [pipBtn] : []), fullscreenBtn);
 
   // Over the frozen last frame while paused, so it is obvious why nothing moves.
   const resume = document.createElement("button");
@@ -339,7 +363,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   resume.addEventListener("click", () => setPaused(peerId, false));
 
   wrap.append(resume, bar);
-  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn });
+  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, focusBtn, fullscreenBtn, pipBtn });
   renderTileControls(peerId);
 }
 
@@ -371,6 +395,15 @@ function renderTileControls(peerId: PeerId): void {
   c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
   c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
   c.focusBtn.setAttribute("aria-pressed", String(isFocused));
+
+  if (c.pipBtn) {
+    const v = tiles.get(peerId);
+    const isPip = document.pictureInPictureElement === v;
+    c.pipBtn.textContent = isPip ? "🗗" : "⧉";
+    c.pipBtn.title = isPip ? `Exit Picture-in-Picture for ${name}` : `Picture-in-Picture for ${name}`;
+    c.pipBtn.setAttribute("aria-label", c.pipBtn.title);
+    c.pipBtn.setAttribute("aria-pressed", String(isPip));
+  }
 
   const isFs = document.fullscreenElement === c.wrap || (document as any).webkitFullscreenElement === c.wrap;
   c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
