@@ -209,10 +209,10 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
       setFocusedTile(peerId);
     }
   });
+  tiles.set(peerId, video);
   // Our own preview is always muted and never paused, so it gets no controls.
   if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
   ui.stage.append(wrap);
-  tiles.set(peerId, video);
   applyAudio(peerId);
 
   // Send-side pausing: tell the sharer to stop encoding for us when their tile
@@ -249,10 +249,11 @@ function listeningFor(peerId: PeerId): { volume: number; muted: boolean } {
  * resuming a tile that is scrolled away doesn't start the upload either.
  */
 function applyViewing(peerId: PeerId): void {
+  const isPip = document.pictureInPictureElement === tiles.get(peerId);
   const visible = onScreen.get(peerId);
   // Before the first observer callback, leave the far end at its default (sending).
-  if (visible === undefined && !paused.has(peerId)) return;
-  mesh?.setViewing(peerId, visible === true && !paused.has(peerId));
+  if (visible === undefined && !isPip && !paused.has(peerId)) return;
+  mesh?.setViewing(peerId, (visible === true || isPip) && !paused.has(peerId));
 }
 
 /** Put the tile's audio where the viewer left it: volume, mute, pause and autoplay. */
@@ -348,8 +349,14 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
       }
     });
     if (video) {
-      video.addEventListener("enterpictureinpicture", () => renderTileControls(peerId));
-      video.addEventListener("leavepictureinpicture", () => renderTileControls(peerId));
+      video.addEventListener("enterpictureinpicture", () => {
+        applyViewing(peerId);
+        renderTileControls(peerId);
+      });
+      video.addEventListener("leavepictureinpicture", () => {
+        applyViewing(peerId);
+        renderTileControls(peerId);
+      });
     }
   }
 
@@ -506,6 +513,9 @@ function removeTile(peerId: PeerId): void {
   observers.get(peerId)?.disconnect();
   observers.delete(peerId);
   dismissUnmutePrompt(peerId);
+  if (document.pictureInPictureElement === video) {
+    void document.exitPictureInPicture().catch(() => {});
+  }
   video.srcObject = null;
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
