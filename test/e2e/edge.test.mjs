@@ -153,7 +153,11 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
 
   it("keeps the host a host across a page refresh", async () => {
     await host.reload();
-    // A refresh lands on /#CODE, which fills the code and waits for Join.
+    // A refresh lands on /#CODE and joins at once, but without the password, so it is
+    // asked for; entering it and pressing Join gets back in.
+    await waitFor(host, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
+      label: "refresh to ask for the password",
+    });
     await host.fill("#room-pass", password);
     await host.click("#join");
     await waitFor(host, inRoom, { label: "host back in the room" });
@@ -225,6 +229,9 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     // A refresh is a reconnect. The locked room must recognise a member who was
     // already in, even though every page here shares the removed person's address.
     await other.reload();
+    await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
+      label: "refresh to ask for the password",
+    });
     await other.fill("#room-pass", password);
     await other.click("#join");
     await waitFor(other, inRoom, { label: "member back in the locked room" });
