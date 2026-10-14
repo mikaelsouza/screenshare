@@ -282,6 +282,44 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(resumed.paused, false);
     assert.equal(resumed.muted, false);
     assert.equal(resumed.volume, 0.4, "resuming should keep the chosen volume");
+
+    // Volume boost past 100% up to 200%:
+    await viewer.fill(`${tile} .tile-volume`, "150");
+    const boosted = await viewer.evaluate(() => {
+      const v = document.querySelector(".tile:has(.tile-controls) video");
+      const input = document.querySelector(".tile:has(.tile-controls) .tile-volume");
+      const pipes = window.__boostPipes;
+      const gainVal = pipes && pipes.size > 0 ? [...pipes.values()][0].gain.gain.value : null;
+      return {
+        volume: v.volume,
+        inputValue: input.value,
+        inputTitle: input.title,
+        boostedAttr: input.dataset.boosted,
+        gainVal,
+      };
+    });
+    assert.equal(boosted.volume, 1.0, "HTMLMediaElement volume should be clamped to 1.0");
+    assert.equal(boosted.inputValue, "150");
+    assert.ok(boosted.inputTitle.includes("150% (boosted)"));
+    assert.equal(boosted.boostedAttr, "true");
+    if (boosted.gainVal !== null) {
+      assert.equal(boosted.gainVal, 1.5, "Web Audio gain should be 1.5 for 150% boost");
+    }
+
+    // Dragging back to standard range resets boost styling:
+    await viewer.fill(`${tile} .tile-volume`, "75");
+    const restored = await viewer.evaluate(() => {
+      const v = document.querySelector(".tile:has(.tile-controls) video");
+      const input = document.querySelector(".tile:has(.tile-controls) .tile-volume");
+      return {
+        volume: v.volume,
+        inputValue: input.value,
+        boostedAttr: input.dataset.boosted,
+      };
+    });
+    assert.equal(restored.volume, 0.75);
+    assert.equal(restored.inputValue, "75");
+    assert.equal(restored.boostedAttr, "false");
   });
 
   it("removes the viewer's tile when the sharer stops", async () => {
