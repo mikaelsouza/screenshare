@@ -179,6 +179,46 @@
         border-radius: 8px;
         overflow: hidden;
         aspect-ratio: 16 / 9;
+        cursor: pointer;
+      }
+      #stage.has-focused {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+        grid-template-rows: 1fr auto;
+        gap: 0.75rem;
+        height: 100%;
+      }
+      #stage.has-focused .tile.tile-focused {
+        grid-column: 1 / -1;
+        grid-row: 1;
+        height: 100%;
+        min-height: 0;
+        aspect-ratio: auto;
+        border-color: var(--accent-color);
+      }
+      #stage.has-focused .tile.tile-focused video {
+        height: 100%;
+        object-fit: contain;
+      }
+      #stage.has-focused .tile:not(.tile-focused) {
+        height: 120px;
+        width: auto;
+        aspect-ratio: 16 / 9;
+        justify-self: center;
+      }
+      .tile:fullscreen {
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: none !important;
+        max-height: none !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        background: #000 !important;
+      }
+      .tile:fullscreen video {
+        width: 100vw !important;
+        height: 100vh !important;
+        object-fit: contain !important;
       }
       .tile video {
         width: 100%;
