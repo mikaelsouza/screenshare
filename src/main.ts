@@ -1234,6 +1234,8 @@ ui.createBtn.addEventListener("click", () => {
   })();
 });
 
+let copyFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
+
 async function copyRoomLink(): Promise<void> {
   const code = (lastJoin?.code ?? ui.roomInput.value.trim()).toUpperCase();
   if (!isValidRoomCode(code)) {
@@ -1255,7 +1257,10 @@ async function copyRoomLink(): Promise<void> {
     try {
       const ta = document.createElement("textarea");
       ta.value = url;
+      ta.setAttribute("readonly", "");
       ta.style.position = "fixed";
+      ta.style.top = "0";
+      ta.style.left = "0";
       ta.style.opacity = "0";
       document.body.appendChild(ta);
       ta.select();
@@ -1264,13 +1269,14 @@ async function copyRoomLink(): Promise<void> {
     } catch {}
   }
   if (copied) {
-    const originalText = ui.copyLinkBtn.textContent;
+    if (copyFeedbackTimeout !== null) clearTimeout(copyFeedbackTimeout);
     ui.copyLinkBtn.textContent = "Copied!";
     ui.copyLinkBtn.classList.add("copied");
     setStatus(`Copied room link: ${url}`, "info");
-    setTimeout(() => {
-      ui.copyLinkBtn.textContent = originalText;
+    copyFeedbackTimeout = setTimeout(() => {
+      ui.copyLinkBtn.textContent = "Copy link";
       ui.copyLinkBtn.classList.remove("copied");
+      copyFeedbackTimeout = null;
     }, 2000);
   } else {
     setStatus(`Could not copy link automatically. Room link: ${url}`, "warn");
