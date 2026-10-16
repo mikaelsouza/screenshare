@@ -829,6 +829,21 @@ export class RoomDO extends DurableObject<Env> {
       this.refuse(ws, admission.code, admission.message);
       return;
     }
+    const superseded = this.joinedPeers(ws).filter(
+      ({ att }) =>
+        (offeredRejoinHash !== null &&
+          att.rejoinHash !== undefined &&
+          timingSafeEqual(att.rejoinHash, offeredRejoinHash)) ||
+        (admission.isHost && att.host === true),
+    );
+    for (const { ws: oldWs } of superseded) {
+      this.forgetBudget(oldWs);
+      await this.handleLeave(oldWs);
+      try {
+        oldWs.close(1008, "Session replaced");
+      } catch {}
+    }
+
     const others = this.joinedPeers(ws);
     if (others.length >= MAX_ROOM_SIZE) {
       revokeMinted();
@@ -839,6 +854,9 @@ export class RoomDO extends DurableObject<Env> {
     const now = Date.now();
     const members = await this.getMembers(now);
     if (offeredRejoinHash) delete members[offeredRejoinHash];
+    for (const { att } of superseded) {
+      if (att.rejoinHash) delete members[att.rejoinHash];
+    }
     members[newRejoinHash] = now + EMPTY_ROOM_TTL_MS;
     await this.ctx.storage.put({
       [MEMBERS_KEY]: members,

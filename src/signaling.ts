@@ -76,6 +76,16 @@ export class SignalingClient {
   connect(): void {
     if (this.fatal) return;
     this.closedByUs = false;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.ws) {
+      this.stopPing();
+      const oldWs = this.ws;
+      this.ws = null;
+      this.detachSocket(oldWs);
+    }
     this.handlers.onStatus("connecting");
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -83,6 +93,7 @@ export class SignalingClient {
     this.ws = ws;
 
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       // Deliberately NOT resetting attempts or capacityRefusals here. A refusal also
       // completes the handshake — the server answers 101 and then closes, so that the
       // close code can carry a reason at all — so `open` fires for rejected sockets
@@ -107,6 +118,7 @@ export class SignalingClient {
     };
 
     ws.onmessage = (ev) => {
+      if (this.ws !== ws) return;
       const raw = String(ev.data);
       if (raw === PONG || raw === PING) return; // keepalive, not protocol traffic
       let msg: ServerMessage;
@@ -120,6 +132,7 @@ export class SignalingClient {
     };
 
     ws.onclose = (ev) => {
+      if (this.ws !== ws) return;
       this.stopPing();
       // Closed on purpose: whoever closed it has already said what happened, e.g. that
       // the host removed us, and "Connection closed" would overwrite it. The same goes
@@ -148,6 +161,7 @@ export class SignalingClient {
     };
 
     ws.onerror = () => {
+      if (this.ws !== ws) return;
       // 'close' always follows; reconnect is handled there.
     };
   }
@@ -231,12 +245,25 @@ export class SignalingClient {
     }, delay);
   }
 
+  private detachSocket(ws: WebSocket): void {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    try {
+      ws.close(1000);
+    } catch {}
+  }
+
   close(): void {
     this.closedByUs = true;
     this.stopPing();
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.ws?.close();
-    this.ws = null;
+    if (this.ws) {
+      const oldWs = this.ws;
+      this.ws = null;
+      this.detachSocket(oldWs);
+    }
   }
 }

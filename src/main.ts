@@ -1291,6 +1291,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 
 function leaveRoom(): void {
   stopHealthPolling();
+  if (capture) client?.setSharing(false);
   client?.close();
   client = null;
   mesh?.close();
@@ -1537,6 +1538,7 @@ ui.shareBtn.addEventListener("click", () => {
 });
 
 window.addEventListener("beforeunload", () => leaveRoom());
+window.addEventListener("pagehide", () => leaveRoom());
 
 // Deep link: /#ROOMCODE joins the room straight away.
 //
