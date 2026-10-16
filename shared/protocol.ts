@@ -70,6 +70,10 @@ export type ClientMessage =
       hostToken?: string;
       /** Proof of having been in this room, from the last welcome: rejoin past a lock. */
       rejoinToken?: string;
+      /** In-place signaling reconnect: preserve selfId and active P2P links when rejoinToken is valid. */
+      resume?: boolean;
+      /** Current sharing state on an in-place resume, so peers do not see sharing drop to false. */
+      sharing?: boolean;
       /** The diagnostics page: a throwaway join that claims nothing and gets short-lived TURN. */
       diagnostics?: boolean;
     }
@@ -197,6 +201,12 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           }
           if (typeof record.rejoinToken === "string" && record.rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
             joinMsg.rejoinToken = record.rejoinToken;
+          }
+          if (record.resume === true) {
+            joinMsg.resume = true;
+          }
+          if (typeof record.sharing === "boolean") {
+            joinMsg.sharing = record.sharing;
           }
           if (record.diagnostics === true) {
             joinMsg.diagnostics = true;

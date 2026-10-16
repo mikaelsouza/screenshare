@@ -12,10 +12,11 @@ export function baseUrl(port) {
 /** Start `wrangler dev` on `port` and wait until it actually answers. */
 export async function startServer(port) {
   const BASE_URL = baseUrl(port);
+  const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
   const proc = spawn(
-    "npx",
+    cmd,
     ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--log-level", "warn"],
-    { stdio: ["ignore", "pipe", "pipe"], env: process.env },
+    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32" },
   );
   let log = "";
   proc.stdout.on("data", (d) => { log += d; });
@@ -36,13 +37,22 @@ export async function startServer(port) {
 
 export async function stopServer(server) {
   if (!server) return;
-  server.proc.kill("SIGTERM");
-  await new Promise((r) => setTimeout(r, 300));
-  if (server.proc.exitCode === null) server.proc.kill("SIGKILL");
+  if (process.platform === "win32") {
+    try {
+      const killer = spawn("taskkill", ["/F", "/T", "/PID", String(server.proc.pid)], { stdio: "ignore" });
+      await new Promise((r) => killer.on("close", r));
+    } catch {}
+  } else {
+    server.proc.kill("SIGTERM");
+    await new Promise((r) => setTimeout(r, 300));
+    if (server.proc.exitCode === null) server.proc.kill("SIGKILL");
+  }
 }
 
 export async function launchBrowser() {
-  const executablePath = process.env.CHROMIUM_BIN;
+  const executablePath =
+    process.env.CHROMIUM_BIN ??
+    (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined);
   if (!executablePath) throw new Error("CHROMIUM_BIN is unset — run inside 'nix develop'.");
   return chromium.launch({
     executablePath,

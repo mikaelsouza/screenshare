@@ -1087,6 +1087,23 @@ function currentName(): string {
 /** Incremented per join so a superseded in-flight join can detect it lost the race. */
 let joinGeneration = 0;
 
+const RECONNECT_GRACE_MS = 8_000;
+const peerLeftTimers = new Map<PeerId, ReturnType<typeof setTimeout>>();
+
+function teardownPeer(peerId: PeerId): void {
+  const timer = peerLeftTimers.get(peerId);
+  if (timer) {
+    clearTimeout(timer);
+    peerLeftTimers.delete(peerId);
+  }
+  mesh?.removeMember(peerId);
+  names.delete(peerId);
+  members.delete(peerId);
+  listening.delete(peerId);
+  removeTile(peerId);
+  renderRoster();
+}
+
 async function joinRoom(code: string, password?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setStatus("That doesn't look like a valid room code.", "error");
@@ -1114,11 +1131,60 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         ),
 
       onWelcome: (selfIdFromServer, peers, iceServers, room) => {
-        // The signalling socket reconnects on any network blip, and the server issues
-        // a fresh peer id each time, so onWelcome fires again. Without closing the old
-        // Mesh its RTCPeerConnections stay open and keep encoding and uploading to
-        // peers that have already replaced us — a silent bandwidth leak that compounds
-        // with every reconnect.
+        for (const timer of peerLeftTimers.values()) clearTimeout(timer);
+        peerLeftTimers.clear();
+
+        const servers: RTCIceServer[] = iceServers.length > 0 ? iceServers : FALLBACK_ICE;
+        const relayOnly = ui.relayOnly.checked;
+
+        // When reconnecting in-place, reconcile without tearing down healthy links/tiles
+        if (
+          mesh !== null &&
+          selfId !== null &&
+          selfId === selfIdFromServer &&
+          relayActive === relayOnly
+        ) {
+          const activeMesh = mesh;
+          if (room.hostToken) saveHostToken(code, room.hostToken);
+          saveRejoinToken(code, room.rejoinToken);
+          isHost = room.host;
+          roomLocked = room.locked;
+
+          activeMesh.updateIceServers(servers);
+
+          const welcomePeerIds = new Set(peers.map((p) => p.id));
+          for (const id of [...members.keys()]) {
+            if (!welcomePeerIds.has(id)) {
+              teardownPeer(id);
+            }
+          }
+
+          for (const p of peers) {
+            names.set(p.id, p.name);
+            members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
+            const existingVideo = tiles.get(p.id);
+            if (existingVideo) {
+              const label = existingVideo.closest(".tile")?.querySelector(".tile-label");
+              if (label) label.textContent = p.name;
+              if (!p.sharing) removeTile(p.id);
+            }
+            activeMesh.setMemberSharing(p.id, p.sharing);
+          }
+
+          if (capture) {
+            client?.setSharing(true);
+            if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
+          }
+
+          setStatus(
+            `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+          );
+          startHealthPolling();
+          renderRoster();
+          return;
+        }
+
+        // Full reset path (first connect, page reload, or selfId/relay changed)
         mesh?.close();
         monitors.clear();
         members.clear();
@@ -1126,24 +1192,15 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         selfId = null;
         if (room.hostToken) saveHostToken(code, room.hostToken);
         saveRejoinToken(code, room.rejoinToken);
-        // Tiles from before a reconnect belong to links that no longer exist; anyone
-        // still sharing is connected afresh and gets a new tile.
-        for (const id of [...tiles.keys()]) removeTile(id);
+
+        // Preserve streamer's local preview tile across all reconnects
+        for (const id of [...tiles.keys()]) {
+          if (id !== SELF_TILE) removeTile(id);
+        }
+        if (tiles.has(SELF_TILE)) names.set(SELF_TILE, "You");
         isHost = room.host;
         roomLocked = room.locked;
 
-        // Minted by the Durable Object and delivered with the welcome, so holding a
-        // joined WebSocket is what authorises them.
-        const servers: RTCIceServer[] = iceServers.length > 0 ? iceServers : FALLBACK_ICE;
-
-        // Fall back to a normal connection rather than a broken one. Privacy mode is a
-        // preference; silently connecting nobody is not a way to honour it.
-        // Privacy mode must fail closed. Downgrading to iceTransportPolicy "all"
-        // signals host and srflx candidates — the user's real IP — to every peer,
-        // which is precisely what the checkbox promises to prevent. A security
-        // control that quietly turns itself off is worse than one that is absent,
-        // because the user goes on believing it is working.
-        const relayOnly = ui.relayOnly.checked;
         relayActive = false;
         if (relayOnly && !hasTurnServer(servers)) {
           setStatus(
@@ -1170,14 +1227,19 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           {
             onRemoteStream: (peerId, stream) => {
               const video = tileFor(peerId);
-              video.srcObject = stream;
-              stream.addEventListener("addtrack", () => applyAudio(peerId));
-              stream.addEventListener("removetrack", () => applyAudio(peerId));
+              if (video.srcObject !== stream) {
+                video.srcObject = stream;
+                stream.addEventListener("addtrack", () => applyAudio(peerId));
+                stream.addEventListener("removetrack", () => applyAudio(peerId));
+              }
               applyAudio(peerId);
               startPlayback(video, peerId);
             },
             onRemoteStreamGone: (peerId) => removeTile(peerId),
             onConnectionState: (peerId, state) => {
+              if ((state === "failed" || state === "closed") && peerLeftTimers.has(peerId)) {
+                teardownPeer(peerId);
+              }
               if (state === "failed") {
                 console.warn(`[main] connection to ${peerId} failed`);
               }
@@ -1200,6 +1262,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           // this socket down as not sharing, so say so first: others connect only to
           // sharers, and the server relays an offer only when one side shares.
           client?.setSharing(true);
+          if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           void mesh.setCapture(capture);
         }
         startHealthPolling();
@@ -1207,6 +1270,10 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       },
 
       onPeerJoined: (peer: PeerInfo) => {
+        if (peerLeftTimers.has(peer.id)) {
+          clearTimeout(peerLeftTimers.get(peer.id)!);
+          peerLeftTimers.delete(peer.id);
+        }
         names.set(peer.id, peer.name);
         members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
         mesh?.addMember(peer.id, peer.sharing);
@@ -1214,15 +1281,24 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         renderRoster();
       },
       onPeerLeft: (id) => {
-        mesh?.removeMember(id);
-        names.delete(id);
-        members.delete(id);
-        listening.delete(id);
-        removeTile(id);
-        renderRoster();
+        if (mesh?.hasConnectedLink(id)) {
+          if (peerLeftTimers.has(id)) {
+            clearTimeout(peerLeftTimers.get(id)!);
+          }
+          const timer = setTimeout(() => {
+            teardownPeer(id);
+          }, RECONNECT_GRACE_MS);
+          peerLeftTimers.set(id, timer);
+        } else {
+          teardownPeer(id);
+        }
       },
       onSignal: (from, data) => void mesh?.handleSignal(from, data),
       onPeerState: (id, sharing) => {
+        if (peerLeftTimers.has(id)) {
+          clearTimeout(peerLeftTimers.get(id)!);
+          peerLeftTimers.delete(id);
+        }
         if (!sharing) removeTile(id);
         const m = members.get(id);
         if (m) m.sharing = sharing;
@@ -1278,6 +1354,9 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           ui.passInput.focus();
           return;
         }
+        if (code === "unknown-peer" || code === "not-sharing") {
+          return;
+        }
         setStatus(`${code}: ${message}`, "error");
       },
     },
@@ -1290,6 +1369,8 @@ async function joinRoom(code: string, password?: string): Promise<void> {
 }
 
 function leaveRoom(): void {
+  for (const timer of peerLeftTimers.values()) clearTimeout(timer);
+  peerLeftTimers.clear();
   stopHealthPolling();
   if (capture) client?.setSharing(false);
   client?.close();

@@ -79,6 +79,8 @@ class FakeRTCPeerConnection {
     this.restartIceCalls++;
   }
 
+  setConfiguration = vi.fn((_config?: RTCConfiguration): void => {});
+
   async addIceCandidate(candidate: RTCIceCandidateInit): Promise<void> {
     this.addedCandidates.push(candidate);
   }
@@ -716,4 +718,73 @@ describe("negotiation recovery", () => {
     viewerPc.onconnectionstatechange?.();
     expect(viewerPc.restartIceCalls).toBe(0);
   });
+
+  it("does not tear down remote stream when an audio track ends, only when video ends", async () => {
+    const callbacks = cb();
+    const mesh = new Mesh("me", opts, () => {}, callbacks);
+    mesh.addMember("streamer", true);
+    await mesh.handleSignal("streamer", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const audioListeners: Record<string, () => void> = {};
+    const audioTrack = {
+      kind: "audio",
+      addEventListener: (ev: string, fn: () => void) => { audioListeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+
+    const videoListeners: Record<string, () => void> = {};
+    const videoTrack = {
+      kind: "video",
+      addEventListener: (ev: string, fn: () => void) => { videoListeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+
+    const fakeStream = {
+      id: "remote-stream",
+      getTracks: () => [audioTrack, videoTrack],
+    } as unknown as MediaStream;
+
+    // Simulate video track arrival
+    pc.ontrack?.({
+      track: videoTrack,
+      receiver: {} as unknown as RTCRtpReceiver,
+      streams: [fakeStream],
+    } as unknown as RTCTrackEvent);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledWith("streamer", fakeStream);
+
+    // Simulate audio track arrival on same stream
+    pc.ontrack?.({
+      track: audioTrack,
+      receiver: {} as unknown as RTCRtpReceiver,
+      streams: [fakeStream],
+    } as unknown as RTCTrackEvent);
+
+    // Audio track ends -> onRemoteStreamGone should NOT be called
+    audioListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).not.toHaveBeenCalled();
+
+    // Video track ends -> onRemoteStreamGone IS called
+    videoListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("streamer");
+  });
+
+  it("updates ICE servers on existing peer links and exposes hasConnectedLink", async () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    expect(mesh.hasConnectedLink("bob")).toBe(false);
+    pc.connectionState = "connecting";
+    expect(mesh.hasConnectedLink("bob")).toBe(true);
+    pc.connectionState = "connected";
+    expect(mesh.hasConnectedLink("bob")).toBe(true);
+    pc.connectionState = "disconnected";
+    expect(mesh.hasConnectedLink("bob")).toBe(false);
+
+    pc.setConfiguration = vi.fn();
+    const newServers = [{ urls: "stun:stun.cloudflare.com:3478" }];
+    mesh.updateIceServers(newServers);
+    expect(pc.setConfiguration).toHaveBeenCalledWith(expect.objectContaining({ iceServers: newServers }));
+  });
 });
+

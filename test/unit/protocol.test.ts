@@ -212,3 +212,44 @@ describe("parseClientMessage peer ids", () => {
     expect(parseClientMessage(JSON.stringify({ t: "signal", to, data: { k: "offer", sdp: "v=0" } }))).toBeNull();
   });
 });
+
+describe("parseClientMessage join options", () => {
+  it("parses resume and sharing when valid booleans", () => {
+    const parsed = parseClientMessage(
+      JSON.stringify({
+        t: "join",
+        room: "ABCDEFGH",
+        displayName: "alice",
+        rejoinToken: "tok123",
+        resume: true,
+        sharing: true,
+      }),
+    );
+    expect(parsed).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+      rejoinToken: "tok123",
+      resume: true,
+      sharing: true,
+    });
+  });
+
+  it("ignores non-boolean or false resume and sharing values", () => {
+    const parsed = parseClientMessage(
+      JSON.stringify({
+        t: "join",
+        room: "ABCDEFGH",
+        displayName: "alice",
+        resume: "true",
+        sharing: "yes",
+      }),
+    );
+    expect(parsed).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+    });
+  });
+});
+

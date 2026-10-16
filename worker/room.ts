@@ -148,6 +148,13 @@ const JOIN_DEADLINE_MS = 10_000;
 /** Unparseable messages a socket may send before it is closed. */
 const MAX_BAD_MESSAGES = 5;
 
+export interface MemberEntry {
+  until: number;
+  id?: string;
+  turnUser?: string;
+  sharing?: boolean;
+}
+
 interface PeerAttachment {
   id: string;
   name: string;
@@ -520,12 +527,22 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
 
+    const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+    if (raw === PING) {
+      try {
+        ws.send(PONG);
+      } catch {}
+      return;
+    }
+    if (raw === PONG) {
+      return;
+    }
+
     if (!this.spendMessage(attachment.id)) {
       this.refuse(ws, "rate-limited", "Too many messages");
       return;
     }
 
-    const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
     const clientMsg = parseClientMessage(raw);
     if (!clientMsg) {
       const bad = (this.badMessages.get(attachment.id) ?? 0) + 1;
@@ -550,10 +567,12 @@ export class RoomDO extends DurableObject<Env> {
         if (attachment.joined || this.joining.has(attachment.id) || this.gone.has(attachment.id)) {
           return;
         }
-        this.joining.add(attachment.id);
+        const joinId = attachment.id;
+        this.joining.add(joinId);
         try {
           await this.handleJoin(ws, attachment, clientMsg);
         } finally {
+          this.joining.delete(joinId);
           this.joining.delete(attachment.id);
         }
         return;
@@ -668,6 +687,16 @@ export class RoomDO extends DurableObject<Env> {
         try {
           ws.serializeAttachment(attachment);
         } catch {}
+
+        if (attachment.rejoinHash) {
+          const now = Date.now();
+          const members = await this.getMembers(now);
+          const member = members[attachment.rejoinHash];
+          if (member) {
+            member.sharing = attachment.sharing;
+            await this.ctx.storage.put({ [MEMBERS_KEY]: members });
+          }
+        }
 
         const stateMsg: ServerMessage = {
           t: "peer-state",
@@ -836,12 +865,58 @@ export class RoomDO extends DurableObject<Env> {
           timingSafeEqual(att.rejoinHash, offeredRejoinHash)) ||
         (admission.isHost && att.host === true),
     );
-    for (const { ws: oldWs } of superseded) {
-      this.forgetBudget(oldWs);
-      await this.handleLeave(oldWs);
-      try {
-        oldWs.close(1008, "Session replaced");
-      } catch {}
+
+    const isResume =
+      clientMsg.resume === true &&
+      (admission.returning ||
+        superseded.some(
+          ({ att }) =>
+            offeredRejoinHash !== null &&
+            att.rejoinHash !== undefined &&
+            timingSafeEqual(att.rejoinHash, offeredRejoinHash),
+        ));
+
+    const supersededSocket = superseded[0];
+    if (isResume) {
+      const preservedId = supersededSocket?.att.id ?? admission.memberTicket?.id;
+      if (preservedId) {
+        attachment.id = preservedId;
+        this.gone.delete(preservedId);
+      }
+      if (typeof clientMsg.sharing === "boolean") {
+        attachment.sharing = clientMsg.sharing;
+      } else if (supersededSocket?.att.sharing !== undefined) {
+        attachment.sharing = supersededSocket.att.sharing;
+      } else if (admission.memberTicket?.sharing !== undefined) {
+        attachment.sharing = admission.memberTicket.sharing;
+      }
+    }
+
+    if (isResume && superseded.length > 0) {
+      for (const { ws: oldWs, att: oldAtt } of superseded) {
+        oldAtt.id = crypto.randomUUID();
+        this.forgetBudget(oldWs);
+        oldAtt.joined = false;
+        if (!minted.username && oldAtt.turnUser) {
+          attachment.turnUser = oldAtt.turnUser;
+        }
+        oldAtt.turnUser = undefined;
+        try {
+          oldWs.serializeAttachment(oldAtt);
+        } catch {}
+        try {
+          oldWs.close(1008, "Session replaced");
+        } catch {}
+      }
+      this.gone.delete(attachment.id);
+    } else {
+      for (const { ws: oldWs } of superseded) {
+        this.forgetBudget(oldWs);
+        await this.handleLeave(oldWs);
+        try {
+          oldWs.close(1008, "Session replaced");
+        } catch {}
+      }
     }
 
     const others = this.joinedPeers(ws);
@@ -857,7 +932,12 @@ export class RoomDO extends DurableObject<Env> {
     for (const { att } of superseded) {
       if (att.rejoinHash) delete members[att.rejoinHash];
     }
-    members[newRejoinHash] = now + EMPTY_ROOM_TTL_MS;
+    members[newRejoinHash] = {
+      until: now + EMPTY_ROOM_TTL_MS,
+      id: attachment.id,
+      ...(attachment.sharing ? { sharing: true } : {}),
+      ...(attachment.turnUser ? { turnUser: attachment.turnUser } : {}),
+    };
     await this.ctx.storage.put({
       [MEMBERS_KEY]: members,
       // Only the join that creates the room may set its password (see CLAIMED_KEY).
@@ -887,7 +967,9 @@ export class RoomDO extends DurableObject<Env> {
 
     attachment.name = sanitiseName(clientMsg.displayName);
     attachment.joined = true;
-    attachment.sharing = false;
+    if (!isResume) {
+      attachment.sharing = false;
+    }
     attachment.host = admission.isHost;
     attachment.rejoinHash = newRejoinHash;
     if (minted.username) attachment.turnUser = minted.username;
@@ -914,18 +996,31 @@ export class RoomDO extends DurableObject<Env> {
       locked: admission.locked,
     });
 
-    // After the welcome, so the newcomer is set up before anyone signals it.
-    const joinedMsg: ServerMessage = {
-      t: "peer-joined",
-      peer: {
-        id: attachment.id,
-        name: attachment.name,
-        sharing: false,
-        ...(admission.isHost ? { host: true } : {}),
-      },
-    };
-    for (const { ws: s } of others) {
-      sendSafe(s, joinedMsg);
+    if (isResume && superseded.length > 0) {
+      if (supersededSocket && attachment.sharing !== supersededSocket.att.sharing) {
+        const stateMsg: ServerMessage = {
+          t: "peer-state",
+          id: attachment.id,
+          sharing: attachment.sharing,
+        };
+        for (const { ws: s } of others) {
+          sendSafe(s, stateMsg);
+        }
+      }
+    } else {
+      // After the welcome, so the newcomer is set up before anyone signals it.
+      const joinedMsg: ServerMessage = {
+        t: "peer-joined",
+        peer: {
+          id: attachment.id,
+          name: attachment.name,
+          sharing: attachment.sharing,
+          ...(admission.isHost ? { host: true } : {}),
+        },
+      };
+      for (const { ws: s } of others) {
+        sendSafe(s, joinedMsg);
+      }
     }
     return;
   }
@@ -941,7 +1036,14 @@ export class RoomDO extends DurableObject<Env> {
     offeredRejoinHash: string | null;
     ip: string | undefined;
   }): Promise<
-    | { ok: true; creates: boolean; isHost: boolean; locked: boolean }
+    | {
+        ok: true;
+        creates: boolean;
+        isHost: boolean;
+        locked: boolean;
+        returning: boolean;
+        memberTicket?: MemberEntry;
+      }
     | { ok: false; code: ErrorCode; message: string }
   > {
     const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
@@ -956,7 +1058,7 @@ export class RoomDO extends DurableObject<Env> {
           message: `Room passwords need at least ${MIN_PASSWORD_LENGTH} characters.`,
         };
       }
-      return { ok: true, creates: true, isHost: true, locked: false };
+      return { ok: true, creates: true, isHost: true, locked: false, returning: false };
     }
 
     const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
@@ -964,16 +1066,12 @@ export class RoomDO extends DurableObject<Env> {
       tokens.offeredHostHash !== null && hostHash !== null && timingSafeEqual(tokens.offeredHostHash, hostHash);
     const now = Date.now();
     const locked = await this.lockedNow(now);
-    if (isHost) return { ok: true, creates: false, isHost, locked };
-
-    // Someone already in the room coming back after a blip (a refresh, a network
-    // change, Hide my IP) presents the ticket their last welcome gave them. Without
-    // it a locked room shut out its own members on their first reconnect, and a
-    // kick shut out everyone behind the kicked person's address. A kick deletes the
-    // kicked person's ticket, so it does not let them back.
     const members = await this.getMembers(now);
-    const returning = tokens.offeredRejoinHash !== null && members[tokens.offeredRejoinHash] !== undefined;
-    if (returning) return { ok: true, creates: false, isHost, locked };
+    const memberTicket = tokens.offeredRejoinHash !== null ? members[tokens.offeredRejoinHash] : undefined;
+    const returning = memberTicket !== undefined;
+
+    if (isHost) return { ok: true, creates: false, isHost, locked, returning, memberTicket };
+    if (returning) return { ok: true, creates: false, isHost, locked, returning: true, memberTicket };
 
     if (locked) return { ok: false, code: "room-locked", message: "This room is locked. Ask the host to unlock it." };
     if (tokens.ip) {
@@ -982,7 +1080,7 @@ export class RoomDO extends DurableObject<Env> {
         return { ok: false, code: "kicked", message: "You were removed from this room." };
       }
     }
-    return { ok: true, creates: false, isHost, locked };
+    return { ok: true, creates: false, isHost, locked, returning: false };
   }
 
   /**
@@ -1006,10 +1104,16 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /** Live rejoin tickets, hash to expiry, with expired ones dropped. */
-  private async getMembers(now: number): Promise<Record<string, number>> {
-    const all = (await this.ctx.storage.get<Record<string, number>>(MEMBERS_KEY)) ?? {};
-    const live: Record<string, number> = {};
-    for (const [k, until] of Object.entries(all)) if (until > now) live[k] = until;
+  private async getMembers(now: number): Promise<Record<string, MemberEntry>> {
+    const all = (await this.ctx.storage.get<Record<string, number | MemberEntry>>(MEMBERS_KEY)) ?? {};
+    const live: Record<string, MemberEntry> = {};
+    for (const [k, val] of Object.entries(all)) {
+      if (typeof val === "number") {
+        if (val > now) live[k] = { until: val };
+      } else if (val && typeof val.until === "number" && val.until > now) {
+        live[k] = val;
+      }
+    }
     return live;
   }
 
