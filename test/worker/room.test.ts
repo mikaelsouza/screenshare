@@ -1302,8 +1302,8 @@ describe("RoomDO host controls (batch D)", () => {
     expect(w.host).toBe(true);
     expect(w.locked).toBe(true);
 
-    h.send({ t: "lock", locked: false });
-    await h.nextOf("room-state");
+    back.send({ t: "lock", locked: false });
+    await back.nextOf("room-state");
     const d = await Client.connect();
     expect((await d.join("dave")).locked).toBe(false);
     for (const s of [h, b, back, d]) s.close();
@@ -1565,5 +1565,271 @@ describe("RoomDO final review fixes", () => {
     expect((await b.nextOf("signal")).data.k).toBe("ice");
     a.close();
     b.close();
+  });
+
+  it("evicts previous socket and broadcasts peer-left on rejoin with rejoinToken while sharing", async () => {
+    const spy = await slowMint(CODE, 0);
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice starts sharing
+    a1.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    const a1Closed = closeCodeOf(a1.ws);
+
+    // Alice reconnects on a2 with rejoinToken while a1 is still open (ghost socket)
+    const a2 = await Client.connect();
+    a2.send({ t: "join", room: CODE, displayName: "alice", rejoinToken: wa1.rejoinToken });
+
+    // Bob receives peer-left for a1's selfId before peer-joined for a2's selfId
+    const left = await b.nextOf("peer-left");
+    expect(left.id).toBe(wa1.selfId);
+
+    const joined = await b.nextOf("peer-joined");
+    const wa2 = await a2.nextOf("welcome");
+    expect(joined.peer.id).toBe(wa2.selfId);
+    expect(wa2.selfId).not.toBe(wa1.selfId);
+
+    // a2's peer list contains only bob and not a1
+    expect(wa2.peers).toHaveLength(1);
+    expect(wa2.peers[0]!.name).toBe("bob");
+    expect(wa2.peers.some((p) => p.id === wa1.selfId)).toBe(false);
+
+    // a1's socket was closed with 1008 ("Session replaced")
+    expect(await a1Closed).toBe(1008);
+
+    // a1's TURN credential was revoked
+    expect(await spy.revoked()).toContain("user-1");
+
+    a2.close();
+    b.close();
+  });
+
+  it("evicts previous host socket on rejoin with hostToken", async () => {
+    const h1 = await Client.connect();
+    const wh1 = await h1.join("host");
+    expect(wh1.host).toBe(true);
+    expect(typeof wh1.hostToken).toBe("string");
+
+    const b = await Client.connect();
+    await b.join("bob");
+    await h1.nextOf("peer-joined");
+
+    const h1Closed = closeCodeOf(h1.ws);
+
+    // Rejoin with hostToken on a new socket without closing h1
+    const h2 = await Client.connect();
+    h2.send({ t: "join", room: CODE, displayName: "host", hostToken: wh1.hostToken });
+
+    const left = await b.nextOf("peer-left");
+    expect(left.id).toBe(wh1.selfId);
+
+    const joined = await b.nextOf("peer-joined");
+    const wh2 = await h2.nextOf("welcome");
+    expect(wh2.host).toBe(true);
+    expect(joined.peer.id).toBe(wh2.selfId);
+    expect(joined.peer.host).toBe(true);
+
+    expect(wh2.peers).toHaveLength(1);
+    expect(wh2.peers[0]!.name).toBe("bob");
+    expect(wh2.peers.some((p) => p.id === wh1.selfId)).toBe(false);
+
+    expect(await h1Closed).toBe(1008);
+
+    h2.close();
+    b.close();
+  });
+
+  it("allows a returning peer to rejoin a full room when their previous socket is still open", async () => {
+    const joined: Client[] = [];
+    let peer0Welcome: Extract<ServerMessage, { t: "welcome" }> | null = null;
+    for (let i = 0; i < MAX_ROOM_SIZE; i++) {
+      const c = await Client.connect();
+      const w = await c.join(`peer${i}`);
+      if (i === 0) peer0Welcome = w;
+      joined.push(c);
+    }
+    expect(peer0Welcome?.rejoinToken).toBeTruthy();
+
+    const peer0Closed = closeCodeOf(joined[0]!.ws);
+
+    // Peer 0 reconnects with its rejoinToken without closing its old socket
+    const c0Back = await Client.connect();
+    c0Back.send({ t: "join", room: CODE, displayName: "peer0-back", rejoinToken: peer0Welcome!.rejoinToken });
+
+    const backWelcome = await c0Back.nextOf("welcome");
+    expect(backWelcome.selfId).toBeTruthy();
+    expect(backWelcome.peers).toHaveLength(MAX_ROOM_SIZE - 1);
+    expect(backWelcome.peers.some((p) => p.id === peer0Welcome!.selfId)).toBe(false);
+
+    expect(await peer0Closed).toBe(1008);
+
+    c0Back.close();
+    for (const c of joined) c.close();
+  });
+
+  it("allows the host to rejoin a full room with hostToken when previous host socket is still open", async () => {
+    const h1 = await Client.connect();
+    const wh1 = await h1.join("host");
+    const token = wh1.hostToken!;
+    const joined: Client[] = [h1];
+    for (let i = 1; i < MAX_ROOM_SIZE; i++) {
+      const c = await Client.connect();
+      await c.join(`peer${i}`);
+      joined.push(c);
+    }
+    const h1Closed = closeCodeOf(h1.ws);
+
+    // Host reconnects with hostToken while h1 is still open in a full room
+    const hBack = await Client.connect();
+    hBack.send({ t: "join", room: CODE, displayName: "host-back", hostToken: token });
+
+    const backWelcome = await hBack.nextOf("welcome");
+    expect(backWelcome.host).toBe(true);
+    expect(backWelcome.peers).toHaveLength(MAX_ROOM_SIZE - 1);
+    expect(backWelcome.peers.some((p) => p.id === wh1.selfId)).toBe(false);
+    expect(await h1Closed).toBe(1008);
+
+    hBack.close();
+    for (const c of joined) c.close();
+  });
+
+  it("handles multiple sequential rejoins while sharing without ghost roster entries", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice 1 shares
+    a1.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    const a1Closed = closeCodeOf(a1.ws);
+
+    // Alice reconnects on a2 with wa1.rejoinToken
+    const a2 = await Client.connect();
+    a2.send({ t: "join", room: CODE, displayName: "alice", rejoinToken: wa1.rejoinToken });
+    expect((await b.nextOf("peer-left")).id).toBe(wa1.selfId);
+    const wa2 = await a2.nextOf("welcome");
+    expect((await b.nextOf("peer-joined")).peer.id).toBe(wa2.selfId);
+    expect(await a1Closed).toBe(1008);
+
+    // Alice 2 re-announces sharing
+    a2.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    const a2Closed = closeCodeOf(a2.ws);
+
+    // Alice reconnects on a3 with wa2.rejoinToken
+    const a3 = await Client.connect();
+    a3.send({ t: "join", room: CODE, displayName: "alice", rejoinToken: wa2.rejoinToken });
+    expect((await b.nextOf("peer-left")).id).toBe(wa2.selfId);
+    const wa3 = await a3.nextOf("welcome");
+    expect((await b.nextOf("peer-joined")).peer.id).toBe(wa3.selfId);
+    expect(await a2Closed).toBe(1008);
+
+    expect(wa3.peers).toHaveLength(1);
+    expect(wa3.peers[0]!.name).toBe("bob");
+
+    a3.close();
+    b.close();
+  });
+
+  it("evicts previous socket on rejoin with rejoinToken in a locked room", async () => {
+    const h = await Client.connect();
+    await h.join("host");
+    const b1 = await Client.connect();
+    const wb1 = await b1.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b1.nextOf("room-state");
+
+    const b1Closed = closeCodeOf(b1.ws);
+
+    // Bob reconnects with rejoinToken while b1 is still open and room is locked
+    const b2 = await Client.connect();
+    b2.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb1.rejoinToken });
+
+    expect((await h.nextOf("peer-left")).id).toBe(wb1.selfId);
+    const wb2 = await b2.nextOf("welcome");
+    expect(wb2.locked).toBe(true);
+    expect((await h.nextOf("peer-joined")).peer.id).toBe(wb2.selfId);
+    expect(wb2.peers.some((p) => p.id === wb1.selfId)).toBe(false);
+    expect(await b1Closed).toBe(1008);
+
+    h.close();
+    b2.close();
+  });
+
+  it("evicts previous host socket when host rejoins presenting both hostToken and rejoinToken", async () => {
+    const h1 = await Client.connect();
+    const wh1 = await h1.join("host");
+    const b = await Client.connect();
+    await b.join("bob");
+    await h1.nextOf("peer-joined");
+
+    const h1Closed = closeCodeOf(h1.ws);
+
+    // Host reconnects presenting both tokens
+    const h2 = await Client.connect();
+    h2.send({
+      t: "join",
+      room: CODE,
+      displayName: "host",
+      hostToken: wh1.hostToken,
+      rejoinToken: wh1.rejoinToken,
+    });
+
+    expect((await b.nextOf("peer-left")).id).toBe(wh1.selfId);
+    const wh2 = await h2.nextOf("welcome");
+    expect(wh2.host).toBe(true);
+    expect((await b.nextOf("peer-joined")).peer.id).toBe(wh2.selfId);
+    expect(wh2.peers).toHaveLength(1);
+    expect(await h1Closed).toBe(1008);
+
+    h2.close();
+    b.close();
+  });
+
+  it("evicts previous socket on rejoin with rejoinToken in a password-protected room while sharing", async () => {
+    const a = await Client.connect();
+    const wa = await a.join("alice", "super-secret");
+
+    const b1 = await Client.connect();
+    const wb1 = await b1.join("bob", "super-secret");
+    await a.nextOf("peer-joined");
+
+    // Bob starts sharing
+    b1.send({ t: "state", sharing: true });
+    expect((await a.nextOf("peer-state")).sharing).toBe(true);
+
+    const b1Closed = closeCodeOf(b1.ws);
+
+    // Bob reconnects with password and rejoinToken while b1 is still open
+    const b2 = await Client.connect();
+    b2.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      password: "super-secret",
+      rejoinToken: wb1.rejoinToken,
+    });
+
+    // Alice sees bob's old socket leave before new socket joins
+    expect((await a.nextOf("peer-left")).id).toBe(wb1.selfId);
+    const wb2 = await b2.nextOf("welcome");
+    expect((await a.nextOf("peer-joined")).peer.id).toBe(wb2.selfId);
+    expect(wb2.peers.some((p) => p.id === wb1.selfId)).toBe(false);
+    expect(await b1Closed).toBe(1008);
+
+    a.close();
+    b2.close();
   });
 });

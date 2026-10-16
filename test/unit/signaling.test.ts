@@ -229,6 +229,109 @@ describe("SignalingClient reconnection", () => {
     expect(h.onWelcome).toHaveBeenCalledWith("p1", [], [], { host: false, locked: false });
     c.close();
   });
+
+  it("closes and detaches prior socket when connect() is called again", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    expect(ws1.readyState).toBe(1);
+
+    const oldMsgHandler = ws1.onmessage;
+    const oldCloseHandler = ws1.onclose;
+
+    // Call connect() again while ws1 is open
+    c.connect();
+    expect(FakeWebSocket.instances.length).toBe(2);
+    expect(ws1.readyState).toBe(3); // closed by detachSocket
+    expect(ws1.onmessage).toBeNull();
+    expect(ws1.onclose).toBeNull();
+
+    // Advancing time does not ping on detached or connecting socket
+    const ws1SentCount = ws1.sent.length;
+    vi.advanceTimersByTime(60_000);
+    expect(ws1.sent.length).toBe(ws1SentCount);
+
+    // Even if late events were invoked on old handlers, they should be ignored
+    oldMsgHandler?.({ data: JSON.stringify({ t: "peer-left", id: "p1" }) });
+    expect(h.onPeerLeft).not.toHaveBeenCalled();
+
+    // Late 1008 from server closing the replaced session does NOT make the client fatal
+    oldCloseHandler?.({ code: 1008 });
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    expect(ws2.sent.length).toBeGreaterThan(0);
+
+    c.close();
+  });
+
+  it("detaches prior connecting socket when connect() is called before open", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    const oldOpenHandler = ws1.onopen;
+
+    // Call connect() again while ws1 is still connecting
+    c.connect();
+    const ws2 = FakeWebSocket.instances[1]!;
+    expect(ws1.onopen).toBeNull();
+
+    // Invoking old open handler does not trigger join or ping
+    oldOpenHandler?.();
+    expect(ws1.sent.length).toBe(0);
+
+    // Opening ws2 works properly
+    ws2.open();
+    expect(ws2.sent.length).toBe(1);
+    expect(JSON.parse(ws2.sent[0]!).t).toBe("join");
+
+    c.close();
+  });
+
+  it("guards against error events on prior detached sockets", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    const oldErrorHandler = ws1.onerror;
+
+    c.connect();
+    expect(ws1.onerror).toBeNull();
+
+    // Invoking old error handler does not trigger reconnect or error
+    oldErrorHandler?.();
+    vi.advanceTimersByTime(30_000);
+    // Only 2 instances created (ws1 and ws2), no extra reconnect from ws1's error
+    expect(FakeWebSocket.instances.length).toBe(2);
+
+    c.close();
+  });
+
+  it("handles close() followed by connect() without staying closed", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    c.close();
+    expect(ws1.readyState).toBe(3);
+
+    // Call connect() after close()
+    c.connect();
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    expect(ws2.sent.length).toBe(1);
+    expect(JSON.parse(ws2.sent[0]!).t).toBe("join");
+
+    // Server close triggers reconnect because closedByUs was reset
+    ws2.serverClose(1006);
+    vi.advanceTimersByTime(30_000);
+    expect(FakeWebSocket.instances.length).toBe(3);
+
+    c.close();
+  });
 });
 
 describe("SignalingClient capacity refusals", () => {
