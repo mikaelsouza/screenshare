@@ -7,7 +7,7 @@
  * send-side pausing for unwatched tiles are load-bearing rather than nice-to-have at
  * this size. Beyond 8 the mesh stops being the right shape and an SFU is needed.
  */
-export const MAX_ROOM_SIZE = 8;
+export const MAX_ROOM_SIZE = 20;
 export const ROOM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no O/0/I/1/L
 export const ROOM_CODE_LENGTH = 8;
 

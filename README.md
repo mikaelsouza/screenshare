@@ -1,7 +1,7 @@
 # screenshare
 
 Low-latency screen sharing for a small group of friends. One person shares their
-screen with game audio; everyone else in the room watches. Rooms hold up to 8 people
+screen with game audio; everyone else in the room watches. Rooms hold up to 20 people
 and multiple people can share at once.
 
 **Video never touches a server.** After a handshake through the signalling server,
@@ -120,8 +120,8 @@ per-IP request limits run twice: in memory, and through Cloudflare's rate-limiti
 | ----- | ----- | --------------------- |
 | Room creation | 20/min | `/api/room` only returns a random string |
 | WebSocket upgrades | 60/min | The expensive route: `idFromName` instantiates a Durable Object for any valid code |
-| Sockets per IP per room | 16 (`MAX_ROOM_SIZE * 2`) | A household or CGNAT block shares one address, so this must exceed the room cap, with headroom for half-open sockets |
-| Sockets per room | 32 (`MAX_ROOM_SIZE * 4`) | Unjoined sockets do not count against the room cap and would otherwise pile up |
+| Sockets per IP per room | 40 (`MAX_ROOM_SIZE * 2`) | A household or CGNAT block shares one address, so this must exceed the room cap, with headroom for half-open sockets |
+| Sockets per room | 80 (`MAX_ROOM_SIZE * 4`) | Unjoined sockets do not count against the room cap and would otherwise pile up |
 | SDP / ICE candidate size | 64 KB / 1 KB | Unbounded, a joined peer could loop 1 MB blobs at another peer through the object |
 | Frame size | 80 KB | Checked before parsing; closes with 1009 |
 | Messages per socket | burst 200, then 20/s | Covers joining a full room with TURN; a flood past it closes with 1008 |
