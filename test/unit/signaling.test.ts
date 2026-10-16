@@ -3,7 +3,10 @@ import { SignalingClient } from "@src/signaling";
 
 /** Records every socket the client opens, so reconnect behaviour is observable. */
 class FakeWebSocket {
+  static readonly CONNECTING = 0;
   static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
   static instances: FakeWebSocket[] = [];
 
   readyState = 1;
@@ -457,4 +460,275 @@ describe("SignalingClient capacity refusals", () => {
     c.close();
   });
 });
+
+describe("SignalingClient keepalive and session resumption", () => {
+  let docListeners: Record<string, () => void>;
+  let winListeners: Record<string, () => void>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "https:", host: "example.com" });
+
+    docListeners = {};
+    winListeners = {};
+    vi.stubGlobal("document", {
+      visibilityState: "visible",
+      addEventListener: (ev: string, fn: () => void) => { docListeners[ev] = fn; },
+      removeEventListener: (ev: string) => { delete docListeners[ev]; },
+    });
+    vi.stubGlobal("window", {
+      addEventListener: (ev: string, fn: () => void) => { winListeners[ev] = fn; },
+      removeEventListener: (ev: string) => { delete winListeners[ev]; },
+    });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("sends pings every 15 seconds when open", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    vi.advanceTimersByTime(15_000);
+    expect(ws.sent).toContain("ping");
+    c.close();
+  });
+
+  it("sends resume: true and sharing state on reconnect after being welcomed", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+
+    // Welcome arrives and peer starts sharing
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+    c.setSharing(true);
+
+    // Socket blips
+    ws1.serverClose(1006);
+    vi.advanceTimersByTime(20_000);
+
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    const joinMsg = JSON.parse(ws2.sent[0]!);
+    expect(joinMsg.resume).toBe(true);
+    expect(joinMsg.sharing).toBe(true);
+    c.close();
+  });
+
+  it("queues signal and state messages during reconnect and flushes them on welcome", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Socket drops
+    ws1.serverClose(1006);
+
+    // Send signals and state while disconnected
+    c.signal("p2", { k: "offer", sdp: "offer-sdp" });
+    c.setSharing(true);
+
+    // Reconnect socket opens
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+
+    // Messages should not be sent until welcome
+    expect(ws2.sent.length).toBe(1); // only join message
+
+    // Welcome arrives
+    ws2.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Flushed!
+    expect(ws2.sent.length).toBe(3);
+    expect(JSON.parse(ws2.sent[1]!)).toEqual({
+      t: "signal",
+      to: "p2",
+      data: { k: "offer", sdp: "offer-sdp" },
+    });
+    expect(JSON.parse(ws2.sent[2]!)).toEqual({
+      t: "state",
+      sharing: true,
+    });
+    c.close();
+  });
+
+  it("triggers proactive reconnect if watchdog detects dead socket (>65s) while visible", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+
+    // No messages received for 75s
+    vi.advanceTimersByTime(75_000);
+
+    // Watchdog should have triggered reconnect
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(1);
+    c.close();
+  });
+
+  it("handles visibilitychange and online events to ping or reconnect immediately", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+
+    // Visibility change when open sends ping
+    const sentBefore = ws1.sent.length;
+    docListeners["visibilitychange"]?.();
+    expect(ws1.sent.length).toBe(sentBefore + 1);
+    expect(ws1.sent[ws1.sent.length - 1]).toBe("ping");
+
+    // Close socket to simulate offline
+    ws1.serverClose(1006);
+
+    // Online event triggers immediate reconnect without waiting for backoff timer
+    winListeners["online"]?.();
+    expect(FakeWebSocket.instances.length).toBe(2);
+
+    c.close();
+    // Cleaned up listeners
+    expect(docListeners["visibilitychange"]).toBeUndefined();
+    expect(winListeners["online"]).toBeUndefined();
+  });
+
+  it("drops oldest messages when pending queue exceeds 64 messages (FIFO limit)", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Socket drops
+    ws1.serverClose(1006);
+
+    // Send 70 signals while disconnected
+    for (let i = 0; i < 70; i++) {
+      c.signal("p2", { k: "ice", candidate: { candidate: `cand-${i}`, sdpMid: "0", sdpMLineIndex: 0 } });
+    }
+
+    // Reconnect socket opens
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+
+    // Welcome arrives
+    ws2.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Total sent on ws2 = 1 (join) + 64 (flushed FIFO items, dropped first 6)
+    expect(ws2.sent.length).toBe(65);
+    const firstSent = JSON.parse(ws2.sent[1]!);
+    expect(firstSent.data.candidate.candidate).toBe("cand-6");
+    const lastSent = JSON.parse(ws2.sent[64]!);
+    expect(lastSent.data.candidate.candidate).toBe("cand-69");
+    c.close();
+  });
+
+  it("does not reconnect on visibility or online events if connect() has not been called yet", () => {
+    new SignalingClient("ABCDEFGH", "alice", handlers());
+    expect(FakeWebSocket.instances.length).toBe(0);
+
+    docListeners["visibilitychange"]?.();
+    expect(FakeWebSocket.instances.length).toBe(0);
+
+    winListeners["online"]?.();
+    expect(FakeWebSocket.instances.length).toBe(0);
+  });
+
+  it("does not abort or reconnect a socket that is currently in WebSocket.CONNECTING state", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    expect(FakeWebSocket.instances.length).toBe(1);
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.readyState = 0; // Simulate WebSocket.CONNECTING
+
+    // Rapid successive wakeup events while handshake is in-flight
+    docListeners["visibilitychange"]?.();
+    winListeners["online"]?.();
+
+    // Still only the single socket in-flight — handshake not aborted
+    expect(FakeWebSocket.instances.length).toBe(1);
+    expect(ws1.readyState).toBe(0);
+    c.close();
+  });
+
+  it("flushes pre-welcome queued messages before onWelcome handler executes", () => {
+    const sentDuringWelcome: string[] = [];
+    const h = handlers();
+
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Socket drops
+    ws1.serverClose(1006);
+
+    // Set onWelcome spy now to observe flush order on reconnection welcome
+    h.onWelcome = vi.fn(() => {
+      const ws2 = FakeWebSocket.instances[1]!;
+      sentDuringWelcome.push(...ws2.sent);
+    });
+
+    // Queue a signal while disconnected
+    c.signal("p2", { k: "offer", sdp: "queued-offer" });
+
+    // Reconnection socket opens
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+
+    // Welcome arrives
+    ws2.onmessage?.({
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+    });
+
+    // Verify queued message was flushed BEFORE onWelcome executed
+    expect(sentDuringWelcome.length).toBe(2); // join + queued offer
+    expect(JSON.parse(sentDuringWelcome[1]!)).toEqual({
+      t: "signal",
+      to: "p2",
+      data: { k: "offer", sdp: "queued-offer" },
+    });
+    c.close();
+  });
+
+  it("reconnects immediately when ws.send(PING) throws an exception", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+
+    // Mock send to throw on ping
+    ws1.send = (data: string) => {
+      if (data === "ping") throw new Error("Socket broken");
+    };
+
+    vi.advanceTimersByTime(15_000);
+    expect(FakeWebSocket.instances.length).toBe(2);
+    c.close();
+  });
+});
+
 

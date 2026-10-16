@@ -288,11 +288,31 @@ class PeerLink {
     this.cb.onRemoteStream(this.peerId, stream);
 
     ev.track.addEventListener("ended", () => {
+      if (ev.track.kind === "audio") return;
       if (this.remoteStream === stream) {
         this.remoteStream = null;
         this.cb.onRemoteStreamGone(this.peerId);
       }
     });
+  }
+
+  get connectionState(): RTCPeerConnectionState {
+    return this.pc.connectionState;
+  }
+
+  updateIceServers(iceServers: RTCIceServer[]): void {
+    this.opts.iceServers = iceServers;
+    try {
+      if (typeof this.pc.setConfiguration === "function") {
+        const current = typeof this.pc.getConfiguration === "function" ? this.pc.getConfiguration() : {};
+        this.pc.setConfiguration({
+          ...current,
+          iceServers,
+        });
+      }
+    } catch (err) {
+      console.warn(`[mesh] updateIceServers failed for ${this.peerId}`, err);
+    }
   }
 
   /**
@@ -584,6 +604,20 @@ export class Mesh {
 
   peers(): PeerId[] {
     return [...this.links.keys()];
+  }
+
+  updateIceServers(iceServers: RTCIceServer[]): void {
+    this.opts.iceServers = iceServers;
+    for (const link of this.links.values()) {
+      link.updateIceServers(iceServers);
+    }
+  }
+
+  hasConnectedLink(peerId: PeerId): boolean {
+    const link = this.links.get(peerId);
+    if (!link) return false;
+    const state = link.connectionState;
+    return state === "connected" || state === "connecting";
   }
 
   close(): void {

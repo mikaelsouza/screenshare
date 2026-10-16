@@ -43,7 +43,7 @@ export interface SignalingHandlers {
  * answers these via setWebSocketAutoResponse(), which replies WITHOUT waking the
  * object — so keepalives cost nothing in either duration or request billing.
  */
-const PING_INTERVAL_MS = 30_000;
+const PING_INTERVAL_MS = 15_000;
 
 /**
  * "Try Again Later": the server is at capacity right now. Worth retrying — the
@@ -63,6 +63,11 @@ export class SignalingClient {
   private fatal = false;
   /** Consecutive 1013 refusals, so a full room does not retry indefinitely. */
   private capacityRefusals = 0;
+  private started = false;
+  private welcomed = false;
+  private sharing = false;
+  private lastReceivedAt = 0;
+  private pendingMessages: ClientMessage[] = [];
 
   constructor(
     private readonly room: string,
@@ -71,10 +76,18 @@ export class SignalingClient {
     private readonly password?: string,
     /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
     private readonly tokens?: () => { hostToken?: string; rejoinToken?: string },
-  ) {}
+  ) {
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", this.onOnline);
+    }
+  }
 
   connect(): void {
     if (this.fatal) return;
+    this.started = true;
     this.closedByUs = false;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
@@ -101,6 +114,7 @@ export class SignalingClient {
       // every refusal looked like a fresh success, so the client hammered the Worker
       // roughly twice a second forever and never reported why. Only a welcome proves
       // we are actually in the room.
+      this.lastReceivedAt = Date.now();
       this.handlers.onStatus("open");
       const joinMsg: ClientMessage = {
         t: "join",
@@ -113,12 +127,17 @@ export class SignalingClient {
       const { hostToken, rejoinToken } = this.tokens?.() ?? {};
       if (hostToken) joinMsg.hostToken = hostToken;
       if (rejoinToken) joinMsg.rejoinToken = rejoinToken;
+      if (this.welcomed) {
+        joinMsg.resume = true;
+        joinMsg.sharing = this.sharing;
+      }
       this.send(joinMsg);
       this.startPing();
     };
 
     ws.onmessage = (ev) => {
       if (this.ws !== ws) return;
+      this.lastReceivedAt = Date.now();
       const raw = String(ev.data);
       if (raw === PONG || raw === PING) return; // keepalive, not protocol traffic
       let msg: ServerMessage;
@@ -146,6 +165,7 @@ export class SignalingClient {
       // wake-up per cycle while overwriting the message explaining what happened.
       if (ev.code === 1008) {
         this.fatal = true;
+        this.pendingMessages = [];
         return;
       }
       // Capacity is transient, so retry — but bounded, and say so when giving up.
@@ -153,6 +173,7 @@ export class SignalingClient {
         this.capacityRefusals++;
         if (this.capacityRefusals > MAX_CAPACITY_RETRIES) {
           this.fatal = true;
+          this.pendingMessages = [];
           this.handlers.onError("rate-limited", "The room is still at capacity. Try again in a minute.");
           return;
         }
@@ -172,6 +193,14 @@ export class SignalingClient {
         // Proof the connection actually worked, which is what clears the counters.
         this.attempts = 0;
         this.capacityRefusals = 0;
+        this.welcomed = true;
+        {
+          const queued = this.pendingMessages;
+          this.pendingMessages = [];
+          for (const m of queued) {
+            this.send(m);
+          }
+        }
         this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? [], {
           host: msg.host === true,
           ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
@@ -201,7 +230,18 @@ export class SignalingClient {
   }
 
   send(msg: ClientMessage): void {
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+      return;
+    }
+    if (this.welcomed && !this.closedByUs && !this.fatal) {
+      if (msg.t === "signal" || msg.t === "state") {
+        if (this.pendingMessages.length >= 64) {
+          this.pendingMessages.shift();
+        }
+        this.pendingMessages.push(msg);
+      }
+    }
   }
 
   signal(to: PeerId, data: SignalData): void {
@@ -209,6 +249,7 @@ export class SignalingClient {
   }
 
   setSharing(sharing: boolean): void {
+    this.sharing = sharing;
     this.send({ t: "state", sharing });
   }
 
@@ -222,10 +263,69 @@ export class SignalingClient {
     this.send({ t: "lock", locked });
   }
 
+  private onVisibilityChange = (): void => {
+    if (typeof document !== "undefined" && document.visibilityState === "visible") {
+      this.handleWakeup();
+    }
+  };
+
+  private onOnline = (): void => {
+    this.handleWakeup();
+  };
+
+  private handleWakeup(): void {
+    if (!this.started || this.closedByUs || this.fatal) return;
+    if (this.ws?.readyState === 0 || this.ws?.readyState === WebSocket.CONNECTING) return;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      if (this.lastReceivedAt > 0 && Date.now() - this.lastReceivedAt > 65_000) {
+        this.reconnectNow();
+      } else {
+        try {
+          this.ws.send(PING);
+        } catch {
+          this.reconnectNow();
+        }
+      }
+    } else {
+      this.reconnectNow();
+    }
+  }
+
+  private reconnectNow(): void {
+    if (this.fatal || this.closedByUs) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopPing();
+    this.attempts = 0;
+    if (this.ws) {
+      const oldWs = this.ws;
+      this.ws = null;
+      this.detachSocket(oldWs);
+    }
+    this.connect();
+  }
+
   private startPing(): void {
     this.stopPing();
     this.pingTimer = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(PING);
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        const isVisible = typeof document === "undefined" || document.visibilityState === "visible";
+        if (
+          isVisible &&
+          this.lastReceivedAt > 0 &&
+          Date.now() - this.lastReceivedAt > 65_000
+        ) {
+          this.reconnectNow();
+          return;
+        }
+        try {
+          this.ws.send(PING);
+        } catch {
+          this.reconnectNow();
+        }
+      }
     }, PING_INTERVAL_MS);
   }
 
@@ -256,7 +356,15 @@ export class SignalingClient {
   }
 
   close(): void {
+    this.started = false;
     this.closedByUs = true;
+    if (typeof document !== "undefined") {
+      document.removeEventListener("visibilitychange", this.onVisibilityChange);
+    }
+    if (typeof window !== "undefined") {
+      window.removeEventListener("online", this.onOnline);
+    }
+    this.pendingMessages = [];
     this.stopPing();
     if (this.reconnectTimer !== null) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;

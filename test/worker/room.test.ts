@@ -1832,4 +1832,307 @@ describe("RoomDO final review fixes", () => {
     a.close();
     b2.close();
   });
+
+  it("in-place resume (resume: true + rejoinToken) with old socket open preserves selfId and active TURN credential without broadcasting peer-left", async () => {
+    const spy = await slowMint(CODE, 0);
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice starts sharing
+    a1.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    const a1Closed = closeCodeOf(a1.ws);
+
+    // Alice reconnects on a2 with resume: true and rejoinToken while a1 is still open
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa1.rejoinToken,
+      resume: true,
+      sharing: true,
+    });
+
+    const wa2 = await a2.nextOf("welcome");
+    // selfId is preserved!
+    expect(wa2.selfId).toBe(wa1.selfId);
+
+    // a1's socket was closed with 1008 ("Session replaced")
+    expect(await a1Closed).toBe(1008);
+
+    // a1's TURN credential was NOT revoked!
+    expect(await spy.revoked()).not.toContain("user-1");
+
+    // Bob receives NO peer-left or peer-joined
+    expect(await b.silentFor(300)).toBe(true);
+
+    a2.close();
+    b.close();
+  });
+
+  it("in-place resume (resume: true + rejoinToken) after previous socket closed restores selfId and broadcasts peer-joined", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice starts sharing
+    a1.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    // Alice's socket closes (simulating disconnect before reconnect)
+    a1.close();
+    expect((await b.nextOf("peer-left")).id).toBe(wa1.selfId);
+
+    // Alice reconnects with resume: true and rejoinToken
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa1.rejoinToken,
+      resume: true,
+      sharing: true,
+    });
+
+    const wa2 = await a2.nextOf("welcome");
+    // selfId is preserved!
+    expect(wa2.selfId).toBe(wa1.selfId);
+
+    // Bob receives peer-joined with preserved selfId and sharing: true
+    const joined = await b.nextOf("peer-joined");
+    expect(joined.peer.id).toBe(wa1.selfId);
+    expect(joined.peer.sharing).toBe(true);
+
+    a2.close();
+    b.close();
+  });
+
+  it("raw PING frames in webSocketMessage do not trigger bad-message or close after repeated sends", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+
+    const pongs: string[] = [];
+    a.ws.addEventListener("message", (ev) => {
+      const data = String((ev as MessageEvent).data);
+      if (data === PONG) pongs.push(data);
+    });
+
+    // Send more than MAX_BAD_MESSAGES (5) raw "ping" frames
+    for (let i = 0; i < 10; i++) {
+      a.ws.send(PING);
+    }
+
+    // Wait for replies
+    await new Promise((r) => setTimeout(r, 200));
+
+    // Verify pongs received and socket is still OPEN
+    expect(pongs.length).toBe(10);
+    expect(a.ws.readyState).toBe(WebSocket.OPEN);
+
+    // Can still send regular messages without bad-message error
+    a.send({ t: "state", sharing: true });
+    expect(await a.silentFor(200)).toBe(true);
+
+    a.close();
+  });
+
+  it("in-place resume (resume: true + rejoinToken) into a locked room preserves selfId and sharing without error", async () => {
+    const h = await Client.connect();
+    await h.join("host");
+    const b1 = await Client.connect();
+    const wb1 = await b1.join("bob");
+    await h.nextOf("peer-joined");
+
+    // Bob starts sharing
+    b1.send({ t: "state", sharing: true });
+    expect((await h.nextOf("peer-state")).sharing).toBe(true);
+
+    // Host locks room
+    h.send({ t: "lock", locked: true });
+    expect((await h.nextOf("room-state")).locked).toBe(true);
+    expect((await b1.nextOf("room-state")).locked).toBe(true);
+
+    const b1Closed = closeCodeOf(b1.ws);
+
+    // Bob reconnects with resume: true and rejoinToken into the locked room while b1 is open
+    const b2 = await Client.connect();
+    b2.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      rejoinToken: wb1.rejoinToken,
+      resume: true,
+      sharing: true,
+    });
+
+    const wb2 = await b2.nextOf("welcome");
+    expect(wb2.selfId).toBe(wb1.selfId);
+    expect(wb2.locked).toBe(true);
+    expect(await b1Closed).toBe(1008);
+    expect(await h.silentFor(300)).toBe(true);
+
+    // Bob disconnects socket and resumes again into locked room
+    b2.close();
+    expect((await h.nextOf("peer-left")).id).toBe(wb1.selfId);
+
+    const b3 = await Client.connect();
+    b3.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      rejoinToken: wb2.rejoinToken,
+      resume: true,
+      sharing: true,
+    });
+
+    const wb3 = await b3.nextOf("welcome");
+    expect(wb3.selfId).toBe(wb1.selfId);
+    expect(wb3.locked).toBe(true);
+    const joined = await h.nextOf("peer-joined");
+    expect(joined.peer.id).toBe(wb1.selfId);
+    expect(joined.peer.sharing).toBe(true);
+
+    h.close();
+    b3.close();
+  });
+
+  it("resume: true without rejoinToken is treated as a normal join with fresh selfId", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice reconnects with resume: true but omits rejoinToken
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      resume: true,
+    });
+
+    const wa2 = await a2.nextOf("welcome");
+    // Not treated as in-place resume: new selfId assigned
+    expect(wa2.selfId).not.toBe(wa1.selfId);
+
+    a1.close();
+    a2.close();
+    b.close();
+  });
+
+  it("multiple sequential in-place resumes preserve selfId across each reconnection", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // First in-place resume
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa1.rejoinToken,
+      resume: true,
+      sharing: false,
+    });
+    const wa2 = await a2.nextOf("welcome");
+    expect(wa2.selfId).toBe(wa1.selfId);
+
+    // Second in-place resume
+    const a3 = await Client.connect();
+    a3.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa2.rejoinToken,
+      resume: true,
+      sharing: false,
+    });
+    const wa3 = await a3.nextOf("welcome");
+    expect(wa3.selfId).toBe(wa1.selfId);
+
+    // Bob receives NO peer-left or peer-joined across both resumes
+    expect(await b.silentFor(300)).toBe(true);
+
+    a3.close();
+    b.close();
+  });
+
+  it("in-place resume preserves message budget and does not retain preservedId in gone set after superseded socket closes", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const a1Closed = closeCodeOf(a1.ws);
+
+    // In-place resume on a2 while a1 is open
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa1.rejoinToken,
+      resume: true,
+      sharing: false,
+    });
+    const wa2 = await a2.nextOf("welcome");
+    expect(wa2.selfId).toBe(wa1.selfId);
+
+    // Ensure a1 is closed and webSocketClose lifecycle has completed
+    expect(await a1Closed).toBe(1008);
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Send messages on a2 to confirm rate-limit budget was not erased or broken by a1's close
+    for (let i = 0; i < 20; i++) {
+      a2.send({ t: "state", sharing: false });
+    }
+    expect(await a2.silentFor(200)).toBe(true);
+
+    a2.close();
+  });
+
+  it("in-place resume after socket closed recovers sharing state from member ticket when sharing is omitted in join message", async () => {
+    const a1 = await Client.connect();
+    const wa1 = await a1.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a1.nextOf("peer-joined");
+
+    // Alice starts sharing
+    a1.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+
+    // Alice's socket disconnects
+    a1.close();
+    expect((await b.nextOf("peer-left")).id).toBe(wa1.selfId);
+
+    // Alice reconnects with resume: true and rejoinToken, but omits `sharing`
+    const a2 = await Client.connect();
+    a2.send({
+      t: "join",
+      room: CODE,
+      displayName: "alice",
+      rejoinToken: wa1.rejoinToken,
+      resume: true,
+    });
+
+    const wa2 = await a2.nextOf("welcome");
+    expect(wa2.selfId).toBe(wa1.selfId);
+
+    // Bob receives peer-joined with sharing recovered from memberTicket
+    const joined = await b.nextOf("peer-joined");
+    expect(joined.peer.id).toBe(wa1.selfId);
+    expect(joined.peer.sharing).toBe(true);
+
+    a2.close();
+    b.close();
+  });
 });
