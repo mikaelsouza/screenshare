@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Screenshare latency clock</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #050607;
+        --fg: #f8fafc;
+        --muted: #94a3b8;
+        --accent: #22d3ee;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100vw;
+        height: 100vh;
+        margin: 0;
+        overflow: hidden;
+        background: var(--bg);
+      }
+      body {
+        display: grid;
+        place-items: center;
+        color: var(--fg);
+        font-family: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+        user-select: none;
+      }
+      main {
+        display: grid;
+        justify-items: center;
+        gap: 2vh;
+        padding: 2vw;
+        text-align: center;
+      }
+      #clock {
+        font-size: clamp(4rem, 19vw, 19rem);
+        font-weight: 700;
+        line-height: 0.95;
+        letter-spacing: -0.04em;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      #clock .ms {
+        color: var(--accent);
+      }
+      .row {
+        display: flex;
+        align-items: baseline;
+        gap: 1.5vw;
+        color: var(--muted);
+        font-size: clamp(1rem, 2.4vw, 2.4rem);
+        font-variant-numeric: tabular-nums;
+      }
+      .row strong {
+        color: var(--fg);
+        font-size: 1.35em;
+      }
+      #fullscreen {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        padding: 0.5rem 0.9rem;
+        border: 1px solid #334155;
+        border-radius: 0.4rem;
+        background: #0f172a;
+        color: var(--fg);
+        font: inherit;
+        font-size: 0.7rem;
+        cursor: pointer;
+        opacity: 0.55;
+      }
+      #fullscreen:hover,
+      #fullscreen:focus-visible {
+        opacity: 1;
+        outline: 2px solid var(--accent);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div id="clock" aria-label="Millisecond clock">--:--:--.<span class="ms">---</span></div>
+      <div class="row">
+        <span><strong id="frames">0</strong> frames</span>
+        <span><strong id="fps">0</strong> fps</span>
+        <span><strong id="epoch">0</strong> epoch ms</span>
+      </div>
+    </main>
+    <button id="fullscreen" type="button" title="Fullscreen (F)">Fullscreen</button>
+
+    <script>
+      // A file-URL page, deliberately: the timer must not become a production route or
+      // a Vite entry, and it has to be openable in its own browser window so one peer
+      // can share it while the other photographs both clocks.
+      const clockEl = document.getElementById("clock");
+      const framesEl = document.getElementById("frames");
+      const fpsEl = document.getElementById("fps");
+      const epochEl = document.getElementById("epoch");
+
+      let frames = 0;
+      let fpsFrames = 0;
+      let fpsWindowStarted = performance.now();
+
+      function pad(value, width) {
+        return String(value).padStart(width, "0");
+      }
+
+      function render(now) {
+        const date = new Date();
+        const hours = pad(date.getHours(), 2);
+        const minutes = pad(date.getMinutes(), 2);
+        const seconds = pad(date.getSeconds(), 2);
+        const millis = pad(date.getMilliseconds(), 3);
+        clockEl.innerHTML = `${hours}:${minutes}:${seconds}.<span class="ms">${millis}</span>`;
+        epochEl.textContent = String(date.getTime());
+        frames += 1;
+        fpsFrames += 1;
+        framesEl.textContent = String(frames);
+        const elapsed = now - fpsWindowStarted;
+        if (elapsed >= 500) {
+          fpsEl.textContent = (fpsFrames * 1000 / elapsed).toFixed(1);
+          fpsFrames = 0;
+          fpsWindowStarted = now;
+        }
+        requestAnimationFrame(render);
+      }
+
+      function toggleFullscreen() {
+        if (document.fullscreenElement) {
+          void document.exitFullscreen();
+        } else {
+          void document.documentElement.requestFullscreen();
+        }
+      }
+
+      document.getElementById("fullscreen").addEventListener("click", toggleFullscreen);
+      addEventListener("keydown", (event) => {
+        if (event.key === "f" || event.key === "F") toggleFullscreen();
+      });
+
+      requestAnimationFrame(render);
+    </script>
+  </body>
+</html>
