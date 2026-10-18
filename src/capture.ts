@@ -18,7 +18,10 @@ export interface QualityPreset {
 export const QUALITY_PRESETS: Record<QualityPresetName, QualityPreset> = {
   "1080p60": { label: "1080p 60fps", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 },
   "1080p30": { label: "1080p 30fps", width: 1920, height: 1080, frameRate: 30, maxBitrate: 6_000_000 },
-  // The floor the project promises: 720p @ 6 Mbps.
+  // Targets, not a minimum: 720p60 aims for 6 Mbps and 720p30 is the 4 Mbps
+  // data-saver tier. maxBitrate caps the encoder, not the delivered rate; the
+  // adapter's 1.5 Mbps floor is just the lowest cap it backs off to, and
+  // maintain-framerate may trade resolution below 720p under loss.
   "720p60": { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
   "720p30": { label: "720p 30fps", width: 1280, height: 720, frameRate: 30, maxBitrate: 4_000_000 },
 };

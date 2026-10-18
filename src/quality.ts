@@ -176,6 +176,8 @@ export class BitrateAdapter {
   constructor(
     private readonly sender: RTCRtpSender,
     private readonly preset: QualityPreset,
+    // Cap floor, not a delivered-bitrate guarantee. If it equals the preset's
+    // ceiling, max(floor, 0.75 * current) never moves and backoff is disabled.
     private readonly floor = 1_500_000,
   ) {
     this.current = preset.maxBitrate;
