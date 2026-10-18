@@ -176,6 +176,13 @@ const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }]
 /** Tile id of our own screen preview. */
 const SELF_TILE = "__self";
 
+/**
+ * Streams whose addtrack/removetrack listeners are already wired. A tile can be
+ * removed and recreated for the same retained remote stream (the far end stopped
+ * and started sharing again), and adding the listeners each time would leak them.
+ */
+const wiredStreams = new WeakSet<MediaStream>();
+
 function tileFor(peerId: PeerId): HTMLVideoElement {
   const existing = tiles.get(peerId);
   if (existing) return existing;
@@ -1022,6 +1029,9 @@ async function startSharingInner(): Promise<void> {
   if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
+  // A codec chosen while not sharing is stored on the mesh; the attach below applies
+  // it to the retained transceivers (one offer) if it differs from the negotiated one.
+  mesh.setCodec(currentCodec());
   // Announced before any offer goes out: viewers connect only to sharers, and the
   // server refuses an offer when neither side is sharing.
   client?.setSharing(true);
@@ -1229,8 +1239,11 @@ async function joinRoom(code: string, password?: string): Promise<void> {
               const video = tileFor(peerId);
               if (video.srcObject !== stream) {
                 video.srcObject = stream;
-                stream.addEventListener("addtrack", () => applyAudio(peerId));
-                stream.addEventListener("removetrack", () => applyAudio(peerId));
+                if (!wiredStreams.has(stream)) {
+                  wiredStreams.add(stream);
+                  stream.addEventListener("addtrack", () => applyAudio(peerId));
+                  stream.addEventListener("removetrack", () => applyAudio(peerId));
+                }
               }
               applyAudio(peerId);
               startPlayback(video, peerId);
@@ -1427,10 +1440,12 @@ function initQualityControls(): void {
     void mesh?.setPreset(QUALITY_PRESETS[name]);
   });
 
-  // Codec choice only takes effect through setCodecPreferences on the next offer,
-  // so it cannot be changed mid-stream without renegotiating.
+  // Codec choice takes effect through setCodecPreferences on the next offer. While
+  // idle, record it on the mesh so the next attach reorders the retained transceiver;
+  // while sharing, keep the existing next-share behaviour.
   ui.codec.addEventListener("change", () => {
     localStorage.setItem("codec", ui.codec.value);
+    if (!capture && isCodecName(ui.codec.value)) mesh?.setCodec(ui.codec.value);
     if (capture) setStatus("Codec applies the next time you start sharing.", "warn");
   });
   // Privacy toggle (Relay only)

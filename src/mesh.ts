@@ -102,10 +102,32 @@ class PeerLink {
   /** What we last asked the far end for; flushed when the channel opens. */
   private desiredView: boolean | null = null;
 
-  private videoSender: RTCRtpSender | null = null;
-  private audioSender: RTCRtpSender | null = null;
+  /**
+   * One sendonly transceiver per kind, created on the first attach and kept for the
+   * life of the link. Removing them (or stopping them) leaves the m-line behind and
+   * the next share adds another pair, so a link that survives a stop/start grew by
+   * two m-lines each cycle. replaceTrack(null) keeps the sender, MID and encodings
+   * valid, so resuming needs no renegotiation and costs nothing.
+   */
+  private videoTx: RTCRtpTransceiver | null = null;
+  private audioTx: RTCRtpTransceiver | null = null;
+  /** Codec the video transceiver was last ordered for; compared on the next attach. */
+  private appliedCodec: CodecName | null = null;
+  /** Whether our capture is currently on the senders. */
+  attached = false;
   private adapter: BitrateAdapter | null = null;
   private remoteStream: MediaStream | null = null;
+
+  /**
+   * Every media mutation runs on this one chain. Otherwise a stop/start or a preset
+   * change can interleave replaceTrack(null) with replaceTrack(track), or leave two
+   * adapters ticking on the same sender.
+   */
+  private mediaQueue: Promise<void> = Promise.resolve();
+  /** Latest capture generation requested here; older queued toggles become no-ops. */
+  private latestGeneration = 0;
+  /** Set by Mesh.addPeer when the link was created while we were sharing. */
+  ready: Promise<void> = Promise.resolve();
 
   constructor(
     readonly selfId: PeerId,
@@ -148,7 +170,9 @@ class PeerLink {
       // The sharing side restarts ICE, which renegotiates through the usual offer
       // path; left alone, the viewer's picture just froze until someone rejoined.
       // Only the sender, so both sides do not restart into a glare.
-      if (this.pc.connectionState === "failed" && this.videoSender) this.pc.restartIce();
+      // A detached link has null-track senders: restarting ICE there would offer
+      // m-lines with nothing behind them for no reason.
+      if (this.pc.connectionState === "failed" && this.attached) this.pc.restartIce();
       this.cb.onConnectionState(this.peerId, this.pc.connectionState);
     };
     this.pc.ontrack = (ev) => this.onTrack(ev);
@@ -164,6 +188,33 @@ class PeerLink {
     if (createsControl) {
       this.bindControl(this.pc.createDataChannel("control", { ordered: true }));
     }
+  }
+
+  private get videoSender(): RTCRtpSender | null {
+    return this.videoTx?.sender ?? null;
+  }
+
+  private get audioSender(): RTCRtpSender | null {
+    return this.audioTx?.sender ?? null;
+  }
+
+  private get isClosed(): boolean {
+    return this.pc.signalingState === "closed" || this.pc.connectionState === "closed";
+  }
+
+  private enqueueMedia<T>(operation: () => Promise<T>, generation?: number): Promise<T> {
+    // A newer capture generation makes every older queued attach/detach stale. The
+    // chain itself always resolves, so one failed operation does not wedge the link.
+    if (generation !== undefined) this.latestGeneration = Math.max(this.latestGeneration, generation);
+    const run = this.mediaQueue.then(() => {
+      if (generation !== undefined && generation < this.latestGeneration) return undefined as T;
+      return operation();
+    });
+    this.mediaQueue = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
   }
 
   // ---- negotiation -------------------------------------------------------
@@ -291,11 +342,22 @@ class PeerLink {
 
     ev.track.addEventListener("ended", () => {
       if (ev.track.kind === "audio") return;
-      if (this.remoteStream === stream) {
-        this.remoteStream = null;
-        this.cb.onRemoteStreamGone(this.peerId);
-      }
+      // Keep the stream even though its video track ended: the link survives a
+      // stop/start, and reemitRemoteStream() re-shows this tile once sharing
+      // resumes without waiting for an ontrack that will never come.
+      if (this.remoteStream === stream) this.cb.onRemoteStreamGone(this.peerId);
     });
+  }
+
+  /**
+   * Re-announce the retained remote stream after the far end starts sharing again
+   * on this same link. No-op while the link is gone or its video track is not live
+   * (a replacement link will deliver a fresh ontrack instead).
+   */
+  reemitRemoteStream(): void {
+    if (this.isClosed || !this.remoteStream) return;
+    if (!this.remoteStream.getVideoTracks().some((t) => t.readyState === "live")) return;
+    this.cb.onRemoteStream(this.peerId, this.remoteStream);
   }
 
   get connectionState(): RTCPeerConnectionState {
@@ -322,63 +384,143 @@ class PeerLink {
    * rebuilt because it captures the preset's ceiling as its recovery target — reusing
    * the old one would let it climb back to the previous preset's bitrate.
    */
-  async reapplyEncoding(): Promise<void> {
-    if (!this.videoSender) return;
-    this.adapter?.stop();
-    await applyVideoEncoding(this.videoSender, this.opts.preset);
-    // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
-    // in both directions rather than only pausing.
-    await this.setSenderActive(this.remoteWantsVideo);
-    this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
-    this.adapter.start();
+  reapplyEncoding(): Promise<void> {
+    return this.enqueueMedia(async () => {
+      if (this.isClosed || !this.attached) return;
+      const sender = this.videoSender;
+      if (!sender) return;
+      this.adapter?.stop();
+      await this.applyVideoSettings(sender);
+      // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
+      // in both directions rather than only pausing.
+      await this.setSenderActiveNow(this.remoteWantsVideo);
+      this.adapter = new BitrateAdapter(sender, this.opts.preset);
+      this.adapter.start();
+    });
   }
 
-  async attachCapture(capture: CaptureResult): Promise<void> {
-    await this.detachCapture();
+  attachCapture(capture: CaptureResult, generation = 0): Promise<void> {
+    return this.enqueueMedia(async () => {
+      if (this.isClosed) return;
+      // A new attach replaces the source; the old adapter's tick must not race it.
+      this.adapter?.stop();
+      this.adapter = null;
 
-    // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
-    // addTrack reuses the receive-only transceiver its offer created, and that
-    // sender has no send encodings yet: setting ours is "Read-only field modified",
-    // which stopped the whole share. So a viewer could not share back to a sharer.
-    const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
-    this.videoSender = this.pc.addTransceiver(capture.video, send).sender;
-    // Always open an audio sender, even while silent. A whole-screen share starts
-    // with no audio and gets the game's audio from a second pick moments later, and
-    // the user can swap sources mid-share. With the sender already negotiated, each
-    // of those is a replaceTrack with no renegotiation. Tagging it with the video's
-    // stream keeps the two in one MediaStream on the far end, so they play in sync.
-    this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
-    await applyAudioEncoding(this.audioSender);
+      let codecChanged = false;
+      if (!this.videoTx || !this.audioTx) {
+        // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
+        // addTrack reuses the receive-only transceiver its offer created, and that
+        // sender has no send encodings yet: setting ours is "Read-only field modified",
+        // which stopped the whole share. So a viewer could not share back to a sharer.
+        const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
+        const videoTx = this.pc.addTransceiver(capture.video, send);
+        // Always open an audio sender, even while silent. A whole-screen share starts
+        // with no audio and gets the game's audio from a second pick moments later, and
+        // the user can swap sources mid-share. With the sender already negotiated, each
+        // of those is a replaceTrack with no renegotiation. Tagging it with the video's
+        // stream keeps the two in one MediaStream on the far end, so they play in sync.
+        const audioTx = this.pc.addTransceiver(capture.audio ?? "audio", send);
+        // Assign only after both exist, so a throw cannot leave a half-created pair
+        // that a retry would duplicate.
+        this.videoTx = videoTx;
+        this.audioTx = audioTx;
+        preferCodec(videoTx, this.opts.codec);
+        this.appliedCodec = this.opts.codec;
+      } else {
+        // A codec chosen while stopped is applied here, on the retained transceiver,
+        // and needs exactly one offer after the tracks are back.
+        codecChanged = this.appliedCodec !== this.opts.codec;
+        if (codecChanged) {
+          preferCodec(this.videoTx, this.opts.codec);
+          this.appliedCodec = this.opts.codec;
+        }
+      }
 
-    const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
-    if (tx) preferCodec(tx, this.opts.codec);
+      await this.replaceSenderTrack(this.videoSender, capture.video);
+      await this.replaceSenderTrack(this.audioSender, capture.audio);
+      await this.applyAudioSettings(this.audioSender);
+      await this.applyVideoSettings(this.videoSender);
+      await this.setSenderActiveNow(this.remoteWantsVideo);
+      this.attached = true;
 
-    await applyVideoEncoding(this.videoSender, this.opts.preset);
-    await this.setSenderActive(this.remoteWantsVideo);
-
-    this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
-    this.adapter.start();
+      const sender = this.videoSender;
+      if (sender) {
+        this.adapter = new BitrateAdapter(sender, this.opts.preset);
+        this.adapter.start();
+      }
+      // Enqueued after attach: a previous offer (ours or a glare) is answered first.
+      if (codecChanged) this.retryOffer();
+    }, generation);
   }
 
   /** Swap the audio being sent without renegotiating. Null sends silence. */
-  async replaceAudio(track: MediaStreamTrack | null): Promise<void> {
-    await this.audioSender?.replaceTrack(track);
+  replaceAudio(track: MediaStreamTrack | null): Promise<void> {
+    return this.enqueueMedia(async () => {
+      // While stopped only Mesh's capture.audio matters; attach sends it later.
+      if (this.isClosed || !this.attached) return;
+      await this.replaceSenderTrack(this.audioSender, track);
+    });
   }
 
-  async detachCapture(): Promise<void> {
-    this.adapter?.stop();
-    this.adapter = null;
-    for (const s of [this.videoSender, this.audioSender]) {
-      if (s) {
-        try {
-          this.pc.removeTrack(s);
-        } catch {
-          /* connection may already be closing */
-        }
+  detachCapture(generation = 0): Promise<void> {
+    return this.enqueueMedia(async () => {
+      this.adapter?.stop();
+      this.adapter = null;
+      if (this.isClosed) {
+        this.attached = false;
+        return;
       }
+      // Keep the transceivers, senders, MID and encodings. Null tracks release the
+      // encoder, and direction stays sendonly so resuming needs no renegotiation.
+      await this.replaceSenderTrack(this.videoSender, null);
+      await this.replaceSenderTrack(this.audioSender, null);
+      this.attached = false;
+    }, generation);
+  }
+
+  /**
+   * Apply a codec choice. While stopped this only records it for the next attach;
+   * while attached, reordering the retained transceiver takes one fresh offer.
+   */
+  setCodec(): Promise<void> {
+    return this.enqueueMedia(async () => {
+      if (this.isClosed || !this.videoTx) return;
+      if (this.appliedCodec === this.opts.codec) return;
+      if (!this.attached) return;
+      preferCodec(this.videoTx, this.opts.codec);
+      this.appliedCodec = this.opts.codec;
+      this.retryOffer();
+    });
+  }
+
+  private async replaceSenderTrack(
+    sender: RTCRtpSender | null,
+    track: MediaStreamTrack | null,
+  ): Promise<void> {
+    if (!sender) return;
+    try {
+      await sender.replaceTrack(track);
+    } catch (err) {
+      console.warn(`[mesh] replaceTrack ${this.peerId}`, err);
     }
-    this.videoSender = null;
-    this.audioSender = null;
+  }
+
+  private async applyAudioSettings(sender: RTCRtpSender | null): Promise<void> {
+    if (!sender) return;
+    try {
+      await applyAudioEncoding(sender);
+    } catch (err) {
+      console.warn(`[mesh] applyAudioEncoding ${this.peerId}`, err);
+    }
+  }
+
+  private async applyVideoSettings(sender: RTCRtpSender | null): Promise<void> {
+    if (!sender) return;
+    try {
+      await applyVideoEncoding(sender, this.opts.preset);
+    } catch (err) {
+      console.warn(`[mesh] applyVideoEncoding ${this.peerId}`, err);
+    }
   }
 
   /**
@@ -418,27 +560,38 @@ class PeerLink {
     };
   }
 
+  /** Serialized so it cannot interleave with a stop/start or preset change. */
+  setSenderActive(active: boolean): Promise<void> {
+    return this.enqueueMedia(async () => {
+      if (this.isClosed || !this.attached) return;
+      await this.setSenderActiveNow(active);
+    });
+  }
+
   /**
    * Send-side pausing. The largest single bandwidth lever available: a lone sharer in
    * an 8-person room needs ~42 Mbps up at the 6 Mbps presets (~56 Mbps at the default),
    * and not sending video that nobody is looking at removes most of that. At these room
    * sizes it is what keeps the mesh viable on an ordinary home uplink.
    */
-  private async setSenderActive(active: boolean): Promise<void> {
-    if (!this.videoSender) return;
-    const params = this.videoSender.getParameters();
-    const e = params.encodings?.[0];
-    if (!e || e.active === active) return;
-    e.active = active;
+  private async setSenderActiveNow(active: boolean): Promise<void> {
+    const sender = this.videoSender;
+    if (!sender) return;
     try {
-      await this.videoSender.setParameters(params);
+      const params = sender.getParameters();
+      const e = params.encodings?.[0];
+      if (!e || e.active === active) return;
+      e.active = active;
+      await sender.setParameters(params);
     } catch (err) {
       console.warn(`[mesh] setSenderActive ${this.peerId}`, err);
     }
   }
 
   close(): void {
+    this.attached = false;
     this.adapter?.stop();
+    this.adapter = null;
     if (this.control) {
       this.control.onopen = null;
       this.control.onmessage = null;
@@ -449,12 +602,16 @@ class PeerLink {
     this.pc.ontrack = null;
     this.pc.onconnectionstatechange = null;
     this.pc.close();
+    this.videoTx = null;
+    this.audioTx = null;
   }
 }
 
 export class Mesh {
   private readonly links = new Map<PeerId, PeerLink>();
   private capture: CaptureResult | null = null;
+  /** Bumped by every setCapture; queued attach/detach ops from older ones no-op. */
+  private captureGeneration = 0;
   /**
    * Everyone else in the room, and whether they are sharing.
    *
@@ -482,8 +639,8 @@ export class Mesh {
    * sometimes left the sharer's video never negotiated: a viewer that joined fine
    * and simply never saw anything.
    */
-  addPeer(peerId: PeerId, answering = false): void {
-    if (peerId === this.selfId || this.links.has(peerId)) return;
+  addPeer(peerId: PeerId, answering = false): PeerLink | undefined {
+    if (peerId === this.selfId || this.links.has(peerId)) return undefined;
     // The initiator opens the control channel, unless the other side is sharing
     // too and may be initiating as well; then the id order picks one of us.
     const createsControl =
@@ -497,7 +654,16 @@ export class Mesh {
       createsControl,
     );
     this.links.set(peerId, link);
-    if (this.capture) void link.attachCapture(this.capture);
+    if (this.capture) {
+      const capture = this.capture;
+      // setCapture awaits `ready` for links it creates, so a failed first attach can
+      // still reach main's teardown path. Attach during handleSignal is fire-and-forget.
+      link.ready = link.attachCapture(capture, this.captureGeneration);
+      void link.ready.catch((err) => {
+        console.error(`[mesh] could not attach capture to ${peerId}`, err);
+      });
+    }
+    return link;
   }
 
   removePeer(peerId: PeerId): void {
@@ -527,7 +693,13 @@ export class Mesh {
       this.addMember(peerId, sharing);
       return;
     }
+    const wasSharing = m.sharing;
     m.sharing = sharing;
+    // A real false -> true transition is a new share on a link that may have been
+    // retained while it stopped. Re-announce the stream we kept, so the tile comes
+    // back without an ontrack (none will arrive: the m-lines never left). The
+    // in-place welcome loop repeats already-true states and must not re-emit.
+    if (sharing && !wasSharing) this.links.get(peerId)?.reemitRemoteStream();
     // Starting to share is not a reason to connect from here: their offer does that.
     if (!this.wantsLink(peerId)) this.removePeer(peerId);
   }
@@ -559,20 +731,47 @@ export class Mesh {
    * not sharing themselves, since those existed only to carry our stream.
    */
   async setCapture(capture: CaptureResult | null): Promise<void> {
+    const generation = ++this.captureGeneration;
     // Links that already exist get the capture attached (or detached) here; links
     // created below attach it themselves in addPeer, and attaching twice would leave
     // an extra pair of transceivers behind.
     const existing = [...this.links.values()];
     this.capture = capture;
+    const created: PeerLink[] = [];
     if (capture) {
-      for (const id of this.members.keys()) this.addPeer(id);
+      for (const id of this.members.keys()) {
+        const link = this.addPeer(id);
+        if (link) created.push(link);
+      }
     } else {
       for (const [id, m] of this.members) if (!m.sharing) this.removePeer(id);
     }
-    await Promise.all(
-      existing
-        .filter((l) => this.links.get(l.peerId) === l)
-        .map((l) => (capture ? l.attachCapture(capture) : l.detachCapture())),
+
+    const operations: Promise<void>[] = [];
+    for (const link of existing) {
+      if (this.links.get(link.peerId) !== link) continue;
+      operations.push(capture ? link.attachCapture(capture, generation) : link.detachCapture(generation));
+    }
+    for (const link of created) {
+      if (this.links.get(link.peerId) === link) operations.push(link.ready);
+    }
+    const results = await Promise.allSettled(operations);
+
+    if (!capture) {
+      // Stopping must always reach stopCapture/capture = null in main, even when a
+      // link fails to detach. Log and continue.
+      for (const result of results) {
+        if (result.status === "rejected") console.warn("[mesh] detach failed", result.reason);
+      }
+      return;
+    }
+    // A newer setCapture owns the outcome now. No links at all is not a failure:
+    // sharing alone must still start (main tears down only for a real failed start).
+    if (generation !== this.captureGeneration || operations.length === 0) return;
+    if ([...this.links.values()].some((link) => link.attached)) return;
+    throw new AggregateError(
+      results.filter((r): r is PromiseRejectedResult => r.status === "rejected").map((r) => r.reason),
+      `Could not attach capture to any of ${operations.length} peer link(s)`,
     );
   }
 
@@ -590,14 +789,21 @@ export class Mesh {
     this.links.get(peerId)?.requestRemoteVideo(viewing);
   }
 
-  /**
-   * Change quality for every peer without renegotiating. Codec changes cannot work
-   * this way — setCodecPreferences only takes effect on the next offer — which is why
-   * the UI applies codec on the next share instead.
-   */
+  /** Change quality for every peer without renegotiating. */
   async setPreset(preset: QualityPreset): Promise<void> {
     this.opts.preset = preset;
     await Promise.all([...this.links.values()].map((l) => l.reapplyEncoding()));
+  }
+
+  /**
+   * Choose the codec for every link. A stopped link only stores it; the next attach
+   * applies it on the retained transceiver and sends the one offer that needs.
+   */
+  setCodec(codec: CodecName): void {
+    this.opts.codec = codec;
+    for (const link of this.links.values()) {
+      void link.setCodec().catch((err) => console.warn("[mesh] setCodec failed", err));
+    }
   }
 
   getConnection(peerId: PeerId): RTCPeerConnection | undefined {

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignalData } from "@shared/protocol";
 import type { CaptureResult } from "@src/capture";
+import { BitrateAdapter } from "@src/quality";
 import {
   Mesh,
   type MeshCallbacks,
@@ -41,6 +42,8 @@ class FakeRTCPeerConnection {
 
   senders: RTCRtpSender[] = [];
   transceivers: RTCRtpTransceiver[] = [];
+  addTransceiverCalls: Array<{ trackOrKind: MediaStreamTrack | string; init?: RTCRtpTransceiverInit }> = [];
+  removeTrackCalls: RTCRtpSender[] = [];
   dataChannels: FakeDataChannel[] = [];
   addedCandidates: RTCIceCandidateInit[] = [];
   closed = false;
@@ -85,34 +88,69 @@ class FakeRTCPeerConnection {
     this.addedCandidates.push(candidate);
   }
 
-  addTrack(track: MediaStreamTrack | null, ..._streams: MediaStream[]): RTCRtpSender {
+  private makeSender(track: MediaStreamTrack | null): RTCRtpSender {
     let params: Record<string, unknown> = { encodings: [{ active: true, maxBitrate: 5_000_000 }] };
     const sender = {
       track,
       getParameters: () => structuredClone(params),
       setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
       getStats: async () => new Map() as unknown as RTCStatsReport,
-      replaceTrack: async (t: MediaStreamTrack | null) => { (sender as { track: unknown }).track = t; },
+      replaceTrack: vi.fn(async (t: MediaStreamTrack | null) => {
+        (sender as { track: unknown }).track = t;
+      }),
     } as unknown as RTCRtpSender;
     this.senders.push(sender);
+    return sender;
+  }
 
+  addTrack(track: MediaStreamTrack | null, ..._streams: MediaStream[]): RTCRtpSender {
+    const sender = this.makeSender(track);
     const transceiver = {
       sender,
+      direction: "sendrecv",
+      currentDirection: "sendrecv",
+      mid: String(this.transceivers.length),
+      stopped: false,
       setCodecPreferences: vi.fn(),
+      stop: vi.fn(),
     } as unknown as RTCRtpTransceiver;
     this.transceivers.push(transceiver);
 
     return sender;
   }
 
-  addTransceiver(trackOrKind: MediaStreamTrack | string, _init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
-    const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
-    return this.transceivers.find((t) => t.sender === sender)!;
+  addTransceiver(trackOrKind: MediaStreamTrack | string, init?: RTCRtpTransceiverInit): RTCRtpTransceiver {
+    this.addTransceiverCalls.push({ trackOrKind, init });
+    const sender = this.makeSender(typeof trackOrKind === "string" ? null : trackOrKind);
+    const direction = init?.direction ?? "sendrecv";
+    const transceiver = {
+      sender,
+      direction,
+      currentDirection: direction,
+      mid: String(this.transceivers.length),
+      stopped: false,
+      setCodecPreferences: vi.fn(),
+    } as unknown as RTCRtpTransceiver;
+    transceiver.stop = vi.fn(() => {
+      (transceiver as unknown as { stopped: boolean }).stopped = true;
+      (transceiver as unknown as { direction: string }).direction = "stopped";
+      (transceiver as unknown as { currentDirection: string }).currentDirection = "stopped";
+    });
+    this.transceivers.push(transceiver);
+    return transceiver;
   }
 
+  // Spec-faithful: removeTrack keeps the transceiver and sender, nulls the track and
+  // deactivates the m-line. It cannot free anything, which is why the fix does not
+  // call it while stopping.
   removeTrack(sender: RTCRtpSender): void {
-    const idx = this.senders.indexOf(sender);
-    if (idx !== -1) this.senders.splice(idx, 1);
+    this.removeTrackCalls.push(sender);
+    const transceiver = this.transceivers.find((t) => t.sender === sender);
+    if (transceiver) {
+      (transceiver as unknown as { direction: string }).direction = "inactive";
+      (transceiver as unknown as { currentDirection: string }).currentDirection = "inactive";
+    }
+    void sender.replaceTrack(null);
   }
 
   getTransceivers(): RTCRtpTransceiver[] {
@@ -272,7 +310,16 @@ describe("Mesh and PeerLink", () => {
     expect(pc.senders.length).toBe(2);
 
     await mesh.setCapture(null);
-    expect(pc.senders.length).toBe(0);
+    // Stopping keeps the sendonly transceivers and senders; only the tracks go.
+    // RemoveTrack would deactivate the m-line and leave it behind all the same.
+    expect(pc.senders.length).toBe(2);
+    expect(pc.senders.every((s) => s.track === null)).toBe(true);
+    expect(pc.removeTrackCalls).toHaveLength(0);
+    expect(pc.getTransceivers()).toHaveLength(2);
+    for (const tx of pc.getTransceivers()) {
+      expect(tx.direction).toBe("sendonly");
+      expect((tx as unknown as { stopped: boolean }).stopped).toBe(false);
+    }
   });
 
   it("opens a silent audio sender and swaps audio in without renegotiating", async () => {
@@ -386,13 +433,16 @@ describe("Mesh and PeerLink", () => {
     };
     await mesh.setCapture(capture);
 
-    // Far end says they are NOT viewing tile
+    // Far end says they are NOT viewing tile. Media mutations are serialized, so
+    // the enqueued setParameters lands on a later microtask.
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    await new Promise((r) => setTimeout(r, 0));
     const sender = pc.senders[0]!;
     expect(sender.getParameters().encodings?.[0]?.active).toBe(false);
 
     // Far end says they are viewing tile again
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+    await new Promise((r) => setTimeout(r, 0));
     expect(sender.getParameters().encodings?.[0]?.active).toBe(true);
 
     // Ignores malformed messages
@@ -785,6 +835,261 @@ describe("negotiation recovery", () => {
     const newServers = [{ urls: "stun:stun.cloudflare.com:3478" }];
     mesh.updateIceServers(newServers);
     expect(pc.setConfiguration).toHaveBeenCalledWith(expect.objectContaining({ iceServers: newServers }));
+  });
+});
+
+describe("persistent sendonly transceivers", () => {
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+    relayOnly: false,
+  };
+  const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
+  const capture = (): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    return { stream: { getTracks: () => [video] } as unknown as MediaStream, video, audio: null };
+  };
+  const flush = () => new Promise((r) => setTimeout(r, 10));
+  let sent: SignalData[];
+
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    sent = [];
+    // Mesh mutates the options object it is given, so reset it per test.
+    opts.codec = "h264";
+    opts.preset = { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 };
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }, { mimeType: "video/VP9" }] }),
+    };
+  });
+
+  /**
+   * A link created by the far end's offer, which we keep because that member is
+   * still sharing. This is the link type that used to grow two m-lines per cycle.
+   */
+  async function retainedLink(mesh: Mesh): Promise<FakeRTCPeerConnection> {
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    return FakeRTCPeerConnection.instances[0]!;
+  }
+
+  const offerCount = () => sent.filter((d) => d.k === "offer").length;
+
+  it("reuses one video/audio pair across 20 stop/start cycles", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+
+    await mesh.setCapture(capture());
+    const firstSenders = [...pc.senders];
+    expect(firstSenders).toHaveLength(2);
+    expect(pc.addTransceiverCalls).toHaveLength(2);
+    for (const call of pc.addTransceiverCalls) {
+      expect(call.init?.direction).toBe("sendonly");
+    }
+
+    for (let i = 0; i < 20; i++) {
+      await mesh.setCapture(capture());
+      await mesh.setCapture(null);
+    }
+
+    expect(pc.getTransceivers()).toHaveLength(2);
+    expect(pc.senders).toHaveLength(2);
+    expect(pc.senders[0]).toBe(firstSenders[0]);
+    expect(pc.senders[1]).toBe(firstSenders[1]);
+    expect(pc.addTransceiverCalls).toHaveLength(2);
+    expect(pc.removeTrackCalls).toHaveLength(0);
+    for (const tx of pc.getTransceivers()) {
+      expect(tx.direction).toBe("sendonly");
+      expect((tx as unknown as { stopped: boolean }).stopped).toBe(false);
+    }
+
+    // 1 video from the first attach + 20 from the restarts; one null per stop.
+    const videoReplace = pc.senders[0]!.replaceTrack as unknown as {
+      mock: { calls: Array<[MediaStreamTrack | null]> };
+    };
+    const videoCalls = videoReplace.mock.calls.map(([track]) => track);
+    expect(videoCalls.filter((t) => t !== null)).toHaveLength(21);
+    expect(videoCalls.filter((t) => t === null)).toHaveLength(20);
+  });
+
+  it("re-applies a preset chosen while stopped when sharing resumes", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
+
+    const next = { label: "1080p60", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 };
+    await mesh.setPreset(next);
+    await mesh.setCapture(capture());
+
+    expect(pc.senders[0]!.getParameters().encodings?.[0]?.maxBitrate).toBe(next.maxBitrate);
+    expect(pc.getTransceivers()).toHaveLength(2);
+  });
+
+  it("applies a preset queued during an attach after the attach finishes", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    const start = vi.spyOn(BitrateAdapter.prototype, "start");
+    const stop = vi.spyOn(BitrateAdapter.prototype, "stop");
+
+    const next = { label: "1080p30", width: 1920, height: 1080, frameRate: 30, maxBitrate: 5_000_000 };
+    // Both run without awaiting the first: the queue must order attach then preset.
+    await Promise.all([mesh.setCapture(capture()), mesh.setPreset(next)]);
+
+    // One attach start, then the re-apply stops it and starts exactly one more.
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(stop.mock.calls.length).toBeGreaterThanOrEqual(1);
+    expect(pc.senders[0]!.getParameters().encodings?.[0]?.maxBitrate).toBe(next.maxBitrate);
+    start.mockRestore();
+    stop.mockRestore();
+  });
+
+  it("does not restart ICE or offer while detached", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    await mesh.setCapture(capture());
+    await mesh.setCapture(null);
+
+    const before = offerCount();
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    await flush();
+
+    expect(pc.restartIceCalls).toBe(0);
+    expect(offerCount()).toBe(before);
+  });
+
+  it("does not add transceivers or offer when an ordinary share resumes", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    await mesh.setCapture(capture());
+    await flush();
+    const before = offerCount();
+
+    await mesh.setCapture(null);
+    await mesh.setCapture(capture());
+    await flush();
+
+    expect(pc.addTransceiverCalls).toHaveLength(2);
+    expect(pc.removeTrackCalls).toHaveLength(0);
+    expect(offerCount()).toBe(before);
+  });
+
+  it("applies a codec chosen while stopped on the retained transceiver with one offer", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    await mesh.setCapture(capture());
+    const tx = pc.getTransceivers()[0]!;
+    await mesh.setCapture(null);
+
+    mesh.setCodec("vp9");
+    await flush();
+    // Stopped: recorded only, no offer yet.
+    expect(offerCount()).toBe(0);
+
+    await mesh.setCapture(capture());
+    await flush();
+
+    expect(pc.addTransceiverCalls).toHaveLength(2);
+    expect(tx.setCodecPreferences).toHaveBeenLastCalledWith([
+      expect.objectContaining({ mimeType: "video/VP9" }),
+      expect.objectContaining({ mimeType: "video/H264" }),
+    ]);
+    expect(offerCount()).toBe(1);
+  });
+
+  it("applies a codec change while attached with exactly one offer", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    const pc = await retainedLink(mesh);
+    await mesh.setCapture(capture());
+    const tx = pc.getTransceivers()[0]!;
+
+    mesh.setCodec("vp9");
+    await flush();
+
+    expect(tx.setCodecPreferences).toHaveBeenLastCalledWith(expect.arrayContaining([
+      expect.objectContaining({ mimeType: "video/VP9" }),
+    ]));
+    expect(offerCount()).toBe(1);
+
+    // Repeating the same choice must not offer again.
+    mesh.setCodec("vp9");
+    await flush();
+    expect(offerCount()).toBe(1);
+  });
+
+  it("rejects setCapture(capture) when every attach fails or is already closed", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", false);
+    mesh.addPeer("bob");
+    mesh.addPeer("carol");
+    const closed = FakeRTCPeerConnection.instances[0]!;
+    const throwing = FakeRTCPeerConnection.instances[1]!;
+    closed.close();
+    throwing.addTransceiver = vi.fn(() => {
+      throw new Error("cannot add transceiver");
+    });
+
+    const error = await mesh.setCapture(capture()).catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(AggregateError);
+    expect((error as AggregateError).errors.map(String)).toContain("Error: cannot add transceiver");
+  });
+
+  it("never rejects setCapture(null), even with no links", async () => {
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    mesh.addMember("bob", false);
+    await expect(mesh.setCapture(null)).resolves.toBeUndefined();
+    expect(mesh.peers()).toEqual([]);
+  });
+
+  it("re-emits the retained stream only on a real false -> true sharing transition", async () => {
+    const callbacks = cb();
+    const mesh = new Mesh("me", opts, () => {}, callbacks);
+    const pc = await retainedLink(mesh);
+    // Our own capture keeps the link even when bob stops sharing.
+    await mesh.setCapture(capture());
+
+    const listeners: Record<string, () => void> = {};
+    const videoTrack = {
+      kind: "video",
+      readyState: "live",
+      addEventListener: (ev: string, fn: () => void) => { listeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+    const stream = {
+      id: "remote",
+      getTracks: () => [videoTrack],
+      getVideoTracks: () => [videoTrack],
+    } as unknown as MediaStream;
+
+    pc.ontrack?.({
+      track: videoTrack,
+      receiver: {} as unknown as RTCRtpReceiver,
+      streams: [stream],
+    } as unknown as RTCTrackEvent);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(1);
+
+    // The far end stopped: the tile goes, but the stream reference is kept.
+    listeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("bob");
+
+    mesh.setMemberSharing("bob", false);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
+    expect(callbacks.onRemoteStream).toHaveBeenLastCalledWith("bob", stream);
+
+    // A reconnect welcome repeats the state; that is not a new share.
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
+
+    // A stream whose video track is dead is never re-emitted onto a new tile.
+    (videoTrack as unknown as { readyState: string }).readyState = "ended";
+    mesh.setMemberSharing("bob", false);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
   });
 });
 
