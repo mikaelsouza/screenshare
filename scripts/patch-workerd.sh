@@ -5,7 +5,7 @@
 # Nix loader and libc is enough to make it run.
 #
 # Safe to re-run, and it must be re-run after any `npm install` that repopulates
-# node_modules. `npm run pretest` does this automatically.
+# node_modules. The `postinstall` script runs it automatically.
 set -euo pipefail
 
 if [ -z "${NIX_GLIBC:-}" ]; then

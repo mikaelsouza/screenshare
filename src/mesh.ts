@@ -1,10 +1,12 @@
 /**
- * Full-mesh peer connection manager.
+ * Peer connection manager.
  *
- * In a room of N, every peer holds N-1 RTCPeerConnections and media flows directly
- * between browsers — the server sees signalling only, then goes quiet. That is the
- * whole point of the design, and it's why room size is capped at all: mesh upload cost
- * is linear in room size and borne entirely by the sharer's uplink. See MAX_ROOM_SIZE.
+ * The mesh is not full: a link exists only while at least one end is sharing. A sharer
+ * holds a connection to every other member; a viewer connects only to sharers, never to
+ * other viewers. Media flows directly between browsers — the server sees signalling
+ * only, then goes quiet. That is the whole point of the design, and it is why room size
+ * is capped at all: upload cost is linear in room size and borne entirely by the
+ * sharer's uplink. See MAX_ROOM_SIZE.
  */
 
 import type { IceCandidateInit, PeerId, SignalData } from "@shared/protocol";
@@ -417,10 +419,10 @@ class PeerLink {
   }
 
   /**
-   * Send-side pausing. The largest single bandwidth lever available: in a full
-   * 8-person room a lone sharer needs ~42 Mbps up, and not sending video that nobody
-   * is looking at removes most of that. At this room size it is what keeps the mesh
-   * viable on an ordinary home uplink.
+   * Send-side pausing. The largest single bandwidth lever available: a lone sharer in
+   * an 8-person room needs ~42 Mbps up at the 6 Mbps presets (~56 Mbps at the default),
+   * and not sending video that nobody is looking at removes most of that. At these room
+   * sizes it is what keeps the mesh viable on an ordinary home uplink.
    */
   private async setSenderActive(active: boolean): Promise<void> {
     if (!this.videoSender) return;

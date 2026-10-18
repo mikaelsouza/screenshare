@@ -1,11 +1,13 @@
 /**
  * Hard room cap.
  *
- * Mesh upload cost is linear in room size and paid by the sharer's uplink: at 6 Mbps
- * a lone sharer pushes 6 x (N-1) Mbps, so 8 people means ~42 Mbps up. That is past a
- * typical cable uplink, which is why per-peer bitrate adaptation (BitrateAdapter) and
- * send-side pausing for unwatched tiles are load-bearing rather than nice-to-have at
- * this size. Beyond 8 the mesh stops being the right shape and an SFU is needed.
+ * Upload cost is linear in room size and paid by the sharer's uplink: each viewer
+ * receives one stream at the selected preset's maxBitrate (8 Mbps at the default
+ * 1080p60, 6 Mbps for 1080p30/720p60). An 8-person room therefore needs ~56 Mbps up at
+ * the default, and the 20-person cap ~152 Mbps — past ordinary home uplinks. Per-peer
+ * bitrate adaptation (BitrateAdapter) and send-side pausing for unwatched tiles are what
+ * keep the mesh viable at these sizes. The cap is where the mesh shape still holds;
+ * beyond it an SFU is needed.
  */
 export const MAX_ROOM_SIZE = 20;
 export const ROOM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no O/0/I/1/L

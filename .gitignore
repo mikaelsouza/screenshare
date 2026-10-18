@@ -6,3 +6,9 @@ dist
 .DS_Store
 result
 coverage
+
+# Local design mocks and agent workspace; not part of the app
+/.agents/
+/server.js
+/mocks/
+/mock-*.html
