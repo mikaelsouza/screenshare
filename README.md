@@ -31,18 +31,22 @@ Browser A ═══════════ SRTP media, direct P2P ════�
   allocation. The Durable Object now issues them inside the `welcome` message, so
   holding a WebSocket that has been accepted into a room is the authorisation. (That
   bar is still low — see Known issues.) Each person gets their own credential, which the
-  room revokes when they leave or are removed.
+  room revokes when they leave or are removed. The one exception is the `/diagnostics`
+  probe: on a room nobody has claimed it may mint a five-minute credential without
+  joining, so the page can test a relay allocation. That one is left to expire, not
+  revoked.
 - **RoomDO** (`worker/room.ts`) — one Durable Object per room code, holding the
-  WebSocket connections and routing signalling between peers. It forwards `data`
-  verbatim and never parses SDP. Uses the WebSocket Hibernation API, so idle rooms
-  cost nothing — which is also the source of the subtlest bug this project has had
-  (see Room passwords below).
+  WebSocket connections and routing signalling between peers. It forwards the `data`
+  payload verbatim after a shape and size check, and never parses SDP. Uses the WebSocket
+  Hibernation API, so idle rooms cost nothing — which is also the source of the subtlest
+  bug this project has had (see Room passwords below).
 - **Frontend** (`src/`) — all the WebRTC work: capture, encoder tuning, mesh peer
   management, and per-peer bitrate adaptation.
 
 Roughly 10% of peer pairs sit behind CGNAT or a symmetric NAT and cannot connect
-directly; those fall back to a TURN relay automatically. `/diagnostics` reports which
-path a given network actually took.
+directly; those fall back to a TURN relay automatically. `/diagnostics` tests whether this
+network *can* connect directly (STUN reachability, NAT mapping) and whether a relay can be
+allocated; the label on each live tile reports which path an actual connection took.
 
 ### Rooms, passwords and privacy
 
@@ -84,7 +88,8 @@ of non-relay candidate lines, so the policy is checked on the way out rather tha
 public address, so the mesh is not a full mesh: two people are connected only while at
 least one of them is sharing. Viewers never connect to each other. Opening a room link
 (`/#CODE`) joins the room immediately; a remembered Hide my IP setting is applied before
-it connects, and a password-protected room asks for its password first.
+it connects. A password-protected room refuses that first join with `bad-password`, and
+the status line then asks for the password; Enter or Join retries.
 
 **Everyone is listed.** The participant list above the video shows every member, with
 the first four characters of their id so two people with the same name can be told
@@ -106,8 +111,11 @@ the lock and the ban, so a refresh, a network blip or switching Hide my IP does 
 anyone. Removing someone deletes their ticket. If the host leaves a locked room and does
 not come back within five minutes, the room unlocks itself, since nobody else could.
 
-The relay refuses an **offer** unless the sender or the receiver is sharing, so a modified
-client cannot make another viewer connect to it and learn their address.
+The relay refuses an **offer** unless the sender or receiver is *declared* to be sharing.
+That keeps an ordinary viewer from being dragged into a connection by another viewer, but
+the flag is self-declared: a modified client can claim it while sending nothing, offer to a
+viewer, and receive that viewer's candidates in the answer. The gate prevents accidents,
+not a determined peer — see Known issues.
 
 ### Abuse limits
 
@@ -136,11 +144,15 @@ with a 4xx. This is not incidental: a non-101 answer reaches the browser as a ba
 code 1006 with no body, which is indistinguishable from a network blip, so the client
 reconnects forever and the user is never told why. Terminal refusals close 1008;
 transient capacity refusals close 1013, which the client retries with backoff a bounded
-number of times before giving up with a message.
+number of times before giving up with a message. The hard wrong-password limit also
+closes 1013: its window expires, so the right password still gets in, but the client
+reports the refusal as temporary capacity.
 
 ### Bandwidth
 
-Mesh cost is linear in room size and paid by the **sharer's uplink**:
+Mesh cost is linear in room size and paid by the **sharer's uplink**. Each viewer receives
+one stream per sharer at the selected preset's `maxBitrate`; the table uses the 6 Mbps
+presets (`1080p30`, `720p60`):
 
 | Room | Sharers | Sharer uploads | Each viewer downloads |
 | ---- | ------- | -------------- | --------------------- |
@@ -148,7 +160,9 @@ Mesh cost is linear in room size and paid by the **sharer's uplink**:
 | 8    | 1       | 42 Mbps        | 6 Mbps                |
 | 8    | 2       | 42 Mbps each   | 12 Mbps               |
 
-A full 8-person room needs a fiber-class uplink from the sharer. Two mitigations do
+The default preset is `1080p60` at 8 Mbps, so the same rooms need 24 Mbps, 56 Mbps, and
+56 Mbps up / 16 Mbps down instead. At the 20-person cap a lone sharer uploads 19 copies —
+152 Mbps at the default — so a full room needs a fiber-class uplink. Two mitigations do
 the heavy lifting and are always on: senders are paused for tiles the viewer is not
 looking at (`IntersectionObserver` -> a peer-to-peer data channel -> `encodings[0].active`),
 and each peer's bitrate adapts independently on sustained packet loss. Because mesh
@@ -208,6 +222,10 @@ TURN_API_TOKEN=your_turn_api_token
 Without these the app falls back to STUN only. Direct P2P still works; only the relay
 fallback is unavailable.
 
+The e2e suite expects TURN to be **absent**, though: `wrangler dev` loads `.dev.vars`, and
+two tests assert STUN-only and that Hide my IP refuses without a relay. Move `.dev.vars`
+aside (or use an empty one) before `npm run test:e2e`.
+
 ## Testing
 
 ```bash
@@ -244,10 +262,12 @@ answer that, and `/diagnostics` is the tool for it.
    ```
 3. Optionally, in the Cloudflare dashboard, add a billing notification for Realtime
    usage, so a surprise in relay traffic reaches you before the invoice does.
-4. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc`.
+4. Attach your custom domain by uncommenting `routes` in `wrangler.jsonc` and replacing
+   the `<tld>` placeholder (and the `webmikas` subdomain) with your own.
 5. Push to `main`. `.github/workflows/deploy.yml` runs the typecheck, the unit suite and
    the workerd suite, builds, and deploys with `cloudflare/wrangler-action`. `npm run
-   deploy` does the same thing by hand.
+   deploy` is the shortcut without CI: it only builds and runs `wrangler deploy`, with no
+   typecheck or tests.
 
 `wrangler.jsonc` sets `run_worker_first: true`, which routes *every* request through the
 Worker rather than serving matched assets straight off the edge. That is what makes the
@@ -258,7 +278,7 @@ negligible against 100k/day.
 
 Cloudflare terminates TLS automatically for a Worker custom domain, which
 `getDisplayMedia` requires. Note that the Cloudflare proxy drops idle WebSockets after
-about 100 seconds — the client pings every 30s, answered by the Durable Object's
+about 100 seconds — the client pings every 15s, answered by the Durable Object's
 `setWebSocketAutoResponse` without waking it, so keepalives cost nothing.
 
 ## NixOS notes
@@ -268,9 +288,9 @@ FHS loader `/lib64/ld-linux-x86-64.so.2`, which NixOS does not have.
 `scripts/patch-workerd.sh` repoints them at the Nix loader via patchelf. It runs
 automatically on `npm install` (`postinstall`) and is safe to re-run.
 
-`.npmrc` sets `legacy-peer-deps=true`: `@cloudflare/vitest-pool-workers` declares an
-optional peer on `@vitest/browser-playwright` that makes npm's peer resolver crash.
-`package-lock.json` plus `npm ci` pins exact versions instead.
+`.npmrc` sets `legacy-peer-deps=true`: `vitest` declares an optional peer on
+`@vitest/browser-playwright` that makes npm's peer resolver crash when it is not
+installed. `package-lock.json` plus `npm ci` pins exact versions instead.
 
 `package.json` overrides `sharp` to `^0.35.4`: `@cloudflare/vitest-pool-workers` pins an
 older miniflare whose `sharp` carries a libheif advisory. It is dev tooling only and
@@ -287,6 +307,8 @@ worker/room.ts                 RoomDO: membership, signalling, passwords
 worker/turn.ts                 Cloudflare Realtime TURN credential minting
 worker/upgrade.ts              WebSocket refusals that a browser can actually read
 worker/ratelimit.ts            bounded fixed-window per-key throttle
+worker/ipkey.ts                per-IP key: IPv4 address, or the /64 for IPv6
+src/main.ts                    UI, room lifecycle, share controls, tile layout
 src/capture.ts                 getDisplayMedia + track configuration
 src/quality.ts                 encoder params, codec choice, Opus SDP, bitrate adaptation
 src/mesh.ts                    peer connections (sharer to everyone, never viewer to viewer), perfect negotiation
@@ -322,12 +344,13 @@ relay that restrictive networks depend on. There is a test for exactly that trap
 
 Open defects, in rough order of how likely you are to hit them:
 
-- **Transceiver leak on repeated sharing** (`src/mesh.ts`). `addTrack`/`removeTrack`
-  mean every share -> unshare cycle permanently adds two transceivers and two SDP
-  m-lines to every peer connection: `removeTrack` leaves the transceiver in place
-  already marked as having sent, so the next `addTrack` cannot reuse it. Toggle sharing
-  twenty times in an evening and a 7-peer mesh is carrying 40 m-lines per connection.
-  The fix is one persistent transceiver per link plus `replaceTrack`.
+- **Transceiver leak on repeated sharing** (`src/mesh.ts`). Every share -> unshare cycle
+  adds two fresh sendonly transceivers (`addTransceiver` for video and audio) and then
+  `removeTrack`s them. `removeTrack` leaves each transceiver in place already marked as
+  having sent, so the next share cannot reuse it: each cycle permanently adds two
+  transceivers and two SDP m-lines to every peer connection. Toggle sharing twenty times
+  in an evening and a 7-peer mesh is carrying 40 m-lines per connection. The fix is one
+  persistent transceiver per link plus `replaceTrack`.
 - **TURN credentials are cheap to obtain.** Anyone can create a room, join it, and
   receive 12-hour relay credentials on our Cloudflare allocation. They are now per
   person, revoked on leave, and capped at 20 a minute per address, which blunts this
@@ -336,6 +359,12 @@ Open defects, in rough order of how likely you are to hit them:
   `echo true | npx wrangler secret put TURN_DISABLED` (delete the secret to switch it
   back on). Direct connections keep working; Hide my IP then refuses to connect, as it
   must.
+- **The relay's offer gate trusts a self-declared flag** (`worker/room.ts`, `src/mesh.ts`).
+  `sharing` is set by a client message and never checked against actual media, so a
+  modified client can announce it while sending nothing, offer to any viewer, and receive
+  that viewer's candidates in the answer. Inside a room, "a modified client cannot learn
+  another viewer's address" is therefore not true. Closing it means requiring a real
+  track before the relay, or the answering client, accepts an offer.
 - **`/diagnostics` reports symmetric NAT falsely on multi-homed machines.** It compares
   srflx ports across all local interfaces rather than across STUN servers, so a laptop
   with Wi-Fi and Ethernet both up, or any VPN adapter, looks symmetric even behind a
@@ -357,6 +386,7 @@ tested.
   Chrome on Windows honours `windowAudio: "window"` (per-app audio), whether the
   audio-only second capture stays in sync with the screen video, and whether Chrome
   exposes the picked window's title (the chip falls back to "game window").
-- **8-person rooms with real media**, and multiple simultaneous sharers.
+- **8-person rooms with real media.** Bandwidth and CPU at the cap are unmeasured; two
+  simultaneous sharers, by contrast, are covered by `edge.test.mjs`.
 - **Hardware H.264 encoding.** Check `encoderImplementation` in `chrome://webrtc-internals`
   is not a software fallback; if it is, the encoder is competing with the game for CPU.
