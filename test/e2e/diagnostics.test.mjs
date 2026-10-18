@@ -72,9 +72,30 @@ describe("diagnostics page", { concurrency: 1 }, () => {
 
   it("gives an actionable explanation for every non-passing row", async () => {
     const rows = await page.evaluate(readRows);
+    // INFO is informational rather than passing, so it must explain itself too.
     for (const [name, { status, details }] of Object.entries(rows)) {
       if (status === "PASS") continue;
       assert.ok(details.length > 20, `row "${name}" is ${status} with an unhelpful detail: "${details}"`);
+    }
+  });
+
+  it("does not claim a symmetric NAT without a same-base comparison", async () => {
+    const rows = await page.evaluate(readRows);
+    const nat = rows["NAT mapping"];
+    assert.ok(nat, "NAT mapping row missing");
+    assert.doesNotMatch(nat.details, /symmetric/i);
+    assert.notEqual(nat.status, "FAIL", nat.details);
+
+    if (rows["STUN / public address"].status === "PASS") {
+      assert.ok(
+        nat.status === "INFO" || nat.status === "PASS",
+        `NAT mapping must stay informational while detection is gated, got ${nat.status}: ${nat.details}`,
+      );
+      if (nat.status === "INFO") assert.match(nat.details, /not determinable/i);
+      else assert.match(nat.details, /no evidence/i);
+    } else {
+      assert.equal(nat.status, "WARN", nat.details);
+      assert.match(nat.details, /no server-reflexive/i);
     }
   });
 

@@ -10,9 +10,10 @@
 
 import { PING, PONG, type ServerMessage } from "@shared/protocol";
 import { systemAudioSupport, windowAudioSupport } from "./capture";
-import { type ParsedCandidate as Cand, parseCandidate } from "./stats";
+import { gatherCandidates, natRow, type GatherResult } from "./nat";
+import { classifyNatMapping } from "./stats";
 
-type Status = "pass" | "warn" | "fail" | "running";
+type Status = "pass" | "warn" | "fail" | "info" | "running";
 
 const results = document.getElementById("results") as HTMLTableSectionElement | null;
 const runBtn = document.getElementById("run-btn") as HTMLButtonElement | null;
@@ -21,6 +22,7 @@ const STATUS_STYLE: Record<Exclude<Status, "running">, { icon: string; color: st
   pass: { icon: "PASS", color: "#4ade80" },
   warn: { icon: "WARN", color: "#fbbf24" },
   fail: { icon: "FAIL", color: "#f87171" },
+  info: { icon: "INFO", color: "#8e8e99" },
 };
 
 function addRow(test: string, status: Status, details: string): (s: Status, d: string) => void {
@@ -49,49 +51,16 @@ function addRow(test: string, status: Status, details: string): (s: Status, d: s
   return update;
 }
 
-// ---- ICE candidate gathering ---------------------------------------------
+// ---- STUN probes ----------------------------------------------------------
 
-/** Gather ICE candidates for a throwaway connection. Always resolves. */
-async function gather(config: RTCConfiguration, timeoutMs = 15000): Promise<Cand[]> {
-  const pc = new RTCPeerConnection(config);
-  const found: Cand[] = [];
-  try {
-    // A data channel gives ICE a reason to gather; without media or data there is
-    // nothing to negotiate and Chrome gathers nothing.
-    pc.createDataChannel("probe");
-    const done = new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, timeoutMs);
-      pc.onicecandidate = (ev) => {
-        if (!ev.candidate) {
-          clearTimeout(timer);
-          resolve();
-          return;
-        }
-        const c = parseCandidate(ev.candidate);
-        if (c) found.push(c);
-      };
-    });
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
-    await done;
-  } catch {
-    // Fall through with whatever was gathered.
-  } finally {
-    pc.onicecandidate = null;
-    pc.close();
-  }
-  return found;
-}
-
-// Three distinct STUN endpoints. Distinctness is the point: a symmetric NAT assigns
-// a different external port per destination, so identical ports across all three
-// means endpoint-independent mapping (hole punching will work) and differing ports
-// mean symmetric NAT (it won't, and TURN will be required).
+// Two distinct STUN endpoints. They are not compared against each other directly:
+// a symmetric NAT allocates a different external port per destination, but only
+// candidates that share a local base socket (raddr/rport) are comparable, so the
+// NAT row groups by base instead of pooling every srflx port.
 // Deliberately no :53 endpoint here. UDP/53 is widely intercepted for DNS, and a
 // black-holing STUN server does not merely get skipped — measured on a real network,
 // including stun.cloudflare.com:53 produced srflx=0 across the whole gathering, so
 // this check reported "UDP to STUN is blocked" on a connection where STUN worked fine.
-// Two distinct hosts are still enough for the symmetric-NAT comparison below.
 // Google's server is the second one, so this page (and only this page) shows Google
 // your IP address; the page says so. The app itself only ever uses Cloudflare's.
 const STUN_PROBES: RTCIceServer[] = [
@@ -209,11 +178,11 @@ async function checkIceConfig(): Promise<RTCIceServer[]> {
   }
 }
 
-async function checkStun(): Promise<Cand[]> {
+async function checkStun(): Promise<GatherResult> {
   const row = addRow("STUN / public address", "running", "Gathering candidates…");
-  const cands = await gather({ iceServers: STUN_PROBES });
-  const srflx = cands.filter((c) => c.type === "srflx");
-  const host = cands.filter((c) => c.type === "host");
+  const gathered = await gatherCandidates({ iceServers: STUN_PROBES });
+  const srflx = gathered.candidates.filter((c) => c.type === "srflx");
+  const host = gathered.candidates.filter((c) => c.type === "host");
 
   if (srflx.length === 0) {
     row(
@@ -222,35 +191,18 @@ async function checkStun(): Promise<Cand[]> {
         ? "No server-reflexive candidate. UDP to STUN is likely blocked by a firewall; TURN over TCP/443 will be required."
         : "No candidates at all. WebRTC appears to be blocked entirely.",
     );
-    return cands;
+    return gathered;
   }
   const addrs = [...new Set(srflx.map((c) => c.address).filter(Boolean))];
   row("pass", `Reachable. Public address seen as ${addrs.join(", ") || "(hidden)"}.`);
-  return cands;
+  return gathered;
 }
 
-function checkNatMapping(cands: Cand[]): void {
+/** Render the NAT row. The verdict and copy both come from nat.ts. */
+function checkNatMapping(gathered: GatherResult): void {
   const row = addRow("NAT mapping", "running", "");
-  const ports = [...new Set(cands.filter((c) => c.type === "srflx" && c.port !== null).map((c) => c.port))];
-
-  if (ports.length === 0) {
-    row("warn", "Could not determine — no reflexive candidates to compare.");
-    return;
-  }
-  if (ports.length === 1) {
-    row(
-      "pass",
-      "Endpoint-independent (cone) NAT: the same external port was used for every STUN server. " +
-        "UDP hole punching will work, so connections should be direct.",
-    );
-    return;
-  }
-  row(
-    "warn",
-    `Address/port-dependent (symmetric) NAT: ${ports.length} different external ports were allocated. ` +
-      "Hole punching will fail against another symmetric NAT, so a TURN relay will often be needed. " +
-      "This is typical of CGNAT and corporate firewalls.",
-  );
+  const rendered = natRow(classifyNatMapping(gathered.candidates, gathered.hostSockets));
+  row(rendered.status, rendered.details);
 }
 
 async function checkTurn(iceServers: RTCIceServer[]): Promise<void> {
@@ -266,8 +218,8 @@ async function checkTurn(iceServers: RTCIceServer[]): Promise<void> {
 
   // iceTransportPolicy "relay" discards host and reflexive candidates, so anything
   // gathered here proves the TURN allocation itself succeeded.
-  const cands = await gather({ iceServers: turnOnly, iceTransportPolicy: "relay" });
-  const relay = cands.filter((c) => c.type === "relay");
+  const { candidates } = await gatherCandidates({ iceServers: turnOnly, iceTransportPolicy: "relay" });
+  const relay = candidates.filter((c) => c.type === "relay");
   if (relay.length === 0) {
     row("fail", "No relay candidate allocated. TURN credentials may be invalid or expired.");
     return;
@@ -344,8 +296,8 @@ async function runAll(): Promise<void> {
     checkBrowser();
     await checkLoopback();
     const iceServers = await checkIceConfig();
-    const cands = await checkStun();
-    checkNatMapping(cands);
+    const gathered = await checkStun();
+    checkNatMapping(gathered);
     await checkTurn(iceServers);
   } finally {
     runBtn.disabled = false;
