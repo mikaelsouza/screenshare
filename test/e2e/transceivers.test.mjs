@@ -41,16 +41,35 @@ async function newPage(name) {
   return page;
 }
 
-/** Every live PC as { transceivers, mlines, media, app }, read from its own SDP. */
-const liveShapes = () =>
-  window.__pcs
-    .filter((pc) => pc.connectionState !== "closed")
-    .map((pc) => {
-      const sdp = pc.localDescription?.sdp ?? "";
-      const mlines = (sdp.match(/^m=/gm) ?? []).length;
-      const app = (sdp.match(/^m=application/gm) ?? []).length;
-      return { transceivers: pc.getTransceivers().length, mlines, media: mlines - app, app };
-    });
+/**
+ * Every live PC as { transceivers, mlines, media, app }, read from its own SDP, or
+ * null while any is mid-negotiation. localDescription still holds the previous
+ * description until setLocalDescription lands, so reading it during
+ * have-remote-offer can race the updated (answer) m-line count.
+ */
+const liveShapes = () => {
+  const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
+  if (live.some((pc) => pc.signalingState !== "stable")) return null;
+  return live.map((pc) => {
+    const sdp = pc.localDescription?.sdp ?? "";
+    const mlines = (sdp.match(/^m=/gm) ?? []).length;
+    const app = (sdp.match(/^m=application/gm) ?? []).length;
+    return { transceivers: pc.getTransceivers().length, mlines, media: mlines - app, app };
+  });
+};
+
+/** Stable host shapes, only once the retained 4-transceiver link is present. */
+const hostRetainedShapes = () => {
+  const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
+  if (live.some((pc) => pc.signalingState !== "stable")) return null;
+  const shapes = live.map((pc) => {
+    const sdp = pc.localDescription?.sdp ?? "";
+    const mlines = (sdp.match(/^m=/gm) ?? []).length;
+    const app = (sdp.match(/^m=application/gm) ?? []).length;
+    return { transceivers: pc.getTransceivers().length, mlines, media: mlines - app, app };
+  });
+  return shapes.filter((s) => s.transceivers === 4).length === 1 ? shapes : null;
+};
 
 /** Decoded video frames inbound on the retained host<->late link. */
 const retainedFrames = async () => {
@@ -79,11 +98,16 @@ async function waitFramesGrow(page, label) {
   throw new Error(`${label}: decoded frames stuck at ${start}`);
 }
 
-/** The host's tile for late: full peer id in data-peer, roster shows only 4 chars. */
+/**
+ * The host's tile for late: full peer id in data-peer, roster shows only 4 chars.
+ * Returns only once the tile is actually rendering, so waiting on it covers the
+ * whole "tile exists and decodes" condition rather than just tile creation.
+ */
 const lateTile = () => {
   const el = document.querySelector(`[data-peer^="${window.__lateShort}"] video`);
   if (!el || !el.srcObject) return null;
   const live = el.srcObject.getVideoTracks().some((t) => t.readyState === "live");
+  if (!live || el.videoWidth === 0 || el.readyState < 2) return null;
   return { live, videoWidth: el.videoWidth, readyState: el.readyState };
 };
 
@@ -144,21 +168,9 @@ describe("persistent sendonly transceivers", { concurrency: 1 }, () => {
 
       // The retained host<->late link is one pair each way: 4 transceivers, 5 m-lines.
       // Aggregate host links: host<->viewer (2 media) + host<->late (4 media).
-      const shapes = await waitFor(
-        host,
-        () => {
-          const all = window.__pcs
-            .filter((pc) => pc.connectionState !== "closed")
-            .map((pc) => {
-              const sdp = pc.localDescription?.sdp ?? "";
-              const mlines = (sdp.match(/^m=/gm) ?? []).length;
-              const app = (sdp.match(/^m=application/gm) ?? []).length;
-              return { transceivers: pc.getTransceivers().length, mlines, media: mlines - app, app };
-            });
-          return all.filter((s) => s.transceivers === 4).length === 1 ? all : null;
-        },
-        { label: `cycle ${cycle}: retained host link` },
-      );
+      const shapes = await waitFor(host, hostRetainedShapes, {
+        label: `cycle ${cycle}: retained host link stable`,
+      });
       const retained = shapes.find((s) => s.transceivers === 4);
       assert.deepEqual(retained, { transceivers: 4, mlines: 5, media: 4, app: 1 });
       assert.equal(shapes.reduce((n, s) => n + s.media, 0), 6, `cycle ${cycle}: host media m-lines grew`);
@@ -173,6 +185,7 @@ describe("persistent sendonly transceivers", { concurrency: 1 }, () => {
             .filter((pc) => pc.connectionState !== "closed");
           if (added.length !== 1) return null;
           const pc = added[0];
+          if (pc.signalingState !== "stable") return null;
           const sdp = pc.localDescription?.sdp ?? "";
           const mlines = (sdp.match(/^m=/gm) ?? []).length;
           const app = (sdp.match(/^m=application/gm) ?? []).length;
@@ -200,7 +213,9 @@ describe("persistent sendonly transceivers", { concurrency: 1 }, () => {
       });
 
       // Stopping does not drop the retained link or grow it: still 4 transceivers.
-      const stopped = await host.evaluate(liveShapes);
+      const stopped = await waitFor(host, liveShapes, {
+        label: `cycle ${cycle}: host links stable after stop`,
+      });
       assert.deepEqual(stopped.find((s) => s.transceivers === 4), {
         transceivers: 4,
         mlines: 5,
@@ -213,7 +228,16 @@ describe("persistent sendonly transceivers", { concurrency: 1 }, () => {
   });
 
   it("re-emits the late tile with live video after a restart", async () => {
-    // The previous test ends stopped, with the tile gone and the link retained.
+    // The previous test normally ends stopped. If it aborted mid-cycle, stop late
+    // here so this test still exercises re-emit instead of timing out on setup.
+    if ((await late.textContent("#share")) === "Stop sharing") {
+      await late.click("#share");
+      await waitFor(late, () => document.getElementById("share")?.textContent === "Share screen", {
+        label: "late stopped before restart test",
+      });
+    }
+    // The tile is the observable signal that stopping reached the host on a link
+    // that is still alive, so it must disappear before a restart can re-emit it.
     await waitFor(host, () => !document.querySelector(`[data-peer^="${window.__lateShort}"]`), {
       label: "late tile gone before restart",
     });
@@ -229,7 +253,9 @@ describe("persistent sendonly transceivers", { concurrency: 1 }, () => {
     assert.ok(tile.readyState >= 2, `re-emitted tile readyState ${tile.readyState}`);
 
     // Same retained link, still one pair, and frames keep arriving.
-    const shapes = await host.evaluate(liveShapes);
+    const shapes = await waitFor(host, hostRetainedShapes, {
+      label: "retained host link stable after restart",
+    });
     assert.deepEqual(shapes.find((s) => s.transceivers === 4), {
       transceivers: 4,
       mlines: 5,
