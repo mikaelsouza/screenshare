@@ -275,7 +275,7 @@ export class SignalingClient {
 
   private handleWakeup(): void {
     if (!this.started || this.closedByUs || this.fatal) return;
-    if (this.ws?.readyState === 0 || this.ws?.readyState === WebSocket.CONNECTING) return;
+    if (this.ws?.readyState === WebSocket.CONNECTING) return;
     if (this.ws?.readyState === WebSocket.OPEN) {
       if (this.lastReceivedAt > 0 && Date.now() - this.lastReceivedAt > 65_000) {
         this.reconnectNow();

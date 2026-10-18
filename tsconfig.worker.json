@@ -9,9 +9,8 @@
     "lib": ["ES2022"],
     "types": ["@cloudflare/workers-types"],
     "noEmit": true,
-    "baseUrl": ".",
     "paths": {
-      "@shared/*": ["shared/*"]
+      "@shared/*": ["./shared/*"]
     }
   },
   "include": ["worker/**/*.ts", "shared/**/*.ts"]
