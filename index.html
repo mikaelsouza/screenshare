@@ -49,18 +49,6 @@
         font-weight: 600;
         letter-spacing: -0.01em;
       }
-      .header-links a {
-        color: var(--text-secondary);
-        text-decoration: none;
-        font-size: 0.875rem;
-        padding: 0.35rem 0.65rem;
-        border-radius: 4px;
-        transition: color 0.15s, background-color 0.15s;
-      }
-      .header-links a:hover {
-        color: var(--text-primary);
-        background-color: var(--surface-hover);
-      }
       .toolbar {
         display: flex;
         align-items: center;
@@ -463,24 +451,6 @@
         text-transform: none;
         letter-spacing: normal;
       }
-      #privacy {
-        font-size: 0.8rem;
-        color: var(--text-secondary);
-        text-align: center;
-        padding: 0.4rem 1.5rem;
-        background-color: var(--surface-color);
-        border-bottom: 1px solid var(--border-color);
-      }
-      #privacy summary {
-        cursor: pointer;
-      }
-      #privacy ul {
-        text-align: left;
-        max-width: 42rem;
-        margin: 0.5rem auto 0.25rem;
-        padding-left: 1.25rem;
-        line-height: 1.5;
-      }
       #roster {
         display: flex;
         flex-wrap: wrap;
@@ -536,9 +506,6 @@
       <div class="brand">
         <h1>Screenshare</h1>
       </div>
-      <nav class="header-links">
-        <a href="/diagnostics">Diagnostics</a>
-      </nav>
     </header>
 
     <div class="toolbar">
@@ -550,15 +517,6 @@
       <button type="button" id="create">Create</button>
       <button type="button" id="copy-link" title="Copy room invite link to clipboard">Copy link</button>
     </div>
-
-    <details id="privacy">
-      <summary>People in the room can see your IP address. What else can others see?</summary>
-      <ul>
-        <li>You connect directly to whoever is sharing, and to everyone while you share. Each of them can see your IP address. People who are only watching do not connect to each other.</li>
-        <li>The server sees your IP, the room code and your name while you are connected. It keeps nothing about you afterwards; a room's password and settings are erased 12 hours after it empties.</li>
-        <li>Anyone watching can record what you share. Everyone in the room is listed above the video.</li>
-      </ul>
-    </details>
 
     <section id="roster" hidden aria-labelledby="roster-title">
       <h2 id="roster-title">In this room</h2>

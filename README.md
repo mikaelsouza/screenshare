@@ -8,8 +8,7 @@ quiet; media flows directly browser-to-browser via WebRTC.
 
 [![The room view with an active share](assets/screenshot.png)](https://screenshare.webmikas.com)
 
-**Live:** [screenshare.webmikas.com](https://screenshare.webmikas.com) ·
-**Diagnostics:** [screenshare.webmikas.com/diagnostics](https://screenshare.webmikas.com/diagnostics)
+**Live:** [screenshare.webmikas.com](https://screenshare.webmikas.com)
 
 ## Requirements
 
@@ -78,7 +77,7 @@ reconnecting.
 npm run check        # typecheck client + worker
 npm run test:unit    # pure logic (protocol, SDP, stats, limits)
 npm run test:worker  # RoomDO in real workerd
-npm run test:e2e     # Chromium peers: p2p, edge cases, diagnostics
+npm run test:e2e     # Chromium peers: p2p, edge cases
 npm test             # check + unit + worker
 ```
 
