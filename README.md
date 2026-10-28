@@ -3,9 +3,8 @@
 Low-latency screen sharing for a small group of friends. One or more people share a
 screen with game audio; everyone else watches. Rooms hold up to 20 people.
 
-**Video never touches a server.** The Worker relays a few KB of signalling and then goes
-quiet; media flows browser-to-browser, directly or through a TURN relay when a direct path
-is impossible.
+**Video never touches a server.** The Worker coordinates a few KB of signalling and then goes
+quiet; media flows directly browser-to-browser via WebRTC.
 
 [![The room view with an active share](assets/screenshot.png)](https://screenshare.webmikas.com)
 
@@ -29,32 +28,27 @@ npm run dev        # frontend only
 npm run preview    # built assets + Worker via wrangler dev
 ```
 
-For TURN credentials locally, create a gitignored `.dev.vars` with `TURN_KEY_ID` and
-`TURN_API_TOKEN`. Without them the app falls back to STUN only; direct P2P still works.
-
 ## How it works
 
 ```
 Browser A ──┐                                    ┌── Browser B
             │  WebSocket (signalling only)       │
             └──►  Worker ──► RoomDO (per room) ◄─┘
-                                  │
-                                  └──► Cloudflare Realtime (TURN credentials)
 
 Browser A ═══════════ SRTP media, peer-to-peer ═══════════ Browser B
 ```
 
 - **Worker** (`worker/index.ts`) serves the frontend, hands out room codes at
   `/api/room`, and routes `/ws/:code` to a per-room Durable Object.
-- **RoomDO** (`worker/room.ts`) relays signalling, membership and room state. It never
+- **RoomDO** (`worker/room.ts`) coordinates signalling, membership and room state. It never
   parses SDP or sees media.
 - **Frontend** (`src/`) does capture, encoding, the partial mesh, and per-peer bitrate
   adaptation. Viewers connect only to sharers, never to each other.
 
 ## Privacy
 
-- **Hide my IP** forces relay-only ICE, so peers see the TURN relay rather than your
-  address. It fails closed: with no relay available, it refuses to connect.
+- **Peer-to-peer connections** are direct between browsers using STUN for NAT traversal.
+  People in the room you connect with can see your IP address.
 - **Room passwords** are optional and set by the room's creator, who becomes the host.
   The host can remove people or lock the room; bans, locks and rejoin tickets are
   enforced by the Durable Object.
@@ -74,10 +68,8 @@ reconnecting.
 
 ## Deploy
 
-1. Create a TURN key in the Cloudflare dashboard (Realtime → TURN).
-2. `npx wrangler secret put TURN_KEY_ID` and `npx wrangler secret put TURN_API_TOKEN`.
-3. Set the custom domain in `routes` in `wrangler.jsonc` (replace the `<tld>` placeholder).
-4. Push to `main`. CI runs the checks and deploys with `cloudflare/wrangler-action`;
+1. Set the custom domain in `routes` in `wrangler.jsonc` (replace the `<tld>` placeholder).
+2. Push to `main`. CI runs the checks and deploys with `cloudflare/wrangler-action`;
    `npm run deploy` builds and deploys locally without running any checks.
 
 ## Development
@@ -90,8 +82,7 @@ npm run test:e2e     # Chromium peers: p2p, edge cases, diagnostics
 npm test             # check + unit + worker
 ```
 
-The e2e suite expects TURN to be absent: move `.dev.vars` aside before running it, and
-set `CHROMIUM_BIN` if you are not inside `nix develop`.
+Set `CHROMIUM_BIN` if you are not inside `nix develop`.
 
 ## License
 

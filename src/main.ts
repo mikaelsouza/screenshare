@@ -4,7 +4,6 @@
  * Everything latency-critical lives in mesh.ts / quality.ts. This file is glue.
  */
 
-import { hasTurnServer } from "@shared/ice";
 import {
   MAX_ROOM_SIZE,
   MIN_PASSWORD_LENGTH,
@@ -46,7 +45,6 @@ const ui = {
   roomInput: el<HTMLInputElement>("room-code"),
   passInput: el<HTMLInputElement>("room-pass"),
   genPassBtn: el<HTMLButtonElement>("gen-pass"),
-  relayOnly: el<HTMLInputElement>("relay-only"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
   copyLinkBtn: el<HTMLButtonElement>("copy-link"),
@@ -74,15 +72,6 @@ const ui = {
 
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
-/**
- * Whether relay-only is actually in force on the live mesh.
- *
- * Not the same as the checkbox. The status line used to read the checkbox directly, so
- * it announced "(Privacy Mode)" from the moment the socket opened — before the welcome
- * carrying the ICE servers had arrived, and therefore before anything had verified a
- * relay was even available.
- */
-let relayActive = false;
 let capture: CaptureResult | null = null;
 let stopCaptureListener: (() => void) | null = null;
 /** A second, audio-only capture (picker #2) whose audio replaced the screen's own. */
@@ -165,10 +154,9 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
 }
 
 /**
- * STUN-only fallback. Enough for the direct peer-to-peer path, which is the common
- * case; only the relay fallback needs the credentials the server mints.
+ * STUN server for NAT traversal on the direct peer-to-peer path.
  */
-const FALLBACK_ICE: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
+const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
 
 
 // ---- tiles ---------------------------------------------------------------
@@ -654,10 +642,7 @@ for (const evName of ["fullscreenchange", "webkitfullscreenchange"]) {
 }
 
 /**
- * Surface per-peer link health on each tile. The point is to make a relayed
- * connection visible: it still works, but it means TURN is in the path instead of
- * a direct peer-to-peer route, and that is worth knowing without opening
- * chrome://webrtc-internals.
+ * Surface per-peer link health on each tile (candidate type, bitrate, rtt, fps, packet loss).
  */
 function startHealthPolling(): void {
   stopHealthPolling();
@@ -1126,31 +1111,25 @@ async function joinRoom(code: string, password?: string): Promise<void> {
       onStatus: (s) =>
         setStatus(
           s === "open"
-            ? `In room ${code}${relayActive ? " (Privacy Mode)" : ""}`
+            ? `In room ${code}`
             : `Connection ${s}…`,
         ),
 
-      onWelcome: (selfIdFromServer, peers, iceServers, room) => {
+      onWelcome: (selfIdFromServer, peers, room) => {
         for (const timer of peerLeftTimers.values()) clearTimeout(timer);
         peerLeftTimers.clear();
-
-        const servers: RTCIceServer[] = iceServers.length > 0 ? iceServers : FALLBACK_ICE;
-        const relayOnly = ui.relayOnly.checked;
 
         // When reconnecting in-place, reconcile without tearing down healthy links/tiles
         if (
           mesh !== null &&
           selfId !== null &&
-          selfId === selfIdFromServer &&
-          relayActive === relayOnly
+          selfId === selfIdFromServer
         ) {
           const activeMesh = mesh;
           if (room.hostToken) saveHostToken(code, room.hostToken);
           saveRejoinToken(code, room.rejoinToken);
           isHost = room.host;
           roomLocked = room.locked;
-
-          activeMesh.updateIceServers(servers);
 
           const welcomePeerIds = new Set(peers.map((p) => p.id));
           for (const id of [...members.keys()]) {
@@ -1177,14 +1156,14 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           }
 
           setStatus(
-            `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+            `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
           );
           startHealthPolling();
           renderRoster();
           return;
         }
 
-        // Full reset path (first connect, page reload, or selfId/relay changed)
+        // Full reset path (first connect, page reload, or selfId changed)
         mesh?.close();
         monitors.clear();
         members.clear();
@@ -1201,27 +1180,13 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         isHost = room.host;
         roomLocked = room.locked;
 
-        relayActive = false;
-        if (relayOnly && !hasTurnServer(servers)) {
-          setStatus(
-            "Privacy mode is on but no TURN relay is configured, so your IP cannot be hidden. " +
-              "Not connecting. Untick Hide IP to join without it.",
-            "error",
-          );
-          client?.close();
-          client = null;
-          return;
-        }
-
-        relayActive = relayOnly;
         mesh = new Mesh(
           selfIdFromServer,
           {
-            iceServers: servers,
+            iceServers: ICE_SERVERS,
             preset: QUALITY_PRESETS[currentPreset()],
             codec: currentCodec(),
             jitterBufferTargetMs: 0,
-            relayOnly,
           },
           (to, data) => client?.signal(to, data),
           {
@@ -1255,10 +1220,10 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           mesh.addMember(p.id, p.sharing);
         }
         setStatus(
-          `In room ${code}${relayOnly ? " (Privacy Mode)" : ""} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
+          `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
         );
         if (capture) {
-          // Still sharing across a reconnect or a Hide my IP switch. The server has
+          // Still sharing across a reconnect. The server has
           // this socket down as not sharing, so say so first: others connect only to
           // sharers, and the server relays an offer only when one side shares.
           client?.setSharing(true);
@@ -1377,7 +1342,6 @@ function leaveRoom(): void {
   client = null;
   mesh?.close();
   mesh = null;
-  relayActive = false;
   monitors.clear();
   for (const id of [...tiles.keys()]) removeTile(id);
   for (const id of [...boostPipes.keys()]) teardownBoostPipe(id);
@@ -1432,19 +1396,6 @@ function initQualityControls(): void {
   ui.codec.addEventListener("change", () => {
     localStorage.setItem("codec", ui.codec.value);
     if (capture) setStatus("Codec applies the next time you start sharing.", "warn");
-  });
-  // Privacy toggle (Relay only)
-  ui.relayOnly.checked = localStorage.getItem("relay_only") === "true";
-  ui.relayOnly.addEventListener("change", () => {
-    localStorage.setItem("relay_only", String(ui.relayOnly.checked));
-    // Apply it now by reconnecting, not "next time": every new connection made until
-    // then would hand out the address the user just asked to hide.
-    // lastJoin, not client: after Hide my IP refused to connect there is no client,
-    // and unticking it is exactly how the status line says to get in.
-    if (lastJoin) {
-      void joinRoom(lastJoin.code, lastJoin.password);
-      setStatus(ui.relayOnly.checked ? "Reconnecting with your IP hidden…" : "Reconnecting…", "info");
-    }
   });
 
   // Mute audio button for active sharer
@@ -1622,12 +1573,6 @@ window.addEventListener("beforeunload", () => leaveRoom());
 window.addEventListener("pagehide", () => leaveRoom());
 
 // Deep link: /#ROOMCODE joins the room straight away.
-//
-// It used to only fill in the code and wait for Join, so a first-time visitor saw the
-// Hide my IP option before anything connected. In practice nobody understood that
-// they had to press Join, so opening a link now joins. Hide my IP is remembered across
-// visits and is applied before this runs; ticking it once inside the room reconnects
-// through the relay at once (see the relay-only change handler above).
 //
 // A password-protected room cannot be entered from the link alone: the server answers
 // with bad-password, the status line asks for it, and Enter or Join retries.

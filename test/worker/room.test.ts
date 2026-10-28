@@ -344,26 +344,6 @@ describe("RoomDO membership", () => {
     a.close();
   });
 
-  it("delivers ICE servers with the welcome, so a joined socket is the authorisation", async () => {
-    const a = await Client.connect();
-    const welcome = await a.join("alice");
-    expect(Array.isArray(welcome.iceServers)).toBe(true);
-    a.close();
-  });
-
-  it("degrades to STUN-only when TURN secrets are unset, rather than blocking the join", async () => {
-    // No TURN secrets are configured under test. Direct P2P needs no TURN at all, so
-    // the join must still succeed and hand back a usable STUN-only configuration.
-    const a = await Client.connect();
-    const welcome = await a.join("alice");
-    expect(welcome.selfId).toBeTruthy();
-
-    const urls = JSON.stringify(welcome.iceServers);
-    expect(urls).toContain("stun:");
-    expect(urls).not.toContain("turn:");
-    a.close();
-  });
-
   it("tells a joiner who is already present, and tells the room about the joiner", async () => {
     const a = await Client.connect();
     const w1 = await a.join("alice");
@@ -1320,148 +1300,7 @@ describe("RoomDO host controls (batch D)", () => {
   });
 });
 
-describe("RoomDO diagnostics joins (batch D)", () => {
-  it("hands over ICE servers without claiming the room or appearing in it", async () => {
-    const d = await Client.connect();
-    const closed = closeCodeOf(d.ws);
-    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
-    const w = await d.nextOf("welcome");
-    expect(Array.isArray(w.iceServers)).toBe(true);
-    expect(w.host).toBe(false);
-    expect(await closed).toBe(1000);
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
-    expect(claimed).toBeUndefined();
-
-    // Whoever comes next still creates the room.
-    const a = await Client.connect();
-    const wa = await a.join("alice");
-    expect(wa.host).toBe(true);
-    expect(wa.peers).toEqual([]);
-    a.close();
-  });
-
-  it("is refused on a room somebody created", async () => {
-    const a = await Client.connect();
-    await a.join("alice");
-    const d = await Client.connect();
-    d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
-    expect((await d.nextOf("error")).code).toBe("bad-message");
-    expect(await a.silentFor()).toBe(true);
-    a.close();
-  });
-});
-
 describe("RoomDO final review fixes", () => {
-  /**
-   * Replace the room's TURN mint with a slow fake, and record revocations. The real
-   * mint is a fetch to Cloudflare, which is where joins interleave; under test TURN
-   * is unconfigured and the mint returns at once, so the races never show.
-   */
-  async function slowMint(
-    room: string,
-    delayMs: number | number[],
-  ): Promise<{ revoked: () => Promise<string[]>; mints: () => Promise<number> }> {
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(room));
-    await runInDurableObject(stub, (instance) => {
-      const o = instance as unknown as {
-        mintFor: () => Promise<unknown>;
-        revokeLater: (u?: string) => void;
-        __revoked: string[];
-        __mints: number;
-      };
-      o.__revoked = [];
-      o.__mints = 0;
-      o.mintFor = async () => {
-        o.__mints++;
-        const n = o.__mints;
-        await scheduler.wait(Array.isArray(delayMs) ? (delayMs[n - 1] ?? 0) : delayMs);
-        return { iceServers: [], username: `user-${n}` };
-      };
-      o.revokeLater = (u?: string) => {
-        if (u) o.__revoked.push(u);
-      };
-    });
-    const read = <T>(k: "__revoked" | "__mints") =>
-      runInDurableObject(stub, (instance) => (instance as unknown as Record<string, T>)[k]);
-    return { revoked: () => read<string[]>("__revoked"), mints: () => read<number>("__mints") };
-  }
-
-  it("never tells a joiner about someone before its own welcome, even when joins overlap", async () => {
-    const a = await Client.connect();
-    await a.join("alice");
-    // Bob's mint is slow and carol's is not, so carol commits while bob is mid-join.
-    await slowMint(CODE, [400, 0]);
-    const b = await Client.connect();
-    const c = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob" });
-    await new Promise((r) => setTimeout(r, 50));
-    c.send({ t: "join", room: CODE, displayName: "carol" });
-    const firstB = await b.next(3000);
-    const firstC = await c.next(3000);
-    expect(firstB.t).toBe("welcome");
-    expect(firstC.t).toBe("welcome");
-    // Whichever committed second lists the other; the first hears peer-joined later.
-    const wb = firstB as Extract<ServerMessage, { t: "welcome" }>;
-    const wc = firstC as Extract<ServerMessage, { t: "welcome" }>;
-    const bKnowsC = wb.peers.some((p) => p.id === wc.selfId) || (await b.nextOf("peer-joined")).peer.id === wc.selfId;
-    const cKnowsB = wc.peers.some((p) => p.id === wb.selfId) || (await c.nextOf("peer-joined")).peer.id === wb.selfId;
-    expect(bKnowsC && cKnowsB).toBe(true);
-    for (const s of [a, b, c]) s.close();
-  });
-
-  it("does not announce, and revokes the credential of, a joiner that left mid-join", async () => {
-    const a = await Client.connect();
-    await a.join("alice");
-    const spy = await slowMint(CODE, 300);
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob" });
-    await new Promise((r) => setTimeout(r, 50));
-    b.close();
-    // Nothing about bob reaches alice: no peer-joined for someone already gone.
-    expect(await a.silentFor(700)).toBe(true);
-    expect(await spy.revoked()).toEqual(["user-1"]);
-    a.close();
-  });
-
-  it("leaves the room unclaimed when its creator disconnects mid-join", async () => {
-    await slowMint(CODE, 300);
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
-    await new Promise((r) => setTimeout(r, 50));
-    a.close();
-    await new Promise((r) => setTimeout(r, 500));
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    expect(await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"))).toBeUndefined();
-  });
-
-  it("revokes a peer's own credential when it leaves or is removed", async () => {
-    const spy = await slowMint(CODE, 0);
-    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.1" });
-    await h.join("host");
-    const b = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.5" });
-    const wb = await b.join("bob");
-    const c = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.6" });
-    await c.join("carol");
-    expect(await spy.mints()).toBe(3);
-
-    h.send({ t: "kick", id: wb.selfId });
-    await h.nextOf("peer-left");
-    c.close();
-    await h.nextOf("peer-left");
-    expect((await spy.revoked()).sort()).toEqual(["user-2", "user-3"]);
-    h.close();
-  });
-
-  it("mints once per diagnostics socket, however many joins it sends", async () => {
-    const spy = await slowMint(CODE, 100);
-    const d = await Client.connect();
-    for (let i = 0; i < 5; i++) d.send({ t: "join", room: CODE, displayName: "diagnostics", diagnostics: true });
-    await d.nextOf("welcome");
-    expect(await spy.mints()).toBe(1);
-  });
-
   it("lets a member back into a locked room with its rejoin ticket, and nobody else", async () => {
     const h = await Client.connect();
     const wh = await h.join("host");
@@ -1568,7 +1407,6 @@ describe("RoomDO final review fixes", () => {
   });
 
   it("evicts previous socket and broadcasts peer-left on rejoin with rejoinToken while sharing", async () => {
-    const spy = await slowMint(CODE, 0);
     const a1 = await Client.connect();
     const wa1 = await a1.join("alice");
     const b = await Client.connect();
@@ -1601,9 +1439,6 @@ describe("RoomDO final review fixes", () => {
 
     // a1's socket was closed with 1008 ("Session replaced")
     expect(await a1Closed).toBe(1008);
-
-    // a1's TURN credential was revoked
-    expect(await spy.revoked()).toContain("user-1");
 
     a2.close();
     b.close();
@@ -1833,8 +1668,7 @@ describe("RoomDO final review fixes", () => {
     b2.close();
   });
 
-  it("in-place resume (resume: true + rejoinToken) with old socket open preserves selfId and active TURN credential without broadcasting peer-left", async () => {
-    const spy = await slowMint(CODE, 0);
+  it("in-place resume (resume: true + rejoinToken) with old socket open preserves selfId without broadcasting peer-left", async () => {
     const a1 = await Client.connect();
     const wa1 = await a1.join("alice");
     const b = await Client.connect();
@@ -1864,9 +1698,6 @@ describe("RoomDO final review fixes", () => {
 
     // a1's socket was closed with 1008 ("Session replaced")
     expect(await a1Closed).toBe(1008);
-
-    // a1's TURN credential was NOT revoked!
-    expect(await spy.revoked()).not.toContain("user-1");
 
     // Bob receives NO peer-left or peer-joined
     expect(await b.silentFor(300)).toBe(true);

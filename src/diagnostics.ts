@@ -3,12 +3,10 @@
  *
  * Answers one question with facts instead of guesswork: will this browser, on this
  * network, hold a direct peer-to-peer connection? Roughly 10% of users sit behind
- * CGNAT or a symmetric NAT that forces a TURN relay, and when that happens the
- * symptom is just "their stream feels worse" — indistinguishable from a slow PC.
+ * CGNAT or a symmetric NAT where hole punching fails.
  * This page names the cause.
  */
 
-import { PING, PONG, type ServerMessage } from "@shared/protocol";
 import { systemAudioSupport, windowAudioSupport } from "./capture";
 import { type ParsedCandidate as Cand, parseCandidate } from "./stats";
 
@@ -83,10 +81,10 @@ async function gather(config: RTCConfiguration, timeoutMs = 15000): Promise<Cand
   return found;
 }
 
-// Three distinct STUN endpoints. Distinctness is the point: a symmetric NAT assigns
-// a different external port per destination, so identical ports across all three
+// Two distinct STUN endpoints. Distinctness is the point: a symmetric NAT assigns
+// a different external port per destination, so identical ports across both
 // means endpoint-independent mapping (hole punching will work) and differing ports
-// mean symmetric NAT (it won't, and TURN will be required).
+// mean symmetric NAT (it won't, and direct connections will fail).
 // Deliberately no :53 endpoint here. UDP/53 is widely intercepted for DNS, and a
 // black-holing STUN server does not merely get skipped — measured on a real network,
 // including stun.cloudflare.com:53 produced srflx=0 across the whole gathering, so
@@ -141,74 +139,6 @@ function checkBrowser(): void {
   }
 }
 
-/**
- * Fetch ICE servers the way the app does: open a real room WebSocket and read them
- * off the welcome. There is no public /api/ice to query — credentials are authorised
- * by holding a joined socket — so this also exercises the genuine path end to end.
- */
-async function fetchIceViaRoom(timeoutMs = 10_000): Promise<RTCIceServer[]> {
-  const res = await fetch("/api/room");
-  if (!res.ok) throw new Error(`/api/room returned HTTP ${res.status}`);
-  const { code } = (await res.json()) as { code: string };
-
-  const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${proto}//${location.host}/ws/${code}`);
-
-  try {
-    return await new Promise<RTCIceServer[]>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timed out waiting for welcome")), timeoutMs);
-      // `diagnostics` asks for a five-minute credential and leaves the room unclaimed,
-      // rather than creating a real room with a 12-hour one on every run.
-      ws.onopen = () =>
-        ws.send(JSON.stringify({ t: "join", room: code, displayName: "diagnostics", diagnostics: true }));
-      ws.onerror = () => {
-        clearTimeout(timer);
-        reject(new Error("signalling socket failed"));
-      };
-      ws.onmessage = (ev) => {
-        const raw = String(ev.data);
-        if (raw === PONG || raw === PING) return;
-        let msg: ServerMessage;
-        try {
-          msg = JSON.parse(raw) as ServerMessage;
-        } catch {
-          return;
-        }
-        if (msg.t === "welcome") {
-          clearTimeout(timer);
-          resolve(msg.iceServers as RTCIceServer[]);
-        } else if (msg.t === "error") {
-          clearTimeout(timer);
-          reject(new Error(`${msg.code}: ${msg.message}`));
-        }
-      };
-    });
-  } finally {
-    try { ws.close(); } catch { /* already closed */ }
-  }
-}
-
-async function checkIceConfig(): Promise<RTCIceServer[]> {
-  const row = addRow("TURN credentials", "running", "Joining a temporary room to request them…");
-  try {
-    const servers = await fetchIceViaRoom();
-    const hasTurn = servers.some((s) => {
-      const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-      return urls.some((u) => typeof u === "string" && u.startsWith("turn"));
-    });
-    row(
-      hasTurn ? "pass" : "warn",
-      hasTurn
-        ? `${servers.length} ICE server entries, including TURN relay credentials.`
-        : "STUN only — no TURN credentials configured. Peers behind symmetric NAT or CGNAT will fail to connect.",
-    );
-    return servers;
-  } catch (err) {
-    row("warn", `Could not obtain ICE servers (${String(err)}). Falling back to public STUN.`);
-    return STUN_PROBES;
-  }
-}
-
 async function checkStun(): Promise<Cand[]> {
   const row = addRow("STUN / public address", "running", "Gathering candidates…");
   const cands = await gather({ iceServers: STUN_PROBES });
@@ -219,7 +149,7 @@ async function checkStun(): Promise<Cand[]> {
     row(
       "fail",
       host.length > 0
-        ? "No server-reflexive candidate. UDP to STUN is likely blocked by a firewall; TURN over TCP/443 will be required."
+        ? "No server-reflexive candidate. UDP to STUN is likely blocked by a firewall; direct P2P connections will fail."
         : "No candidates at all. WebRTC appears to be blocked entirely.",
     );
     return cands;
@@ -248,32 +178,9 @@ function checkNatMapping(cands: Cand[]): void {
   row(
     "warn",
     `Address/port-dependent (symmetric) NAT: ${ports.length} different external ports were allocated. ` +
-      "Hole punching will fail against another symmetric NAT, so a TURN relay will often be needed. " +
+      "Hole punching will fail against another symmetric NAT, so direct P2P connections will fail. " +
       "This is typical of CGNAT and corporate firewalls.",
   );
-}
-
-async function checkTurn(iceServers: RTCIceServer[]): Promise<void> {
-  const turnOnly = iceServers.filter((s) => {
-    const urls = Array.isArray(s.urls) ? s.urls : [s.urls];
-    return urls.some((u) => typeof u === "string" && u.startsWith("turn"));
-  });
-  const row = addRow("TURN relay", "running", "Allocating a relay candidate…");
-  if (turnOnly.length === 0) {
-    row("warn", "Skipped — no TURN servers configured.");
-    return;
-  }
-
-  // iceTransportPolicy "relay" discards host and reflexive candidates, so anything
-  // gathered here proves the TURN allocation itself succeeded.
-  const cands = await gather({ iceServers: turnOnly, iceTransportPolicy: "relay" });
-  const relay = cands.filter((c) => c.type === "relay");
-  if (relay.length === 0) {
-    row("fail", "No relay candidate allocated. TURN credentials may be invalid or expired.");
-    return;
-  }
-  const protos = [...new Set(relay.map((c) => c.protocol).filter(Boolean))];
-  row("pass", `Relay allocated over ${protos.join(", ") || "udp"}. Fallback path is available.`);
 }
 
 async function checkLoopback(): Promise<void> {
@@ -343,10 +250,8 @@ async function runAll(): Promise<void> {
   try {
     checkBrowser();
     await checkLoopback();
-    const iceServers = await checkIceConfig();
     const cands = await checkStun();
     checkNatMapping(cands);
-    await checkTurn(iceServers);
   } finally {
     runBtn.disabled = false;
     runBtn.textContent = "Run test";

@@ -2,9 +2,7 @@
  * getStats() extraction.
  *
  * The one number that matters most here is `candidateType`: "srflx" or "host" means
- * the connection is direct peer-to-peer, which is the entire premise of this project.
- * "relay" means the stream is being bounced through Cloudflare's TURN servers, which
- * works but costs latency. Without this module that distinction is invisible.
+ * the connection is direct peer-to-peer.
  */
 
 import type { LinkHealth } from "./quality";

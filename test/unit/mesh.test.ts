@@ -5,7 +5,6 @@ import {
   Mesh,
   type MeshCallbacks,
   type MeshOptions,
-  keepRelayCandidatesOnly,
   parseControlMessage,
 } from "@src/mesh";
 
@@ -133,7 +132,6 @@ describe("Mesh and PeerLink", () => {
     preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
     codec: "h264",
     jitterBufferTargetMs: 0,
-    relayOnly: false,
   };
 
   beforeEach(() => {
@@ -170,33 +168,6 @@ describe("Mesh and PeerLink", () => {
     // The answering side never opens one.
     mesh.addPeer("zed", true);
     expect(FakeRTCPeerConnection.instances[3]!.dataChannels).toHaveLength(0);
-  });
-
-  it("applies iceTransportPolicy 'relay' when relayOnly is true and filters non-relay candidates", () => {
-    const relayOptions: MeshOptions = { ...defaultOptions, relayOnly: true };
-    const mesh = new Mesh("alice", relayOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
-    mesh.addPeer("bob");
-
-    const pc = FakeRTCPeerConnection.instances[0]!;
-    expect(pc.config.iceTransportPolicy).toBe("relay");
-
-    // Simulate ICE candidate gathering
-    const hostCandidate = {
-      candidate: "candidate:1 1 udp 2122260223 192.168.1.100 54321 typ host",
-      sdpMid: "0",
-      sdpMLineIndex: 0,
-    } as unknown as RTCIceCandidate;
-    pc.onicecandidate?.({ candidate: hostCandidate });
-    expect(sentSignals.length).toBe(0); // host candidate stripped!
-
-    const relayCandidate = {
-      candidate: "candidate:2 1 udp 41885439 198.51.100.9 60000 typ relay raddr 0.0.0.0 rport 0",
-      sdpMid: "0",
-      sdpMLineIndex: 0,
-    } as unknown as RTCIceCandidate;
-    pc.onicecandidate?.({ candidate: relayCandidate });
-    expect(sentSignals.length).toBe(1);
-    expect(sentSignals[0]?.data.k).toBe("ice");
   });
 
   it("negotiates offers and answers between peers", async () => {
@@ -460,26 +431,7 @@ describe("Mesh and PeerLink", () => {
   });
 });
 
-describe("relay-only hardening", () => {
-  const SDP_WITH_CANDIDATES = [
-    "v=0",
-    "m=audio 9 UDP/TLS/RTP/SAVPF 111",
-    "a=candidate:1 1 udp 2122260223 192.168.1.100 54321 typ host generation 0",
-    "a=candidate:2 1 udp 1686052607 203.0.113.7 61000 typ srflx raddr 192.168.1.100 rport 54321",
-    "a=candidate:3 1 udp 41885439 198.51.100.9 60000 typ relay raddr 203.0.113.7 rport 61000",
-    "a=rtpmap:111 opus/48000/2",
-    "",
-  ].join("\r\n");
-
-  it("strips every non-relay candidate line from SDP and keeps everything else", () => {
-    const out = keepRelayCandidatesOnly(SDP_WITH_CANDIDATES);
-    expect(out).not.toContain("192.168.1.100 54321 typ host");
-    expect(out).not.toContain("typ srflx");
-    expect(out).toContain("typ relay");
-    expect(out).toContain("a=rtpmap:111 opus/48000/2");
-    expect(out.endsWith("\r\n")).toBe(true);
-  });
-
+describe("channel hardening", () => {
   let sent: SignalData[];
   beforeEach(() => {
     FakeRTCPeerConnection.instances = [];
@@ -487,13 +439,12 @@ describe("relay-only hardening", () => {
     sent = [];
   });
 
-  function relayMesh(relayOnly: boolean): FakeRTCPeerConnection {
+  it("closes data channels other than the control channel", () => {
     const opts: MeshOptions = {
-      iceServers: [{ urls: "turn:turn.example.com" }],
+      iceServers: [{ urls: "stun:stun.example.com" }],
       preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
       codec: "h264",
       jitterBufferTargetMs: 0,
-      relayOnly,
     };
     const mesh = new Mesh("alice", opts, (_to, data) => sent.push(data), {
       onRemoteStream: vi.fn(),
@@ -502,35 +453,6 @@ describe("relay-only hardening", () => {
     });
     mesh.addPeer("bob");
     const pc = FakeRTCPeerConnection.instances[0]!;
-    pc.createOffer = async () => ({ type: "offer", sdp: SDP_WITH_CANDIDATES });
-    pc.createAnswer = async () => ({ type: "answer", sdp: SDP_WITH_CANDIDATES });
-    return pc;
-  }
-
-  it("sends only relay candidates inside offers and answers in relay-only mode", async () => {
-    const pc = relayMesh(true);
-    pc.onnegotiationneeded?.();
-    await new Promise((r) => setTimeout(r, 10));
-    const offer = sent.find((d) => d.k === "offer");
-    expect(offer && "sdp" in offer ? offer.sdp : "").not.toMatch(/typ (host|srflx)/);
-  });
-
-  it("leaves SDP untouched when relay-only is off", async () => {
-    const pc = relayMesh(false);
-    pc.onnegotiationneeded?.();
-    await new Promise((r) => setTimeout(r, 10));
-    const offer = sent.find((d) => d.k === "offer");
-    expect(offer && "sdp" in offer ? offer.sdp : "").toContain("typ srflx");
-  });
-
-  it("drops a candidate it cannot classify instead of sending it", () => {
-    const pc = relayMesh(true);
-    pc.onicecandidate?.({ candidate: { candidate: "", sdpMid: "0", sdpMLineIndex: 0 } as unknown as RTCIceCandidate });
-    expect(sent.filter((d) => d.k === "ice")).toHaveLength(0);
-  });
-
-  it("closes data channels other than the control channel", () => {
-    const pc = relayMesh(false);
     const stray = new FakeDataChannel("exfil");
     pc.ondatachannel?.({ channel: stray as unknown as RTCDataChannel });
     expect(stray.readyState).toBe("closed");
@@ -668,7 +590,6 @@ describe("negotiation recovery", () => {
     preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
     codec: "h264",
     jitterBufferTargetMs: 0,
-    relayOnly: false,
   };
   const cb = (): MeshCallbacks => ({ onRemoteStream: vi.fn(), onRemoteStreamGone: vi.fn(), onConnectionState: vi.fn() });
   const capture = (): CaptureResult => {
@@ -767,7 +688,7 @@ describe("negotiation recovery", () => {
     expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("streamer");
   });
 
-  it("updates ICE servers on existing peer links and exposes hasConnectedLink", async () => {
+  it("exposes hasConnectedLink based on connectionState", async () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);
     await mesh.setCapture(capture());
@@ -780,11 +701,6 @@ describe("negotiation recovery", () => {
     expect(mesh.hasConnectedLink("bob")).toBe(true);
     pc.connectionState = "disconnected";
     expect(mesh.hasConnectedLink("bob")).toBe(false);
-
-    pc.setConfiguration = vi.fn();
-    const newServers = [{ urls: "stun:stun.cloudflare.com:3478" }];
-    mesh.updateIceServers(newServers);
-    expect(pc.setConfiguration).toHaveBeenCalledWith(expect.objectContaining({ iceServers: newServers }));
   });
 });
 

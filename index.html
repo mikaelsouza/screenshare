@@ -100,16 +100,6 @@
         width: 140px;
         text-align: center;
       }
-      .privacy-label {
-        font-size: 0.8rem;
-        color: var(--text-secondary);
-        display: flex;
-        align-items: center;
-        gap: 0.35rem;
-        cursor: pointer;
-        user-select: none;
-        margin-left: 0.5rem;
-      }
       button {
         background-color: var(--surface-hover);
         color: var(--text-primary);
@@ -299,8 +289,7 @@
         font-variant-numeric: tabular-nums;
         color: var(--text-secondary);
       }
-      /* A relayed stream is the one outcome worth flagging in the UI: it still
-         works, but it is going through TURN instead of peer-to-peer. */
+      /* Non-direct link indicator (e.g. while route is still being established or fallback candidate). */
       .tile-health[data-direct="false"] {
         color: #fbbf24;
       }
@@ -560,17 +549,12 @@
       <button type="button" id="join" class="primary">Join</button>
       <button type="button" id="create">Create</button>
       <button type="button" id="copy-link" title="Copy room invite link to clipboard">Copy link</button>
-      <label class="privacy-label" title="Send your video and audio through a relay, so people in the room see the relay's address instead of yours. Adds some delay.">
-        <input type="checkbox" id="relay-only" />
-        Hide my IP (relay, adds delay)
-      </label>
     </div>
 
     <details id="privacy">
-      <summary>People in the room can see your IP address unless Hide my IP is on. What else can others see?</summary>
+      <summary>People in the room can see your IP address. What else can others see?</summary>
       <ul>
-        <li>You connect directly to whoever is sharing, and to everyone while you share. Each of them can see your IP address unless Hide my IP is on. People who are only watching do not connect to each other.</li>
-        <li>With Hide my IP on, your traffic goes through Cloudflare's relay. Cloudflare sees your IP instead; the video and audio stay encrypted end to end.</li>
+        <li>You connect directly to whoever is sharing, and to everyone while you share. Each of them can see your IP address. People who are only watching do not connect to each other.</li>
         <li>The server sees your IP, the room code and your name while you are connected. It keeps nothing about you afterwards; a room's password and settings are erased 12 hours after it empties.</li>
         <li>Anyone watching can record what you share. Everyone in the room is listed above the video.</li>
       </ul>

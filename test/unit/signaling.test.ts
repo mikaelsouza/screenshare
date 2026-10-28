@@ -121,10 +121,9 @@ describe("SignalingClient reconnection", () => {
         t: "welcome",
         selfId: "me",
         peers: [{ id: "p1", name: "bob", sharing: false }],
-        iceServers: [{ urls: "stun:example.com" }],
       }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], [{ urls: "stun:example.com" }], {
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [{ id: "p1", name: "bob", sharing: false }], {
       host: false,
       locked: false,
     });
@@ -214,23 +213,6 @@ describe("SignalingClient reconnection", () => {
     const c = new SignalingClient("ABCDEFGH", "alice", handlers());
     // Not connected yet
     expect(() => c.send({ t: "state", sharing: false })).not.toThrow();
-  });
-
-  it("defaults to empty array when welcome message omits iceServers", () => {
-    const h = handlers();
-    const c = new SignalingClient("ABCDEFGH", "alice", h);
-    c.connect();
-    const ws = FakeWebSocket.instances[0]!;
-    ws.open();
-    ws.onmessage?.({
-      data: JSON.stringify({
-        t: "welcome",
-        selfId: "p1",
-        peers: [],
-      }),
-    });
-    expect(h.onWelcome).toHaveBeenCalledWith("p1", [], [], { host: false, locked: false });
-    c.close();
   });
 
   it("closes and detaches prior socket when connect() is called again", () => {
@@ -392,7 +374,7 @@ describe("SignalingClient capacity refusals", () => {
     // A welcome, not a bare `open`, is what proves the connection worked.
     const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
     ws.open();
-    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "a", peers: [], iceServers: [] }) });
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "a", peers: [] }) });
 
     // With the counter cleared, four more refusals must each still reconnect.
     // Without the reset the fifth cumulative refusal would have tripped the limit.
@@ -411,9 +393,9 @@ describe("SignalingClient capacity refusals", () => {
     expect(JSON.parse(ws.sent[0]!)).not.toHaveProperty("hostToken");
 
     ws.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], iceServers: [], host: true, hostToken: "tok", locked: false }),
+      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], host: true, hostToken: "tok", locked: false }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [], [], { host: true, hostToken: "tok", locked: false });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], { host: true, hostToken: "tok", locked: false });
     token = "tok";
 
     ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
@@ -448,9 +430,9 @@ describe("SignalingClient capacity refusals", () => {
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
     ws.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], iceServers: [], host: false, rejoinToken: "r1", locked: true }),
+      data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], host: false, rejoinToken: "r1", locked: true }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [], [], { host: false, rejoinToken: "r1", locked: true });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], { host: false, rejoinToken: "r1", locked: true });
     rejoin = "r1";
     ws.serverClose(1006);
     vi.advanceTimersByTime(20_000);
@@ -508,7 +490,7 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     // Welcome arrives and peer starts sharing
     ws1.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
     c.setSharing(true);
 
@@ -530,7 +512,7 @@ describe("SignalingClient keepalive and session resumption", () => {
     const ws1 = FakeWebSocket.instances[0]!;
     ws1.open();
     ws1.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Socket drops
@@ -550,7 +532,7 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     // Welcome arrives
     ws2.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Flushed!
@@ -612,7 +594,7 @@ describe("SignalingClient keepalive and session resumption", () => {
     const ws1 = FakeWebSocket.instances[0]!;
     ws1.open();
     ws1.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Socket drops
@@ -630,7 +612,7 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     // Welcome arrives
     ws2.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Total sent on ws2 = 1 (join) + 64 (flushed FIFO items, dropped first 6)
@@ -679,7 +661,7 @@ describe("SignalingClient keepalive and session resumption", () => {
     const ws1 = FakeWebSocket.instances[0]!;
     ws1.open();
     ws1.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Socket drops
@@ -701,7 +683,7 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     // Welcome arrives
     ws2.onmessage?.({
-      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], iceServers: [] }),
+      data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }),
     });
 
     // Verify queued message was flushed BEFORE onWelcome executed

@@ -7,8 +7,6 @@ import { TRY_AGAIN_LATER, isUpgrade, rejectUpgrade } from "./upgrade";
 export interface Env {
   ASSETS: Fetcher;
   ROOMS: DurableObjectNamespace<RoomDO>;
-  TURN_KEY_ID: string;        // wrangler secret
-  TURN_API_TOKEN: string;     // wrangler secret
   /**
    * Cloudflare's rate-limiting bindings (wrangler.jsonc `ratelimits`). Unlike the
    * in-memory RateLimiter these are shared across isolates in a location, so a client
@@ -17,10 +15,6 @@ export interface Env {
    */
   WS_LIMITER?: RateLimit;
   ROOM_LIMITER?: RateLimit;
-  /** TURN mints per client, checked by the room on each join (worker/room.ts). */
-  TURN_LIMITER?: RateLimit;
-  /** Kill switch for TURN; see worker/turn.ts. */
-  TURN_DISABLED?: string;
 }
 
 export { RoomDO };
@@ -85,8 +79,7 @@ function applySecurityHeaders(res: Response, url: URL): Response {
   // connect-src is 'self' rather than a blanket `wss: ws:`. The signalling socket is
   // same-origin, and in an app whose whole point is that media never leaves a direct
   // peer link, "any host, any WebSocket" is a ready-made exfiltration channel for
-  // injected script. rtc.live.cloudflare.com is not listed because only the Worker
-  // ever talks to it — the page never does.
+  // injected script.
   //
   // base-uri and form-action do not inherit from default-src, so they need saying.
   //

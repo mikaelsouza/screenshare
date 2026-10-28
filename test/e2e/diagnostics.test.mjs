@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import { baseUrl, INSTRUMENT, launchBrowser, startServer, stopServer, waitFor } from "./helpers.mjs";
 
-const PORT = 8891;
+const PORT = 8892;
 const BASE_URL = baseUrl(PORT);
 
 let server;
@@ -48,7 +48,7 @@ describe("diagnostics page", { concurrency: 1 }, () => {
 
   it("reports every check it claims to run", async () => {
     const rows = await page.evaluate(readRows);
-    for (const name of ["Browser", "Secure context", "System audio", "WebRTC loopback", "TURN credentials", "STUN / public address", "NAT mapping"]) {
+    for (const name of ["Browser", "Secure context", "System audio", "WebRTC loopback", "STUN / public address", "NAT mapping"]) {
       assert.ok(name in rows, `missing row "${name}"; got ${Object.keys(rows).join(", ")}`);
     }
   });
@@ -60,14 +60,6 @@ describe("diagnostics page", { concurrency: 1 }, () => {
     assert.equal(rows["Secure context"].status, "PASS");
     // Proves the local WebRTC stack works, independently of any network condition.
     assert.equal(rows["WebRTC loopback"].status, "PASS", rows["WebRTC loopback"].details);
-  });
-
-  it("reports STUN-only when no TURN credentials are configured", async () => {
-    // wrangler dev has no TURN secrets, so this must warn rather than claim success.
-    const rows = await page.evaluate(readRows);
-    assert.equal(rows["TURN credentials"].status, "WARN");
-    assert.match(rows["TURN credentials"].details, /STUN only/i);
-    assert.equal(rows["TURN relay"].status, "WARN");
   });
 
   it("gives an actionable explanation for every non-passing row", async () => {

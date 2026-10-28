@@ -20,7 +20,6 @@ import {
   preferCodec,
   tuneReceiverLatency,
 } from "./quality";
-import { parseCandidate } from "./stats";
 
 export interface MeshOptions {
   iceServers: RTCIceServer[];
@@ -28,8 +27,6 @@ export interface MeshOptions {
   codec: CodecName;
   /** Receive-side jitter buffer target, ms. 0 = lowest latency. */
   jitterBufferTargetMs: number;
-  /** When true, forces WebRTC through TURN relay only to protect user IP address. */
-  relayOnly?: boolean;
 }
 
 export interface MeshCallbacks {
@@ -63,20 +60,6 @@ export function parseControlMessage(data: unknown): ControlMessage | null {
   const rec = msg as Record<string, unknown>;
   if (rec.c !== "view" || typeof rec.want !== "boolean") return null;
   return { c: "view", want: rec.want };
-}
-
-/**
- * Drop every ICE candidate line that is not a relay candidate.
- *
- * Relay-only mode already sets iceTransportPolicy "relay", which stops the browser
- * gathering anything else. This is the second lock on the same door: the SDP is what
- * the far end actually receives, so it is checked on the way out rather than trusted.
- */
-export function keepRelayCandidatesOnly(sdp: string): string {
-  return sdp
-    .split("\r\n")
-    .filter((line) => !line.startsWith("a=candidate:") || / typ relay(?: |$)/.test(line))
-    .join("\r\n");
 }
 
 class PeerLink {
@@ -121,17 +104,11 @@ class PeerLink {
       iceServers: opts.iceServers,
       bundlePolicy: "max-bundle",
       rtcpMuxPolicy: "require",
-      iceTransportPolicy: opts.relayOnly ? "relay" : "all",
     });
 
     this.pc.onnegotiationneeded = () => void this.negotiate();
     this.pc.onicecandidate = ({ candidate }) => {
       if (candidate) {
-        if (this.opts.relayOnly) {
-          // Fail closed: a candidate we cannot classify is not sent.
-          const parsed = parseCandidate(candidate);
-          if (!parsed || parsed.type !== "relay") return;
-        }
         this.send({
           k: "ice",
           candidate: {
@@ -192,7 +169,7 @@ class PeerLink {
       offer.sdp = mungeOpusSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
-      if (sdp) this.send({ k: "offer", sdp: this.outgoingSdp(sdp) });
+      if (sdp) this.send({ k: "offer", sdp });
     } catch (err) {
       // The same race, lost a step later.
       if (seen !== this.remoteOffers || this.pc.signalingState === "have-remote-offer") this.retryOffer();
@@ -251,7 +228,7 @@ class PeerLink {
         answer.sdp = mungeOpusSdp(answer.sdp ?? "");
         await this.pc.setLocalDescription(answer);
         const out = this.pc.localDescription?.sdp;
-        if (out) this.send({ k: "answer", sdp: this.outgoingSdp(out) });
+        if (out) this.send({ k: "answer", sdp: out });
       }
     } catch (err) {
       this.isSettingRemoteAnswerPending = false;
@@ -262,11 +239,6 @@ class PeerLink {
         this.flushPendingOffer();
       }
     }
-  }
-
-  /** The SDP as it leaves this browser: relay candidates only in relay-only mode. */
-  private outgoingSdp(sdp: string): string {
-    return this.opts.relayOnly ? keepRelayCandidatesOnly(sdp) : sdp;
   }
 
   private async addIce(candidate: IceCandidateInit): Promise<void> {
@@ -300,21 +272,6 @@ class PeerLink {
 
   get connectionState(): RTCPeerConnectionState {
     return this.pc.connectionState;
-  }
-
-  updateIceServers(iceServers: RTCIceServer[]): void {
-    this.opts.iceServers = iceServers;
-    try {
-      if (typeof this.pc.setConfiguration === "function") {
-        const current = typeof this.pc.getConfiguration === "function" ? this.pc.getConfiguration() : {};
-        this.pc.setConfiguration({
-          ...current,
-          iceServers,
-        });
-      }
-    } catch (err) {
-      console.warn(`[mesh] updateIceServers failed for ${this.peerId}`, err);
-    }
   }
 
   /**
@@ -606,13 +563,6 @@ export class Mesh {
 
   peers(): PeerId[] {
     return [...this.links.keys()];
-  }
-
-  updateIceServers(iceServers: RTCIceServer[]): void {
-    this.opts.iceServers = iceServers;
-    for (const link of this.links.values()) {
-      link.updateIceServers(iceServers);
-    }
   }
 
   hasConnectedLink(peerId: PeerId): boolean {

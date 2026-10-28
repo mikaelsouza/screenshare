@@ -5,7 +5,7 @@ import { baseUrl, INSTRUMENT, launchBrowser, startServer, stopServer, waitFor } 
 /**
  * The paths p2p.test.mjs does not walk: a password-protected room made with Create,
  * joining after sharing has started, stopping and sharing again, two people sharing
- * at once, the host refreshing, Hide my IP with no relay, and removal and locking.
+ * at once, the host refreshing, and removal and locking.
  */
 const PORT = 8891;
 const BASE_URL = baseUrl(PORT);
@@ -168,20 +168,6 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
       () => [...document.querySelectorAll("#roster-list li")].filter((li) => li.textContent.includes("(host)")).length === 1,
       { label: "one host in the viewer's list" },
     );
-  });
-
-  it("refuses to connect with Hide my IP on when no relay is available", async () => {
-    // wrangler dev has no TURN secrets, so relay-only cannot be honoured. It must
-    // refuse rather than quietly connecting with the real address.
-    const page = await newPage("private");
-    await page.check("#relay-only");
-    await joinWith(page, code, password);
-    await waitFor(page, () => /cannot be hidden/i.test(document.getElementById("status")?.textContent ?? ""), {
-      label: "Hide my IP to refuse without a relay",
-    });
-    await new Promise((r) => setTimeout(r, 1500));
-    assert.equal(await page.evaluate(() => window.__pcs.length), 0, "a connection was made with Hide my IP on");
-    await page.close();
   });
 
   it("does not let a removed person back in, and a locked room refuses newcomers", async () => {

@@ -36,13 +36,6 @@ export const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 export const PING = "ping";
 export const PONG = "pong";
 
-/** Serializable subset of RTCIceServer, shared by the worker and the client. */
-export interface IceServerConfig {
-  urls: string | string[];
-  username?: string;
-  credential?: string;
-}
-
 export type PeerId = string;
 export interface PeerInfo {
   id: PeerId;
@@ -76,8 +69,6 @@ export type ClientMessage =
       resume?: boolean;
       /** Current sharing state on an in-place resume, so peers do not see sharing drop to false. */
       sharing?: boolean;
-      /** The diagnostics page: a throwaway join that claims nothing and gets short-lived TURN. */
-      diagnostics?: boolean;
     }
   | { t: "signal"; to: PeerId; data: SignalData }
   | { t: "state"; sharing: boolean }
@@ -87,13 +78,10 @@ export type ClientMessage =
   | { t: "lock"; locked: boolean };
 
 export type ServerMessage =
-  // iceServers ride along with the welcome rather than being served from a public
-  // endpoint: possession of a joined WebSocket is what authorises TURN credentials.
   | {
       t: "welcome";
       selfId: PeerId;
       peers: PeerInfo[];
-      iceServers: IceServerConfig[];
       /** Whether this socket is the room's host. */
       host: boolean;
       /** Issued once, to the join that creates the room. Keep it to stay host on reconnect. */
@@ -209,9 +197,6 @@ export function parseClientMessage(raw: string): ClientMessage | null {
           }
           if (typeof record.sharing === "boolean") {
             joinMsg.sharing = record.sharing;
-          }
-          if (record.diagnostics === true) {
-            joinMsg.diagnostics = true;
           }
           return joinMsg;
         }

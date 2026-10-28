@@ -6,7 +6,6 @@
  */
 
 import {
-  type IceServerConfig,
   PING,
   PONG,
   type ClientMessage,
@@ -28,7 +27,7 @@ export interface RoomInfo {
 }
 
 export interface SignalingHandlers {
-  onWelcome(selfId: PeerId, peers: PeerInfo[], iceServers: IceServerConfig[], room: RoomInfo): void;
+  onWelcome(selfId: PeerId, peers: PeerInfo[], room: RoomInfo): void;
   onPeerJoined(peer: PeerInfo): void;
   onPeerLeft(id: PeerId): void;
   onSignal(from: PeerId, data: SignalData): void;
@@ -201,7 +200,7 @@ export class SignalingClient {
             this.send(m);
           }
         }
-        this.handlers.onWelcome(msg.selfId, msg.peers, msg.iceServers ?? [], {
+        this.handlers.onWelcome(msg.selfId, msg.peers, {
           host: msg.host === true,
           ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
           ...(typeof msg.rejoinToken === "string" ? { rejoinToken: msg.rejoinToken } : {}),

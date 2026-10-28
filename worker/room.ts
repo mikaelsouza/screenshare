@@ -12,7 +12,6 @@ import {
 } from "@shared/protocol";
 import type { Env } from "./index";
 import { ipKey } from "./ipkey";
-import { DIAGNOSTICS_TURN_TTL_SECONDS, type MintedIce, getIceServers, revokeCredential } from "./turn";
 import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
 /**
@@ -129,8 +128,8 @@ const MAX_FRAME_LENGTH = 80 * 1024;
  * Per-socket message budget: a token bucket of MESSAGE_BURST, refilled at
  * MESSAGE_REFILL_PER_SEC.
  *
- * The burst has to cover the worst honest case, which is joining a full room with
- * TURN: seven links, each an offer or answer plus a dozen trickled candidates, all
+ * The burst has to cover the worst honest case, which is joining a full room:
+ * seven links, each an offer or answer plus trickled candidates, all
  * within a second or two. Sustained traffic after that is a handful of messages per
  * renegotiation. A flood well past both is not a browser doing WebRTC.
  */
@@ -151,7 +150,6 @@ const MAX_BAD_MESSAGES = 5;
 export interface MemberEntry {
   until: number;
   id?: string;
-  turnUser?: string;
   sharing?: boolean;
 }
 
@@ -166,11 +164,6 @@ interface PeerAttachment {
   openedAt?: number;
   /** Presented the room's host token. */
   host?: boolean;
-  /**
-   * This peer's own TURN username, revoked when it leaves. In the attachment rather
-   * than in memory so a hibernation between join and leave does not lose it.
-   */
-  turnUser?: string;
   /** Hash of the rejoin ticket this socket was issued, deleted if it is kicked. */
   rejoinHash?: string;
 }
@@ -296,41 +289,6 @@ export class RoomDO extends DurableObject<Env> {
     try {
       ws.close(closeCode, message);
     } catch {}
-  }
-
-  /** Remembers a failed TURN mint for a short while, so an outage is not hammered. */
-  private readonly turnBackoff = { failedUntil: 0 };
-
-  /**
-   * TURN credentials for one join, or STUN only when this address has minted too many
-   * lately. Every join mints its own credential, so without a per-address cap anyone
-   * could harvest relay access by joining in a loop. Never throws: a join must not
-   * fail because TURN did.
-   */
-  private async mintFor(ip: string | undefined, ttlSeconds?: number): Promise<MintedIce> {
-    try {
-      if (ip && this.env.TURN_LIMITER) {
-        let ok = true;
-        try {
-          ({ success: ok } = await this.env.TURN_LIMITER.limit({ key: ip }));
-        } catch {
-          // Fail open, like the other limiters: the binding is a guard, not a gate.
-        }
-        if (!ok) return await getIceServers({ ...this.env, TURN_DISABLED: "true" }, this.turnBackoff);
-      }
-      return await getIceServers(this.env, this.turnBackoff, ttlSeconds);
-    } catch (err) {
-      console.error("[room] could not mint ICE servers", err);
-      return { iceServers: [], username: null };
-    }
-  }
-
-  /** Revoke a TURN credential without holding up whatever is closing. */
-  private revokeLater(username: string | undefined): void {
-    if (!username) return;
-    // Not ctx.waitUntil, which does nothing in a Durable Object: an outstanding fetch
-    // keeps the object alive by itself.
-    void revokeCredential(this.env, username);
   }
 
   /** Joined sockets other than `except`, with their attachments. */
@@ -562,8 +520,7 @@ export class RoomDO extends DurableObject<Env> {
     switch (clientMsg.t) {
       case "join": {
         // A second "join" on the same socket must be ignored, not duplicated — also
-        // while the first is still in flight, since it awaits hashing and a fetch, and
-        // after a diagnostics join, which never marks the socket joined.
+        // while the first is still in flight, since it awaits password and token hashing.
         if (attachment.joined || this.joining.has(attachment.id) || this.gone.has(attachment.id)) {
           return;
         }
@@ -722,33 +679,6 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     clientMsg: Extract<ClientMessage, { t: "join" }>,
   ): Promise<void> {
-    // Diagnostics: a throwaway join that only wants short-lived TURN to test with.
-    // It claims nothing, stores nothing and never shows up in the room, and it is
-    // only accepted on a room nobody has created, so it cannot peek into a real one.
-    if (clientMsg.diagnostics) {
-      if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true) {
-        this.refuse(ws, "bad-message", "Diagnostics need a fresh room");
-        return;
-      }
-      // One credential per socket: marked done now, before the mint's await.
-      this.gone.add(attachment.id);
-      const minted = await this.mintFor(attachment.ip, DIAGNOSTICS_TURN_TTL_SECONDS);
-      // Not revoked on close: the page tests the relay after it has hung up, and
-      // the credential expires within minutes anyway.
-      sendSafe(ws, {
-        t: "welcome",
-        selfId: attachment.id,
-        peers: [],
-        iceServers: minted.iceServers,
-        host: false,
-        locked: false,
-      });
-      try {
-        ws.close(1000, "Diagnostics done");
-      } catch {}
-      return;
-    }
-
     // Clamp before anything touches storage. displayName is clamped below for the
     // same reason; an unbounded password would exceed the 128 KiB Durable Object
     // value limit, and the rejected put would propagate out of webSocketMessage
@@ -823,38 +753,11 @@ export class RoomDO extends DurableObject<Env> {
 
     const tokens = { offered, offeredHostHash, offeredRejoinHash, ip: attachment.ip };
 
-    // Checked once before the TURN mint, so a refused join does not cost a
-    // credential, and again after it: the mint is a fetch, and anything can happen
-    // in the room meanwhile (the host locks it, someone kicks, another join creates
-    // the room).
-    const early = await this.admit(tokens);
-    if (!early.ok) {
-      this.refuse(ws, early.code, early.message);
-      return;
-    }
-
-    // Mint TURN credentials here rather than from a public HTTP endpoint: reaching
-    // this line requires a live WebSocket that has been accepted into the room, so
-    // the socket itself is the authorisation. A failure must not block the join —
-    // direct P2P is the common path and needs no TURN at all.
-    //
-    // Before the join is committed, not after. With the mint between marking this
-    // socket joined and sending its welcome, a second join finishing first sent
-    // this peer peer-joined ahead of its own welcome, which lists nobody — so the
-    // peer never learned the newcomer existed. And a kick or close during the mint
-    // produced a peer-joined for someone already gone, with no peer-left after.
-    const minted = await this.mintFor(attachment.ip);
-    const revokeMinted = (): void => this.revokeLater(minted.username ?? undefined);
-
     // ---- commit. From here to the broadcast, only storage awaits: input gates
     // hold across those, so nothing else in the room runs in between.
-    if (this.gone.has(attachment.id)) {
-      revokeMinted();
-      return;
-    }
+    if (this.gone.has(attachment.id)) return;
     const admission = await this.admit(tokens);
     if (!admission.ok) {
-      revokeMinted();
       this.refuse(ws, admission.code, admission.message);
       return;
     }
@@ -897,10 +800,6 @@ export class RoomDO extends DurableObject<Env> {
         oldAtt.id = crypto.randomUUID();
         this.forgetBudget(oldWs);
         oldAtt.joined = false;
-        if (!minted.username && oldAtt.turnUser) {
-          attachment.turnUser = oldAtt.turnUser;
-        }
-        oldAtt.turnUser = undefined;
         try {
           oldWs.serializeAttachment(oldAtt);
         } catch {}
@@ -921,7 +820,6 @@ export class RoomDO extends DurableObject<Env> {
 
     const others = this.joinedPeers(ws);
     if (others.length >= MAX_ROOM_SIZE) {
-      revokeMinted();
       this.refuse(ws, "room-full", "Room is full");
       return;
     }
@@ -936,7 +834,6 @@ export class RoomDO extends DurableObject<Env> {
       until: now + EMPTY_ROOM_TTL_MS,
       id: attachment.id,
       ...(attachment.sharing ? { sharing: true } : {}),
-      ...(attachment.turnUser ? { turnUser: attachment.turnUser } : {}),
     };
     await this.ctx.storage.put({
       [MEMBERS_KEY]: members,
@@ -972,11 +869,9 @@ export class RoomDO extends DurableObject<Env> {
     }
     attachment.host = admission.isHost;
     attachment.rejoinHash = newRejoinHash;
-    if (minted.username) attachment.turnUser = minted.username;
     try {
       ws.serializeAttachment(attachment);
     } catch {
-      revokeMinted();
       return;
     }
 
@@ -989,7 +884,6 @@ export class RoomDO extends DurableObject<Env> {
         sharing: att.sharing,
         ...(att.host ? { host: true } : {}),
       })),
-      iceServers: minted.iceServers,
       host: admission.isHost,
       ...(admission.creates ? { hostToken: newHostToken } : {}),
       rejoinToken: newRejoinToken,
@@ -1026,9 +920,9 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
-   * Whether a join may enter, from storage alone, so it can be asked again after an
-   * await. Storage reads hold the input gate, so the answer and the commit that
-   * follows it see the same room.
+   * Whether a join may enter, evaluated against storage directly before commit.
+   * Storage reads hold the input gate, so the admission check and the commit that
+   * follows it see the same room state.
    */
   private async admit(tokens: {
     offered: string | undefined;
@@ -1147,7 +1041,7 @@ export class RoomDO extends DurableObject<Env> {
     if (!att) return;
     this.budgets.delete(att.id);
     this.badMessages.delete(att.id);
-    // Remembered so a join mid-mint does not commit a socket that is already closed.
+    // Remembered so a concurrent close does not commit a socket that is already gone.
     // Ids are UUIDs and never reused, so this only needs to outlive that one join.
     this.gone.add(att.id);
   }
@@ -1160,9 +1054,6 @@ export class RoomDO extends DurableObject<Env> {
 
     // Mark not joined to prevent duplicate peer-left broadcasts on close after error
     attachment.joined = false;
-    // Best effort: a credential that fails to revoke simply lives out its TTL.
-    this.revokeLater(attachment.turnUser);
-    attachment.turnUser = undefined;
     try {
       ws.serializeAttachment(attachment);
     } catch {}
