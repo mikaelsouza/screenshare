@@ -4,7 +4,6 @@ import {
   MIN_PASSWORD_LENGTH,
   PING,
   PONG,
-  type PeerInfo,
   type ErrorCode,
   type ServerMessage,
   type ClientMessage,
@@ -197,7 +196,7 @@ function getAttachment(ws: WebSocket): PeerAttachment | null {
  * full-width letters into their plain forms. Cut to 32 after cleaning, so invisible
  * characters cannot eat the budget.
  */
-export function sanitiseName(raw: string): string {
+function sanitiseName(raw: string): string {
   const cleaned = raw
     .normalize("NFKC")
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")

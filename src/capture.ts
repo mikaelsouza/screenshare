@@ -50,7 +50,7 @@ interface ChromeDisplayMediaOptions extends DisplayMediaStreamOptions {
  */
 export type AudioMode = "app" | "system" | "none";
 
-export const AUDIO_MODES: readonly AudioMode[] = ["app", "system", "none"];
+const AUDIO_MODES: readonly AudioMode[] = ["app", "system", "none"];
 export const DEFAULT_AUDIO_MODE: AudioMode = "app";
 
 export function isAudioMode(v: string | null): v is AudioMode {
@@ -58,7 +58,7 @@ export function isAudioMode(v: string | null): v is AudioMode {
 }
 
 /** What picker #1 returned. Chrome reports it on the video track's settings. */
-export type Surface = "monitor" | "window" | "browser" | "unknown";
+type Surface = "monitor" | "window" | "browser" | "unknown";
 
 export interface CaptureResult {
   stream: MediaStream;
@@ -118,7 +118,7 @@ export function systemAudioSupport(): { supported: boolean; reason?: string } {
 }
 
 /** First Chromium version with the `windowAudio` option. */
-export const WINDOW_AUDIO_MIN_CHROME = 141;
+const WINDOW_AUDIO_MIN_CHROME = 141;
 
 /**
  * Whether the browser understands `windowAudio`, which "app" mode depends on.

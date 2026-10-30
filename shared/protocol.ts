@@ -31,7 +31,7 @@ export const MAX_CANDIDATE_LENGTH = 1024;
  * Peer ids are server-issued crypto.randomUUID() values. Anything else in a `to` field
  * cannot name a peer, so it is rejected at parse time rather than carried further.
  */
-export const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const PING = "ping";
 export const PONG = "pong";
@@ -114,7 +114,7 @@ export type ErrorCode =
   | "not-sharing";
 
 /** Longest host token accepted. Real ones are UUIDs, 36 characters. */
-export const MAX_HOST_TOKEN_LENGTH = 64;
+const MAX_HOST_TOKEN_LENGTH = 64;
 
 /** Shortest password a new room accepts. Enforced by the server on the claiming join. */
 export const MIN_PASSWORD_LENGTH = 8;

@@ -1635,7 +1635,7 @@ describe("RoomDO final review fixes", () => {
 
   it("evicts previous socket on rejoin with rejoinToken in a password-protected room while sharing", async () => {
     const a = await Client.connect();
-    const wa = await a.join("alice", "super-secret");
+    await a.join("alice", "super-secret");
 
     const b1 = await Client.connect();
     const wb1 = await b1.join("bob", "super-secret");

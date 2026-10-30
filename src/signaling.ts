@@ -16,7 +16,7 @@ import {
 } from "@shared/protocol";
 
 /** Room control state carried by the welcome. */
-export interface RoomInfo {
+interface RoomInfo {
   /** Whether we are the room's host. */
   host: boolean;
   /** Present only on the welcome that created the room. Keep it to stay host. */
