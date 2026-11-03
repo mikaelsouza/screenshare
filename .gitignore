@@ -12,3 +12,5 @@ coverage
 /server.js
 /mocks/
 /mock-*.html
+/release/
+/reports/
