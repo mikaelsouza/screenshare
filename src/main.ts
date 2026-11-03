@@ -1186,7 +1186,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             iceServers: ICE_SERVERS,
             preset: QUALITY_PRESETS[currentPreset()],
             codec: currentCodec(),
-            jitterBufferTargetMs: 0,
+            jitterBufferTargetMs: 150,
           },
           (to, data) => client?.signal(to, data),
           {
