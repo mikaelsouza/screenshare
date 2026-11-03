@@ -4,7 +4,12 @@ import { defineConfig } from "vitest/config";
 /** Pure-logic tests. The Durable Object has its own config (vitest.workers.config.ts). */
 export default defineConfig({
   test: {
-    include: ["test/unit/**/*.test.ts"],
+    include: [
+      "test/unit/**/*.test.ts",
+      "test/formal/**/*.test.ts",
+      "test/fuzz/**/*.test.ts",
+    ],
+    testTimeout: 15000,
     environment: "node",
     coverage: {
       provider: "v8",
@@ -18,6 +23,7 @@ export default defineConfig({
       "@shared": resolve(import.meta.dirname, "shared"),
       "@src": resolve(import.meta.dirname, "src"),
       "@worker": resolve(import.meta.dirname, "worker"),
+      "@electron": resolve(import.meta.dirname, "electron"),
     },
   },
 });

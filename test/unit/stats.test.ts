@@ -175,6 +175,35 @@ describe("isDirect", () => {
     expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "unknown" } as LinkHealth)).toBe(true);
     expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "srflx" } as LinkHealth)).toBe(false);
   });
+
+  it("sanitizes non-finite numbers (NaN, Infinity) to null", async () => {
+    const pc = {
+      getStats: async () =>
+        new Map([
+          [
+            "CP",
+            {
+              type: "candidate-pair",
+              currentRoundTripTime: Infinity,
+              availableOutgoingBitrate: NaN,
+            },
+          ],
+          [
+            "O",
+            {
+              type: "outbound-rtp",
+              kind: "video",
+              framesPerSecond: NaN,
+            },
+          ],
+        ]) as unknown as RTCStatsReport,
+    } as unknown as RTCPeerConnection;
+
+    const h = await new LinkMonitor(pc).read();
+    expect(h?.rttMs).toBeNull();
+    expect(h?.availableOutgoingBitrate).toBeNull();
+    expect(h?.framesPerSecond).toBeNull();
+  });
 });
 
 describe("parseCandidate", () => {

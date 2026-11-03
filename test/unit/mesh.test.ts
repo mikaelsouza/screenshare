@@ -688,6 +688,28 @@ describe("negotiation recovery", () => {
     expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("streamer");
   });
 
+  it("applies jitterBufferTargetMs on incoming track receivers", async () => {
+    const mesh = new Mesh("me", { ...opts, jitterBufferTargetMs: 150 }, () => {}, cb());
+    mesh.addMember("streamer", false);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const receiver = {
+      jitterBufferTarget: null,
+      playoutDelayHint: null,
+    } as unknown as RTCRtpReceiver;
+
+    const fakeTrack = { kind: "video", addEventListener: () => {} } as unknown as MediaStreamTrack;
+    pc.ontrack?.({
+      track: fakeTrack,
+      receiver,
+      streams: [{ id: 'mock-stream' } as unknown as MediaStream],
+    } as unknown as RTCTrackEvent);
+
+    const r = receiver as unknown as { jitterBufferTarget: number; playoutDelayHint: number };
+    expect(r.jitterBufferTarget).toBe(150);
+    expect(r.playoutDelayHint).toBe(0.15);
+  });
+
   it("exposes hasConnectedLink based on connectionState", async () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);

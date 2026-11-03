@@ -34,4 +34,12 @@ describe("ipKey", () => {
   it("passes through something it cannot parse rather than throwing", () => {
     expect(ipKey("not:an:address::x::y")).toBe("not:an:address::x::y");
   });
+
+  it("preserves tail hextets needed for the /64 prefix", () => {
+    expect(ipKey("1::2:3:4:5:6:7")).toBe("1:0:2:3::/64");
+  });
+
+  it("rejects addresses with invalid characters in the tail", () => {
+    expect(ipKey("2001:db8::zzzz")).toBe("2001:db8::zzzz");
+  });
 });

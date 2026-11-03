@@ -1,0 +1,48 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "vitest",
+  "plugins": [
+    "@stryker-mutator/vitest-runner"
+  ],
+  "mutate": [
+    "shared/protocol.ts",
+    "worker/ipkey.ts",
+    "worker/ratelimit.ts",
+    "src/quality.ts",
+    "src/stats.ts"
+  ],
+  "ignorePatterns": [
+    "release/**",
+    "dist/**",
+    ".agents/**",
+    "reports/**",
+    ".stryker-tmp/**"
+  ],
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  },
+  "reporters": [
+    "html",
+    "clear-text",
+    "progress",
+    "json"
+  ],
+  "htmlReporter": {
+    "fileName": "reports/mutation/mutation.html"
+  },
+  "jsonReporter": {
+    "fileName": "reports/mutation/mutation.json"
+  },
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": null
+  },
+  "coverageAnalysis": "off",
+  "inPlace": false,
+  "tsconfigFile": "tsconfig.stryker.json",
+  "cleanTempDir": "always",
+  "concurrency": 2,
+  "timeoutMS": 15000
+}

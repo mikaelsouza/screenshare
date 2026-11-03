@@ -11,8 +11,15 @@
     "paths": {
       "@shared/*": ["./shared/*"],
       "@src/*": ["./src/*"],
-      "@worker/*": ["./worker/*"]
+      "@worker/*": ["./worker/*"],
+      "@electron/*": ["./electron/*"]
     }
   },
-  "include": ["src/**/*.ts", "shared/**/*.ts", "test/unit/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "shared/**/*.ts",
+    "test/unit/**/*.ts",
+    "test/formal/**/*.ts",
+    "test/fuzz/**/*.ts"
+  ]
 }
