@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LinkMonitor, isDirect, parseCandidate, summarize } from "@src/stats";
+import { LinkMonitor, isDirect, summarize } from "@src/stats";
 import type { LinkHealth } from "@src/quality";
 
 /** Build a fake RTCPeerConnection whose getStats() returns scripted reports. */
@@ -206,40 +206,3 @@ describe("isDirect", () => {
   });
 });
 
-describe("parseCandidate", () => {
-  const line = "candidate:842163049 1 udp 1677729535 203.0.113.5 54321 typ srflx raddr 192.168.1.5 rport 49152";
-
-  it("reads the parsed fields when the browser provides them", () => {
-    const c = parseCandidate({
-      candidate: line, type: "srflx", address: "203.0.113.5", port: 54321, protocol: "udp",
-    } as RTCIceCandidate);
-    expect(c).toMatchObject({ type: "srflx", address: "203.0.113.5", port: 54321, protocol: "udp" });
-  });
-
-  it("falls back to parsing the SDP line when fields are null", () => {
-    // Older Chromium leaves these null even though the line is well-formed.
-    const c = parseCandidate({
-      candidate: line, type: null, address: null, port: null, protocol: null,
-    } as unknown as RTCIceCandidate);
-    expect(c).toMatchObject({ type: "srflx", address: "203.0.113.5", port: 54321, protocol: "udp" });
-  });
-
-  it("parses relay and host candidates", () => {
-    const relay = "candidate:1 1 udp 41885439 198.51.100.9 60000 typ relay raddr 0.0.0.0 rport 0";
-    expect(parseCandidate({ candidate: relay } as unknown as RTCIceCandidate)?.type).toBe("relay");
-    const host = "candidate:2 1 tcp 2105524479 192.168.1.5 9 typ host tcptype active";
-    expect(parseCandidate({ candidate: host } as unknown as RTCIceCandidate)).toMatchObject({
-      type: "host", protocol: "tcp",
-    });
-  });
-
-  it("returns null for an empty candidate (the end-of-gathering sentinel)", () => {
-    expect(parseCandidate({ candidate: "" } as RTCIceCandidate)).toBeNull();
-  });
-
-  it("handles malformed candidate string gracefully", () => {
-    expect(parseCandidate({ candidate: "invalid string" } as unknown as RTCIceCandidate)).toMatchObject({
-      type: "unknown",
-    });
-  });
-});

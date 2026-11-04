@@ -146,7 +146,7 @@ const JOIN_DEADLINE_MS = 10_000;
 /** Unparseable messages a socket may send before it is closed. */
 const MAX_BAD_MESSAGES = 5;
 
-export interface MemberEntry {
+interface MemberEntry {
   until: number;
   id?: string;
   sharing?: boolean;

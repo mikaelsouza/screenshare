@@ -26,7 +26,7 @@ interface RoomInfo {
   locked: boolean;
 }
 
-export interface SignalingHandlers {
+interface SignalingHandlers {
   onWelcome(selfId: PeerId, peers: PeerInfo[], room: RoomInfo): void;
   onPeerJoined(peer: PeerInfo): void;
   onPeerLeft(id: PeerId): void;

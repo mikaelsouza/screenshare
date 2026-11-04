@@ -263,7 +263,7 @@ describe("Formal Invariants: RoomDO State Machine (Features 32, 33, 35, 36, 37, 
       let rejectedCount = 0;
 
       for (let i = 0; i < peersToJoin; i++) {
-        const { clientWs, serverWs } = await connectPeer(`10.0.1.${i}`);
+        const { serverWs } = await connectPeer(`10.0.1.${i}`);
         await room.webSocketMessage(
           serverWs,
           JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: `Peer${i}` })

@@ -1,12 +1,20 @@
 {
-  "$schema": "https://unpkg.com/knip@5/schema.json",
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "electron/preload.cjs"
+  ],
+  "project": [
+    "src/**/*.{js,ts}",
+    "shared/**/*.{js,ts}",
+    "worker/**/*.{js,ts}",
+    "electron/**/*.{js,cjs}",
+    "scripts/**/*.{js,mjs}",
+    "test/**/*.{js,ts,mjs}"
+  ],
   "vitest": {
     "config": [
       "vitest.config.ts",
       "vitest.workers.config.ts"
     ]
-  },
-  "ignoreDependencies": [
-    "cloudflare"
-  ]
+  }
 }

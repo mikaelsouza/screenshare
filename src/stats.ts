@@ -180,32 +180,3 @@ export function summarize(h: LinkHealth): string {
   return bits.join(" · ");
 }
 
-// ---- ICE candidate parsing ------------------------------------------------
-
-export interface ParsedCandidate {
-  type: string;
-  address: string;
-  port: number | null;
-  protocol: string;
-}
-
-/**
- * Read type/address/port off an ICE candidate.
- *
- * Prefers the parsed RTCIceCandidate fields but falls back to the SDP text, because
- * older Chromium builds leave `.type`, `.address` and `.port` null even though the
- * candidate line itself is well-formed. Line shape:
- *   candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <type> ...
- */
-export function parseCandidate(c: RTCIceCandidate): ParsedCandidate | null {
-  const raw = c.candidate;
-  if (!raw) return null;
-  const m = /candidate:\S+ \d+ (\S+) \d+ (\S+) (\d+) typ (\S+)/i.exec(raw);
-  const portText = m?.[3];
-  return {
-    type: c.type ?? m?.[4] ?? "unknown",
-    address: c.address ?? m?.[2] ?? "",
-    port: c.port ?? (portText !== undefined ? Number(portText) : null),
-    protocol: c.protocol ?? m?.[1] ?? "",
-  };
-}

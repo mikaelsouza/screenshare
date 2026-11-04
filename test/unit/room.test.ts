@@ -540,7 +540,6 @@ describe("worker/room (Features 9-17)", () => {
           sharing: false,
         }),
       );
-      const welcomeA = wsA.sent.map((s) => JSON.parse(s)).find((m) => m.t === "welcome");
 
       // 2. Viewer B joins (sharing: false)
       const wsB = await connectAndGetServerWs("203.0.113.2");

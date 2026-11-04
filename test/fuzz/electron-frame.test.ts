@@ -1,7 +1,6 @@
 // @ts-nocheck
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
-import { EventEmitter } from "node:events";
 
 /**
  * Headless reproduction of WebSocketConnection RFC 6455 frame processing from electron/server.js

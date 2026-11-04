@@ -41,7 +41,6 @@
   },
   "coverageAnalysis": "off",
   "inPlace": false,
-  "tsconfigFile": "tsconfig.stryker.json",
   "cleanTempDir": "always",
   "concurrency": 2,
   "timeoutMS": 15000
