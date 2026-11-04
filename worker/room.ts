@@ -331,18 +331,9 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
-   * Salted SHA-256 of a room password, hex encoded.
-   *
-   * Room passwords come out of users' ordinary password habits, so the plaintext is
-   * worth more than access to this one room and should not sit in storage. The Durable
-   * Object id is a stable, room-specific salt, so the same password in two rooms does
-   * not produce the same hash.
+   * Salted SHA-256, hex. The Durable Object id is a stable, room-specific salt, and the
+   * host/rejoin tokens get their own prefix so they never equal a password hash.
    */
-  private async hashPassword(password: string): Promise<string> {
-    return this.hashSecret(password);
-  }
-
-  /** Salted SHA-256, hex. The host token gets its own prefix so it never equals a password hash. */
   private async hashSecret(secret: string, kind?: "host" | "rejoin"): Promise<string> {
     const prefix = kind ? `${this.ctx.id.toString()}:${kind}` : this.ctx.id.toString();
     const data = new TextEncoder().encode(`${prefix}:${secret}`);
@@ -529,7 +520,6 @@ export class RoomDO extends DurableObject<Env> {
           await this.handleJoin(ws, attachment, clientMsg);
         } finally {
           this.joining.delete(joinId);
-          this.joining.delete(attachment.id);
         }
         return;
       }
@@ -692,7 +682,7 @@ export class RoomDO extends DurableObject<Env> {
     // the password the other was setting, or a stranger's password could win.
     // The same goes for the host and rejoin tokens: those offered, and those this
     // join would be issued.
-    const offeredHash = offered ? await this.hashPassword(offered) : null;
+    const offeredHash = offered ? await this.hashSecret(offered) : null;
     const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
     const offeredRejoinHash = clientMsg.rejoinToken
       ? await this.hashSecret(clientMsg.rejoinToken, "rejoin")
@@ -998,12 +988,10 @@ export class RoomDO extends DurableObject<Env> {
 
   /** Live rejoin tickets, hash to expiry, with expired ones dropped. */
   private async getMembers(now: number): Promise<Record<string, MemberEntry>> {
-    const all = (await this.ctx.storage.get<Record<string, number | MemberEntry>>(MEMBERS_KEY)) ?? {};
+    const all = (await this.ctx.storage.get<Record<string, MemberEntry>>(MEMBERS_KEY)) ?? {};
     const live: Record<string, MemberEntry> = {};
     for (const [k, val] of Object.entries(all)) {
-      if (typeof val === "number") {
-        if (val > now) live[k] = { until: val };
-      } else if (val && typeof val.until === "number" && val.until > now) {
+      if (val && typeof val.until === "number" && val.until > now) {
         live[k] = val;
       }
     }

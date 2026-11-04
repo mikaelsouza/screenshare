@@ -76,12 +76,10 @@ export class LinkMonitor {
 
     let outbound: Stat | null = null;
     let remoteInbound: Stat | null = null;
-    let inbound: Stat | null = null;
     for (const s of byId.values()) {
       if (s["kind"] !== "video") continue;
       if (s["type"] === "outbound-rtp") outbound = s;
       else if (s["type"] === "remote-inbound-rtp") remoteInbound = s;
-      else if (s["type"] === "inbound-rtp") inbound = s;
     }
 
     // Rates from counter deltas.
@@ -112,31 +110,17 @@ export class LinkMonitor {
     }
     this.prev = sample;
 
-    // jitterBufferDelay is cumulative seconds; divide by the emitted-count to get
-    // the current average delay per frame, which is the actual latency contribution.
-    let jitterBufferDelayMs: number | null = null;
-    if (inbound) {
-      const delay = num(inbound["jitterBufferDelay"]);
-      const count = num(inbound["jitterBufferEmittedCount"]);
-      if (delay !== null && count !== null && count > 0) {
-        jitterBufferDelayMs = (delay / count) * 1000;
-      }
-    }
-
     const rttSec = pair ? num(pair["currentRoundTripTime"]) : null;
 
     return {
       candidateType: (local ? str(local["candidateType"]) : null) ?? "unknown",
       remoteCandidateType: (remote ? str(remote["candidateType"]) : null) ?? "unknown",
       rttMs: rttSec === null ? null : rttSec * 1000,
-      availableOutgoingBitrate: pair ? num(pair["availableOutgoingBitrate"]) : null,
       packetLossRatio,
       outboundBitrate,
       framesPerSecond: outbound ? num(outbound["framesPerSecond"]) : null,
       frameWidth: outbound ? num(outbound["frameWidth"]) : null,
       frameHeight: outbound ? num(outbound["frameHeight"]) : null,
-      encoderImplementation: outbound ? str(outbound["encoderImplementation"]) : null,
-      jitterBufferDelayMs,
     };
   }
 }
@@ -149,8 +133,7 @@ const DIRECT_CANDIDATE_TYPES = ["host", "srflx", "prflx"];
  *
  * Requires a positively direct candidate type rather than merely "not relay": both
  * fields fall back to the sentinel "unknown" before ICE nominates a pair, and
- * treating that as direct would render `direct (unknown)` and suppress the relay
- * warning on a connection that may well be relayed.
+ * treating that as direct would render `direct (unknown)`.
  */
 export function isDirect(h: LinkHealth): boolean {
   return (
@@ -159,7 +142,7 @@ export function isDirect(h: LinkHealth): boolean {
   );
 }
 
-/** True when the route is not yet known, as opposed to known-and-relayed. */
+/** True when the route is not yet known. */
 export function isRouteUnknown(h: LinkHealth): boolean {
   return h.candidateType === "unknown" || h.remoteCandidateType === "unknown";
 }
@@ -168,7 +151,7 @@ export function isRouteUnknown(h: LinkHealth): boolean {
 export function summarize(h: LinkHealth): string {
   const bits: string[] = [];
   bits.push(
-    isRouteUnknown(h) ? "connecting…" : isDirect(h) ? `direct (${h.candidateType})` : "relayed (TURN)",
+    isRouteUnknown(h) ? "connecting…" : isDirect(h) ? `direct (${h.candidateType})` : "relayed",
   );
   if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms rtt`);
   if (h.outboundBitrate !== null) bits.push(`${(h.outboundBitrate / 1e6).toFixed(1)} Mbps`);
@@ -179,4 +162,3 @@ export function summarize(h: LinkHealth): string {
   }
   return bits.join(" · ");
 }
-

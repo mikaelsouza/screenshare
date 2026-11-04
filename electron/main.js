@@ -1,9 +1,7 @@
 // @ts-nocheck
-// 
 import { app, BrowserWindow, session, desktopCapturer, shell } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startLocalServer } from './server.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,14 +10,10 @@ const isDev = process.env.ELECTRON_DEV === '1' || process.env.NODE_ENV === 'deve
 const isSmokeTest = process.argv.includes('--smoke-test') || process.env.SMOKE_TEST === '1';
 
 // The app loads the hosted site so it shares rooms (signaling via the Cloudflare Worker /
-// Durable Object) with browser users. The embedded server (server.js) keeps rooms in
-// local memory only, so it's used just for dev (`electron:dev`) or when explicitly
-// requested with SCREENSHARE_LOCAL=1 (offline/LAN testing, smoke test).
+// Durable Object) with browser users.
 const REMOTE_APP_URL = process.env.SCREENSHARE_URL || 'https://screenshare.webmikas.com';
-const useLocalServer = isDev || process.env.SCREENSHARE_LOCAL === '1';
 
 let mainWindow = null;
-let localServer = null;
 // Origin of the page we load; capture permissions are only granted to it.
 let trustedOrigin = null;
 
@@ -102,20 +96,9 @@ function isTrustedUrl(url) {
   }
 }
 
-async function resolveTargetUrl() {
-  if (!useLocalServer) {
-    return REMOTE_APP_URL;
-  }
-  // Start the embedded local HTTP + WS server.
-  // In dev, the server must listen on the fixed port Vite proxies to (see vite.config.ts).
-  if (!localServer) {
-    const serverPort = isDev && process.env.ELECTRON_SERVER_PORT
-      ? parseInt(process.env.ELECTRON_SERVER_PORT, 10)
-      : undefined;
-    localServer = await startLocalServer({ port: serverPort });
-  }
+function resolveTargetUrl() {
   const devServerUrl = process.env.VITE_DEV_SERVER_URL;
-  return isDev && devServerUrl ? devServerUrl : localServer.url;
+  return isDev && devServerUrl ? devServerUrl : REMOTE_APP_URL;
 }
 
 function offlinePage(url, description) {
@@ -130,7 +113,7 @@ function offlinePage(url, description) {
 }
 
 async function initApplication() {
-  const targetUrl = await resolveTargetUrl();
+  const targetUrl = resolveTargetUrl();
   trustedOrigin = new URL(targetUrl).origin;
   console.log(`[main] Loading ${targetUrl}`);
 
@@ -210,16 +193,5 @@ app.on('activate', async () => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit();
-  }
-});
-
-app.on('before-quit', async () => {
-  if (localServer) {
-    try {
-      await localServer.close();
-    } catch (err) {
-      console.error('[main] Error closing local server:', err);
-    }
-    localServer = null;
   }
 });

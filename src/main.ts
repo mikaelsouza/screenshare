@@ -259,11 +259,10 @@ interface BoostAudioPipe {
   compressor?: DynamicsCompressorNode;
 }
 const boostPipes = new Map<PeerId, BoostAudioPipe>();
-(window as any).__boostPipes = boostPipes;
 let sharedAudioCtx: AudioContext | null = null;
 
 function getSharedAudioContext(): AudioContext | null {
-  const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+  const AudioContextClass = window.AudioContext;
   if (!AudioContextClass) return null;
   if (!sharedAudioCtx || sharedAudioCtx.state === "closed") {
     try {
@@ -416,17 +415,10 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   fullscreenBtn.type = "button";
   fullscreenBtn.className = "tile-fullscreen";
   fullscreenBtn.addEventListener("click", () => {
-    const isFs = document.fullscreenElement === wrap || (document as any).webkitFullscreenElement === wrap;
-    if (isFs) {
-      if (typeof document.exitFullscreen === "function") {
-        void document.exitFullscreen().catch(() => {});
-      } else if (typeof (document as any).webkitExitFullscreen === "function") {
-        (document as any).webkitExitFullscreen();
-      }
+    if (document.fullscreenElement === wrap) {
+      void document.exitFullscreen().catch(() => {});
     } else if (typeof wrap.requestFullscreen === "function") {
       void wrap.requestFullscreen().catch(() => {});
-    } else if (typeof (wrap as any).webkitRequestFullscreen === "function") {
-      (wrap as any).webkitRequestFullscreen();
     }
   });
 
@@ -519,7 +511,7 @@ function renderTileControls(peerId: PeerId): void {
     c.pipBtn.setAttribute("aria-pressed", String(isPip));
   }
 
-  const isFs = document.fullscreenElement === c.wrap || (document as any).webkitFullscreenElement === c.wrap;
+  const isFs = document.fullscreenElement === c.wrap;
   c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
   c.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
   c.fullscreenBtn.setAttribute("aria-label", c.fullscreenBtn.title);
@@ -635,11 +627,9 @@ function removeTile(peerId: PeerId): void {
   if (focusedPeerId === peerId) setFocusedTile(null);
 }
 
-for (const evName of ["fullscreenchange", "webkitfullscreenchange"]) {
-  document.addEventListener(evName, () => {
-    for (const id of tileControls.keys()) renderTileControls(id);
-  });
-}
+document.addEventListener("fullscreenchange", () => {
+  for (const id of tileControls.keys()) renderTileControls(id);
+});
 
 /**
  * Surface per-peer link health on each tile (candidate type, bitrate, rtt, fps, packet loss).

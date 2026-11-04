@@ -20,14 +20,12 @@ const DIRECT_REPORT = {
     localCandidateId: "L",
     remoteCandidateId: "R",
     currentRoundTripTime: 0.024,
-    availableOutgoingBitrate: 9_000_000,
   },
   L: { type: "local-candidate", candidateType: "srflx" },
   R: { type: "remote-candidate", candidateType: "srflx" },
   O: {
     type: "outbound-rtp", kind: "video", bytesSent: 1_000_000, packetsSent: 1000,
     framesPerSecond: 60, frameWidth: 1920, frameHeight: 1080,
-    encoderImplementation: "ExternalEncoder (NVENC)",
   },
   RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 10 },
 };
@@ -78,18 +76,6 @@ describe("LinkMonitor", () => {
     expect(h?.packetLossRatio).toBeCloseTo(30 / 600, 5);
   });
 
-  it("averages jitter buffer delay per emitted frame", async () => {
-    const h = await new LinkMonitor(fakePc([{
-      I: { type: "inbound-rtp", kind: "video", jitterBufferDelay: 1.5, jitterBufferEmittedCount: 100 },
-    }])).read();
-    expect(h?.jitterBufferDelayMs).toBeCloseTo(15); // 1.5s / 100 frames = 15ms
-  });
-
-  it("surfaces the encoder implementation, which reveals software fallback", async () => {
-    const h = await new LinkMonitor(fakePc([DIRECT_REPORT])).read();
-    expect(h?.encoderImplementation).toContain("NVENC");
-  });
-
   it("returns null instead of throwing when getStats rejects", async () => {
     const pc = { getStats: async () => { throw new Error("closed"); } } as unknown as RTCPeerConnection;
     expect(await new LinkMonitor(pc).read()).toBeNull();
@@ -105,9 +91,8 @@ describe("LinkMonitor", () => {
 describe("isDirect", () => {
   const base: LinkHealth = {
     candidateType: "srflx", remoteCandidateType: "srflx", rttMs: 20,
-    availableOutgoingBitrate: null, packetLossRatio: null, outboundBitrate: null,
+    packetLossRatio: null, outboundBitrate: null,
     framesPerSecond: null, frameWidth: null, frameHeight: null,
-    encoderImplementation: null, jitterBufferDelayMs: null,
   };
 
   it("treats host and srflx pairs as direct", () => {
@@ -125,9 +110,6 @@ describe("isDirect", () => {
     expect(summarize(base)).toContain("direct");
   });
 
-  // Regression: isDirect used to be `!== "relay"` on both fields, so the "unknown"
-  // sentinel returned before ICE nominates a pair reported as direct — rendering
-  // `direct (unknown)` and suppressing the relay warning on a possibly-relayed link.
   it("does not claim an unknown route is direct", () => {
     expect(isDirect({ ...base, candidateType: "unknown", remoteCandidateType: "unknown" })).toBe(false);
     expect(isDirect({ ...base, candidateType: "unknown" })).toBe(false);
@@ -157,14 +139,11 @@ describe("isDirect", () => {
       candidateType: "srflx",
       remoteCandidateType: "srflx",
       rttMs: 15,
-      availableOutgoingBitrate: 8_000_000,
       packetLossRatio: 0.045, // 4.5%
       outboundBitrate: 6_000_000,
       framesPerSecond: 60,
       frameWidth: 1920,
       frameHeight: 1080,
-      encoderImplementation: "NVENC",
-      jitterBufferDelayMs: 5,
     });
     expect(s).toContain("4.5% loss");
   });
@@ -185,7 +164,6 @@ describe("isDirect", () => {
             {
               type: "candidate-pair",
               currentRoundTripTime: Infinity,
-              availableOutgoingBitrate: NaN,
             },
           ],
           [
@@ -201,8 +179,6 @@ describe("isDirect", () => {
 
     const h = await new LinkMonitor(pc).read();
     expect(h?.rttMs).toBeNull();
-    expect(h?.availableOutgoingBitrate).toBeNull();
     expect(h?.framesPerSecond).toBeNull();
   });
 });
-

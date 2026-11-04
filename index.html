@@ -225,8 +225,7 @@
       #stage.has-focused .tile:not(.tile-focused) .tile-fit {
         display: none;
       }
-      .tile:fullscreen,
-      .tile:-webkit-full-screen {
+      .tile:fullscreen {
         width: 100% !important;
         height: 100% !important;
         max-width: none !important;
@@ -236,14 +235,12 @@
         aspect-ratio: auto !important;
         background: #000 !important;
       }
-      .tile:fullscreen video,
-      .tile:-webkit-full-screen video {
+      .tile:fullscreen video {
         width: 100% !important;
         height: 100% !important;
         object-fit: contain !important;
       }
-      .tile:fullscreen[data-fit="cover"] video,
-      .tile:-webkit-full-screen[data-fit="cover"] video {
+      .tile:fullscreen[data-fit="cover"] video {
         object-fit: cover !important;
       }
       .tile video {

@@ -1,6 +1,6 @@
 /**
  * Automated Launch & Smoke Check Script for Screenshare Electron App
- * 
+ *
  * Uses playwright-core to:
  * 1. Launch the Electron application.
  * 2. Wait for BrowserWindow load.
@@ -11,14 +11,9 @@
  */
 // @ts-nocheck
 
-// 
-
-
 import { _electron as electron } from 'playwright-core';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import fs from 'node:fs';
-import { execSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, '..');
@@ -36,14 +31,7 @@ async function runSmokeTest() {
   console.log('[smoke-test] Starting Electron Automated Smoke Check');
   console.log('[smoke-test] ========================================');
 
-  // Step 1: Ensure dist/ assets are built
-  const distIndexPath = path.join(projectRoot, 'dist', 'index.html');
-  if (!fs.existsSync(distIndexPath)) {
-    console.log('[smoke-test] dist/index.html not found. Building Vite assets...');
-    execSync('npm run build', { cwd: projectRoot, stdio: 'inherit' });
-  }
-
-  // Step 2: Resolve Electron executable path
+  // Resolve Electron executable path
   let executablePath = process.env.ELECTRON_EXEC_PATH;
   if (!executablePath) {
     try {
@@ -67,8 +55,6 @@ async function runSmokeTest() {
       ELECTRON_DEV: '0',
       NODE_ENV: 'test',
       SMOKE_TEST: '1',
-      // Test the locally built dist/ by default; SMOKE_REMOTE=1 tests the hosted site.
-      ...(process.env.SMOKE_REMOTE === '1' ? {} : { SCREENSHARE_LOCAL: '1' }),
     },
   };
 
@@ -76,12 +62,10 @@ async function runSmokeTest() {
   console.log('[smoke-test] Electron process launched successfully.');
 
   try {
-    // Step 3: Acquire first BrowserWindow
     console.log('[smoke-test] Waiting for BrowserWindow to open...');
     const window = await app.firstWindow();
     console.log('[smoke-test] BrowserWindow acquired.');
 
-    // Step 4: Register error monitoring
     window.on('console', (msg) => {
       const type = msg.type();
       const text = msg.text();
@@ -99,18 +83,15 @@ async function runSmokeTest() {
       pageErrors.push(message);
     });
 
-    // Step 5: Wait for DOM readiness
     await window.waitForLoadState('domcontentloaded');
     console.log('[smoke-test] DOMContentLoaded event received.');
 
-    // Step 6: Verify window title
     const windowTitle = await window.title();
     console.log(`[smoke-test] Window title: "${windowTitle}"`);
     if (!windowTitle.toLowerCase().includes('screenshare')) {
       throw new Error(`Expected title to contain "Screenshare", but got: "${windowTitle}"`);
     }
 
-    // Step 7: Verify required DOM elements
     const requiredElements = [
       { selector: '#display-name', name: 'Display Name Input' },
       { selector: '#room-code', name: 'Room Code Input' },
@@ -129,10 +110,8 @@ async function runSmokeTest() {
       }
     }
 
-    // Step 8: Verify interactive elements and inputs
     console.log('[smoke-test] Testing UI input interactions...');
 
-    // Test #room-code input
     await window.fill('#room-code', 'SMOKETST');
     const enteredRoom = await window.inputValue('#room-code');
     if (enteredRoom !== 'SMOKETST') {
@@ -140,14 +119,12 @@ async function runSmokeTest() {
     }
     await window.fill('#room-code', '');
 
-    // Test #display-name input
     await window.fill('#display-name', 'SmokeTester');
     const enteredName = await window.inputValue('#display-name');
     if (enteredName !== 'SmokeTester') {
       throw new Error(`Expected #display-name to contain "SmokeTester", got "${enteredName}"`);
     }
 
-    // Test button readiness
     await window.waitForSelector('#create', { state: 'visible', timeout: 5000 });
     const isCreateEnabled = await window.isEnabled('#create');
     if (!isCreateEnabled) {
@@ -159,7 +136,6 @@ async function runSmokeTest() {
       throw new Error('#share button is unexpectedly disabled.');
     }
 
-    // Step 9: Verify Preload contextBridge exposure
     const preloadInfo = await window.evaluate(() => {
       return {
         isElectron: Boolean(window.electronAPI?.isElectron),
@@ -168,22 +144,17 @@ async function runSmokeTest() {
     });
     console.log(`[smoke-test] Preload context check: isElectron=${preloadInfo.isElectron}, platform=${preloadInfo.platform}`);
 
-    // Step 10: Validate errors
     if (pageErrors.length > 0) {
       throw new Error(`Smoke test failed due to ${pageErrors.length} uncaught page error(s):\n${pageErrors.join('\n')}`);
     }
 
-    // Filter out benign external offline network warnings
+    // Filter out benign external warnings
     const fatalErrors = consoleErrors.filter((text) => {
       if (text.includes('favicon.ico')) return false;
       if (text.includes('stun:')) return false;
       if (text.includes('stun.cloudflare.com')) return false;
-      // Hosted site only: Cloudflare injects its Web Analytics beacon (an external script
-      // plus an inline loader) at the edge, and the site's own CSP blocks both. Harmless.
-      if (process.env.SMOKE_REMOTE === '1') {
-        if (text.includes('cloudflareinsights.com')) return false;
-        if (text.startsWith('Refused to execute inline script')) return false;
-      }
+      if (text.includes('cloudflareinsights.com')) return false;
+      if (text.startsWith('Refused to execute inline script')) return false;
       return true;
     });
 

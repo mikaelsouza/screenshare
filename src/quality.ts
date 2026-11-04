@@ -150,14 +150,11 @@ export interface LinkHealth {
   candidateType: string;      // "host" | "srflx" | "relay" | "prflx"
   remoteCandidateType: string;
   rttMs: number | null;
-  availableOutgoingBitrate: number | null;
   packetLossRatio: number | null;
   outboundBitrate: number | null;
   framesPerSecond: number | null;
   frameWidth: number | null;
   frameHeight: number | null;
-  encoderImplementation: string | null;
-  jitterBufferDelayMs: number | null;
 }
 
 /**
