@@ -111,4 +111,34 @@ describe("createPcmAudioTrack", () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(stopAudio).toHaveBeenCalledTimes(1);
   });
+
+  it("does not call stopAudio when an older replaced PCM track is stopped after a newer one is created", () => {
+    const unsub1 = vi.fn();
+    const unsub2 = vi.fn();
+    const stopAudio = vi.fn();
+    const teardowns: Array<() => void> = [];
+    const bridge = {
+      onAudioPcm: vi.fn().mockReturnValueOnce(unsub1).mockReturnValueOnce(unsub2),
+      stopAudio,
+    };
+    const deps = {
+      createTrack: (_ring: StereoRingBuffer, onTeardown: () => void) => {
+        teardowns.push(onTeardown);
+        return { kind: "audio" } as unknown as MediaStreamTrack;
+      },
+    };
+
+    createPcmAudioTrack(bridge, deps);
+    createPcmAudioTrack(bridge, deps);
+
+    // Stopping the older track unsubscribes its listener but leaves main-process capture running.
+    teardowns[0]!();
+    expect(unsub1).toHaveBeenCalledTimes(1);
+    expect(stopAudio).not.toHaveBeenCalled();
+
+    // Stopping the newest track stops main-process capture.
+    teardowns[1]!();
+    expect(unsub2).toHaveBeenCalledTimes(1);
+    expect(stopAudio).toHaveBeenCalledTimes(1);
+  });
 });

@@ -122,7 +122,8 @@ function setupMediaHandlers() {
 
   ipcMain.handle('audio:start-window', (event, sourceId) => {
     if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
-    const targetId = typeof sourceId === 'string' && sourceId ? sourceId : lastPickedSource?.id;
+    const targetId = lastPickedSource?.id;
+    if (typeof sourceId === 'string' && sourceId && sourceId !== targetId) return false;
     return Boolean(targetId && audioSession.startForWindow(targetId));
   });
 

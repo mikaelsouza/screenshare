@@ -35,7 +35,9 @@ export function createAudioSessionController(deps) {
   let mode = "off";
   /** @type {number | null} */
   let activePid = null;
+  let followWindowAudio = false;
 
+  /** Stop the currently active WASAPI loopback device, if any. */
   function stopDevice() {
     try {
       // Stryker disable next-line OptionalChaining: catch block swallows null TypeError when device is null
@@ -54,6 +56,7 @@ export function createAudioSessionController(deps) {
   function startForWindow(sourceId) {
     const pid = deps.resolvePid(sourceId);
     if (pid === null) return false;
+    followWindowAudio = true;
     if (activePid === pid) return true;
     stopDevice();
     try {
@@ -76,6 +79,7 @@ export function createAudioSessionController(deps) {
    */
   function startForSystem() {
     if (mode === "system") return true;
+    followWindowAudio = false;
     stopDevice();
     try {
       const next = deps.createCapture();
@@ -102,12 +106,14 @@ export function createAudioSessionController(deps) {
      * @returns {boolean}
      */
     switchWindow(sourceId) {
-      if (mode !== "window") return false;
+      if (!followWindowAudio) return false;
       return startForWindow(sourceId);
     },
 
+    /** Stop any active audio capture session and reset to "off". */
     stop() {
       stopDevice();
+      followWindowAudio = false;
       mode = "off";
       activePid = null;
     },

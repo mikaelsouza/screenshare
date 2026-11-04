@@ -635,6 +635,19 @@ describe("desktop WASAPI audio integration", () => {
     expect(result.stream.getTracks()).toEqual([video]);
   });
 
+  it("stops the captured video and main-process audio if audio setup throws after captureScreen", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, displayAudio } = makeDeps("window", true);
+    (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      throw new Error("AudioContext failed");
+    });
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    await expect(c.start(preset, "app")).rejects.toThrow("AudioContext failed");
+    expect(video.stopped).toBe(true);
+    expect(displayAudio!.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+  });
+
   it("supports captureAudioOnly for window and system via the WASAPI bridge, and falls back when absent", async () => {
     const bridge = makeAudioBridge();
     const { deps, pcmTrack } = makeDeps();

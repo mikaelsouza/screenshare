@@ -43,6 +43,7 @@ export class StereoRingBuffer {
     this.right = new Float32Array(capacity);
   }
 
+  /** Write interleaved planar left and right channel samples into the ring buffer. */
   write(leftIn: Float32Array, rightIn: Float32Array): void {
     const n = leftIn.length;
     for (let i = 0; i < n; i++) {
@@ -57,6 +58,7 @@ export class StereoRingBuffer {
     }
   }
 
+  /** Read up to `outLeft.length` stereo frames from the ring buffer, zero-filling on underrun. */
   read(outLeft: Float32Array, outRight: Float32Array): void {
     const len = outLeft.length;
     for (let i = 0; i < len; i++) {
@@ -123,9 +125,12 @@ const defaultPcmDeps: PcmTrackDeps = {
 /** ~150 ms of 48 kHz stereo buffer. */
 const RING_CAPACITY_FRAMES = 7_200;
 
+let latestPcmTrackToken: symbol | null = null;
+
 /**
  * Create a live MediaStreamTrack fed by `bridge.onAudioPcm`. Calling `track.stop()`
- * unsubscribes from PCM updates and tells the main process to stop capturing audio.
+ * unsubscribes from PCM updates and tells the main process to stop capturing audio
+ * if no newer PCM track has replaced this one.
  */
 export function createPcmAudioTrack(
   bridge: PcmAudioBridge,
@@ -133,6 +138,8 @@ export function createPcmAudioTrack(
 ): MediaStreamTrack {
   const ring = new StereoRingBuffer(RING_CAPACITY_FRAMES);
   let stopped = false;
+  const token = Symbol();
+  latestPcmTrackToken = token;
   const unsubscribe = bridge.onAudioPcm((bytes) => {
     const { left, right } = deinterleavePcm16Stereo(bytes);
     ring.write(left, right);
@@ -142,7 +149,7 @@ export function createPcmAudioTrack(
     if (stopped) return;
     stopped = true;
     unsubscribe();
-    bridge.stopAudio();
+    if (latestPcmTrackToken === token) bridge.stopAudio();
   };
 
   return deps.createTrack(ring, teardown);

@@ -79,6 +79,7 @@ const defaultDeps: ElectronCaptureDeps = {
   webCaptureAudioOnly: captureAudioOnly,
 };
 
+/** Check whether the preload bridge exposes all required WASAPI audio IPC methods. */
 function hasAudioBridge(
   api: FollowAPI,
 ): api is FollowAPI &
@@ -106,6 +107,7 @@ function buildDefaultAudioProvider(
   };
 }
 
+/** Create the Electron desktop capture controller with game-client following and WASAPI audio. */
 export function createElectronCaptureController(
   api: FollowAPI,
   cb: CaptureCallbacks,
@@ -196,7 +198,7 @@ export function createElectronCaptureController(
       // Subscribe first: the main process starts following as soon as the window is
       // picked, which can be before getDisplayMedia resolves here.
       unsubscribe = api.onFollowUpdate(handle);
-      let result: CaptureResult;
+      let result: CaptureResult | null = null;
       try {
         result = await deps.captureScreen(p, mode);
         const chosenAudio = await audioProvider(result, mode);
@@ -205,6 +207,8 @@ export function createElectronCaptureController(
           result.stream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
         }
       } catch (err) {
+        if (result) stopCapture(result);
+        api.stopAudio?.();
         release();
         throw err;
       }

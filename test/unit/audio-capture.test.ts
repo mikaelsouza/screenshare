@@ -137,6 +137,26 @@ describe("createAudioSessionController", () => {
     expect(session.switchWindow("window:10:0")).toBe(false);
     expect(devices).toHaveLength(1);
     expect(session.currentMode()).toBe("system");
+
+    session.startForWindow("window:10:0");
+    session.stop();
+    expect(session.switchWindow("window:20:0")).toBe(false);
+  });
+
+  it("retries switchWindow after a transient WASAPI failure during a window swap", () => {
+    const { session, createCapture, devices, sendPcm } = setup();
+    expect(session.startForWindow("window:10:0")).toBe(true);
+    createCapture.mockImplementationOnce(() => ({
+      start: vi.fn(() => { throw new Error("transient WASAPI error"); }),
+      startSystemAudio: vi.fn(),
+      stop: vi.fn(),
+    }));
+    expect(session.switchWindow("window:20:0")).toBe(false);
+    expect(session.currentMode()).toBe("off");
+    // Next poll tick retries switchWindow and recovers window audio.
+    expect(session.switchWindow("window:20:0")).toBe(true);
+    expect(session.currentMode()).toBe("window");
+    expect(devices.at(-1)!.start).toHaveBeenCalledWith(2000, sendPcm);
   });
 
   it("resets state and returns false if starting window or system capture throws", () => {
