@@ -65,7 +65,9 @@ function setupMediaHandlers() {
       });
     } catch (err) {
       console.error('[main] desktopCapturer.getSources failed:', err);
-      callback({});
+      // Electron's callback({}) rejects getDisplayMedia in the page, and also
+      // throws synchronously on the main-process stack.
+      try { callback({}); } catch {}
       return;
     }
 
@@ -75,11 +77,18 @@ function setupMediaHandlers() {
       settled = true;
       if (!source) {
         // Rejects getDisplayMedia, which the page treats as a cancelled pick.
-        callback({});
+        // Electron also throws "Video was requested, but no video stream was
+        // provided" synchronously here; inside setTimeout that would be uncaught.
+        try { callback({}); } catch {}
         return;
       }
       stopFollow();
-      callback({ video: source, audio: request.audioRequested ? 'loopback' : undefined });
+      try {
+        callback({ video: source, audio: request.audioRequested ? 'loopback' : undefined });
+      } catch (err) {
+        console.error('[main] setDisplayMediaRequestHandler callback failed:', err);
+        return;
+      }
       // The exception to "share what was picked": a game's lobby or game window is
       // followed between the two. See electron/follow.
       const match = matchProfile(source.name);
