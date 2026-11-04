@@ -20,6 +20,7 @@
     "test:worker": "vitest run --config vitest.workers.config.ts",
     "test:formal": "vitest run test/formal --config vitest.config.ts --passWithNoTests",
     "test:fuzz": "vitest run test/fuzz --config vitest.config.ts --passWithNoTests",
+    "test:mutate": "stryker run",
     "test:e2e": "npm run build && node --test --test-concurrency=1 test/e2e/*.test.mjs",
     "test": "npm run check && npm run test:unit && npm run test:worker",
     "test:all": "npm run test && npm run test:formal && npm run test:fuzz && npm run test:e2e",
@@ -32,6 +33,8 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.23.0",
     "@cloudflare/workers-types": "^5",
+    "@stryker-mutator/core": "^10.1.1",
+    "@stryker-mutator/vitest-runner": "^10.1.1",
     "@vitest/coverage-v8": "^4.1.12",
     "concurrently": "^9.1.2",
     "cross-env": "^7.0.3",

@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "packageManager": "npm",
+  "testRunner": "vitest",
+  "plugins": ["@stryker-mutator/vitest-runner"],
+  "tsconfigFile": "",
+  "mutate": [
+    "electron/follow/**/*.js",
+    "electron/picker.js",
+    "src/platform/**/*.ts",
+    "src/mesh.ts"
+  ],
+  "ignorePatterns": ["release/**", "dist/**", "reports/**", ".wrangler/**", ".stryker-tmp/**"],
+  "vitest": {
+    "configFile": "vitest.config.ts"
+  },
+  "reporters": ["html", "clear-text", "progress"],
+  "htmlReporter": {
+    "fileName": "reports/mutation/mutation.html"
+  },
+  "thresholds": {
+    "high": 80,
+    "low": 60,
+    "break": 60
+  },
+  "concurrency": 4,
+  "timeoutMS": 15000
+}

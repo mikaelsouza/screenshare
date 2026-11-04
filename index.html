@@ -440,6 +440,26 @@
       }
       #audio-chip[data-kind="warn"]::before { background: #fbbf24; }
       #audio-chip[data-kind="off"]::before { background: var(--text-secondary); }
+      /* Shown while the desktop app follows a game between its lobby and game windows. */
+      #follow-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.2rem 0.75rem;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        background: var(--bg-color);
+        font-size: 0.8rem;
+      }
+      #follow-chip::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent-color);
+        flex: none;
+      }
+      #follow-chip[data-kind="warn"]::before { background: #fbbf24; }
       #audio-chip button {
         padding: 0.2rem 0.6rem;
         font-size: 0.75rem;
@@ -547,6 +567,9 @@
       <span id="audio-chip" hidden>
         <span id="audio-chip-text"></span>
         <button type="button" id="audio-change">Change</button>
+      </span>
+      <span id="follow-chip" hidden>
+        <span id="follow-chip-text"></span>
       </span>
       <button type="button" id="mute-audio" style="display: none;">Mute audio</button>
       <span id="surface-warning" hidden>Sharing your whole screen: notifications and other windows are visible.</span>

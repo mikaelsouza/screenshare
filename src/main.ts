@@ -14,11 +14,8 @@ import {
 } from "@shared/protocol";
 import {
   captureAudioOnly,
-  captureScreen,
   isAudioMode,
-  onCaptureEnded,
   stopAudioSource,
-  stopCapture,
   systemAudioSupport,
   windowAudioSupport,
   DEFAULT_AUDIO_MODE,
@@ -30,6 +27,8 @@ import {
   type QualityPresetName,
 } from "./capture";
 import { Mesh } from "./mesh";
+import { createCaptureController } from "./platform";
+import type { EndReason, FollowState } from "./platform/types";
 import { DEFAULT_CODEC, type CodecName } from "./quality";
 import { SignalingClient } from "./signaling";
 import { LinkMonitor, isDirect, summarize } from "./stats";
@@ -54,6 +53,8 @@ const ui = {
   audioChip: el<HTMLElement>("audio-chip"),
   audioChipText: el<HTMLElement>("audio-chip-text"),
   audioChangeBtn: el<HTMLButtonElement>("audio-change"),
+  followChip: el<HTMLElement>("follow-chip"),
+  followChipText: el<HTMLElement>("follow-chip-text"),
   audioPrompt: el<HTMLElement>("audio-prompt"),
   audioPromptText: el<HTMLElement>("audio-prompt-text"),
   audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
@@ -73,7 +74,6 @@ const ui = {
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
 let capture: CaptureResult | null = null;
-let stopCaptureListener: (() => void) | null = null;
 /** A second, audio-only capture (picker #2) whose audio replaced the screen's own. */
 let audioSource: AudioSource | null = null;
 /** Survives audio swaps, so a new source doesn't unmute what the user muted. */
@@ -827,6 +827,12 @@ function currentAudioMode(): AudioMode {
 function audioDescription(): { text: string; kind: "ok" | "warn" | "off" } {
   if (audioLost) return { text: "Audio stopped: that window closed", kind: "warn" };
   if (!capture?.audio) return { text: "No audio", kind: "off" };
+  // The desktop app can only capture everything the PC plays (Electron's loopback).
+  if (captureController.kind === "electron") {
+    return currentAudioMode() === "app"
+      ? { text: "All system audio: the desktop app can't isolate one game yet", kind: "warn" }
+      : { text: "All system audio", kind: "ok" };
+  }
   if (audioSource) {
     return audioSource.kind === "window"
       ? { text: `Game audio: ${audioSource.label ?? "game window"}`, kind: "ok" }
@@ -952,6 +958,38 @@ async function chooseNoAudio(): Promise<void> {
   ui.audioPrompt.hidden = true;
 }
 
+/**
+ * Web or desktop capture, picked once at load. See src/platform for the boundary.
+ */
+const captureController = createCaptureController({
+  onEnded: (reason: EndReason) => {
+    void stopSharing().then(() => {
+      if (reason === "follow-ended") setStatus("The game closed, so sharing stopped.", "info");
+    });
+  },
+  onVideoTrackSwapped: async (track, stream) => {
+    if (!capture) return;
+    await mesh?.setVideoTrack(track);
+    renderSelfPreview(stream);
+  },
+  onFollowState: (state) => renderFollowChip(state),
+});
+
+/** The chip shown while the desktop app follows a game between its windows. */
+function renderFollowChip(state: FollowState | null): void {
+  if (!state) {
+    ui.followChip.hidden = true;
+    return;
+  }
+  ui.followChip.hidden = false;
+  ui.followChip.dataset["kind"] = state.role === "waiting" ? "warn" : "ok";
+  ui.followChipText.textContent =
+    state.role === "waiting"
+      ? `Following ${state.profile}: waiting for its next window…`
+      : `Following ${state.profile}: ${state.role === "game" ? "in game" : "lobby"}`;
+  ui.followChip.title = state.title ?? "";
+}
+
 /** Set for the whole of startSharing, including the await on the OS picker. */
 let sharingPending = false;
 
@@ -980,20 +1018,20 @@ async function startSharingInner(): Promise<void> {
   }
 
   const mode = currentAudioMode();
-  if (mode !== "none") {
+  // These checks are about the browser's picker; the desktop app has its own.
+  if (mode !== "none" && captureController.kind === "web") {
     const audio = mode === "app" ? windowAudioSupport() : systemAudioSupport();
     if (!audio.supported && audio.reason) setStatus(audio.reason, "warn");
   }
 
   try {
-    capture = await captureScreen(QUALITY_PRESETS[currentPreset()], mode);
+    capture = await captureController.start(QUALITY_PRESETS[currentPreset()], mode);
   } catch (err) {
     // Includes the user simply cancelling the picker, which isn't an error.
     console.warn("[main] capture cancelled or failed", err);
     return;
   }
 
-  stopCaptureListener = onCaptureEnded(capture, () => void stopSharing());
   if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
@@ -1022,18 +1060,25 @@ async function startSharingInner(): Promise<void> {
   // A whole-screen pick in "Game only" mode comes back silent on purpose; any other
   // pick that should have had audio but didn't (unticked, or the window has none)
   // gets the same offer, including the fallback to all system audio.
-  if (mode !== "none" && !capture.audio) {
+  // The second pick is a browser-only workaround; the desktop app has system audio.
+  if (mode !== "none" && !capture.audio && captureController.kind === "web") {
     showAudioPrompt(capture.surface === "monitor" && mode === "app" ? "screen" : "missing");
   }
 }
 
+/** Set while stopSharing awaits the mesh, so a second stop (e.g. the source ending) is a no-op. */
+let stoppingShare = false;
+
 async function stopSharing(): Promise<void> {
-  if (!capture) return;
-  stopCaptureListener?.();
-  stopCaptureListener = null;
-  await mesh?.setCapture(null);
-  stopCapture(capture);
-  capture = null;
+  if (!capture || stoppingShare) return;
+  stoppingShare = true;
+  try {
+    await mesh?.setCapture(null);
+  } finally {
+    captureController.stop();
+    capture = null;
+    stoppingShare = false;
+  }
   if (audioSource) stopAudioSource(audioSource);
   audioSource = null;
   audioLost = false;
@@ -1378,6 +1423,7 @@ function initQualityControls(): void {
     const name = ui.preset.value as QualityPresetName;
     if (!(name in QUALITY_PRESETS)) return;
     localStorage.setItem("preset", name);
+    captureController.setPreset(QUALITY_PRESETS[name]);
     void mesh?.setPreset(QUALITY_PRESETS[name]);
   });
 

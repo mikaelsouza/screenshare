@@ -322,6 +322,14 @@ class PeerLink {
     await this.audioSender?.replaceTrack(track);
   }
 
+  /**
+   * Swap the video being sent without renegotiating. The encoder settings and the
+   * bitrate adapter stay attached to the sender, so they carry over to the new track.
+   */
+  async replaceVideo(track: MediaStreamTrack): Promise<void> {
+    await this.videoSender?.replaceTrack(track);
+  }
+
   async detachCapture(): Promise<void> {
     this.adapter?.stop();
     this.adapter = null;
@@ -541,6 +549,17 @@ export class Mesh {
     if (!this.capture) return;
     this.capture.audio = track;
     await Promise.all([...this.links.values()].map((l) => l.replaceAudio(track)));
+  }
+
+  /**
+   * Swap the shared video for every peer, e.g. when the captured window is replaced
+   * by another one mid-share. Like setAudioTrack, it updates the capture too, so a
+   * peer who joins later is sent the current window rather than the original one.
+   */
+  async setVideoTrack(track: MediaStreamTrack): Promise<void> {
+    if (!this.capture) return;
+    this.capture.video = track;
+    await Promise.all([...this.links.values()].map((l) => l.replaceVideo(track)));
   }
 
   setViewing(peerId: PeerId, viewing: boolean): void {

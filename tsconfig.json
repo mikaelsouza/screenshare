@@ -10,6 +10,7 @@
     "skipLibCheck": true,
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "noEmit": true,
+    "allowJs": true,
     "paths": {
       "@shared/*": ["./shared/*"],
       "@src/*": ["./src/*"],
@@ -20,6 +21,8 @@
   "include": [
     "src/**/*.ts",
     "shared/**/*.ts",
+    "electron/follow/**/*.js",
+    "electron/picker.js",
     "test/unit/**/*.ts",
     "test/formal/**/*.ts",
     "test/fuzz/**/*.ts"

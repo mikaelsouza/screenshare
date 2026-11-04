@@ -279,6 +279,56 @@ describe("Mesh and PeerLink", () => {
     expect(pc.senders[1]!.track).toBeNull();
   });
 
+  it("swaps the video for every peer without renegotiating, and for late joiners", async () => {
+    const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addPeer("bob");
+    mesh.addPeer("carol");
+    const [bob, carol] = FakeRTCPeerConnection.instances;
+
+    const lobby = { kind: "video" } as unknown as MediaStreamTrack;
+    const capture: CaptureResult = {
+      stream: { getTracks: () => [lobby] } as unknown as MediaStream,
+      video: lobby,
+      audio: null,
+    };
+    await mesh.setCapture(capture);
+    const bobVideo = bob!.senders[0]!;
+    expect(bobVideo.track).toBe(lobby);
+
+    const game = { kind: "video" } as unknown as MediaStreamTrack;
+    await mesh.setVideoTrack(game);
+    expect(capture.video).toBe(game);
+    for (const pc of [bob!, carol!]) {
+      expect(pc.senders).toHaveLength(2);
+      expect(pc.senders[0]!.track).toBe(game);
+    }
+    // The same sender, so encoder settings and the bitrate adapter carry over.
+    expect(bob!.senders[0]).toBe(bobVideo);
+
+    mesh.addPeer("dave");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(FakeRTCPeerConnection.instances[2]!.senders[0]!.track).toBe(game);
+  });
+
+  it("survives a swap racing a peer who just joined, and sends that peer the new window", async () => {
+    const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    const lobby = { kind: "video" } as unknown as MediaStreamTrack;
+    await mesh.setCapture({ stream: { getTracks: () => [lobby] } as unknown as MediaStream, video: lobby, audio: null });
+    // The new link attaches the capture asynchronously; the swap lands first.
+    mesh.addPeer("dave");
+    const game = { kind: "video" } as unknown as MediaStreamTrack;
+    await expect(mesh.setVideoTrack(game)).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(FakeRTCPeerConnection.instances[0]!.senders[0]!.track).toBe(game);
+  });
+
+  it("ignores a video swap when not sharing", async () => {
+    const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addPeer("bob");
+    await mesh.setVideoTrack({ kind: "video" } as unknown as MediaStreamTrack);
+    expect(FakeRTCPeerConnection.instances[0]!.senders).toHaveLength(0);
+  });
+
   it("sends and handles view control messages via data channel", () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
     mesh.addPeer("aaron"); // alice is impolite, creates channel

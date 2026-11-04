@@ -1,5 +1,8 @@
 // @ts-nocheck
-import { app, BrowserWindow, session, desktopCapturer, shell } from 'electron';
+import { app, BrowserWindow, Menu, session, desktopCapturer, ipcMain, shell } from 'electron';
+import { matchProfile } from './follow/profiles.js';
+import { createFollower } from './follow/follower.js';
+import { buildPickerTemplate } from './picker.js';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,29 +52,57 @@ if (!gotTheLock) {
 }
 
 function setupMediaHandlers() {
-  // 1. Desktop capturer integration for navigator.mediaDevices.getDisplayMedia
-  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
-    desktopCapturer
-      .getSources({ types: ['screen', 'window'], fetchWindowIcons: true })
-      .then((sources) => {
-        if (!sources || sources.length === 0) {
-          callback({});
-          return;
-        }
-
-        // Prefer full screen display surface, fall back to first source
-        const primaryScreen = sources.find((s) => s.id.startsWith('screen:'));
-        const selectedSource = primaryScreen || sources[0];
-
-        callback({
-          video: selectedSource,
-          audio: request.audioRequested ? 'loopback' : undefined,
-        });
-      })
-      .catch((err) => {
-        console.error('[main] setDisplayMediaRequestHandler error:', err);
-        callback({});
+  // 1. getDisplayMedia: let the user pick a window or screen from a native menu,
+  //    as Chrome's own picker does on the web. Audio is Electron's loopback, i.e.
+  //    everything the PC plays: Electron cannot capture a single window's audio.
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    let sources;
+    try {
+      sources = await desktopCapturer.getSources({
+        types: ['window', 'screen'],
+        fetchWindowIcons: true,
+        thumbnailSize: { width: 0, height: 0 },
       });
+    } catch (err) {
+      console.error('[main] desktopCapturer.getSources failed:', err);
+      callback({});
+      return;
+    }
+
+    let settled = false;
+    const finish = (source) => {
+      if (settled) return;
+      settled = true;
+      if (!source) {
+        // Rejects getDisplayMedia, which the page treats as a cancelled pick.
+        callback({});
+        return;
+      }
+      stopFollow();
+      callback({ video: source, audio: request.audioRequested ? 'loopback' : undefined });
+      // The exception to "share what was picked": a game's lobby or game window is
+      // followed between the two. See electron/follow.
+      const match = matchProfile(source.name);
+      if (match) startFollow(match.profile, source);
+    };
+
+    const template = buildPickerTemplate(sources, finish, {
+      excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
+    });
+    if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
+      finish(null);
+      return;
+    }
+    Menu.buildFromTemplate(template).popup({
+      window: mainWindow,
+      // Runs when the menu closes, which on Windows can be before the clicked
+      // item's handler. Wait a moment so a real pick always wins over "cancelled".
+      callback: () => setTimeout(() => finish(null), 100),
+    });
+  });
+
+  ipcMain.on('follow:stop', (event) => {
+    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) stopFollow();
   });
 
   // 2. Permission request handler for display-capture & media (trusted origin only,
@@ -86,6 +117,54 @@ function setupMediaHandlers() {
     const allowed = permission === 'display-capture' || permission === 'media';
     return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL());
   });
+}
+
+// ---- game follow -----------------------------------------------------------
+
+/** How often the open windows are checked while following a game. */
+const FOLLOW_POLL_MS = 1000;
+
+/** The active follow, if any: { follower, timer }. */
+let follow = null;
+
+function sendFollowUpdate(profile, status) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('follow:update', { ...status, profile: profile.label });
+}
+
+function startFollow(profile, source) {
+  stopFollow();
+  const follower = createFollower(profile, { initial: source });
+  const state = { follower, timer: null, busy: false };
+  follow = state;
+  sendFollowUpdate(profile, follower.current());
+
+  // Polled here rather than in the page: the page's timers are throttled while the
+  // game covers its window, which is exactly when this has to keep running.
+  state.timer = setInterval(async () => {
+    if (state.busy) return;
+    state.busy = true;
+    try {
+      const windows = await desktopCapturer.getSources({
+        types: ['window'],
+        thumbnailSize: { width: 0, height: 0 },
+      });
+      if (follow !== state) return;
+      const status = follower.evaluate(windows);
+      if (!status) return;
+      sendFollowUpdate(profile, status);
+      if (status.role === 'ended') stopFollow();
+    } catch (err) {
+      console.error('[main] follow poll failed:', err);
+    } finally {
+      state.busy = false;
+    }
+  }, FOLLOW_POLL_MS);
+}
+
+function stopFollow() {
+  if (follow?.timer) clearInterval(follow.timer);
+  follow = null;
 }
 
 function isTrustedUrl(url) {
@@ -177,6 +256,7 @@ async function initApplication() {
   });
   mainWindow.on('closed', () => {
     clearTimeout(retryTimer);
+    stopFollow();
     mainWindow = null;
   });
 

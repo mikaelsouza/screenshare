@@ -14,3 +14,4 @@ coverage
 /mock-*.html
 /release/
 /reports/
+.stryker-tmp
