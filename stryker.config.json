@@ -6,6 +6,7 @@
   "tsconfigFile": "",
   "mutate": [
     "electron/follow/**/*.js",
+    "electron/audio/**/*.js",
     "electron/picker.js",
     "src/platform/**/*.ts",
     "src/mesh.ts"

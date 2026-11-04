@@ -38,12 +38,12 @@ export function menuLabel(name) {
  * @template {PickerSource} S
  * @param {readonly S[]} sources
  * @param {(source: S) => void} onPick
- * @param {{ excludeId?: string | null }} [options] `excludeId`: our own window.
+ * @param {{ excludeId?: string | null, windowsOnly?: boolean }} [options] `excludeId`: our own window.
  * @returns {PickerItem[]}
  */
-export function buildPickerTemplate(sources, onPick, { excludeId = null } = {}) {
+export function buildPickerTemplate(sources, onPick, { excludeId = null, windowsOnly = false } = {}) {
   const windows = sources.filter((s) => s.id.startsWith("window:") && s.id !== excludeId && s.name.trim() !== "");
-  const screens = sources.filter((s) => s.id.startsWith("screen:"));
+  const screens = windowsOnly ? [] : sources.filter((s) => s.id.startsWith("screen:"));
 
   /** @type {PickerItem[]} */
   const items = [];

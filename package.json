@@ -52,5 +52,9 @@
   },
   "overrides": {
     "sharp": "^0.35.4"
+  },
+  "dependencies": {
+    "koffi": "^3.3.6",
+    "loopback-capture": "^4.0.0"
   }
 }

@@ -13,7 +13,18 @@ export function createCaptureController(
   const onFollowUpdate = api?.onFollowUpdate;
   const stopFollow = api?.stopFollow;
   if (api?.isElectron && onFollowUpdate && stopFollow) {
-    return createElectronCaptureController({ onFollowUpdate, stopFollow }, cb);
+    return createElectronCaptureController(
+      {
+        onFollowUpdate,
+        stopFollow,
+        startWindowAudio: api.startWindowAudio,
+        pickWindowAudio: api.pickWindowAudio,
+        startSystemAudio: api.startSystemAudio,
+        stopAudio: api.stopAudio,
+        onAudioPcm: api.onAudioPcm,
+      },
+      cb,
+    );
   }
   return createWebCaptureController(cb);
 }
