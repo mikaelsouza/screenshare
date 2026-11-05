@@ -160,8 +160,8 @@ void describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
       await page.goto(BASE_URL);
       await page.evaluate((peerName) => localStorage.setItem("name", peerName), name);
       // A fresh load, not a same-document hash change: this is someone opening a link.
+      await page.goto("about:blank");
       await page.goto(`${BASE_URL}/#${ROOM}`);
-      await page.reload();
       await waitFor(page, () => document.getElementById("status")?.textContent?.includes("In room"), {
         label: `${name} to join from the link`,
       });
@@ -203,7 +203,7 @@ void describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
       { label: "viewer to receive a remote video track", timeout: 45_000 },
     );
 
-    // And the frames must actually decode — a track that never renders is not delivery.
+    // And the frames must actually decode â€” a track that never renders is not delivery.
     await waitFor(
       viewer,
       async () => {
@@ -232,7 +232,7 @@ void describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
   });
 
   // Regression: tiles relied on the `autoplay` attribute while unmuted, which Chrome
-  // blocks without a user gesture — a shared deep link produced a permanently black
+  // blocks without a user gesture â€” a shared deep link produced a permanently black
   // tile. This suite used to relax the autoplay policy, hiding exactly that.
   // skipcq: JS-0098
   void it("actually plays the received video, not just receives it", async () => {
@@ -247,7 +247,7 @@ void describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     );
     assert.equal(playing.paused, false, `video element is paused: ${JSON.stringify(playing)}`);
 
-    // currentTime must advance — a non-paused element that never renders is still broken.
+    // currentTime must advance â€” a non-paused element that never renders is still broken.
     const t0 = await viewer.evaluate(
       () => [...document.querySelectorAll<HTMLVideoElement>(".tile video")].find((videoEl) => videoEl.srcObject)?.currentTime ?? 0,
     );
