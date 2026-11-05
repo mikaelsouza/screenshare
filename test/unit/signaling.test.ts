@@ -725,7 +725,7 @@ describe("SignalingClient keepalive and session resumption", () => {
     winListeners["online"]?.();
     expect(FakeWebSocket.instances.length).toBe(2);
 
-    const ws2 = FakeWebSocket.instances[1]!;
+    const ws2 = FakeWebSocket.instances[1]!; // skipcq: JS-0339
     ws2.open();
     ws2.send = (data: string) => {
       if (data === "ping") throw new Error("Socket broken");
@@ -734,14 +734,14 @@ describe("SignalingClient keepalive and session resumption", () => {
     expect(FakeWebSocket.instances.length).toBe(3);
 
     // Trigger wakeup when lastReceivedAt > 65_000ms stale
-    const ws3 = FakeWebSocket.instances[2]!;
+    const ws3 = FakeWebSocket.instances[2]!; // skipcq: JS-0339
     ws3.open();
     vi.setSystemTime(Date.now() + 70_000);
     winListeners["online"]?.();
     expect(FakeWebSocket.instances.length).toBe(4);
 
     // Calling connect() explicitly while a reconnectTimer is pending clears the timer
-    const ws4 = FakeWebSocket.instances[3]!;
+    const ws4 = FakeWebSocket.instances[3]!; // skipcq: JS-0339
     ws4.open();
     ws4.serverClose(1006);
     c.connect();

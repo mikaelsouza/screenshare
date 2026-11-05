@@ -791,7 +791,7 @@ describe("negotiation recovery", () => {
     mesh.setMemberSharing("new-peer", true);
     expect(mesh.peers()).toContain("new-peer");
 
-    const pc = FakeRTCPeerConnection.instances[0]!;
+    const pc = FakeRTCPeerConnection.instances[0]!; // skipcq: JS-0339
     pc.onicecandidate?.({
       candidate: {
         candidate: "candidate:1 1 udp 1 127.0.0.1 9999 typ host",
@@ -809,7 +809,7 @@ describe("negotiation recovery", () => {
     const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
     mesh.addMember("zed", true);
     await mesh.setCapture(capture());
-    const pc = FakeRTCPeerConnection.instances[0]!;
+    const pc = FakeRTCPeerConnection.instances[0]!; // skipcq: JS-0339
     pc.signalingState = "stable";
 
     // When createOffer resolves after a remote offer was already answered (applyingOffer=false, signalingState="stable"),

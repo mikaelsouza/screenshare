@@ -124,6 +124,7 @@ export const MIN_PASSWORD_LENGTH = 8;
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.
  * Works in both Cloudflare Workers and modern browsers.
  */
+// skipcq: JS-0067
 export function generateRoomCode(): string {
   const alphabetLen = ROOM_CODE_ALPHABET.length;
   // Largest multiple of alphabetLen <= 256 (31 * 8 = 248)
