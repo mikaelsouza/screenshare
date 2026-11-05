@@ -66,7 +66,7 @@ describe("SignalingClient reconnection", () => {
   });
 
   // Regression: the client reconnected on every close, including the fatal 1008 the
-  // Durable Object sends for a full room — an unbounded reconnect/rejoin/reject loop,
+  // Durable Object sends for a full room â€” an unbounded reconnect/rejoin/reject loop,
   // each cycle a billable Worker request plus a DO wake-up.
   it("does not reconnect after a fatal 1008 close", () => {
     const c = new SignalingClient("ABCDEFGH", "alice", handlers());
@@ -343,7 +343,7 @@ describe("SignalingClient capacity refusals", () => {
   }
 
   it("retries a 1013 refusal rather than treating it as terminal", () => {
-    // Capacity is transient — usually a half-open socket the runtime has not reaped —
+    // Capacity is transient â€” usually a half-open socket the runtime has not reaped â€”
     // so a client refused for it must come back. 1008 would strand a user who did
     // nothing wrong, and a failed handshake (1006) would retry forever with no reason
     // ever shown.
@@ -420,7 +420,7 @@ describe("SignalingClient capacity refusals", () => {
     ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "bad-password", message: "This room needs a password" }) });
     ws.serverClose(1008);
     expect(h.onError).toHaveBeenCalledWith("bad-password", "This room needs a password");
-    // Reporting "closed" after the error replaced the explanation with "Connection closed…".
+    // Reporting "closed" after the error replaced the explanation with "Connection closedâ€¦".
     expect(h.onStatus).not.toHaveBeenCalledWith("closed");
   });
 
@@ -648,7 +648,7 @@ describe("SignalingClient keepalive and session resumption", () => {
     docListeners["visibilitychange"]?.();
     winListeners["online"]?.();
 
-    // Still only the single socket in-flight — handshake not aborted
+    // Still only the single socket in-flight â€” handshake not aborted
     expect(FakeWebSocket.instances.length).toBe(1);
     expect(ws1.readyState).toBe(0);
     c.close();
@@ -704,13 +704,48 @@ describe("SignalingClient keepalive and session resumption", () => {
     const ws1 = FakeWebSocket.instances[0]!;
     ws1.open();
 
+    // Send kick and lock commands while open
+    c.kick("00000000-0000-4000-8000-000000000001");
+    c.setLocked(true);
+    expect(JSON.parse(ws1.sent[1] ?? "{}")).toEqual({
+      t: "kick",
+      id: "00000000-0000-4000-8000-000000000001",
+    });
+    expect(JSON.parse(ws1.sent[2] ?? "{}")).toEqual({
+      t: "lock",
+      locked: true,
+    });
+
     // Mock send to throw on ping
     ws1.send = (data: string) => {
       if (data === "ping") throw new Error("Socket broken");
     };
 
-    vi.advanceTimersByTime(15_000);
+    // Trigger wakeup while ws1.send throws on PING
+    winListeners["online"]?.();
     expect(FakeWebSocket.instances.length).toBe(2);
+
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    ws2.send = (data: string) => {
+      if (data === "ping") throw new Error("Socket broken");
+    };
+    vi.advanceTimersByTime(15_000);
+    expect(FakeWebSocket.instances.length).toBe(3);
+
+    // Trigger wakeup when lastReceivedAt > 65_000ms stale
+    const ws3 = FakeWebSocket.instances[2]!;
+    ws3.open();
+    vi.setSystemTime(Date.now() + 70_000);
+    winListeners["online"]?.();
+    expect(FakeWebSocket.instances.length).toBe(4);
+
+    // Calling connect() explicitly while a reconnectTimer is pending clears the timer
+    const ws4 = FakeWebSocket.instances[3]!;
+    ws4.open();
+    ws4.serverClose(1006);
+    c.connect();
+    expect(FakeWebSocket.instances.length).toBe(5);
     c.close();
   });
 });

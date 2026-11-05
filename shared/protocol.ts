@@ -4,7 +4,7 @@
  * Upload cost is linear in room size and paid by the sharer's uplink: each viewer
  * receives one stream at the selected preset's maxBitrate (8 Mbps at the default
  * 1080p60, 6 Mbps for 1080p30/720p60). An 8-person room therefore needs ~56 Mbps up at
- * the default, and the 20-person cap ~152 Mbps — past ordinary home uplinks. Per-peer
+ * the default, and the 20-person cap ~152 Mbps â€” past ordinary home uplinks. Per-peer
  * bitrate adaptation (BitrateAdapter) and send-side pausing for unwatched tiles are what
  * keep the mesh viable at these sizes. The cap is where the mesh shape still holds;
  * beyond it an SFU is needed.
@@ -133,13 +133,10 @@ export function generateRoomCode(): string {
 
   while (code.length < ROOM_CODE_LENGTH) {
     crypto.getRandomValues(buffer);
-    for (let i = 0; i < buffer.length; i++) {
+    for (let i = 0; i < buffer.length && code.length < ROOM_CODE_LENGTH; i++) {
       const byte = buffer[i];
       if (byte !== undefined && byte < limit) {
         code += ROOM_CODE_ALPHABET.charAt(byte % alphabetLen);
-        if (code.length === ROOM_CODE_LENGTH) {
-          return code;
-        }
       }
     }
   }

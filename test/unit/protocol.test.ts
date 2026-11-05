@@ -169,7 +169,7 @@ describe("parseClientMessage", () => {
 
 describe("signal size limits", () => {
   // Unbounded, a joined peer could send a 1 MB sdp in a tight loop: every frame wakes
-  // the Durable Object and is forwarded verbatim to the victim's socket — amplification
+  // the Durable Object and is forwarded verbatim to the victim's socket â€” amplification
   // against a peer, plus unbounded object CPU and wall-clock billing.
   const sig = (data: unknown): unknown =>
     parseClientMessage(JSON.stringify({ t: "signal", to: P1, data }));
@@ -214,12 +214,13 @@ describe("parseClientMessage peer ids", () => {
 });
 
 describe("parseClientMessage join options", () => {
-  it("parses resume and sharing when valid booleans", () => {
+  it("parses hostToken, rejoinToken, resume and sharing when valid", () => {
     const parsed = parseClientMessage(
       JSON.stringify({
         t: "join",
         room: "ABCDEFGH",
         displayName: "alice",
+        hostToken: "host-tok-123",
         rejoinToken: "tok123",
         resume: true,
         sharing: true,
@@ -229,10 +230,24 @@ describe("parseClientMessage join options", () => {
       t: "join",
       room: "ABCDEFGH",
       displayName: "alice",
+      hostToken: "host-tok-123",
       rejoinToken: "tok123",
       resume: true,
       sharing: true,
     });
+  });
+
+  it("parses kick and lock messages and rejects invalid variants", () => {
+    expect(parseClientMessage(JSON.stringify({ t: "kick", id: P1 }))).toEqual({
+      t: "kick",
+      id: P1,
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "kick", id: "not-a-uuid" }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "lock", locked: true }))).toEqual({
+      t: "lock",
+      locked: true,
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "lock", locked: "yes" }))).toBeNull();
   });
 
   it("ignores non-boolean or false resume and sharing values", () => {

@@ -782,5 +782,54 @@ describe("negotiation recovery", () => {
     pc.connectionState = "disconnected";
     expect(mesh.hasConnectedLink("bob")).toBe(false);
   });
+
+  it("relays local ICE candidates and handles setMemberSharing for unknown peers", async () => {
+    const sent: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", opts, (to, data) => sent.push({ to, data }), cb());
+    await mesh.setCapture(capture());
+    // Calling setMemberSharing for a peer not yet in members adds them and connects
+    mesh.setMemberSharing("new-peer", true);
+    expect(mesh.peers()).toContain("new-peer");
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.onicecandidate?.({
+      candidate: {
+        candidate: "candidate:1 1 udp 1 127.0.0.1 9999 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+        usernameFragment: "ufrag",
+      } as RTCIceCandidate,
+    });
+    pc.onicecandidate?.({ candidate: null });
+    expect(sent.some((s) => s.to === "new-peer" && s.data.k === "ice")).toBe(true);
+  });
+
+  it("retries offer when signalingState changes during createOffer", async () => {
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("me", opts, (_to, d) => sent.push(d), cb());
+    mesh.addMember("zed", true);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.signalingState = "stable";
+
+    // When createOffer resolves after a remote offer was already answered (applyingOffer=false, signalingState="stable"),
+    // retryOffer schedules flushPendingOffer via setTimeout(..., 0).
+    let calls = 0;
+    const origCreateOffer = pc.createOffer.bind(pc);
+    pc.createOffer = vi.fn(async () => {
+      calls++;
+      if (calls === 1) {
+        await mesh.handleSignal("zed", { k: "offer", sdp: "v=0\r\n" });
+        pc.signalingState = "stable";
+      } else if (calls === 2) {
+        pc.signalingState = "have-local-offer";
+      }
+      return origCreateOffer();
+    });
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(sent.some((d) => d.k === "offer")).toBe(true);
+  });
 });
 
