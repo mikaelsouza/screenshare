@@ -1,0 +1,65 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+  path_filters:
+    - "!dist/**"
+    - "!release/**"
+    - "!reports/**"
+    - "!coverage/**"
+    - "!package-lock.json"
+    - "!flake.lock"
+  path_instructions:
+    - path: "worker/**/*.ts"
+      instructions: |
+        Focus on Cloudflare Workers and Durable Object correctness:
+        - Verify WebSocket Hibernation state consistency (`serializeAttachment` / `deserializeAttachment` and `ctx.getWebSockets()`).
+        - Check room capacity enforcement, password verification, and rate-limiting invariants.
+        - Ignore formatting, style, and unused-variable issues (handled by tsc, oxlint, knip, and DeepSource).
+    - path: "electron/**/*.{js,cjs,ts,cts}"
+      instructions: |
+        Focus on Electron security boundaries and native OS integration:
+        - Verify `contextIsolation`, `sandbox`, and IPC sender/argument validation between main and preload.
+        - Check Windows Koffi FFI calls, handle lifetimes, and native audio loopback resource cleanup on stop/error.
+        - Ignore stylistic preferences.
+    - path: "src/**/*.ts"
+      instructions: |
+        Focus on WebRTC mesh lifecycle, media track cleanup, and signaling state machines:
+        - Check for leaked `RTCPeerConnection`, `MediaStreamTrack`, `AudioContext`, or event listeners on disconnect/reconnect.
+        - Verify browser autoplay, CSP/Trusted Types compliance, and SDP munging edge cases.
+        - Ignore formatting, naming conventions, and minor stylistic issues.
+    - path: "shared/**/*.ts"
+      instructions: |
+        Focus on wire-protocol backward compatibility, runtime message validation, and bounds checking on untrusted signaling payloads.
+    - path: ".github/workflows/*.yml"
+      instructions: |
+        Verify that all third-party GitHub Actions are pinned to full 40-character commit SHAs (never mutable tags), permissions follow least privilege, and untrusted PR inputs are never interpolated into `run:` scripts.
+  tools:
+    biome:
+      enabled: false
+    eslint:
+      enabled: false
+    oxc:
+      enabled: false
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+
+chat:
+  auto_reply: true

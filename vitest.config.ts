@@ -14,8 +14,14 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       include: ["shared/**/*.ts", "src/**/*.ts", "worker/ratelimit.ts"],
-      exclude: ["src/main.ts"],
-      reporter: ["text", "json", "html"],
+      exclude: ["src/main.ts", "src/platform/types.ts"],
+      reporter: ["text", "json", "html", "lcov"],
+      thresholds: {
+        statements: 93,
+        branches: 88,
+        functions: 92,
+        lines: 94,
+      },
     },
   },
   resolve: {

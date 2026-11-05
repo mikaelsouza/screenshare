@@ -11,6 +11,9 @@
     "scripts/**/*.{js,mjs}",
     "test/**/*.{js,ts,mjs}"
   ],
+  "rules": {
+    "cycles": "error"
+  },
   "vitest": {
     "config": [
       "vitest.config.ts",

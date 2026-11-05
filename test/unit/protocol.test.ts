@@ -163,7 +163,7 @@ describe("parseClientMessage", () => {
       JSON.stringify({ t: "signal", to: P1, data: { k: "ice", candidate: null } }),
       JSON.stringify({ t: "signal", to: P1, data: [] }),
     ];
-    for (const raw of bad) expect(parseClientMessage(raw), raw).toBeNull();
+    for (const raw of bad) expect(parseClientMessage(raw)).toBeNull();
   });
 });
 

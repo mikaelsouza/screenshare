@@ -1,0 +1,41 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc",
+    "import",
+    "promise",
+    "node",
+    "vitest"
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    "eqeqeq": "error",
+    "no-debugger": "error",
+    "no-self-compare": "error",
+    "no-template-curly-in-string": "error",
+    "no-unreachable": "error",
+    "no-unused-vars": "error",
+    "no-constant-condition": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-unsafe-function-type": "error",
+    "typescript/no-wrapper-object-types": "error",
+    "typescript/prefer-as-const": "error",
+    "vitest/expect-expect": "error",
+    "vitest/valid-expect": "error",
+    "unicorn/no-useless-spread": "allow",
+    "vitest/require-mock-type-parameters": "allow",
+    "vitest/no-conditional-expect": "allow"
+  },
+  "overrides": [
+    {
+      "files": ["src/main.ts"],
+      "rules": {
+        "typescript/no-explicit-any": "allow"
+      }
+    }
+  ]
+}
