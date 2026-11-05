@@ -330,6 +330,7 @@ describe("BitrateAdapter", () => {
     adapter.start(100);
     adapter.stop();
     adapter.stop(); // idempotent
+    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
   });
 
   it("handles incomplete or non-advancing stats in sampleLossRatio", async () => {

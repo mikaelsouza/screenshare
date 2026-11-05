@@ -48,8 +48,8 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
 
     for (const payload of pollutionPayloads) {
       expect(() => parseClientMessage(payload)).not.toThrow();
-      expect((Object.prototype as any).polluted).toBeUndefined();
-      expect((Object.prototype as any).isAdmin).toBeUndefined();
+      expect((Object.prototype as Record<string, unknown>).polluted).toBeUndefined();
+      expect((Object.prototype as Record<string, unknown>).isAdmin).toBeUndefined();
     }
 
     fc.assert(
@@ -64,7 +64,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
           const serialized = JSON.stringify(evilObj);
 
           expect(() => parseClientMessage(serialized)).not.toThrow();
-          expect((Object.prototype as any)[key]).toBeUndefined();
+          expect((Object.prototype as Record<string, unknown>)[key]).toBeUndefined();
           return true;
         }
       ),

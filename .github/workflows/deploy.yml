@@ -1,7 +1,9 @@
 name: Deploy to Cloudflare Workers
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches:
       - main
 
@@ -12,6 +14,7 @@ permissions:
 
 jobs:
   deploy:
+    if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' }}
     runs-on: ubuntu-latest
     # No `environment:` here. Environments (scoped secrets, branch restrictions) need
     # GitHub Pro for a private repository; on the Free plan they cannot be configured,
@@ -24,6 +27,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
 
       - name: Setup Node.js
@@ -34,16 +38,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
-
-      - name: Run checks and tests
-        run: |
-          npm run check
-          npm run test:unit
-          # The Durable Object suite runs in real workerd and is the only thing
-          # covering room capacity, password enforcement and hibernation. Leaving it
-          # out of CI meant a regression in worker/room.ts could ship to production
-          # with a fully green pipeline.
-          npm run test:worker
 
       - name: Build static assets
         run: npm run build

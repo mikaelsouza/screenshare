@@ -458,6 +458,7 @@ describe("Mesh and PeerLink", () => {
     // Throw on setParameters
     const sender = pc.senders[0]!;
     sender.setParameters = vi.fn().mockRejectedValue(new Error("setParameters failure"));
+    expect(ch.send).toHaveBeenCalled();
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
   });
 
@@ -476,6 +477,7 @@ describe("Mesh and PeerLink", () => {
 
     // Negotiation failure handling
     pc.createOffer = vi.fn().mockRejectedValue(new Error("offer creation failed"));
+    expect(pc.dataChannels).toBeDefined();
     pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 20));
   });
