@@ -560,16 +560,16 @@ describe("desktop WASAPI audio integration", () => {
     const { deps } = makeDeps();
     expect(createElectronCaptureController(full, callbacks(), deps).hasPerAppAudio).toBe(true);
     expect(
-      createElectronCaptureController({ ...full, startWindowAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ startWindowAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, startSystemAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ startSystemAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, stopAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ stopAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, onAudioPcm: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ onAudioPcm: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
   });
 
@@ -670,7 +670,7 @@ describe("desktop WASAPI audio integration", () => {
     bridge.pickWindowAudio.mockResolvedValueOnce({ ok: false, label: null });
     expect(await c.captureAudioOnly("window")).toBeNull();
 
-    const noPickBridge = { ...bridge, pickWindowAudio: undefined };
+    const { pickWindowAudio: _unusedPickWindowAudio, ...noPickBridge } = bridge;
     expect(await createElectronCaptureController(noPickBridge, callbacks(), deps).captureAudioOnly("window")).toBeNull();
 
     (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockClear();

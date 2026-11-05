@@ -36,9 +36,9 @@ export const FOLLOW_PROFILES: readonly FollowProfile[] = [
  * The role a window plays in one profile, or null if it is not one of its windows.
  */
 export function roleIn(profile: FollowProfile, title: string): WindowRole | null {
-  const t = title.trim();
-  if (profile.gameTitles.includes(t)) return "game";
-  if (profile.lobbyTitles.includes(t)) return "lobby";
+  const trimmedTitle = title.trim();
+  if (profile.gameTitles.includes(trimmedTitle)) return "game";
+  if (profile.lobbyTitles.includes(trimmedTitle)) return "lobby";
   return null;
 }
 

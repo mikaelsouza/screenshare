@@ -8,7 +8,7 @@ export interface PickerSource {
   /** "window:…" or "screen:…", as desktopCapturer reports. */
   id: string;
   name: string;
-  appIcon?: { isEmpty(): boolean; resize(o: { width: number; height: number }): unknown } | null | undefined;
+  appIcon?: { isEmpty(): boolean; resize(options: { width: number; height: number }): unknown } | null;
 }
 
 export interface PickerItem {
@@ -26,8 +26,8 @@ const MAX_LABEL = 60;
  * Long titles are cut so the menu stays a sensible width.
  */
 export function menuLabel(name: string): string {
-  const t = name.trim();
-  const short = t.length > MAX_LABEL ? `${t.slice(0, MAX_LABEL - 1)}…` : t;
+  const trimmedName = name.trim();
+  const short = trimmedName.length > MAX_LABEL ? `${trimmedName.slice(0, MAX_LABEL - 1)}…` : trimmedName;
   return short.replace(/&/g, "&&");
 }
 

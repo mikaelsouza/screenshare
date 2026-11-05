@@ -40,16 +40,16 @@ export interface ElectronAPI {
   readonly version: string;
   onFollowUpdate?: (cb: (update: FollowUpdate) => void) => () => void;
   stopFollow?: () => void;
-  startWindowAudio?: ((sourceId?: string) => Promise<boolean>) | undefined;
-  pickWindowAudio?: (() => Promise<{ ok: boolean; label: string | null }>) | undefined;
-  startSystemAudio?: (() => Promise<boolean>) | undefined;
-  stopAudio?: (() => void) | undefined;
-  onAudioPcm?: ((cb: (pcm: Uint8Array) => void) => () => void) | undefined;
+  startWindowAudio?: (sourceId?: string) => Promise<boolean>;
+  pickWindowAudio?: () => Promise<{ ok: boolean; label: string | null }>;
+  startSystemAudio?: () => Promise<boolean>;
+  stopAudio?: () => void;
+  onAudioPcm?: (cb: (pcm: Uint8Array) => void) => () => void;
 }
 
 declare global {
   interface Window {
-    electronAPI?: ElectronAPI | undefined;
+    electronAPI?: ElectronAPI;
   }
 }
 

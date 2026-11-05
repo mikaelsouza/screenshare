@@ -696,6 +696,39 @@ describe("SignalingClient keepalive and session resumption", () => {
     c.close();
   });
 
+  it("supports kick, setLocked, connect during pending reconnect, and wakeup edge cases", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }) });
+
+    c.kick("00000000-0000-4000-8000-000000000000");
+    c.setLocked(true);
+    expect(JSON.parse(ws1.sent[1]!)).toEqual({ t: "kick", id: "00000000-0000-4000-8000-000000000000" });
+    expect(JSON.parse(ws1.sent[2]!)).toEqual({ t: "lock", locked: true });
+
+    // Wakeup when lastReceivedAt > 65s ago while socket still OPEN
+    vi.setSystemTime(Date.now() + 70_000);
+    winListeners["online"]?.();
+    expect(FakeWebSocket.instances.length).toBe(2);
+    const wsMid = FakeWebSocket.instances[1]!;
+    wsMid.open();
+    wsMid.send = () => {
+      throw new Error("broken");
+    };
+    winListeners["online"]?.();
+    expect(FakeWebSocket.instances.length).toBe(3);
+
+    // Calling connect() while reconnectTimer is pending clears reconnectTimer
+    const wsLast = FakeWebSocket.instances[2]!;
+    wsLast.open();
+    wsLast.serverClose(1006);
+    c.connect();
+    expect(FakeWebSocket.instances.length).toBe(4);
+    c.close();
+  });
+
   it("reconnects immediately when ws.send(PING) throws an exception", () => {
     const c = new SignalingClient("ABCDEFGH", "alice", handlers());
     c.connect();

@@ -4,6 +4,7 @@ import {
   QUALITY_PRESETS,
   captureAudioOnly,
   captureScreen,
+  isAudioMode,
   onCaptureEnded,
   stopAudioSource,
   stopCapture,
@@ -14,6 +15,9 @@ import {
 describe("QUALITY_PRESETS", () => {
   it("defines standard resolution and framerate presets", () => {
     expect(DEFAULT_PRESET).toBe("1080p60");
+    expect(isAudioMode("app")).toBe(true);
+    expect(isAudioMode("invalid")).toBe(false);
+    expect(isAudioMode(null)).toBe(false);
     expect(QUALITY_PRESETS["1080p60"]).toEqual({
       label: "1080p 60fps",
       width: 1920,

@@ -132,13 +132,10 @@ export function generateRoomCode(): string {
 
   while (code.length < ROOM_CODE_LENGTH) {
     crypto.getRandomValues(buffer);
-    for (let i = 0; i < buffer.length; i++) {
+    for (let i = 0; i < buffer.length && code.length < ROOM_CODE_LENGTH; i++) {
       const byte = buffer[i];
       if (byte !== undefined && byte < limit) {
         code += ROOM_CODE_ALPHABET.charAt(byte % alphabetLen);
-        if (code.length === ROOM_CODE_LENGTH) {
-          return code;
-        }
       }
     }
   }

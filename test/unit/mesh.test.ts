@@ -765,6 +765,36 @@ describe("negotiation recovery", () => {
     expect(r.playoutDelayHint).toBe(0.15);
   });
 
+  it("adds unknown member on setMemberSharing and retries offer on glare during createOffer", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("alice", opts, (to, data) => signals.push({ to, data }), cb());
+    mesh.setMemberSharing("bob", true);
+    await mesh.setCapture(capture());
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.onicecandidate?.({
+      candidate: { candidate: "cand1", sdpMid: "0", sdpMLineIndex: 0, usernameFragment: "u1" } as RTCIceCandidate,
+    });
+    expect(signals.some((s) => s.data.k === "ice")).toBe(true);
+
+    // Glare during createOffer where remote offer arrived & settled while createOffer was pending
+    let resolveOffer!: (d: RTCSessionDescriptionInit) => void;
+    let firstOffer = true;
+    pc.createOffer = (): Promise<RTCSessionDescriptionInit> => {
+      if (firstOffer) {
+        firstOffer = false;
+        return new Promise<RTCSessionDescriptionInit>((r) => {
+          resolveOffer = r;
+        });
+      }
+      return Promise.resolve({ type: "offer", sdp: "v=0\r\n" });
+    };
+    pc.onnegotiationneeded?.();
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    pc.signalingState = "stable";
+    resolveOffer({ type: "offer", sdp: "v=0\r\n" });
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
   it("exposes hasConnectedLink based on connectionState", async () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);
