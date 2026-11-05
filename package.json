@@ -5,6 +5,9 @@
   "author": "Screenshare Team",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
   "main": "dist-electron/main.js",
   "scripts": {
     "dev": "vite",
