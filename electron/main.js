@@ -156,7 +156,7 @@ function setupMediaHandlers() {
           resolve({ ok: false, label: null });
           return;
         }
-        const ok = audioSession.startForWindow(picked.id);
+        const ok = audioSession.startForWindow(picked.id, { follow: false });
         resolve({ ok, label: ok ? picked.name : null });
       };
       const template = buildPickerTemplate(sources, finish, {

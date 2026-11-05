@@ -141,6 +141,12 @@ describe("createAudioSessionController", () => {
     session.startForWindow("window:10:0");
     session.stop();
     expect(session.switchWindow("window:20:0")).toBe(false);
+
+    // An audio-only window pick ({ follow: false }) disables game-follow audio switching.
+    expect(session.startForWindow("window:10:0")).toBe(true);
+    expect(session.startForWindow("window:20:0", { follow: false })).toBe(true);
+    expect(session.switchWindow("window:10:0")).toBe(false);
+    expect(session.currentMode()).toBe("window");
   });
 
   it("retries switchWindow after a transient WASAPI failure during a window swap", () => {

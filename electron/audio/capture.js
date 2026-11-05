@@ -51,12 +51,13 @@ export function createAudioSessionController(deps) {
   /**
    * Capture only the process tree that owns `sourceId`.
    * @param {string} sourceId
+   * @param {{ follow?: boolean }} [options]
    * @returns {boolean}
    */
-  function startForWindow(sourceId) {
+  function startForWindow(sourceId, { follow = true } = {}) {
     const pid = deps.resolvePid(sourceId);
     if (pid === null) return false;
-    followWindowAudio = true;
+    followWindowAudio = follow;
     if (activePid === pid) return true;
     stopDevice();
     try {
