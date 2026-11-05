@@ -7,10 +7,11 @@ on:
     branches:
       - main
 
-# Least privilege for the built-in token: this job only reads the repository. The
-# Cloudflare deploy uses its own API token, not GITHUB_TOKEN.
+# Least privilege for the built-in token: this job reads the repository and checks
+# workflow run statuses. The Cloudflare deploy uses its own API token, not GITHUB_TOKEN.
 permissions:
   contents: read
+  actions: read
 
 # Serialize production deployments so two pushes to main never race, and never cancel
 # an in-flight Cloudflare deployment halfway through.
@@ -36,15 +37,38 @@ jobs:
           ref: main
           persist-credentials: false
 
-      - name: Verify workflow_run SHA matches current main tip
+      - name: Verify CI and CodeQL passed for current main tip
         env:
-          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           CURRENT_MAIN_SHA="$(git rev-parse HEAD)"
-          if [ "$CURRENT_MAIN_SHA" != "$WORKFLOW_RUN_SHA" ]; then
-            echo "::error::Skipping stale deployment: workflow_run SHA ($WORKFLOW_RUN_SHA) is behind current main ($CURRENT_MAIN_SHA)."
-            exit 1
-          fi
+          echo "Verifying CI and CodeQL status for main tip: $CURRENT_MAIN_SHA"
+
+          for WORKFLOW_FILE in "ci.yml" "codeql.yml"; do
+            ATTEMPTS=0
+            while true; do
+              RUN_JSON="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$CURRENT_MAIN_SHA&per_page=1")"
+              STATUS="$(printf '%s' "$RUN_JSON" | jq -r '.workflow_runs[0].status // "missing"')"
+              CONCLUSION="$(printf '%s' "$RUN_JSON" | jq -r '.workflow_runs[0].conclusion // "null"')"
+
+              if [ "$STATUS" = "completed" ]; then
+                if [ "$CONCLUSION" = "success" ]; then
+                  echo "$WORKFLOW_FILE succeeded for $CURRENT_MAIN_SHA."
+                  break
+                fi
+                echo "::error::$WORKFLOW_FILE completed with conclusion '$CONCLUSION' for $CURRENT_MAIN_SHA."
+                exit 1
+              fi
+
+              ATTEMPTS=$((ATTEMPTS + 1))
+              if [ "$ATTEMPTS" -ge 60 ]; then
+                echo "::error::Timed out waiting for $WORKFLOW_FILE on $CURRENT_MAIN_SHA (last status: $STATUS)."
+                exit 1
+              fi
+              sleep 10
+            done
+          done
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0

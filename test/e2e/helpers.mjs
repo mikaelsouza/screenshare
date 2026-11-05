@@ -16,7 +16,7 @@ export async function startServer(port) {
   const proc = spawn(
     cmd,
     ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--log-level", "warn"],
-    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32" },
+    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32", detached: process.platform !== "win32" },
   );
   let log = "";
   proc.stdout.on("data", (d) => { log += d; });
@@ -43,9 +43,12 @@ export async function stopServer(server) {
       await new Promise((r) => killer.on("close", r));
     } catch {}
   } else {
-    server.proc.kill("SIGTERM");
+    try { process.kill(-server.proc.pid, "SIGTERM"); } catch {}
     await new Promise((r) => setTimeout(r, 300));
-    if (server.proc.exitCode === null) server.proc.kill("SIGKILL");
+    if (server.proc.exitCode === null) { try { process.kill(-server.proc.pid, "SIGKILL"); } catch {} }
+    server.proc.stdout?.destroy();
+    server.proc.stderr?.destroy();
+    server.proc.unref();
   }
 }
 
