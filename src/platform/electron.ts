@@ -1,5 +1,5 @@
 /**
- * Desktop capture. The picker lives in the Electron main process (electron/main.js),
+ * Desktop capture. The picker lives in the Electron main process (electron/main.ts),
  * and getDisplayMedia goes through it, so starting a share works as on the web.
  *
  * Audio rules in the desktop app (when the WASAPI audio bridge is present):
@@ -30,11 +30,13 @@ import type {
 } from "./types";
 
 /** The parts of window.electronAPI this controller uses. */
-export type FollowAPI = Required<Pick<ElectronAPI, "onFollowUpdate" | "stopFollow">> &
-  Pick<
-    ElectronAPI,
-    "startWindowAudio" | "pickWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm"
-  >;
+export type FollowAPI = {
+  onFollowUpdate: NonNullable<ElectronAPI["onFollowUpdate"]>;
+  stopFollow: NonNullable<ElectronAPI["stopFollow"]>;
+} & Pick<
+  ElectronAPI,
+  "startWindowAudio" | "pickWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm"
+>;
 
 export interface ElectronCaptureDeps {
   captureScreen: (preset: QualityPreset, mode: AudioMode) => Promise<CaptureResult>;
@@ -43,7 +45,7 @@ export interface ElectronCaptureDeps {
   makeStream: (tracks: MediaStreamTrack[]) => MediaStream;
   createPcmTrack: (bridge: PcmAudioBridge) => MediaStreamTrack;
   webCaptureAudioOnly: (kind: "window" | "system") => Promise<AudioSource | null>;
-  audioSource?: AudioSourceProvider;
+  audioSource?: AudioSourceProvider | undefined;
 }
 
 /** Electron's (Chromium's) desktop-source constraints. Not in TypeScript's DOM lib. */
@@ -63,7 +65,9 @@ async function captureDesktopSource(sourceId: string, preset: QualityPreset): Pr
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   const track = stream.getVideoTracks()[0];
   if (!track) {
-    stream.getTracks().forEach((t) => t.stop());
+    stream.getTracks().forEach((t) => {
+      t.stop();
+    });
     throw new Error(`no video track for source ${sourceId}`);
   }
   // Same reason as captureScreen: games want framerate over per-frame sharpness.
@@ -82,8 +86,12 @@ const defaultDeps: ElectronCaptureDeps = {
 /** Check whether the preload bridge exposes all required WASAPI audio IPC methods. */
 function hasAudioBridge(
   api: FollowAPI,
-): api is FollowAPI &
-  Required<Pick<ElectronAPI, "startWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm">> {
+): api is FollowAPI & {
+  startWindowAudio: NonNullable<ElectronAPI["startWindowAudio"]>;
+  startSystemAudio: NonNullable<ElectronAPI["startSystemAudio"]>;
+  stopAudio: NonNullable<ElectronAPI["stopAudio"]>;
+  onAudioPcm: NonNullable<ElectronAPI["onAudioPcm"]>;
+} {
   return Boolean(api.startWindowAudio && api.startSystemAudio && api.stopAudio && api.onAudioPcm);
 }
 

@@ -33,8 +33,11 @@ interface Sample {
  */
 export class LinkMonitor {
   private prev: Sample | null = null;
+  private readonly pc: RTCPeerConnection;
 
-  constructor(private readonly pc: RTCPeerConnection) {}
+  constructor(pc: RTCPeerConnection) {
+    this.pc = pc;
+  }
 
   async read(): Promise<LinkHealth | null> {
     let report: RTCStatsReport;

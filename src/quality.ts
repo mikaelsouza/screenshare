@@ -169,12 +169,18 @@ export class BitrateAdapter {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastPacketsSent = 0;
   private lastPacketsLost = 0;
+  private readonly sender: RTCRtpSender;
+  private readonly preset: QualityPreset;
+  private readonly floor: number;
 
   constructor(
-    private readonly sender: RTCRtpSender,
-    private readonly preset: QualityPreset,
-    private readonly floor = 1_500_000,
+    sender: RTCRtpSender,
+    preset: QualityPreset,
+    floor = 1_500_000,
   ) {
+    this.sender = sender;
+    this.preset = preset;
+    this.floor = floor;
     this.current = preset.maxBitrate;
   }
 

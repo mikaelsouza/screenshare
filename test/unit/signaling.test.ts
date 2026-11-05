@@ -15,8 +15,10 @@ class FakeWebSocket {
   onclose: ((ev: { code: number }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
+  readonly url: string;
 
-  constructor(readonly url: string) {
+  constructor(url: string) {
+    this.url = url;
     FakeWebSocket.instances.push(this);
   }
   send(data: string): void { this.sent.push(data); }
@@ -270,7 +272,7 @@ describe("SignalingClient reconnection", () => {
     // Opening ws2 works properly
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect(JSON.parse(ws2.sent[0]!).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
 
     c.close();
   });
@@ -308,7 +310,7 @@ describe("SignalingClient reconnection", () => {
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect(JSON.parse(ws2.sent[0]!).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
 
     // Server close triggers reconnect because closedByUs was reset
     ws2.serverClose(1006);
@@ -405,7 +407,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect(JSON.parse(ws2.sent[0]!).hostToken).toBe("tok");
+    expect((JSON.parse(ws2.sent[0]!) as { hostToken?: string }).hostToken).toBe("tok");
     c.close();
   });
 
@@ -438,7 +440,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect(JSON.parse(ws2.sent[0]!).rejoinToken).toBe("r1");
+    expect((JSON.parse(ws2.sent[0]!) as { rejoinToken?: string }).rejoinToken).toBe("r1");
     c.close();
   });
 });
@@ -500,7 +502,7 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    const joinMsg = JSON.parse(ws2.sent[0]!);
+    const joinMsg = JSON.parse(ws2.sent[0]!) as { resume?: boolean; sharing?: boolean };
     expect(joinMsg.resume).toBe(true);
     expect(joinMsg.sharing).toBe(true);
     c.close();
@@ -617,9 +619,9 @@ describe("SignalingClient keepalive and session resumption", () => {
 
     // Total sent on ws2 = 1 (join) + 64 (flushed FIFO items, dropped first 6)
     expect(ws2.sent.length).toBe(65);
-    const firstSent = JSON.parse(ws2.sent[1]!);
+    const firstSent = JSON.parse(ws2.sent[1]!) as { data: { candidate: { candidate: string } } };
     expect(firstSent.data.candidate.candidate).toBe("cand-6");
-    const lastSent = JSON.parse(ws2.sent[64]!);
+    const lastSent = JSON.parse(ws2.sent[64]!) as { data: { candidate: { candidate: string } } };
     expect(lastSent.data.candidate.candidate).toBe("cand-69");
     c.close();
   });

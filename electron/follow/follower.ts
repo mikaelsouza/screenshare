@@ -1,4 +1,3 @@
-// @ts-check
 /**
  * Follows one game between its lobby window and its game window.
  *
@@ -12,27 +11,32 @@
  *    other opens) until profile.graceMs has passed, and then "ended".
  */
 
-import { roleIn } from "./profiles.js";
+import { roleIn, type FollowProfile, type WindowRole } from "./profiles.js";
 
-/** @typedef {import("./profiles.js").FollowProfile} FollowProfile */
-/** @typedef {import("./profiles.js").WindowRole} WindowRole */
-/** @typedef {{ id: string, name: string }} WindowSource */
-/**
- * @typedef {object} FollowStatus
- * @property {WindowRole | "waiting" | "ended"} role
- * @property {string | null} sourceId
- * @property {string | null} title
- */
+export interface WindowSource {
+  id: string;
+  name: string;
+}
+
+export interface FollowStatus {
+  role: WindowRole | "waiting" | "ended";
+  sourceId: string | null;
+  title: string | null;
+}
+
+export interface Follower {
+  current: () => FollowStatus;
+  evaluate: (sources: readonly WindowSource[]) => FollowStatus | null;
+}
 
 /**
  * The window to follow right now: the game window if open, else the lobby window.
- * @param {FollowProfile} profile
- * @param {readonly WindowSource[]} sources
- * @returns {{ source: WindowSource, role: WindowRole } | null}
  */
-export function pickSource(profile, sources) {
-  /** @type {WindowSource | undefined} */
-  let lobby;
+export function pickSource(
+  profile: FollowProfile,
+  sources: readonly WindowSource[],
+): { source: WindowSource; role: WindowRole } | null {
+  let lobby: WindowSource | undefined;
   for (const source of sources) {
     const role = roleIn(profile, source.name);
     if (role === "game") return { source, role };
@@ -42,34 +46,31 @@ export function pickSource(profile, sources) {
 }
 
 /**
- * @param {FollowProfile} profile
- * @param {{ initial: WindowSource, now?: () => number }} options
- *   `initial` is the window the user picked, which is already being captured.
+ * `initial` is the window the user picked, which is already being captured.
  */
-export function createFollower(profile, { initial, now = Date.now }) {
+export function createFollower(
+  profile: FollowProfile,
+  { initial, now = Date.now }: { initial: WindowSource; now?: (() => number) | undefined },
+): Follower {
   const initialRole = roleIn(profile, initial.name);
-  /** @type {FollowStatus} */
-  let status = initialRole
+  let status: FollowStatus = initialRole
     ? { role: initialRole, sourceId: initial.id, title: initial.name }
     : { role: "waiting", sourceId: null, title: null };
   /** When the current wait started; null while a window is open. */
-  let waitingSince = initialRole ? null : now();
+  let waitingSince: number | null = initialRole ? null : now();
 
   return {
-    /** @returns {FollowStatus} */
-    current() {
+    current(): FollowStatus {
       return { ...status };
     },
 
     /**
      * Reconcile with the windows open now.
-     * @param {readonly WindowSource[]} sources
-     * @returns {FollowStatus | null} The new status, or null when nothing changed.
+     * @returns The new status, or null when nothing changed.
      */
-    evaluate(sources) {
+    evaluate(sources: readonly WindowSource[]): FollowStatus | null {
       if (status.role === "ended") return null;
-      /** @type {FollowStatus} */
-      let next;
+      let next: FollowStatus;
       const pick = pickSource(profile, sources);
       if (pick) {
         waitingSince = null;

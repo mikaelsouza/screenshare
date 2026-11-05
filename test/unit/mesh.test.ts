@@ -13,8 +13,11 @@ class FakeDataChannel {
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
   sent: string[] = [];
+  readonly label: string;
 
-  constructor(readonly label: string) {}
+  constructor(label: string) {
+    this.label = label;
+  }
 
   send(data: string): void {
     this.sent.push(data);
@@ -43,8 +46,10 @@ class FakeRTCPeerConnection {
   dataChannels: FakeDataChannel[] = [];
   addedCandidates: RTCIceCandidateInit[] = [];
   closed = false;
+  readonly config: RTCConfiguration;
 
-  constructor(readonly config: RTCConfiguration) {
+  constructor(config: RTCConfiguration) {
+    this.config = config;
     FakeRTCPeerConnection.instances.push(this);
   }
 
@@ -442,9 +447,10 @@ describe("Mesh and PeerLink", () => {
     const ch = pc.dataChannels[0]!;
 
     // Throw on ch.send
-    ch.send = vi.fn().mockImplementation(() => {
+    const sendSpy = vi.fn().mockImplementation(() => {
       throw new Error("send failure");
     });
+    ch.send = sendSpy;
     mesh.setViewing("aaron", false);
 
     const videoTrack = { kind: "video" } as unknown as MediaStreamTrack;
@@ -458,6 +464,7 @@ describe("Mesh and PeerLink", () => {
     // Throw on setParameters
     const sender = pc.senders[0]!;
     sender.setParameters = vi.fn().mockRejectedValue(new Error("setParameters failure"));
+    expect(sendSpy).toHaveBeenCalled();
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
   });
 
@@ -476,6 +483,7 @@ describe("Mesh and PeerLink", () => {
 
     // Negotiation failure handling
     pc.createOffer = vi.fn().mockRejectedValue(new Error("offer creation failed"));
+    expect(pc.dataChannels).toBeDefined();
     pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 20));
   });

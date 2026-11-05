@@ -1,16 +1,43 @@
-import { spawn } from "node:child_process";
-import { chromium } from "playwright-core";
+import { spawn, type ChildProcess } from "node:child_process";
+import { chromium, type Browser, type Page } from "playwright-core";
+
+export interface GdmRecordedOptions {
+  selfBrowserSurface?: string | undefined;
+  video?: {
+    displaySurface?: string | undefined;
+  } | undefined;
+}
+
+declare global {
+  interface Window {
+    __pcs: RTCPeerConnection[];
+    __csp: string[];
+    __gdmOpts: GdmRecordedOptions[];
+    __gdmStreams?: MediaStream[] | undefined;
+  }
+}
+
+export interface ServerHandle {
+  proc: ChildProcess;
+  log: () => string;
+}
+
+export interface WaitForOptions {
+  timeout?: number | undefined;
+  interval?: number | undefined;
+  label?: string | undefined;
+}
 
 /**
  * Each test file gets its own port: `node --test` runs files in separate processes
  * concurrently, so a shared port would make them collide.
  */
-export function baseUrl(port) {
-  return `http://127.0.0.1:${port}`;
+export function baseUrl(port: number): string {
+  return `http://127.0.0.1:${String(port)}`;
 }
 
 /** Start `wrangler dev` on `port` and wait until it actually answers. */
-export async function startServer(port) {
+export async function startServer(port: number): Promise<ServerHandle> {
   const BASE_URL = baseUrl(port);
   const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
   const proc = spawn(
@@ -19,8 +46,12 @@ export async function startServer(port) {
     { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32" },
   );
   let log = "";
-  proc.stdout.on("data", (d) => { log += d; });
-  proc.stderr.on("data", (d) => { log += d; });
+  proc.stdout.on("data", (d: Buffer) => {
+    log += d.toString();
+  });
+  proc.stderr.on("data", (d: Buffer) => {
+    log += d.toString();
+  });
 
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
@@ -28,30 +59,42 @@ export async function startServer(port) {
     try {
       const res = await fetch(`${BASE_URL}/api/room`);
       if (res.ok) return { proc, log: () => log };
-    } catch { /* not up yet */ }
-    await new Promise((r) => setTimeout(r, 400));
+    } catch {
+      /* not up yet */
+    }
+    await new Promise<void>((r) => {
+      setTimeout(r, 400);
+    });
   }
   proc.kill("SIGKILL");
   throw new Error(`wrangler dev never became ready:\n${log}`);
 }
 
-export async function stopServer(server) {
+export async function stopServer(server: ServerHandle | undefined): Promise<void> {
   if (!server) return;
   if (process.platform === "win32") {
     try {
       const killer = spawn("taskkill", ["/F", "/T", "/PID", String(server.proc.pid)], { stdio: "ignore" });
-      await new Promise((r) => killer.on("close", r));
-    } catch {}
+      await new Promise<void>((r) => {
+        killer.on("close", () => {
+          r();
+        });
+      });
+    } catch {
+      // Ignore taskkill errors
+    }
   } else {
     server.proc.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 300));
+    await new Promise<void>((r) => {
+      setTimeout(r, 300);
+    });
     if (server.proc.exitCode === null) server.proc.kill("SIGKILL");
   }
 }
 
-export async function launchBrowser() {
+export async function launchBrowser(): Promise<Browser> {
   const executablePath =
-    process.env.CHROMIUM_BIN ??
+    process.env["CHROMIUM_BIN"] ??
     (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined);
   if (!executablePath) throw new Error("CHROMIUM_BIN is unset — run inside 'nix develop'.");
   return chromium.launch({
@@ -85,7 +128,7 @@ export async function launchBrowser() {
  * 2. Records every RTCPeerConnection so the test can inspect real getStats() output,
  *    without the app having to export anything for testability.
  */
-export const INSTRUMENT = () => {
+export const INSTRUMENT: () => void = () => {
   window.__pcs = [];
   // Every CSP or Trusted Types violation, so a suite can fail on one instead of the
   // page quietly losing a script or a style.
@@ -96,16 +139,17 @@ export const INSTRUMENT = () => {
   // What the app asks the screen picker for; the privacy defaults live there.
   window.__gdmOpts = [];
   const Native = window.RTCPeerConnection;
-  window.RTCPeerConnection = function (...args) {
+  const WrappedPC = function (this: unknown, ...args: ConstructorParameters<typeof RTCPeerConnection>): RTCPeerConnection {
     const pc = new Native(...args);
     window.__pcs.push(pc);
     return pc;
-  };
-  window.RTCPeerConnection.prototype = Native.prototype;
-  Object.setPrototypeOf(window.RTCPeerConnection, Native);
+  } as unknown as typeof RTCPeerConnection;
+  WrappedPC.prototype = Native.prototype;
+  Object.setPrototypeOf(WrappedPC, Native);
+  window.RTCPeerConnection = WrappedPC;
 
-  navigator.mediaDevices.getDisplayMedia = async (options) => {
-    window.__gdmOpts.push(JSON.parse(JSON.stringify(options ?? {})));
+  navigator.mediaDevices.getDisplayMedia = (options?: DisplayMediaStreamOptions): Promise<MediaStream> => {
+    window.__gdmOpts.push(JSON.parse(JSON.stringify(options ?? {})) as GdmRecordedOptions);
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
@@ -115,7 +159,8 @@ export const INSTRUMENT = () => {
     // and framesDecoded on the far side stays flat.
     setInterval(() => {
       frame++;
-      ctx.fillStyle = `hsl(${frame % 360}, 90%, 50%)`;
+      if (!ctx) return;
+      ctx.fillStyle = `hsl(${String(frame % 360)}, 90%, 50%)`;
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = "#fff";
       ctx.font = "72px monospace";
@@ -130,18 +175,24 @@ export const INSTRUMENT = () => {
     osc.start();
     for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
     (window.__gdmStreams ??= []).push(stream);
-    return stream;
+    return Promise.resolve(stream);
   };
 };
 
 /** Poll an in-page predicate until it returns truthy. */
-export async function waitFor(page, fn, { timeout = 30_000, interval = 500, label = "condition" } = {}) {
+export async function waitFor<T>(
+  page: Page,
+  fn: () => T | Promise<T>,
+  { timeout = 30_000, interval = 500, label = "condition" }: WaitForOptions = {},
+): Promise<NonNullable<T>> {
   const deadline = Date.now() + timeout;
-  let last;
+  let last: Awaited<T> | undefined;
   while (Date.now() < deadline) {
     last = await page.evaluate(fn);
-    if (last) return last;
-    await new Promise((r) => setTimeout(r, interval));
+    if (last) return last as NonNullable<T>;
+    await new Promise<void>((r) => {
+      setTimeout(r, interval);
+    });
   }
   throw new Error(`timed out waiting for ${label}; last value: ${JSON.stringify(last)}`);
 }

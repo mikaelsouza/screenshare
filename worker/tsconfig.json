@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.worker.json",
+  "compilerOptions": {
+    "paths": {
+      "@shared/*": ["../shared/*"]
+    }
+  },
+  "include": ["./**/*.ts", "../shared/**/*.ts"]
+}

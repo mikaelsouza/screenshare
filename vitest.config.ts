@@ -1,8 +1,8 @@
 import { resolve } from "node:path";
-import { defineConfig } from "vitest/config";
+import { defineConfig, type ViteUserConfig } from "vitest/config";
 
 /** Pure-logic tests. The Durable Object has its own config (vitest.workers.config.ts). */
-export default defineConfig({
+const config: ViteUserConfig = defineConfig({
   test: {
     include: [
       "test/unit/**/*.test.ts",
@@ -13,9 +13,22 @@ export default defineConfig({
     environment: "node",
     coverage: {
       provider: "v8",
-      include: ["shared/**/*.ts", "src/**/*.ts", "worker/ratelimit.ts"],
-      exclude: ["src/main.ts"],
-      reporter: ["text", "json", "html"],
+      include: [
+        "shared/**/*.ts",
+        "src/**/*.ts",
+        "worker/ratelimit.ts",
+        "electron/follow/**/*.ts",
+        "electron/audio/**/*.ts",
+        "electron/picker.ts",
+      ],
+      exclude: ["src/main.ts", "src/platform/types.ts"],
+      reporter: ["text", "json", "html", "lcov"],
+      thresholds: {
+        statements: 93,
+        branches: 88,
+        functions: 92,
+        lines: 94,
+      },
     },
   },
   resolve: {
@@ -27,3 +40,5 @@ export default defineConfig({
     },
   },
 });
+
+export default config;

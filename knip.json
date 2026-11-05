@@ -1,15 +1,17 @@
 {
   "$schema": "https://unpkg.com/knip@6/schema.json",
   "entry": [
-    "electron/preload.cjs"
+    "electron/preload.cts",
+    "electron/main.ts",
+    "test/e2e/*.test.ts"
   ],
   "project": [
-    "src/**/*.{js,ts}",
-    "shared/**/*.{js,ts}",
-    "worker/**/*.{js,ts}",
-    "electron/**/*.{js,cjs}",
-    "scripts/**/*.{js,mjs}",
-    "test/**/*.{js,ts,mjs}"
+    "src/**/*.ts",
+    "shared/**/*.ts",
+    "worker/**/*.ts",
+    "electron/**/*.{ts,cts}",
+    "scripts/**/*.ts",
+    "test/**/*.ts"
   ],
   "vitest": {
     "config": [

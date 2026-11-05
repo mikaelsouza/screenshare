@@ -144,7 +144,10 @@ describe("desktop capture", () => {
   };
   let video: FakeTrack;
   let audio: FakeTrack;
-  let deps: ElectronCaptureDeps & { captureSource: ReturnType<typeof vi.fn>; captureScreen: ReturnType<typeof vi.fn> };
+  let deps: ElectronCaptureDeps & {
+    captureSource: ReturnType<typeof vi.fn<ElectronCaptureDeps["captureSource"]>>;
+    captureScreen: ReturnType<typeof vi.fn<ElectronCaptureDeps["captureScreen"]>>;
+  };
 
   const update = (u: Partial<FollowUpdate>): FollowUpdate => ({
     role: "lobby",
@@ -464,7 +467,18 @@ describe("desktop capture defaults", () => {
     vi.stubGlobal("navigator", {
       mediaDevices: { getDisplayMedia: vi.fn().mockResolvedValue(stream([video])), getUserMedia },
     });
-    vi.stubGlobal("MediaStream", class { constructor(readonly t: MediaStreamTrack[]) {} getTracks() { return this.t; } });
+    vi.stubGlobal(
+      "MediaStream",
+      class {
+        readonly t: MediaStreamTrack[];
+        constructor(t: MediaStreamTrack[]) {
+          this.t = t;
+        }
+        getTracks() {
+          return this.t;
+        }
+      },
+    );
     const audio = track("audio");
     (navigator.mediaDevices.getDisplayMedia as ReturnType<typeof vi.fn>).mockResolvedValue(stream([video, audio]));
     let listener: ((u: FollowUpdate) => void) | null = null;
@@ -661,7 +675,7 @@ describe("desktop WASAPI audio integration", () => {
     });
     expect(winAudio?.stream.getTracks()).toEqual([pcmTrack]);
     expect(winAudio).toEqual({
-      stream: expect.anything(),
+      stream: expect.anything() as unknown as MediaStream,
       track: pcmTrack,
       kind: "window",
       label: "Discord",
@@ -682,7 +696,7 @@ describe("desktop WASAPI audio integration", () => {
     });
     expect(sysAudio?.stream.getTracks()).toEqual([pcmTrack]);
     expect(sysAudio).toEqual({
-      stream: expect.anything(),
+      stream: expect.anything() as unknown as MediaStream,
       track: pcmTrack,
       kind: "system",
       label: null,

@@ -20,9 +20,9 @@ interface RoomInfo {
   /** Whether we are the room's host. */
   host: boolean;
   /** Present only on the welcome that created the room. Keep it to stay host. */
-  hostToken?: string;
+  hostToken?: string | undefined;
   /** Fresh on every welcome. Present it on the next join to get back in if locked. */
-  rejoinToken?: string;
+  rejoinToken?: string | undefined;
   locked: boolean;
 }
 
@@ -67,15 +67,25 @@ export class SignalingClient {
   private sharing = false;
   private lastReceivedAt = 0;
   private pendingMessages: ClientMessage[] = [];
+  private readonly room: string;
+  private readonly displayName: string;
+  private readonly handlers: SignalingHandlers;
+  private readonly password: string | undefined;
+  /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
+  private readonly tokens: (() => { hostToken?: string | undefined; rejoinToken?: string | undefined }) | undefined;
 
   constructor(
-    private readonly room: string,
-    private readonly displayName: string,
-    private readonly handlers: SignalingHandlers,
-    private readonly password?: string,
-    /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
-    private readonly tokens?: () => { hostToken?: string; rejoinToken?: string },
+    room: string,
+    displayName: string,
+    handlers: SignalingHandlers,
+    password?: string,
+    tokens?: () => { hostToken?: string | undefined; rejoinToken?: string | undefined },
   ) {
+    this.room = room;
+    this.displayName = displayName;
+    this.handlers = handlers;
+    this.password = password;
+    this.tokens = tokens;
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", this.onVisibilityChange);
     }

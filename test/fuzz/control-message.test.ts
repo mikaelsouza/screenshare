@@ -14,10 +14,9 @@ describe("Fuzzing Suite: Control Channel Parser (Feature 44)", () => {
   it("never throws on arbitrary input types or unicode", () => {
     fc.assert(
       fc.property(fc.anything(), (input) => {
-        let result: any;
-        expect(() => {
-          result = parseControlMessage(input);
-        }).not.toThrow();
+        const parsed = (): ReturnType<typeof parseControlMessage> => parseControlMessage(input);
+        expect(parsed).not.toThrow();
+        const result = parsed();
 
         if (result !== null) {
           expect(result).toHaveProperty("c", "view");

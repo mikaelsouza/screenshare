@@ -37,8 +37,10 @@ export class StereoRingBuffer {
   private readPos = 0;
   private writePos = 0;
   private available = 0;
+  readonly capacity: number;
 
-  constructor(readonly capacity: number) {
+  constructor(capacity: number) {
+    this.capacity = capacity;
     this.left = new Float32Array(capacity);
     this.right = new Float32Array(capacity);
   }

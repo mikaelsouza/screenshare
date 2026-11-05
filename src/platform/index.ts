@@ -1,12 +1,12 @@
 /** Picks the capture implementation for where the page is running. */
 
 import { createElectronCaptureController } from "./electron";
-import type { CaptureCallbacks, CaptureController } from "./types";
+import type { CaptureCallbacks, CaptureController, ElectronAPI } from "./types";
 import { createWebCaptureController } from "./web";
 
 export function createCaptureController(
   cb: CaptureCallbacks,
-  api = typeof window === "undefined" ? undefined : window.electronAPI,
+  api: ElectronAPI | undefined = typeof window === "undefined" ? undefined : window.electronAPI,
 ): CaptureController {
   // Feature-detect rather than trust isElectron: an older desktop app has the flag
   // but not the follow bridge, and must keep today's behaviour.

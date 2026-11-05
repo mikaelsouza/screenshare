@@ -12,17 +12,20 @@
  */
 export class RateLimiter {
   private readonly entries = new Map<string, { count: number; resetAt: number }>();
+  private readonly max: number;
+  private readonly windowMs: number;
+  /**
+   * Cap on tracked keys. Without one the map only ever grows — an entry is created
+   * per distinct client address and otherwise never removed — so a scan from many
+   * source addresses inflates it for the isolate's whole lifetime.
+   */
+  private readonly maxEntries: number;
 
-  constructor(
-    private readonly max: number,
-    private readonly windowMs: number,
-    /**
-     * Cap on tracked keys. Without one the map only ever grows — an entry is created
-     * per distinct client address and otherwise never removed — so a scan from many
-     * source addresses inflates it for the isolate's whole lifetime.
-     */
-    private readonly maxEntries: number,
-  ) {}
+  constructor(max: number, windowMs: number, maxEntries: number) {
+    this.max = max;
+    this.windowMs = windowMs;
+    this.maxEntries = maxEntries;
+  }
 
   /** Visible for tests: how many keys are currently tracked. */
   get size(): number {

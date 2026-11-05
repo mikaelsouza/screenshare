@@ -179,7 +179,12 @@ describe("captureScreen and track helpers", () => {
         if (event === "ended" && endedHandler === handler) endedHandler = null;
       }),
       triggerEnded: () => { endedHandler?.(); },
-    } as unknown as MediaStreamTrack & { stopped: boolean; triggerEnded: () => void };
+    } as unknown as Omit<MediaStreamTrack, "addEventListener" | "removeEventListener"> & {
+      stopped: boolean;
+      triggerEnded: () => void;
+      addEventListener: ReturnType<typeof vi.fn>;
+      removeEventListener: ReturnType<typeof vi.fn>;
+    } & MediaStreamTrack;
   }
 
   function makeStream(videoTrack: MediaStreamTrack | null, audioTrack: MediaStreamTrack | null) {
@@ -211,7 +216,7 @@ describe("captureScreen and track helpers", () => {
     const aTrack = makeTrack("audio");
     const stream = makeStream(vTrack, aTrack);
 
-    const getDisplayMediaMock = vi.fn().mockResolvedValue(stream);
+    const getDisplayMediaMock = vi.fn<(_opts: DisplayMediaStreamOptions) => Promise<MediaStream>>().mockResolvedValue(stream);
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
@@ -223,27 +228,27 @@ describe("captureScreen and track helpers", () => {
     expect(aTrack.contentHint).toBe("music");
 
     const callArgs = getDisplayMediaMock.mock.calls[0]?.[0];
-    expect(callArgs.audio).toMatchObject({
+    expect(callArgs?.audio).toMatchObject({
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
     });
     // The picker opens on windows, not the whole screen.
-    expect(callArgs.video).toMatchObject({ displaySurface: "window" });
+    expect(callArgs?.video).toMatchObject({ displaySurface: "window" });
   });
 
   it("supports capture without audio when requested", async () => {
     const vTrack = makeTrack("video");
     const stream = makeStream(vTrack, null);
 
-    const getDisplayMediaMock = vi.fn().mockResolvedValue(stream);
+    const getDisplayMediaMock = vi.fn<(_opts: DisplayMediaStreamOptions) => Promise<MediaStream>>().mockResolvedValue(stream);
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
     const result = await captureScreen(QUALITY_PRESETS["720p30"], "none");
     expect(result.audio).toBeNull();
     const callArgs = getDisplayMediaMock.mock.calls[0]?.[0];
-    expect(callArgs.audio).toBe(false);
+    expect(callArgs?.audio).toBe(false);
   });
 
   it("throws and stops tracks if getDisplayMedia returned no video track", async () => {
@@ -261,7 +266,7 @@ describe("captureScreen and track helpers", () => {
   });
 
   it("notifies when capture ended and allows unregistering", () => {
-    const vTrack = makeTrack("video") as unknown as MediaStreamTrack & { triggerEnded: () => void };
+    const vTrack = makeTrack("video");
     const stream = makeStream(vTrack, null);
     const cb = vi.fn();
 
