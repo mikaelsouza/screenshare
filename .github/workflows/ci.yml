@@ -19,8 +19,6 @@ jobs:
   verify:
     name: Verify (Typecheck, Lint, Test, E2E)
     runs-on: ubuntu-latest
-    env:
-      DEEPSOURCE_DSN: ${{ secrets.DEEPSOURCE_DSN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -62,8 +60,15 @@ jobs:
           CHROMIUM_BIN: /usr/bin/google-chrome
         run: npm run test:e2e
 
+      - name: Detect DeepSource DSN
+        id: deepsource
+        env:
+          DEEPSOURCE_DSN: ${{ secrets.DEEPSOURCE_DSN }}
+        run: |
+          if [ -n "$DEEPSOURCE_DSN" ]; then echo "enabled=true" >> "$GITHUB_OUTPUT"; fi
+
       - name: Upload coverage to DeepSource
-        if: ${{ env.DEEPSOURCE_DSN != '' }}
+        if: ${{ steps.deepsource.outputs.enabled == 'true' }}
         uses: deepsourcecorp/test-coverage-action@4284bb73a04adb39faaa6bfcc2d0e3dd137ffed7 # v1.1.3
         with:
           key: javascript

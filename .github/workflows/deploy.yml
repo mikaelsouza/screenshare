@@ -48,7 +48,7 @@ jobs:
           for WORKFLOW_FILE in "ci.yml" "codeql.yml"; do
             ATTEMPTS=0
             while true; do
-              RUN_JSON="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$CURRENT_MAIN_SHA&per_page=1")"
+              RUN_JSON="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$CURRENT_MAIN_SHA&branch=main&event=push&per_page=1")"
               STATUS="$(printf '%s' "$RUN_JSON" | jq -r '.workflow_runs[0].status // "missing"')"
               CONCLUSION="$(printf '%s' "$RUN_JSON" | jq -r '.workflow_runs[0].conclusion // "null"')"
 

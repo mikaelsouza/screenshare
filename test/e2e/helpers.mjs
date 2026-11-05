@@ -31,10 +31,15 @@ export async function startServer(port) {
     } catch { /* not up yet */ }
     await new Promise((r) => setTimeout(r, 400));
   }
-  proc.kill("SIGKILL");
+  if (process.platform === "win32") {
+    proc.kill("SIGKILL");
+  } else {
+    try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+  }
   throw new Error(`wrangler dev never became ready:\n${log}`);
 }
 
+/** Stop the wrangler dev server and its child process tree. */
 export async function stopServer(server) {
   if (!server) return;
   if (process.platform === "win32") {
@@ -52,6 +57,7 @@ export async function stopServer(server) {
   }
 }
 
+/** Launch headless Chromium with fake WebRTC media devices and strict autoplay. */
 export async function launchBrowser() {
   const executablePath =
     process.env.CHROMIUM_BIN ??
