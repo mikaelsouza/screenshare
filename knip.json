@@ -13,6 +13,9 @@
     "scripts/**/*.ts",
     "test/**/*.ts"
   ],
+  "rules": {
+    "cycles": "error"
+  },
   "vitest": {
     "config": [
       "vitest.config.ts",

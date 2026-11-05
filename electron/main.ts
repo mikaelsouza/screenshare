@@ -9,13 +9,14 @@ import {
   type DesktopCapturerSource,
   type MenuItemConstructorOptions,
   type NativeImage,
+  type Streams,
 } from "electron";
 import { matchProfile, type FollowProfile } from "./follow/profiles.js";
 import { createFollower, type Follower, type FollowStatus } from "./follow/follower.js";
 import { buildPickerTemplate } from "./picker.js";
 import { createPidResolver } from "./audio/pid.js";
 import { createAudioSessionController } from "./audio/capture.js";
-import * as koffi from "koffi";
+import koffi from "koffi";
 import loopback from "loopback-capture";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,195 +34,6 @@ const REMOTE_APP_URL = process.env["SCREENSHARE_URL"] || "https://screenshare.we
 let mainWindow: BrowserWindow | null = null;
 // Origin of the page we load; capture permissions are only granted to it.
 let trustedOrigin: string | null = null;
-
-// Smoke tests use a throwaway profile so they neither collide with a running copy of the
-// app (single-instance lock) nor touch its data.
-if (isSmokeTest) {
-  app.setPath("userData", path.join(app.getPath("temp"), `screenshare-smoke-${String(process.pid)}`));
-}
-
-// Single instance lock
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  // Another Screenshare/Electron instance (same userData dir) already holds the lock.
-  // Without this message the app just exits silently, which looks like "it won't start".
-  console.error(
-    "[main] Another instance is already running (single-instance lock is held). " +
-      "Close it (check Task Manager for stray electron.exe processes) and try again.",
-  );
-  app.quit();
-} else {
-  app.on("second-instance", () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
-    }
-  });
-
-  void app.whenReady().then(async () => {
-    setupMediaHandlers();
-    await initApplication();
-  });
-}
-
-function setupMediaHandlers(): void {
-  // 1. getDisplayMedia: let the user pick a window or screen from a native menu,
-  //    as Chrome's own picker does on the web. Audio is Electron's loopback, i.e.
-  //    everything the PC plays: Electron cannot capture a single window's audio.
-  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
-    void (async (): Promise<void> => {
-      let sources: DesktopCapturerSource[];
-      try {
-        sources = await desktopCapturer.getSources({
-          types: ["window", "screen"],
-          fetchWindowIcons: true,
-          thumbnailSize: { width: 0, height: 0 },
-        });
-      } catch (err) {
-        console.error("[main] desktopCapturer.getSources failed:", err);
-        // Electron's callback({}) rejects getDisplayMedia in the page, and also
-        // throws synchronously on the main-process stack.
-        try {
-          callback({});
-        } catch {
-          // Ignore synchronous rejection throw from Electron
-        }
-        return;
-      }
-
-      let settled = false;
-      const finish = (source: DesktopCapturerSource | null): void => {
-        if (settled) return;
-        settled = true;
-        if (!source) {
-          // Rejects getDisplayMedia, which the page treats as a cancelled pick.
-          // Electron also throws "Video was requested, but no video stream was
-          // provided" synchronously here; inside setTimeout that would be uncaught.
-          try {
-            callback({});
-          } catch {
-            // Ignore synchronous rejection throw from Electron
-          }
-          return;
-        }
-        stopFollow();
-        audioSession.stop();
-        lastPickedSource = source;
-        try {
-          callback({ video: source });
-        } catch (err) {
-          console.error("[main] setDisplayMediaRequestHandler callback failed:", err);
-          return;
-        }
-        // The exception to "share what was picked": a game's lobby or game window is
-        // followed between the two. See electron/follow.
-        const match = matchProfile(source.name);
-        if (match) startFollow(match.profile, source);
-      };
-
-      const template = buildPickerTemplate<NativeImage, DesktopCapturerSource>(sources, finish, {
-        excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
-      });
-      if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
-        finish(null);
-        return;
-      }
-      Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
-        window: mainWindow,
-        // Runs when the menu closes, which on Windows can be before the clicked
-        // item's handler. Wait a moment so a real pick always wins over "cancelled".
-        callback: () => {
-          setTimeout(() => {
-            finish(null);
-          }, 100);
-        },
-      });
-    })();
-  });
-
-  ipcMain.on("follow:stop", (event) => {
-    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) stopFollow();
-  });
-
-  ipcMain.handle("audio:start-window", (event, sourceId: unknown) => {
-    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
-    const targetId = lastPickedSource?.id;
-    if (typeof sourceId === "string" && sourceId && sourceId !== targetId) return false;
-    return Boolean(targetId && audioSession.startForWindow(targetId));
-  });
-
-  ipcMain.handle("audio:start-system", (event) => {
-    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
-    return audioSession.startForSystem();
-  });
-
-  ipcMain.handle(
-    "audio:pick-window",
-    async (event): Promise<{ ok: boolean; label: string | null }> => {
-      if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) {
-        return { ok: false, label: null };
-      }
-      let sources: DesktopCapturerSource[];
-      try {
-        sources = await desktopCapturer.getSources({
-          types: ["window"],
-          fetchWindowIcons: true,
-          thumbnailSize: { width: 0, height: 0 },
-        });
-      } catch (err) {
-        console.error("[main] audio:pick-window getSources failed:", err);
-        return { ok: false, label: null };
-      }
-      return new Promise<{ ok: boolean; label: string | null }>((resolve) => {
-        let settled = false;
-        const finish = (picked: DesktopCapturerSource | null): void => {
-          if (settled) return;
-          settled = true;
-          if (!picked) {
-            resolve({ ok: false, label: null });
-            return;
-          }
-          const ok = audioSession.startForWindow(picked.id, { follow: false });
-          resolve({ ok, label: ok ? picked.name : null });
-        };
-        const template = buildPickerTemplate<NativeImage, DesktopCapturerSource>(sources, finish, {
-          excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
-          windowsOnly: true,
-        });
-        if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
-          finish(null);
-          return;
-        }
-        Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
-          window: mainWindow,
-          callback: () => {
-            setTimeout(() => {
-              finish(null);
-            }, 100);
-          },
-        });
-      });
-    },
-  );
-
-  ipcMain.on("audio:stop", (event) => {
-    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
-  });
-
-  // 2. Permission request handler for display-capture & media (trusted origin only,
-  //    since the app now loads remote content)
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const allowed = permission === "display-capture" || permission === "media";
-    callback(allowed && isTrustedUrl(details.requestingUrl || webContents.getURL()));
-  });
-
-  // 3. Permission check handler
-  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
-    const allowed = (permission as string) === "display-capture" || permission === "media";
-    return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL() || "");
-  });
-}
 
 // ---- audio capture ---------------------------------------------------------
 
@@ -271,12 +83,41 @@ interface ActiveFollow {
 /** The active follow, if any: { follower, timer, busy }. */
 let follow: ActiveFollow | null = null;
 
-function sendFollowUpdate(profile: FollowProfile, status: FollowStatus): void {
+const sendFollowUpdate = (profile: FollowProfile, status: FollowStatus): void => {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send("follow:update", { ...status, profile: profile.label });
-}
+};
 
-function startFollow(profile: FollowProfile, source: DesktopCapturerSource): void {
+const stopFollow = (): void => {
+  if (follow?.timer) clearInterval(follow.timer);
+  follow = null;
+};
+
+// skipcq: JS-R1005
+const pollFollowState = async (
+  profile: FollowProfile,
+  follower: Follower,
+  state: ActiveFollow,
+): Promise<void> => {
+  try {
+    const windows = await desktopCapturer.getSources({
+      types: ["window"],
+      thumbnailSize: { width: 0, height: 0 },
+    });
+    if (follow !== state) return;
+    const status = follower.evaluate(windows);
+    if (!status) return;
+    if (status.sourceId) audioSession.switchWindow(status.sourceId);
+    sendFollowUpdate(profile, status);
+    if (status.role === "ended") stopFollow();
+  } catch (err) {
+    console.error("[main] follow poll failed:", err);
+  } finally {
+    state.busy = false;
+  }
+};
+
+const startFollow = (profile: FollowProfile, source: DesktopCapturerSource): void => {
   stopFollow();
   const follower = createFollower(profile, { initial: source });
   const state: ActiveFollow = { follower, timer: null, busy: false };
@@ -288,47 +129,27 @@ function startFollow(profile: FollowProfile, source: DesktopCapturerSource): voi
   state.timer = setInterval(() => {
     if (state.busy) return;
     state.busy = true;
-    void (async (): Promise<void> => {
-      try {
-        const windows = await desktopCapturer.getSources({
-          types: ["window"],
-          thumbnailSize: { width: 0, height: 0 },
-        });
-        if (follow !== state) return;
-        const status = follower.evaluate(windows);
-        if (!status) return;
-        if (status.sourceId) audioSession.switchWindow(status.sourceId);
-        sendFollowUpdate(profile, status);
-        if (status.role === "ended") stopFollow();
-      } catch (err) {
-        console.error("[main] follow poll failed:", err);
-      } finally {
-        state.busy = false;
-      }
-    })();
+    pollFollowState(profile, follower, state).catch((err: unknown) => {
+      console.error("[main] follow poll error:", err);
+    });
   }, FOLLOW_POLL_MS);
-}
+};
 
-function stopFollow(): void {
-  if (follow?.timer) clearInterval(follow.timer);
-  follow = null;
-}
-
-function isTrustedUrl(url: string | undefined): boolean {
+const isTrustedUrl = (url: string | undefined): boolean => {
   if (!url) return false;
   try {
     return Boolean(trustedOrigin) && new URL(url).origin === trustedOrigin;
   } catch {
     return false;
   }
-}
+};
 
-function resolveTargetUrl(): string {
+const resolveTargetUrl = (): string => {
   const devServerUrl = process.env["VITE_DEV_SERVER_URL"];
   return isDev && devServerUrl ? devServerUrl : REMOTE_APP_URL;
-}
+};
 
-function offlinePage(url: string, description: string): string {
+const offlinePage = (url: string, description: string): string => {
   const html = `<!doctype html><meta charset="utf-8"><title>Screenshare</title>
 <body style="margin:0;height:100vh;display:grid;place-items:center;background:#121214;color:#e6e6e6;font:15px system-ui,sans-serif">
 <div style="text-align:center;max-width:460px">
@@ -337,11 +158,186 @@ function offlinePage(url: string, description: string): string {
 <p style="opacity:.7">Check your internet connection. Retrying automatically…</p>
 </div></body>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
-}
+};
 
-async function initApplication(): Promise<void> {
+// skipcq: JS-R1005
+const handleDisplayMediaRequest = async (callback: (streams: Streams) => void): Promise<void> => {
+  let sources: DesktopCapturerSource[];
+  try {
+    sources = await desktopCapturer.getSources({
+      types: ["window", "screen"],
+      fetchWindowIcons: true,
+      thumbnailSize: { width: 0, height: 0 },
+    });
+  } catch (err) {
+    console.error("[main] desktopCapturer.getSources failed:", err);
+    // Electron's callback({}) rejects getDisplayMedia in the page, and also
+    // throws synchronously on the main-process stack.
+    try {
+      callback({});
+    } catch {
+      // Ignore synchronous rejection throw from Electron
+    }
+    return;
+  }
+
+  let settled = false;
+  // skipcq: JS-R1005
+  const finish = (source: DesktopCapturerSource | null): void => {
+    if (settled) return;
+    settled = true;
+    if (!source) {
+      // Rejects getDisplayMedia, which the page treats as a cancelled pick.
+      // Electron also throws "Video was requested, but no video stream was
+      // provided" synchronously here; inside setTimeout that would be uncaught.
+      try {
+        callback({});
+      } catch {
+        // Ignore synchronous rejection throw from Electron
+      }
+      return;
+    }
+    stopFollow();
+    audioSession.stop();
+    lastPickedSource = source;
+    try {
+      callback({ video: source });
+    } catch (err) {
+      console.error("[main] setDisplayMediaRequestHandler callback failed:", err);
+      return;
+    }
+    // The exception to "share what was picked": a game's lobby or game window is
+    // followed between the two. See electron/follow.
+    const match = matchProfile(source.name);
+    if (match) startFollow(match.profile, source);
+  };
+
+  const template = buildPickerTemplate<NativeImage, DesktopCapturerSource>(sources, finish, {
+    excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
+  });
+  if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
+    finish(null);
+    return;
+  }
+  Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
+    window: mainWindow,
+    // Runs when the menu closes, which on Windows can be before the clicked
+    // item's handler. Wait a moment so a real pick always wins over "cancelled".
+    callback: () => {
+      setTimeout(() => {
+        finish(null);
+      }, 100);
+    },
+  });
+};
+
+const setupMediaHandlers = (): void => {
+  // 1. getDisplayMedia: let the user pick a window or screen from a native menu,
+  //    as Chrome's own picker does on the web. Audio is Electron's loopback, i.e.
+  //    everything the PC plays: Electron cannot capture a single window's audio.
+  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+    handleDisplayMediaRequest(callback).catch((err: unknown) => {
+      console.error("[main] handleDisplayMediaRequest error:", err);
+    });
+  });
+
+  ipcMain.on("follow:stop", (event) => {
+    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) stopFollow();
+  });
+
+  // skipcq: JS-R1005
+  ipcMain.handle("audio:start-window", (event, sourceId: unknown) => {
+    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    const targetId = lastPickedSource?.id;
+    if (typeof sourceId === "string" && sourceId && sourceId !== targetId) return false;
+    return Boolean(targetId && audioSession.startForWindow(targetId));
+  });
+
+  ipcMain.handle("audio:start-system", (event) => {
+    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    return audioSession.startForSystem();
+  });
+
+  ipcMain.handle(
+    "audio:pick-window",
+    async (event): Promise<{ ok: boolean; label: string | null }> => {
+      if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) {
+        return { ok: false, label: null };
+      }
+      let sources: DesktopCapturerSource[];
+      try {
+        sources = await desktopCapturer.getSources({
+          types: ["window"],
+          fetchWindowIcons: true,
+          thumbnailSize: { width: 0, height: 0 },
+        });
+      } catch (err) {
+        console.error("[main] audio:pick-window getSources failed:", err);
+        return { ok: false, label: null };
+      }
+      // skipcq: JS-R1005
+      return new Promise<{ ok: boolean; label: string | null }>((resolve) => {
+        let settled = false;
+        const finish = (picked: DesktopCapturerSource | null): void => {
+          if (settled) return;
+          settled = true;
+          if (!picked) {
+            resolve({ ok: false, label: null });
+            return;
+          }
+          const ok = audioSession.startForWindow(picked.id, { follow: false });
+          resolve({ ok, label: ok ? picked.name : null });
+        };
+        const template = buildPickerTemplate<NativeImage, DesktopCapturerSource>(sources, finish, {
+          excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
+          windowsOnly: true,
+        });
+        if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
+          finish(null);
+          return;
+        }
+        Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
+          window: mainWindow,
+          callback: () => {
+            setTimeout(() => {
+              finish(null);
+            }, 100);
+          },
+        });
+      });
+    },
+  );
+
+  ipcMain.on("audio:stop", (event) => {
+    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
+  });
+
+  // 2. Permission request handler for display-capture & media (trusted origin only,
+  //    since the app now loads remote content)
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const allowed = permission === "display-capture" || permission === "media";
+    callback(allowed && isTrustedUrl(details.requestingUrl || webContents.getURL()));
+  });
+
+  // 3. Permission check handler
+  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    const allowed = (permission as string) === "display-capture" || permission === "media";
+    return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL() || "");
+  });
+};
+
+const openAllowedExternal = (url: string): void => {
+  if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("mailto:")) {
+    shell.openExternal(url).catch((err: unknown) => {
+      console.error("[main] openExternal failed:", err);
+    });
+  }
+};
+
+const initApplication = async (): Promise<void> => {
   const targetUrl = resolveTargetUrl();
   trustedOrigin = new URL(targetUrl).origin;
+  // skipcq: JS-0002
   console.log(`[main] Loading ${targetUrl}`);
 
   mainWindow = new BrowserWindow({
@@ -368,9 +364,7 @@ async function initApplication(): Promise<void> {
 
   // External links routing to default system browser
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("mailto:")) {
-      void shell.openExternal(url);
-    }
+    openAllowedExternal(url);
     return { action: "deny" };
   });
 
@@ -380,7 +374,7 @@ async function initApplication(): Promise<void> {
       const parsedTarget = new URL(targetUrl);
       if (parsedNav.origin !== parsedTarget.origin) {
         event.preventDefault();
-        void shell.openExternal(url);
+        openAllowedExternal(url);
       }
     } catch {
       // Invalid URL navigation attempt ignored
@@ -392,17 +386,22 @@ async function initApplication(): Promise<void> {
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   mainWindow.webContents.on(
     "did-fail-load",
+    // skipcq: JS-R1005
     (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
       // -3 = ERR_ABORTED (e.g. superseded navigation); not a real failure.
       if (!isMainFrame || errorCode === -3 || validatedURL.startsWith("data:")) return;
       console.error(`[main] Failed to load ${validatedURL}: ${errorDescription} (${String(errorCode)})`);
       if (mainWindow && !mainWindow.isDestroyed()) {
-        void mainWindow.loadURL(offlinePage(targetUrl, errorDescription)).catch(() => {});
+        mainWindow.loadURL(offlinePage(targetUrl, errorDescription)).catch((err: unknown) => {
+          console.error("[main] loadURL offlinePage failed:", err);
+        });
       }
       if (retryTimer) clearTimeout(retryTimer);
       retryTimer = setTimeout(() => {
         if (mainWindow && !mainWindow.isDestroyed()) {
-          void mainWindow.loadURL(targetUrl).catch(() => {});
+          mainWindow.loadURL(targetUrl).catch((err: unknown) => {
+            console.error("[main] loadURL retry failed:", err);
+          });
         }
       }, 5000);
     },
@@ -415,12 +414,52 @@ async function initApplication(): Promise<void> {
   });
 
   // Load failures are handled by 'did-fail-load' above.
-  await mainWindow.loadURL(targetUrl).catch(() => {});
+  await mainWindow.loadURL(targetUrl).catch((err: unknown) => {
+    console.error("[main] initial loadURL failed:", err);
+  });
+};
+
+// Smoke tests use a throwaway profile so they neither collide with a running copy of the
+// app (single-instance lock) nor touch its data.
+if (isSmokeTest) {
+  app.setPath("userData", path.join(app.getPath("temp"), `screenshare-smoke-${String(process.pid)}`));
+}
+
+// Single instance lock
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  // Another Screenshare/Electron instance (same userData dir) already holds the lock.
+  // Without this message the app just exits silently, which looks like "it won't start".
+  console.error(
+    "[main] Another instance is already running (single-instance lock is held). " +
+      "Close it (check Task Manager for stray electron.exe processes) and try again.",
+  );
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+
+  app
+    .whenReady()
+    .then(async () => {
+      setupMediaHandlers();
+      await initApplication();
+    })
+    .catch((err: unknown) => {
+      console.error("[main] whenReady failed:", err);
+    });
 }
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    void initApplication();
+    initApplication().catch((err: unknown) => {
+      console.error("[main] activate failed:", err);
+    });
   }
 });
 

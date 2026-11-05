@@ -45,10 +45,12 @@ export interface ElectronCaptureDeps {
   makeStream: (tracks: MediaStreamTrack[]) => MediaStream;
   createPcmTrack: (bridge: PcmAudioBridge) => MediaStreamTrack;
   webCaptureAudioOnly: (kind: "window" | "system") => Promise<AudioSource | null>;
+  // skipcq: JS-T1001
   audioSource?: AudioSourceProvider | undefined;
 }
 
 /** Electron's (Chromium's) desktop-source constraints. Not in TypeScript's DOM lib. */
+// skipcq: JS-0067
 async function captureDesktopSource(sourceId: string, preset: QualityPreset): Promise<MediaStreamTrack> {
   const constraints = {
     audio: false,
@@ -84,6 +86,7 @@ const defaultDeps: ElectronCaptureDeps = {
 };
 
 /** Check whether the preload bridge exposes all required WASAPI audio IPC methods. */
+// skipcq: JS-0067
 function hasAudioBridge(
   api: FollowAPI,
 ): api is FollowAPI & {

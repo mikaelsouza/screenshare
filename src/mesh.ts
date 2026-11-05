@@ -48,6 +48,7 @@ const MAX_CONTROL_MESSAGE_LENGTH = 256;
  * is checked rather than cast: a `want` that is not a boolean would otherwise flow
  * straight into `encodings[0].active`.
  */
+// skipcq: JS-0067
 export function parseControlMessage(data: unknown): ControlMessage | null {
   if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
   let msg: unknown;

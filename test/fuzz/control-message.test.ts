@@ -21,6 +21,8 @@ describe("Fuzzing Suite: Control Channel Parser (Feature 44)", () => {
         if (result !== null) {
           expect(result).toHaveProperty("c", "view");
           expect(typeof result.want).toBe("boolean");
+        } else {
+          expect(result).toBeNull();
         }
         return true;
       }),

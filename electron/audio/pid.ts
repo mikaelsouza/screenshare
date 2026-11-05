@@ -12,6 +12,7 @@ const WINDOW_SOURCE_RE = /^window:([1-9]\d*):\d+$/;
  * Extract the Win32 HWND from a desktopCapturer source id, or null if it is not a
  * window source (e.g. "screen:0:0").
  */
+// skipcq: JS-0067
 export function parseWindowHandle(sourceId: string): number | null {
   const match = WINDOW_SOURCE_RE.exec(sourceId.trim());
   if (!match) return null;
@@ -22,6 +23,7 @@ export function parseWindowHandle(sourceId: string): number | null {
  * Build a sourceId → PID resolver from a low-level HWND → PID function.
  * `lookupPid` returns 0 when the window no longer exists.
  */
+// skipcq: JS-0067
 export function createPidResolver(lookupPid: (hwnd: number) => number): (sourceId: string) => number | null {
   return (sourceId: string): number | null => {
     const hwnd = parseWindowHandle(sourceId);

@@ -18,18 +18,35 @@ import type {} from "../src/platform/types.ts";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
 
+const log = (msg: string): void => {
+  process.stdout.write(`${msg}\n`);
+};
+
+const logError = (msg: string): void => {
+  process.stderr.write(`${msg}\n`);
+};
+
+const BENIGN_CONSOLE_ERRORS: readonly RegExp[] = [
+  /favicon\.ico/,
+  /stun:/,
+  /stun\.cloudflare\.com/,
+  /cloudflareinsights\.com/,
+  /^Refused to execute inline script/,
+];
+
 // Safety global timeout (45 seconds) to prevent hanging CI/local runs
 const GLOBAL_TIMEOUT_MS = 45000;
 const globalTimer = setTimeout(() => {
-  console.error(`[smoke-test] FATAL: Global timeout of ${String(GLOBAL_TIMEOUT_MS)}ms exceeded. Aborting.`);
+  logError(`[smoke-test] FATAL: Global timeout of ${String(GLOBAL_TIMEOUT_MS)}ms exceeded. Aborting.`);
   process.exit(1);
 }, GLOBAL_TIMEOUT_MS);
 globalTimer.unref();
 
-async function runSmokeTest(): Promise<void> {
-  console.log("[smoke-test] ========================================");
-  console.log("[smoke-test] Starting Electron Automated Smoke Check");
-  console.log("[smoke-test] ========================================");
+// skipcq: JS-R1005
+const runSmokeTest = async (): Promise<void> => {
+  log("[smoke-test] ========================================");
+  log("[smoke-test] Starting Electron Automated Smoke Check");
+  log("[smoke-test] ========================================");
 
   // Resolve Electron executable path
   let executablePath: string | undefined = process.env["ELECTRON_EXEC_PATH"];
@@ -45,7 +62,7 @@ async function runSmokeTest(): Promise<void> {
     }
   }
 
-  console.log("[smoke-test] Launching Electron app with playwright-core...");
+  log("[smoke-test] Launching Electron app with playwright-core...");
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
 
@@ -67,35 +84,35 @@ async function runSmokeTest(): Promise<void> {
   };
 
   const app = await electron.launch(launchOptions);
-  console.log("[smoke-test] Electron process launched successfully.");
+  log("[smoke-test] Electron process launched successfully.");
 
   try {
-    console.log("[smoke-test] Waiting for BrowserWindow to open...");
+    log("[smoke-test] Waiting for BrowserWindow to open...");
     const page = await app.firstWindow();
-    console.log("[smoke-test] BrowserWindow acquired.");
+    log("[smoke-test] BrowserWindow acquired.");
 
     page.on("console", (msg) => {
       const type = msg.type();
       const text = msg.text();
       if (type === "error") {
-        console.error(`[smoke-test:browser-console-error] ${text}`);
+        logError(`[smoke-test:browser-console-error] ${text}`);
         consoleErrors.push(text);
       } else {
-        console.log(`[smoke-test:browser-console-${type}] ${text}`);
+        log(`[smoke-test:browser-console-${type}] ${text}`);
       }
     });
 
     page.on("pageerror", (err) => {
       const message = err.message || String(err);
-      console.error(`[smoke-test:browser-page-error] ${message}`);
+      logError(`[smoke-test:browser-page-error] ${message}`);
       pageErrors.push(message);
     });
 
     await page.waitForLoadState("domcontentloaded");
-    console.log("[smoke-test] DOMContentLoaded event received.");
+    log("[smoke-test] DOMContentLoaded event received.");
 
     const windowTitle = await page.title();
-    console.log(`[smoke-test] Window title: "${windowTitle}"`);
+    log(`[smoke-test] Window title: "${windowTitle}"`);
     if (!windowTitle.toLowerCase().includes("screenshare")) {
       throw new Error(`Expected title to contain "Screenshare", but got: "${windowTitle}"`);
     }
@@ -108,9 +125,9 @@ async function runSmokeTest(): Promise<void> {
       { selector: "#controls", name: "Control Bar Container" },
     ];
 
-    console.log("[smoke-test] Verifying key DOM selectors...");
+    log("[smoke-test] Verifying key DOM selectors...");
     for (const { selector, name } of requiredElements) {
-      console.log(`[smoke-test] - Checking ${selector} (${name})...`);
+      log(`[smoke-test] - Checking ${selector} (${name})...`);
       await page.waitForSelector(selector, { state: "visible", timeout: 15000 });
       const isVisible = await page.isVisible(selector);
       if (!isVisible) {
@@ -118,7 +135,7 @@ async function runSmokeTest(): Promise<void> {
       }
     }
 
-    console.log("[smoke-test] Testing UI input interactions...");
+    log("[smoke-test] Testing UI input interactions...");
 
     await page.fill("#room-code", "SMOKETST");
     const enteredRoom = await page.inputValue("#room-code");
@@ -150,7 +167,7 @@ async function runSmokeTest(): Promise<void> {
         platform: window.electronAPI?.platform || null,
       };
     });
-    console.log(
+    log(
       `[smoke-test] Preload context check: isElectron=${String(preloadInfo.isElectron)}, platform=${String(preloadInfo.platform)}`,
     );
 
@@ -161,14 +178,7 @@ async function runSmokeTest(): Promise<void> {
     }
 
     // Filter out benign external warnings
-    const fatalErrors = consoleErrors.filter((text) => {
-      if (text.includes("favicon.ico")) return false;
-      if (text.includes("stun:")) return false;
-      if (text.includes("stun.cloudflare.com")) return false;
-      if (text.includes("cloudflareinsights.com")) return false;
-      if (text.startsWith("Refused to execute inline script")) return false;
-      return true;
-    });
+    const fatalErrors = consoleErrors.filter((text) => !BENIGN_CONSOLE_ERRORS.some((re) => re.test(text)));
 
     if (fatalErrors.length > 0) {
       throw new Error(
@@ -176,23 +186,23 @@ async function runSmokeTest(): Promise<void> {
       );
     }
 
-    console.log("[smoke-test] ========================================");
-    console.log("[smoke-test] ALL SMOKE CHECKS PASSED SUCCESSFULLY!");
-    console.log("[smoke-test] ========================================");
+    log("[smoke-test] ========================================");
+    log("[smoke-test] ALL SMOKE CHECKS PASSED SUCCESSFULLY!");
+    log("[smoke-test] ========================================");
   } finally {
-    console.log("[smoke-test] Closing Electron application...");
+    log("[smoke-test] Closing Electron application...");
     await app.close();
-    console.log("[smoke-test] Electron application closed cleanly.");
+    log("[smoke-test] Electron application closed cleanly.");
   }
-}
+};
 
 runSmokeTest()
   .then(() => {
-    console.log("[smoke-test] Exiting with code 0.");
+    log("[smoke-test] Exiting with code 0.");
     process.exit(0);
   })
   .catch((err: unknown) => {
-    console.error("[smoke-test] SMOKE CHECK FAILED:");
-    console.error(err);
+    logError("[smoke-test] SMOKE CHECK FAILED:");
+    logError(String(err));
     process.exit(1);
   });

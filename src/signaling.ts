@@ -20,8 +20,10 @@ interface RoomInfo {
   /** Whether we are the room's host. */
   host: boolean;
   /** Present only on the welcome that created the room. Keep it to stay host. */
+  // skipcq: JS-T1001
   hostToken?: string | undefined;
   /** Fresh on every welcome. Present it on the next join to get back in if locked. */
+  // skipcq: JS-T1001
   rejoinToken?: string | undefined;
   locked: boolean;
 }

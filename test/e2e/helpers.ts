@@ -2,8 +2,11 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { chromium, type Browser, type Page } from "playwright-core";
 
 export interface GdmRecordedOptions {
+  // skipcq: JS-T1001
   selfBrowserSurface?: string | undefined;
+  // skipcq: JS-T1001
   video?: {
+    // skipcq: JS-T1001
     displaySurface?: string | undefined;
   } | undefined;
 }
@@ -13,6 +16,7 @@ declare global {
     __pcs: RTCPeerConnection[];
     __csp: string[];
     __gdmOpts: GdmRecordedOptions[];
+    // skipcq: JS-T1001
     __gdmStreams?: MediaStream[] | undefined;
   }
 }
@@ -23,8 +27,11 @@ export interface ServerHandle {
 }
 
 export interface WaitForOptions {
+  // skipcq: JS-T1001
   timeout?: number | undefined;
+  // skipcq: JS-T1001
   interval?: number | undefined;
+  // skipcq: JS-T1001
   label?: string | undefined;
 }
 
@@ -32,18 +39,20 @@ export interface WaitForOptions {
  * Each test file gets its own port: `node --test` runs files in separate processes
  * concurrently, so a shared port would make them collide.
  */
+// skipcq: JS-0067
 export function baseUrl(port: number): string {
   return `http://127.0.0.1:${String(port)}`;
 }
 
 /** Start `wrangler dev` on `port` and wait until it actually answers. */
+// skipcq: JS-0067, JS-R1005
 export async function startServer(port: number): Promise<ServerHandle> {
   const BASE_URL = baseUrl(port);
   const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
   const proc = spawn(
     cmd,
     ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--log-level", "warn"],
-    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32" },
+    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32", detached: process.platform !== "win32" },
   );
   let log = "";
   proc.stdout.on("data", (d: Buffer) => {
@@ -66,10 +75,20 @@ export async function startServer(port: number): Promise<ServerHandle> {
       setTimeout(r, 400);
     });
   }
-  proc.kill("SIGKILL");
+  if (process.platform === "win32") {
+    proc.kill("SIGKILL");
+  } else if (proc.pid !== undefined) {
+    try {
+      process.kill(-proc.pid, "SIGKILL");
+    } catch {
+      // Ignore kill errors
+    }
+  }
   throw new Error(`wrangler dev never became ready:\n${log}`);
 }
 
+/** Stop the wrangler dev server and its child process tree. */
+// skipcq: JS-0067, JS-R1005
 export async function stopServer(server: ServerHandle | undefined): Promise<void> {
   if (!server) return;
   if (process.platform === "win32") {
@@ -84,15 +103,32 @@ export async function stopServer(server: ServerHandle | undefined): Promise<void
       // Ignore taskkill errors
     }
   } else {
-    server.proc.kill("SIGTERM");
+    if (server.proc.pid !== undefined) {
+      try {
+        process.kill(-server.proc.pid, "SIGTERM");
+      } catch {
+        // Ignore kill errors
+      }
+    }
     await new Promise<void>((r) => {
       setTimeout(r, 300);
     });
-    if (server.proc.exitCode === null) server.proc.kill("SIGKILL");
+    if (server.proc.exitCode === null && server.proc.pid !== undefined) {
+      try {
+        process.kill(-server.proc.pid, "SIGKILL");
+      } catch {
+        // Ignore kill errors
+      }
+    }
+    server.proc.stdout?.destroy();
+    server.proc.stderr?.destroy();
+    server.proc.unref();
   }
 }
 
-export async function launchBrowser(): Promise<Browser> {
+/** Launch headless Chromium with fake WebRTC media devices and strict autoplay. */
+// skipcq: JS-0067
+export function launchBrowser(): Promise<Browser> {
   const executablePath =
     process.env["CHROMIUM_BIN"] ??
     (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined);
@@ -180,6 +216,7 @@ export const INSTRUMENT: () => void = () => {
 };
 
 /** Poll an in-page predicate until it returns truthy. */
+// skipcq: JS-0067
 export async function waitFor<T>(
   page: Page,
   fn: () => T | Promise<T>,

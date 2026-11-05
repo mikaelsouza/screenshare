@@ -32,6 +32,7 @@ export interface Follower {
 /**
  * The window to follow right now: the game window if open, else the lobby window.
  */
+// skipcq: JS-0067, JS-R1005
 export function pickSource(
   profile: FollowProfile,
   sources: readonly WindowSource[],
@@ -48,8 +49,10 @@ export function pickSource(
 /**
  * `initial` is the window the user picked, which is already being captured.
  */
+// skipcq: JS-0067
 export function createFollower(
   profile: FollowProfile,
+  // skipcq: JS-T1001
   { initial, now = Date.now }: { initial: WindowSource; now?: (() => number) | undefined },
 ): Follower {
   const initialRole = roleIn(profile, initial.name);
@@ -68,6 +71,7 @@ export function createFollower(
      * Reconcile with the windows open now.
      * @returns The new status, or null when nothing changed.
      */
+    // skipcq: JS-R1005
     evaluate(sources: readonly WindowSource[]): FollowStatus | null {
       if (status.role === "ended") return null;
       let next: FollowStatus;

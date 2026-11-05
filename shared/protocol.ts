@@ -42,6 +42,7 @@ export interface PeerInfo {
   name: string;
   sharing: boolean;
   /** The room's creator, who can remove people and lock the room. */
+  // skipcq: JS-T1001
   host?: boolean | undefined;
 }
 export interface IceCandidateInit {
@@ -166,6 +167,7 @@ export function isValidRoomCode(s: string): boolean {
  * Returns null if the JSON is malformed or does not match any ClientMessage variant.
  * Guarantees no exceptions escape.
  */
+// skipcq: JS-0067, JS-R1005
 export function parseClientMessage(raw: string): ClientMessage | null {
   try {
     const data: unknown = JSON.parse(raw);

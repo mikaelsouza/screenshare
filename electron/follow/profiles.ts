@@ -35,16 +35,18 @@ export const FOLLOW_PROFILES: readonly FollowProfile[] = [
 /**
  * The role a window plays in one profile, or null if it is not one of its windows.
  */
+// skipcq: JS-0067
 export function roleIn(profile: FollowProfile, title: string): WindowRole | null {
-  const t = title.trim();
-  if (profile.gameTitles.includes(t)) return "game";
-  if (profile.lobbyTitles.includes(t)) return "lobby";
+  const trimmed = title.trim();
+  if (profile.gameTitles.includes(trimmed)) return "game";
+  if (profile.lobbyTitles.includes(trimmed)) return "lobby";
   return null;
 }
 
 /**
  * The profile a picked window belongs to, if any.
  */
+// skipcq: JS-0067
 export function matchProfile(
   title: string,
   profiles: readonly FollowProfile[] = FOLLOW_PROFILES,

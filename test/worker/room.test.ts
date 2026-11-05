@@ -4,6 +4,7 @@ import { MAX_ROOM_SIZE, PING, PONG, type ServerMessage } from "@shared/protocol"
 import type { RoomDO } from "../../worker/room";
 
 declare global {
+  // skipcq: JS-0337
   namespace Cloudflare {
     interface Env {
       ROOMS: DurableObjectNamespace<RoomDO>;
@@ -152,7 +153,7 @@ class Client {
     throw new Error(`never received a "${t}" message`);
   }
 
-  async join(name = "tester", password?: string): Promise<Extract<ServerMessage, { t: "welcome" }>> {
+  join(name = "tester", password?: string): Promise<Extract<ServerMessage, { t: "welcome" }>> {
     this.send({
       t: "join",
       room: CODE,

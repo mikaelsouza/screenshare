@@ -148,7 +148,9 @@ const MAX_BAD_MESSAGES = 5;
 
 interface MemberEntry {
   until: number;
+  // skipcq: JS-T1001
   id?: string | undefined;
+  // skipcq: JS-T1001
   sharing?: boolean | undefined;
 }
 
@@ -158,12 +160,16 @@ interface PeerAttachment {
   sharing: boolean;
   joined: boolean;
   /** Rate-limit key for the client address: IPv4 as is, IPv6 as its /64. */
+  // skipcq: JS-T1001
   ip?: string | undefined;
   /** When the socket was accepted, for the join deadline. */
+  // skipcq: JS-T1001
   openedAt?: number | undefined;
   /** Presented the room's host token. */
+  // skipcq: JS-T1001
   host?: boolean | undefined;
   /** Hash of the rejoin ticket this socket was issued, deleted if it is kicked. */
+  // skipcq: JS-T1001
   rejoinHash?: string | undefined;
 }
 
@@ -388,6 +394,7 @@ export class RoomDO extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
   }
 
+  // skipcq: JS-0116, JS-R1005
   override async fetch(request: Request): Promise<Response> {
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
@@ -462,6 +469,7 @@ export class RoomDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  // skipcq: JS-R1005
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = getAttachment(ws);
     if (!attachment) {

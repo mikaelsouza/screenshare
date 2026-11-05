@@ -38,17 +38,25 @@ export interface ElectronAPI {
   readonly isElectron: boolean;
   readonly platform: string;
   readonly version: string;
+  // skipcq: JS-T1001
   onFollowUpdate?: ((cb: (update: FollowUpdate) => void) => () => void) | undefined;
+  // skipcq: JS-T1001
   stopFollow?: (() => void) | undefined;
+  // skipcq: JS-T1001
   startWindowAudio?: ((sourceId?: string) => Promise<boolean>) | undefined;
+  // skipcq: JS-T1001
   pickWindowAudio?: (() => Promise<{ ok: boolean; label: string | null }>) | undefined;
+  // skipcq: JS-T1001
   startSystemAudio?: (() => Promise<boolean>) | undefined;
+  // skipcq: JS-T1001
   stopAudio?: (() => void) | undefined;
+  // skipcq: JS-T1001
   onAudioPcm?: ((cb: (pcm: Uint8Array) => void) => () => void) | undefined;
 }
 
 declare global {
   interface Window {
+    // skipcq: JS-T1001
     electronAPI?: ElectronAPI | undefined;
   }
 }

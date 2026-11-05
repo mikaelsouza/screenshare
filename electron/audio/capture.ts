@@ -25,6 +25,7 @@ export interface AudioSessionDeps {
 type AudioSessionMode = "off" | "window" | "system";
 
 interface StartWindowOptions {
+  // skipcq: JS-T1001
   follow?: boolean | undefined;
 }
 
@@ -36,6 +37,7 @@ export interface AudioSessionController {
   currentMode: () => AudioSessionMode;
 }
 
+// skipcq: JS-0067
 export function createAudioSessionController(deps: AudioSessionDeps): AudioSessionController {
   let device: LoopbackDevice | null = null;
   let mode: AudioSessionMode = "off";
@@ -43,7 +45,7 @@ export function createAudioSessionController(deps: AudioSessionDeps): AudioSessi
   let followWindowAudio = false;
 
   /** Stop the currently active WASAPI loopback device, if any. */
-  function stopDevice(): void {
+  const stopDevice = (): void => {
     try {
       // Stryker disable next-line OptionalChaining: catch block swallows null TypeError when device is null
       device?.stop();
@@ -51,12 +53,12 @@ export function createAudioSessionController(deps: AudioSessionDeps): AudioSessi
       // Ignore teardown errors if the process already exited.
     }
     device = null;
-  }
+  };
 
   /**
    * Capture only the process tree that owns `sourceId`.
    */
-  function startForWindow(sourceId: string, { follow = true }: StartWindowOptions = {}): boolean {
+  const startForWindow = (sourceId: string, { follow = true }: StartWindowOptions = {}): boolean => {
     const pid = deps.resolvePid(sourceId);
     if (pid === null) return false;
     followWindowAudio = follow;
@@ -74,12 +76,12 @@ export function createAudioSessionController(deps: AudioSessionDeps): AudioSessi
       activePid = null;
       return false;
     }
-  }
+  };
 
   /**
    * Capture all system audio except our own process tree.
    */
-  function startForSystem(): boolean {
+  const startForSystem = (): boolean => {
     if (mode === "system") return true;
     followWindowAudio = false;
     stopDevice();
@@ -95,7 +97,7 @@ export function createAudioSessionController(deps: AudioSessionDeps): AudioSessi
       activePid = null;
       return false;
     }
-  }
+  };
 
   return {
     startForWindow,

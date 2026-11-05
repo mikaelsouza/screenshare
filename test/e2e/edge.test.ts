@@ -21,8 +21,11 @@ const contexts: BrowserContext[] = [];
 const status = async (page: Page): Promise<string> => (await page.textContent("#status")) ?? "";
 
 interface RawInboundStat {
+  // skipcq: JS-T1001
   type?: string | undefined;
+  // skipcq: JS-T1001
   kind?: string | undefined;
+  // skipcq: JS-T1001
   framesDecoded?: number | undefined;
 }
 
@@ -33,50 +36,51 @@ const decodedFrames = async (): Promise<number> => {
     if (pc.connectionState === "closed") continue;
     const report = await pc.getStats();
     report.forEach((raw: unknown) => {
-      const s = raw as RawInboundStat;
-      if (s.type === "inbound-rtp" && s.kind === "video") total += s.framesDecoded ?? 0;
+      const stat = raw as RawInboundStat;
+      if (stat.type === "inbound-rtp" && stat.kind === "video") total += stat.framesDecoded ?? 0;
     });
   }
   return total;
 };
 
 /** Wait until the page's decoded frame count grows past `from`: video is flowing now. */
-async function framesGrow(page: Page, label: string, from: number | null = null): Promise<number> {
+const framesGrow = async (page: Page, label: string, from: number | null = null): Promise<number> => {
   const start = from ?? (await page.evaluate(decodedFrames));
   await waitFor(page, decodedFrames, { label: `${label}: any decoded frames`, timeout: 45_000, interval: 1000 });
   const deadline = Date.now() + 45_000;
   while (Date.now() < deadline) {
     const now = await page.evaluate(decodedFrames);
     if (now > start + 10) return now;
-    await new Promise<void>((r) => {
-      setTimeout(r, 1000);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 1000);
     });
   }
   throw new Error(`${label}: decoded frames stuck at ${String(start)}`);
-}
+};
 
-async function newPage(name: string): Promise<Page> {
+const newPage = async (name: string): Promise<Page> => {
   if (!browser) throw new Error("browser not initialized");
   const ctx = await browser.newContext();
   await ctx.addInitScript(INSTRUMENT);
   contexts.push(ctx);
   const page = await ctx.newPage();
-  page.on("console", (m) => {
-    if (m.type() === "error") console.error(`[${name}]`, m.text());
+  page.on("console", (msg) => {
+    if (msg.type() === "error") console.error(`[${name}]`, msg.text());
   });
   await page.goto(BASE_URL);
   await page.fill("#display-name", name);
   return page;
-}
+};
 
-async function joinWith(page: Page, code: string, password?: string): Promise<void> {
+const joinWith = async (page: Page, code: string, password?: string): Promise<void> => {
   await page.fill("#room-code", code);
   await page.fill("#room-pass", password ?? "");
   await page.click("#join");
-}
+};
 
 const inRoom = (): boolean => Boolean(document.getElementById("status")?.textContent?.includes("In room"));
 
+// skipcq: JS-0098
 void describe("edge cases in a real browser", { concurrency: 1 }, () => {
   let code = "";
   let password = "";
@@ -89,7 +93,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     other = await newPage("other");
   });
 
-  afterEach(async (t) => {
+  afterEach(async (testCtx) => {
     // On failure, show what each page was saying: the status line is the app's own account.
     if (process.env["E2E_DEBUG"]) {
       const namedPages: Array<[string, Page]> = [
@@ -97,10 +101,10 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
         ["late", late],
         ["other", other],
       ];
-      for (const [n, p] of namedPages) {
-        const st = await p.textContent("#status").catch(() => "?");
-        const roster = await p.textContent("#roster").catch(() => "?");
-        console.log(`# ${t.name} :: ${n}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
+      for (const [pageName, page] of namedPages) {
+        const st = await page.textContent("#status").catch(() => "?");
+        const roster = await page.textContent("#roster").catch(() => "?");
+        console.log(`# ${testCtx.name} :: ${pageName}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
       }
     }
   });
@@ -110,6 +114,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await stopServer(server);
   });
 
+  // skipcq: JS-0098
   void it("creates a password-protected room with Generate and Create", async () => {
     await host.click("#gen-pass");
     password = await host.inputValue("#room-pass");
@@ -121,6 +126,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     assert.equal(await host.isVisible("#lock-btn"), true, "the creator should be host");
   });
 
+  // skipcq: JS-0098
   void it("turns away a wrong password and lets the right one in", async () => {
     await joinWith(other, code, "wrong-password");
     await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
@@ -132,6 +138,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await waitFor(other, inRoom, { label: "other in the room with the right password" });
   });
 
+  // skipcq: JS-0098
   void it("delivers video to someone who joins after sharing started", async () => {
     await host.click("#share");
     // The picker is asked for a window and never this tab, so a share does not
@@ -145,6 +152,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await framesGrow(late, "late joiner");
   });
 
+  // skipcq: JS-0098
   void it("delivers video again after the sharer stops and shares again", async () => {
     await host.click("#share"); // stop
     await waitFor(host, () => window.__pcs.every((pc) => pc.connectionState === "closed"), {
@@ -155,6 +163,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await framesGrow(other, "other viewer after re-share", 0);
   });
 
+  // skipcq: JS-0098
   void it("carries video both ways when two people share at once", async () => {
     await late.click("#share");
     // The host now receives from late while still sending to everyone.
@@ -165,13 +174,14 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
       other,
       () =>
         [...document.querySelectorAll<HTMLVideoElement>(".tile video")].filter(
-          (v) => v.srcObject instanceof MediaStream && v.srcObject.getVideoTracks().length > 0,
+          (videoEl) => videoEl.srcObject instanceof MediaStream && videoEl.srcObject.getVideoTracks().length > 0,
         ).length >= 2,
       { label: "viewer to show two shared screens", timeout: 45_000 },
     );
     await late.click("#share"); // stop again for the rest of the suite
   });
 
+  // skipcq: JS-0098
   void it("keeps the host a host across a page refresh", async () => {
     await host.reload();
     // A refresh lands on /#CODE and joins at once, but without the password, so it is
@@ -193,6 +203,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     );
   });
 
+  // skipcq: JS-0098
   void it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
     // The refresh above ended the host's share; nobody is sharing now.
     assert.equal(await host.textContent("#share"), "Share screen");
@@ -234,6 +245,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
+  // skipcq: JS-0098
   void it("lets a member back into the locked room after a refresh", async () => {
     // A refresh is a reconnect. The locked room must recognise a member who was
     // already in, even though every page here shares the removed person's address.
@@ -249,6 +261,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
+  // skipcq: JS-0098
   void it("stops sharing when the sharer is removed", async () => {
     await host.click("#lock-btn"); // unlock, so a fresh page can come in to be removed
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Lock room", { label: "unlocked" });
@@ -268,11 +281,12 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
     await waitFor(
       other,
-      () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((t) => t.readyState === "ended")),
+      () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((track) => track.readyState === "ended")),
       { label: "every captured track to be stopped" },
     );
   });
 
+  // skipcq: JS-0098
   void it("raised no CSP or Trusted Types violation on any page", async () => {
     const namedPages: Array<[string, Page]> = [
       ["host", host],

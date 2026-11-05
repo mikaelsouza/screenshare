@@ -272,7 +272,7 @@ describe("SignalingClient reconnection", () => {
     // Opening ws2 works properly
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { t: string }).t).toBe("join");
 
     c.close();
   });
@@ -310,7 +310,7 @@ describe("SignalingClient reconnection", () => {
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { t: string }).t).toBe("join");
 
     // Server close triggers reconnect because closedByUs was reset
     ws2.serverClose(1006);
@@ -407,7 +407,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect((JSON.parse(ws2.sent[0]!) as { hostToken?: string }).hostToken).toBe("tok");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { hostToken?: string }).hostToken).toBe("tok");
     c.close();
   });
 
@@ -440,7 +440,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect((JSON.parse(ws2.sent[0]!) as { rejoinToken?: string }).rejoinToken).toBe("r1");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { rejoinToken?: string }).rejoinToken).toBe("r1");
     c.close();
   });
 });
