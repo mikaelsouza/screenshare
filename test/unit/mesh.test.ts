@@ -770,7 +770,8 @@ describe("negotiation recovery", () => {
     const mesh = new Mesh("alice", opts, (to, data) => signals.push({ to, data }), cb());
     mesh.setMemberSharing("bob", true);
     await mesh.setCapture(capture());
-    const pc = FakeRTCPeerConnection.instances[0]!;
+    const [pc] = FakeRTCPeerConnection.instances;
+    if (!pc) throw new Error("Expected peer connection");
     pc.onicecandidate?.({
       candidate: { candidate: "cand1", sdpMid: "0", sdpMLineIndex: 0, usernameFragment: "u1" } as RTCIceCandidate,
     });

@@ -77,7 +77,7 @@ async function joinWith(page: Page, code: string, password?: string): Promise<vo
 
 const inRoom = (): boolean => Boolean(document.getElementById("status")?.textContent?.includes("In room"));
 
-void describe("edge cases in a real browser", { concurrency: 1 }, () => {
+await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   let code = "";
   let password = "";
 
@@ -110,7 +110,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await stopServer(server);
   });
 
-  void it("creates a password-protected room with Generate and Create", async () => {
+  await it("creates a password-protected room with Generate and Create", async () => {
     await host.click("#gen-pass");
     password = await host.inputValue("#room-pass");
     assert.ok(password.length >= 8, `generated password too short: ${password}`);
@@ -121,7 +121,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     assert.equal(await host.isVisible("#lock-btn"), true, "the creator should be host");
   });
 
-  void it("turns away a wrong password and lets the right one in", async () => {
+  await it("turns away a wrong password and lets the right one in", async () => {
     await joinWith(other, code, "wrong-password");
     await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
       label: "wrong password to be reported",
@@ -132,7 +132,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await waitFor(other, inRoom, { label: "other in the room with the right password" });
   });
 
-  void it("delivers video to someone who joins after sharing started", async () => {
+  await it("delivers video to someone who joins after sharing started", async () => {
     await host.click("#share");
     // The picker is asked for a window and never this tab, so a share does not
     // default to the whole screen or show the app to itself.
@@ -147,7 +147,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await framesGrow(late, "late joiner");
   });
 
-  void it("delivers video again after the sharer stops and shares again", async () => {
+  await it("delivers video again after the sharer stops and shares again", async () => {
     await host.click("#share"); // stop
     await waitFor(host, () => window.__pcs.every((pc) => pc.connectionState === "closed"), {
       label: "links to close after stopping",
@@ -157,7 +157,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await framesGrow(other, "other viewer after re-share", 0);
   });
 
-  void it("carries video both ways when two people share at once", async () => {
+  await it("carries video both ways when two people share at once", async () => {
     await late.click("#share");
     // The host now receives from late while still sending to everyone.
     await framesGrow(host, "host receiving from the second sharer");
@@ -174,7 +174,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await late.click("#share"); // stop again for the rest of the suite
   });
 
-  void it("keeps the host a host across a page refresh", async () => {
+  await it("keeps the host a host across a page refresh", async () => {
     await host.reload();
     // A refresh lands on /#CODE and joins at once, but without the password, so it is
     // asked for; entering it and pressing Join gets back in.
@@ -195,7 +195,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     );
   });
 
-  void it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
+  await it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
     // The refresh above ended the host's share; nobody is sharing now.
     assert.equal(await host.textContent("#share"), "Share screen");
     await waitFor(host, () => document.querySelectorAll("#roster-list button").length === 2, {
@@ -236,7 +236,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
-  void it("lets a member back into the locked room after a refresh", async () => {
+  await it("lets a member back into the locked room after a refresh", async () => {
     // A refresh is a reconnect. The locked room must recognise a member who was
     // already in, even though every page here shares the removed person's address.
     await other.reload();
@@ -251,7 +251,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
-  void it("stops sharing when the sharer is removed", async () => {
+  await it("stops sharing when the sharer is removed", async () => {
     await host.click("#lock-btn"); // unlock, so a fresh page can come in to be removed
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Lock room", { label: "unlocked" });
     // The removal ban is by address and every page here is 127.0.0.1, so the second
@@ -275,7 +275,7 @@ void describe("edge cases in a real browser", { concurrency: 1 }, () => {
     );
   });
 
-  void it("raised no CSP or Trusted Types violation on any page", async () => {
+  await it("raised no CSP or Trusted Types violation on any page", async () => {
     const pages: Array<[string, Page]> = [
       ["host", host],
       ["late", late],

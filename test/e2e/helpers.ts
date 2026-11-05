@@ -17,7 +17,7 @@ declare global {
     __pcs: RTCPeerConnection[];
     __csp: string[];
     __gdmOpts: DisplayMediaStreamOptions[];
-    __gdmStreams?: MediaStream[] | undefined;
+    __gdmStreams?: MediaStream[];
   }
 }
 
@@ -107,7 +107,7 @@ export async function stopServer(server: ServerHandle | undefined): Promise<void
 }
 
 /** Launch headless Chromium with fake WebRTC media devices and strict autoplay. */
-export async function launchBrowser(): Promise<Browser> {
+export function launchBrowser(): Promise<Browser> {
   const executablePath =
     process.env["CHROMIUM_BIN"] ??
     (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined);
@@ -170,7 +170,8 @@ export const INSTRUMENT = (): void => {
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
-    const ctx = canvas.getContext("2d")!;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("2d context unavailable");
     let frame = 0;
     // Content must actually change every frame, or the encoder sends almost nothing
     // and framesDecoded on the far side stays flat.

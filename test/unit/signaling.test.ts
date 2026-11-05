@@ -270,7 +270,7 @@ describe("SignalingClient reconnection", () => {
     // Opening ws2 works properly
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { t: string }).t).toBe("join");
 
     c.close();
   });
@@ -308,7 +308,7 @@ describe("SignalingClient reconnection", () => {
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
     expect(ws2.sent.length).toBe(1);
-    expect((JSON.parse(ws2.sent[0]!) as { t: string }).t).toBe("join");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { t: string }).t).toBe("join");
 
     // Server close triggers reconnect because closedByUs was reset
     ws2.serverClose(1006);
@@ -405,7 +405,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect((JSON.parse(ws2.sent[0]!) as { hostToken: string }).hostToken).toBe("tok");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { hostToken: string }).hostToken).toBe("tok");
     c.close();
   });
 
@@ -438,7 +438,7 @@ describe("SignalingClient capacity refusals", () => {
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
-    expect((JSON.parse(ws2.sent[0]!) as { rejoinToken: string }).rejoinToken).toBe("r1");
+    expect((JSON.parse(ws2.sent[0] ?? "{}") as { rejoinToken: string }).rejoinToken).toBe("r1");
     c.close();
   });
 });
@@ -697,22 +697,24 @@ describe("SignalingClient keepalive and session resumption", () => {
   });
 
   it("supports kick, setLocked, connect during pending reconnect, and wakeup edge cases", () => {
-    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
-    c.connect();
-    const ws1 = FakeWebSocket.instances[0]!;
+    const client = new SignalingClient("ABCDEFGH", "alice", handlers());
+    client.connect();
+    const [ws1] = FakeWebSocket.instances;
+    if (!ws1) throw new Error("Expected ws1");
     ws1.open();
     ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }) });
 
-    c.kick("00000000-0000-4000-8000-000000000000");
-    c.setLocked(true);
-    expect(JSON.parse(ws1.sent[1]!)).toEqual({ t: "kick", id: "00000000-0000-4000-8000-000000000000" });
-    expect(JSON.parse(ws1.sent[2]!)).toEqual({ t: "lock", locked: true });
+    client.kick("00000000-0000-4000-8000-000000000000");
+    client.setLocked(true);
+    expect(JSON.parse(ws1.sent[1] ?? "{}")).toEqual({ t: "kick", id: "00000000-0000-4000-8000-000000000000" });
+    expect(JSON.parse(ws1.sent[2] ?? "{}")).toEqual({ t: "lock", locked: true });
 
     // Wakeup when lastReceivedAt > 65s ago while socket still OPEN
     vi.setSystemTime(Date.now() + 70_000);
     winListeners["online"]?.();
     expect(FakeWebSocket.instances.length).toBe(2);
-    const wsMid = FakeWebSocket.instances[1]!;
+    const wsMid = FakeWebSocket.instances[1];
+    if (!wsMid) throw new Error("Expected wsMid");
     wsMid.open();
     wsMid.send = () => {
       throw new Error("broken");
@@ -721,12 +723,13 @@ describe("SignalingClient keepalive and session resumption", () => {
     expect(FakeWebSocket.instances.length).toBe(3);
 
     // Calling connect() while reconnectTimer is pending clears reconnectTimer
-    const wsLast = FakeWebSocket.instances[2]!;
+    const wsLast = FakeWebSocket.instances[2];
+    if (!wsLast) throw new Error("Expected wsLast");
     wsLast.open();
     wsLast.serverClose(1006);
-    c.connect();
+    client.connect();
     expect(FakeWebSocket.instances.length).toBe(4);
-    c.close();
+    client.close();
   });
 
   it("reconnects immediately when ws.send(PING) throws an exception", () => {
