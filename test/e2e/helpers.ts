@@ -1,14 +1,16 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { chromium, type Browser, type Page } from "playwright-core";
 
+interface GdmVideoOptions {
+  // skipcq: JS-T1001
+  displaySurface?: string | undefined;
+}
+
 export interface GdmRecordedOptions {
   // skipcq: JS-T1001
   selfBrowserSurface?: string | undefined;
   // skipcq: JS-T1001
-  video?: {
-    // skipcq: JS-T1001
-    displaySurface?: string | undefined;
-  } | undefined;
+  video?: GdmVideoOptions | undefined;
 }
 
 declare global {

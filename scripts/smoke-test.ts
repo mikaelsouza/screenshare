@@ -29,8 +29,8 @@ const logError = (msg: string): void => {
 const BENIGN_CONSOLE_ERRORS: readonly RegExp[] = [
   /favicon\.ico/,
   /stun:/,
-  /stun\.cloudflare\.com/,
-  /cloudflareinsights\.com/,
+  /beacon\.min\.js/,
+  /Content Security Policy/,
   /^Refused to execute inline script/,
 ];
 
