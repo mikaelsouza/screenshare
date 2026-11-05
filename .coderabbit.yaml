@@ -19,6 +19,7 @@ reviews:
       - "main"
   path_filters:
     - "!dist/**"
+    - "!dist-electron/**"
     - "!release/**"
     - "!reports/**"
     - "!coverage/**"
@@ -31,7 +32,7 @@ reviews:
         - Verify WebSocket Hibernation state consistency (`serializeAttachment` / `deserializeAttachment` and `ctx.getWebSockets()`).
         - Check room capacity enforcement, password verification, and rate-limiting invariants.
         - Ignore formatting, style, and unused-variable issues (handled by tsc, oxlint, knip, and DeepSource).
-    - path: "electron/**/*.{js,cjs,ts,cts}"
+    - path: "electron/**/*.{ts,cts}"
       instructions: |
         Focus on Electron security boundaries and native OS integration:
         - Verify `contextIsolation`, `sandbox`, and IPC sender/argument validation between main and preload.

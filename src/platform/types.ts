@@ -31,7 +31,7 @@ export interface FollowState {
 }
 
 /**
- * Exposed by electron/preload.cjs. Every method beyond the flags is optional: the
+ * Exposed by electron/preload.cts. Every method beyond the flags is optional: the
  * desktop app loads the hosted site, so an older app can meet a newer page.
  */
 export interface ElectronAPI {

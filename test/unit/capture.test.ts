@@ -4,6 +4,7 @@ import {
   QUALITY_PRESETS,
   captureAudioOnly,
   captureScreen,
+  isAudioMode,
   onCaptureEnded,
   stopAudioSource,
   stopCapture,
@@ -14,6 +15,9 @@ import {
 describe("QUALITY_PRESETS", () => {
   it("defines standard resolution and framerate presets", () => {
     expect(DEFAULT_PRESET).toBe("1080p60");
+    expect(isAudioMode("app")).toBe(true);
+    expect(isAudioMode("invalid")).toBe(false);
+    expect(isAudioMode(null)).toBe(false);
     expect(QUALITY_PRESETS["1080p60"]).toEqual({
       label: "1080p 60fps",
       width: 1920,
@@ -179,7 +183,7 @@ describe("captureScreen and track helpers", () => {
         if (event === "ended" && endedHandler === handler) endedHandler = null;
       }),
       triggerEnded: () => { endedHandler?.(); },
-    } as unknown as MediaStreamTrack & { stopped: boolean; triggerEnded: () => void };
+    } as unknown as MediaStreamTrack & { stopped: boolean; triggerEnded: () => void; removeEventListener: ReturnType<typeof vi.fn> };
   }
 
   function makeStream(videoTrack: MediaStreamTrack | null, audioTrack: MediaStreamTrack | null) {
@@ -222,7 +226,7 @@ describe("captureScreen and track helpers", () => {
     expect(vTrack.contentHint).toBe("motion");
     expect(aTrack.contentHint).toBe("music");
 
-    const callArgs = getDisplayMediaMock.mock.calls[0]?.[0];
+    const callArgs = getDisplayMediaMock.mock.calls[0]?.[0] as DisplayMediaStreamOptions;
     expect(callArgs.audio).toMatchObject({
       echoCancellation: false,
       noiseSuppression: false,
@@ -242,7 +246,7 @@ describe("captureScreen and track helpers", () => {
 
     const result = await captureScreen(QUALITY_PRESETS["720p30"], "none");
     expect(result.audio).toBeNull();
-    const callArgs = getDisplayMediaMock.mock.calls[0]?.[0];
+    const callArgs = getDisplayMediaMock.mock.calls[0]?.[0] as DisplayMediaStreamOptions;
     expect(callArgs.audio).toBe(false);
   });
 
@@ -261,7 +265,7 @@ describe("captureScreen and track helpers", () => {
   });
 
   it("notifies when capture ended and allows unregistering", () => {
-    const vTrack = makeTrack("video") as unknown as MediaStreamTrack & { triggerEnded: () => void };
+    const vTrack = makeTrack("video");
     const stream = makeStream(vTrack, null);
     const cb = vi.fn();
 

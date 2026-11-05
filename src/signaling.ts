@@ -67,15 +67,27 @@ export class SignalingClient {
   private sharing = false;
   private lastReceivedAt = 0;
   private pendingMessages: ClientMessage[] = [];
+  private readonly room: string;
+  private readonly displayName: string;
+  private readonly handlers: SignalingHandlers;
+  private readonly password: string | undefined;
+  /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
+  private readonly tokens:
+    | (() => { hostToken?: string | undefined; rejoinToken?: string | undefined })
+    | undefined;
 
   constructor(
-    private readonly room: string,
-    private readonly displayName: string,
-    private readonly handlers: SignalingHandlers,
-    private readonly password?: string,
-    /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
-    private readonly tokens?: () => { hostToken?: string; rejoinToken?: string },
+    room: string,
+    displayName: string,
+    handlers: SignalingHandlers,
+    password?: string,
+    tokens?: () => { hostToken?: string | undefined; rejoinToken?: string | undefined },
   ) {
+    this.room = room;
+    this.displayName = displayName;
+    this.handlers = handlers;
+    this.password = password;
+    this.tokens = tokens;
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", this.onVisibilityChange);
     }
@@ -104,7 +116,7 @@ export class SignalingClient {
     const ws = new WebSocket(`${proto}//${location.host}/ws/${encodeURIComponent(this.room)}`);
     this.ws = ws;
 
-    ws.onopen = () => {
+    ws.onopen = (): void => {
       if (this.ws !== ws) return;
       // Deliberately NOT resetting attempts or capacityRefusals here. A refusal also
       // completes the handshake — the server answers 101 and then closes, so that the
@@ -134,7 +146,7 @@ export class SignalingClient {
       this.startPing();
     };
 
-    ws.onmessage = (ev) => {
+    ws.onmessage = (ev): void => {
       if (this.ws !== ws) return;
       this.lastReceivedAt = Date.now();
       const raw = String(ev.data);
@@ -149,7 +161,7 @@ export class SignalingClient {
       this.dispatch(msg);
     };
 
-    ws.onclose = (ev) => {
+    ws.onclose = (ev): void => {
       if (this.ws !== ws) return;
       this.stopPing();
       // Closed on purpose: whoever closed it has already said what happened, e.g. that
@@ -180,7 +192,7 @@ export class SignalingClient {
       if (!this.closedByUs) this.scheduleReconnect();
     };
 
-    ws.onerror = () => {
+    ws.onerror = (): void => {
       if (this.ws !== ws) return;
       // 'close' always follows; reconnect is handled there.
     };

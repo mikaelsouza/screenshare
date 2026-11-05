@@ -235,6 +235,16 @@ describe("parseClientMessage join options", () => {
     });
   });
 
+  it("parses hostToken, kick, and lock messages", () => {
+    expect(
+      parseClientMessage(JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: "alice", hostToken: "htok" })),
+    ).toEqual({ t: "join", room: "ABCDEFGH", displayName: "alice", hostToken: "htok" });
+    expect(parseClientMessage(JSON.stringify({ t: "kick", id: P1 }))).toEqual({ t: "kick", id: P1 });
+    expect(parseClientMessage(JSON.stringify({ t: "kick", id: "not-a-uuid" }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "lock", locked: true }))).toEqual({ t: "lock", locked: true });
+    expect(parseClientMessage(JSON.stringify({ t: "lock", locked: "yes" }))).toBeNull();
+  });
+
   it("ignores non-boolean or false resume and sharing values", () => {
     const parsed = parseClientMessage(
       JSON.stringify({

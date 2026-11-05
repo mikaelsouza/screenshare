@@ -86,7 +86,10 @@ class Client {
   private queue: ServerMessage[] = [];
   private waiters: Array<(m: ServerMessage) => void> = [];
 
-  private constructor(readonly ws: WebSocket) {
+  readonly ws: WebSocket;
+
+  private constructor(ws: WebSocket) {
+    this.ws = ws;
     ws.addEventListener("message", (ev) => {
       const raw = String((ev as MessageEvent).data);
       if (raw === PONG || raw === PING) return;
@@ -141,8 +144,8 @@ class Client {
     throw new Error(`never received a "${t}" message`);
   }
 
-  async join(name = "tester"): Promise<Extract<ServerMessage, { t: "welcome" }>> {
-    this.send({ t: "join", room: CODE, displayName: name });
+  async join(name = "tester", password?: string): Promise<Extract<ServerMessage, { t: "welcome" }>> {
+    this.send({ t: "join", room: CODE, displayName: name, ...(password !== undefined ? { password } : {}) });
     return this.nextOf("welcome");
   }
 

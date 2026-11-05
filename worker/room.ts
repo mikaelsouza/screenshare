@@ -202,7 +202,7 @@ function sanitiseName(raw: string): string {
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
     .replace(/\s+/gu, " ")
     .trim();
-  return [...cleaned].slice(0, 32).join("").trim() || "Anonymous";
+  return Array.from(cleaned).slice(0, 32).join("").trim() || "Anonymous";
 }
 
 function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
@@ -376,7 +376,7 @@ export class RoomDO extends DurableObject<Env> {
    * Erase an abandoned room. Armed when the last peer leaves and cancelled the moment
    * anyone joins, so a reconnect never trips it.
    */
-  async alarm(): Promise<void> {
+  override async alarm(): Promise<void> {
     for (const s of this.ctx.getWebSockets()) {
       const att = getAttachment(s);
       if (att?.joined) {
@@ -388,7 +388,11 @@ export class RoomDO extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
   }
 
-  async fetch(request: Request): Promise<Response> {
+  override fetch(request: Request): Promise<Response> {
+    return Promise.resolve(this.handleFetch(request));
+  }
+
+  private handleFetch(request: Request): Response {
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
@@ -454,7 +458,7 @@ export class RoomDO extends DurableObject<Env> {
       name: "",
       sharing: false,
       joined: false,
-      ip: clientIp ?? undefined,
+      ...(clientIp ? { ip: clientIp } : {}),
       openedAt: now,
     };
     server.serializeAttachment(attachment);
@@ -462,7 +466,7 @@ export class RoomDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = getAttachment(ws);
     if (!attachment) {
       return;
@@ -493,172 +497,173 @@ export class RoomDO extends DurableObject<Env> {
 
     const clientMsg = parseClientMessage(raw);
     if (!clientMsg) {
-      const bad = (this.badMessages.get(attachment.id) ?? 0) + 1;
-      this.badMessages.set(attachment.id, bad);
-      if (bad > MAX_BAD_MESSAGES) {
-        this.refuse(ws, "bad-message", "Too many invalid messages");
-        return;
-      }
+      this.recordBadMessage(ws, attachment.id);
+      return;
+    }
+    await this.dispatchClientMessage(ws, attachment, clientMsg);
+  }
+
+  private recordBadMessage(ws: WebSocket, peerId: string): void {
+    const bad = (this.badMessages.get(peerId) ?? 0) + 1;
+    this.badMessages.set(peerId, bad);
+    if (bad > MAX_BAD_MESSAGES) {
+      this.refuse(ws, "bad-message", "Too many invalid messages");
+      return;
+    }
+    sendSafe(ws, {
+      t: "error",
+      code: "bad-message",
+      message: "Invalid or malformed client message",
+    });
+  }
+
+  private async dispatchClientMessage(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: ClientMessage,
+  ): Promise<void> {
+    if (clientMsg.t === "join") {
+      await this.onJoinMessage(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "kick") {
+      await this.handleKick(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "lock") {
+      await this.handleLock(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "signal") {
+      this.handleSignal(ws, attachment, clientMsg);
+    } else {
+      await this.handleState(ws, attachment, clientMsg);
+    }
+  }
+
+  private async onJoinMessage(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "join" }>,
+  ): Promise<void> {
+    if (attachment.joined || this.joining.has(attachment.id) || this.gone.has(attachment.id)) {
+      return;
+    }
+    const joinId = attachment.id;
+    this.joining.add(joinId);
+    try {
+      await this.handleJoin(ws, attachment, clientMsg);
+    } finally {
+      this.joining.delete(joinId);
+    }
+  }
+
+  private async handleKick(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "kick" }>,
+  ): Promise<void> {
+    if (!attachment.joined || !attachment.host) {
+      sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can remove people" });
+      return;
+    }
+    if (clientMsg.id === attachment.id) return;
+    const target = this.joinedPeers(ws).find(({ att }) => att.id === clientMsg.id);
+    if (!target) {
+      sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
+      return;
+    }
+    const now = Date.now();
+    const rawMembers = await this.getMembers(now);
+    const members = target.att.rejoinHash
+      ? Object.fromEntries(Object.entries(rawMembers).filter(([hash]) => hash !== target.att.rejoinHash))
+      : rawMembers;
+    const writes: Record<string, unknown> = { [MEMBERS_KEY]: members };
+    if (target.att.ip) {
+      const deny = await this.getDenyList(now);
+      deny[target.att.ip] = now + KICK_BAN_MS;
+      writes[DENY_KEY] = deny;
+    }
+    await this.ctx.storage.put(writes);
+    sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
+    await this.handleLeave(target.ws);
+    try {
+      target.ws.close(1008, "Kicked");
+    } catch {
+      /* socket already closed */
+    }
+  }
+
+  private async handleLock(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "lock" }>,
+  ): Promise<void> {
+    if (!attachment.joined || !attachment.host) {
+      sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can lock the room" });
+      return;
+    }
+    await this.ctx.storage.put(LOCKED_KEY, clientMsg.locked);
+    const stateMsg: ServerMessage = { t: "room-state", locked: clientMsg.locked };
+    sendSafe(ws, stateMsg);
+    for (const { ws: s } of this.joinedPeers(ws)) sendSafe(s, stateMsg);
+  }
+
+  private handleSignal(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "signal" }>,
+  ): void {
+    if (!attachment.joined) {
       sendSafe(ws, {
         t: "error",
-        code: "bad-message",
-        message: "Invalid or malformed client message",
+        code: "unknown-peer",
+        message: "Must join room before sending signals",
       });
       return;
     }
+    const target = this.joinedPeers().find(({ att }) => att.id === clientMsg.to);
+    if (!target) {
+      sendSafe(ws, {
+        t: "error",
+        code: "unknown-peer",
+        message: "Peer not found",
+      });
+      return;
+    }
+    if (clientMsg.data.k === "offer" && !attachment.sharing && !target.att.sharing) {
+      sendSafe(ws, { t: "error", code: "not-sharing", message: "Neither of you is sharing" });
+      return;
+    }
+    sendSafe(target.ws, {
+      t: "signal",
+      from: attachment.id,
+      data: clientMsg.data,
+    });
+  }
 
-    switch (clientMsg.t) {
-      case "join": {
-        // A second "join" on the same socket must be ignored, not duplicated — also
-        // while the first is still in flight, since it awaits password and token hashing.
-        if (attachment.joined || this.joining.has(attachment.id) || this.gone.has(attachment.id)) {
-          return;
-        }
-        const joinId = attachment.id;
-        this.joining.add(joinId);
-        try {
-          await this.handleJoin(ws, attachment, clientMsg);
-        } finally {
-          this.joining.delete(joinId);
-        }
-        return;
+  private async handleState(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "state" }>,
+  ): Promise<void> {
+    if (!attachment.joined) return;
+    attachment.sharing = clientMsg.sharing;
+    try {
+      ws.serializeAttachment(attachment);
+    } catch {
+      /* ignore attachment serialization failure */
+    }
+    if (attachment.rejoinHash) {
+      const now = Date.now();
+      const members = await this.getMembers(now);
+      const member = members[attachment.rejoinHash];
+      if (member) {
+        member.sharing = attachment.sharing;
+        await this.ctx.storage.put({ [MEMBERS_KEY]: members });
       }
-
-      case "kick": {
-        if (!attachment.joined || !attachment.host) {
-          sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can remove people" });
-          return;
-        }
-        if (clientMsg.id === attachment.id) return;
-        const target = this.joinedPeers(ws).find(({ att }) => att.id === clientMsg.id);
-        if (!target) {
-          sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
-          return;
-        }
-        {
-          // Written before the close, so a rejoin racing the close meets the ban. The
-          // ticket goes too, or it would carry them straight past the ban.
-          const now = Date.now();
-          const members = await this.getMembers(now);
-          if (target.att.rejoinHash) delete members[target.att.rejoinHash];
-          const writes: Record<string, unknown> = { [MEMBERS_KEY]: members };
-          if (target.att.ip) {
-            const deny = await this.getDenyList(now);
-            deny[target.att.ip] = now + KICK_BAN_MS;
-            writes[DENY_KEY] = deny;
-          }
-          await this.ctx.storage.put(writes);
-        }
-        sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
-        // Leave first, so everyone hears peer-left and the credential is revoked even
-        // if the close never completes.
-        await this.handleLeave(target.ws);
-        try {
-          target.ws.close(1008, "Kicked");
-        } catch {}
-        return;
-      }
-
-      case "lock": {
-        if (!attachment.joined || !attachment.host) {
-          sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can lock the room" });
-          return;
-        }
-        await this.ctx.storage.put(LOCKED_KEY, clientMsg.locked);
-        const stateMsg: ServerMessage = { t: "room-state", locked: clientMsg.locked };
-        sendSafe(ws, stateMsg);
-        for (const { ws: s } of this.joinedPeers(ws)) sendSafe(s, stateMsg);
-        return;
-      }
-
-      case "signal": {
-        if (!attachment.joined) {
-          sendSafe(ws, {
-            t: "error",
-            code: "unknown-peer",
-            message: "Must join room before sending signals",
-          });
-          return;
-        }
-
-        // Look up the target socket by attachment id among getWebSockets()
-        let targetSocket: WebSocket | null = null;
-        let targetSharing = false;
-        for (const s of this.ctx.getWebSockets()) {
-          const att = getAttachment(s);
-          if (att && att.joined && att.id === clientMsg.to) {
-            targetSocket = s;
-            targetSharing = att.sharing;
-            break;
-          }
-        }
-
-        // Unknown/!joined -> "unknown-peer" error back to sender
-        if (!targetSocket) {
-          sendSafe(ws, {
-            t: "error",
-            code: "unknown-peer",
-            // Not echoing `to`: it is whatever the client sent.
-            message: "Peer not found",
-          });
-          return;
-        }
-
-        // A connection starts with an offer, and there is a connection only when one
-        // side shares: viewers never connect to each other. The client enforces that,
-        // but a modified client could offer to another viewer to learn their address
-        // from the answer, so the relay enforces it too. Clients announce sharing
-        // before they offer, so an honest offer always passes.
-        if (clientMsg.data.k === "offer" && !attachment.sharing && !targetSharing) {
-          sendSafe(ws, { t: "error", code: "not-sharing", message: "Neither of you is sharing" });
-          return;
-        }
-
-        // Otherwise forward { t:"signal", from: senderId, data } VERBATIM. Never parse or inspect `data`.
-        sendSafe(targetSocket, {
-          t: "signal",
-          from: attachment.id,
-          data: clientMsg.data,
-        });
-        return;
-      }
-
-      case "state": {
-        if (!attachment.joined) {
-          return;
-        }
-
-        // Update the sender's attachment sharing flag, broadcast { t:"peer-state", id, sharing }
-        attachment.sharing = clientMsg.sharing;
-        try {
-          ws.serializeAttachment(attachment);
-        } catch {}
-
-        if (attachment.rejoinHash) {
-          const now = Date.now();
-          const members = await this.getMembers(now);
-          const member = members[attachment.rejoinHash];
-          if (member) {
-            member.sharing = attachment.sharing;
-            await this.ctx.storage.put({ [MEMBERS_KEY]: members });
-          }
-        }
-
-        const stateMsg: ServerMessage = {
-          t: "peer-state",
-          id: attachment.id,
-          sharing: attachment.sharing,
-        };
-
-        for (const s of this.ctx.getWebSockets()) {
-          if (s === ws) continue;
-          const att = getAttachment(s);
-          if (att && att.joined) {
-            sendSafe(s, stateMsg);
-          }
-        }
-        return;
-      }
+    }
+    const stateMsg: ServerMessage = {
+      t: "peer-state",
+      id: attachment.id,
+      sharing: attachment.sharing,
+    };
+    for (const { ws: s } of this.joinedPeers(ws)) {
+      sendSafe(s, stateMsg);
     }
   }
 
@@ -925,7 +930,7 @@ export class RoomDO extends DurableObject<Env> {
         isHost: boolean;
         locked: boolean;
         returning: boolean;
-        memberTicket?: MemberEntry;
+        memberTicket?: MemberEntry | undefined;
       }
     | { ok: false; code: ErrorCode; message: string }
   > {
@@ -998,7 +1003,7 @@ export class RoomDO extends DurableObject<Env> {
     return live;
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+  override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.forgetBudget(ws);
     await this.handleLeave(ws);
     // Cloudflare's hibernation contract requires the server to complete the closing
@@ -1013,7 +1018,7 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+  override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     this.forgetBudget(ws);
     await this.handleLeave(ws);
     try {

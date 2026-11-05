@@ -1,46 +1,92 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { baseUrl, INSTRUMENT, launchBrowser, startServer, stopServer, waitFor } from "./helpers.mjs";
+import type { Browser, Page } from "playwright-core";
+import {
+  baseUrl,
+  INSTRUMENT,
+  launchBrowser,
+  startServer,
+  stopServer,
+  waitFor,
+  type ServerHandle,
+} from "./helpers.ts";
 
 // Fresh per run: wrangler dev keeps Durable Object storage between runs, and a room
 // claimed by an earlier run has a host this run cannot be.
 const ROOM = Array.from(
   crypto.getRandomValues(new Uint8Array(8)),
-  (b) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[b % 31],
+  (byteVal) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[byteVal % 31] ?? "A",
 ).join("");
 const PORT = 8890;
 const BASE_URL = baseUrl(PORT);
 
-let server;
-let browser;
-let sharer;
-let viewer;
+let server: ServerHandle | undefined;
+let browser: Browser | undefined;
+let sharer: Page;
+let viewer: Page;
 /** A second viewer: viewers must never connect to each other, only to the sharer. */
-let viewer2;
+let viewer2: Page;
+
+interface LinkStatEntry {
+  connectionState: RTCPeerConnectionState;
+  localType: string | null;
+  remoteType: string | null;
+  framesDecoded: number | null;
+  framesEncoded: number | null;
+  bytesReceived: number | null;
+}
+
+interface RawStatRecord {
+  id: string;
+  type: string;
+  kind?: string;
+  selectedCandidatePairId?: string;
+  localCandidateId?: string;
+  remoteCandidateId?: string;
+  candidateType?: string;
+  framesDecoded?: number;
+  framesEncoded?: number;
+  bytesReceived?: number;
+}
 
 /** Read link stats out of the page's recorded RTCPeerConnections. */
-const readStats = async () => {
-  const out = [];
+const readStats = async (): Promise<LinkStatEntry[]> => {
+  const candidateType = (byId: Map<string, RawStatRecord>, id?: string): string | null =>
+    byId.get(id ?? "")?.candidateType ?? null;
+
+  const applyTransport = (entry: LinkStatEntry, rec: RawStatRecord, byId: Map<string, RawStatRecord>): void => {
+    const pair = byId.get(rec.selectedCandidatePairId ?? "");
+    if (!pair) return;
+    entry.localType = candidateType(byId, pair.localCandidateId);
+    entry.remoteType = candidateType(byId, pair.remoteCandidateId);
+  };
+
+  const applyRecord = (entry: LinkStatEntry, rec: RawStatRecord, byId: Map<string, RawStatRecord>): void => {
+    if (rec.type === "transport") {
+      applyTransport(entry, rec, byId);
+    } else if (rec.type === "inbound-rtp" && rec.kind === "video") {
+      entry.framesDecoded = rec.framesDecoded ?? 0;
+      entry.bytesReceived = rec.bytesReceived ?? 0;
+    } else if (rec.type === "outbound-rtp" && rec.kind === "video") {
+      entry.framesEncoded = rec.framesEncoded ?? 0;
+    }
+  };
+
+  const out: LinkStatEntry[] = [];
   for (const pc of window.__pcs) {
     const report = await pc.getStats();
-    const entry = { connectionState: pc.connectionState, localType: null, remoteType: null, framesDecoded: null, framesEncoded: null, bytesReceived: null };
-    const byId = new Map();
-    report.forEach((s, id) => byId.set(id, s));
-    for (const s of byId.values()) {
-      if (s.type === "transport" && s.selectedCandidatePairId) {
-        const pair = byId.get(s.selectedCandidatePairId);
-        if (pair) {
-          entry.localType = byId.get(pair.localCandidateId)?.candidateType ?? null;
-          entry.remoteType = byId.get(pair.remoteCandidateId)?.candidateType ?? null;
-        }
-      }
-      if (s.type === "inbound-rtp" && s.kind === "video") {
-        entry.framesDecoded = s.framesDecoded ?? 0;
-        entry.bytesReceived = s.bytesReceived ?? 0;
-      }
-      if (s.type === "outbound-rtp" && s.kind === "video") {
-        entry.framesEncoded = s.framesEncoded ?? 0;
-      }
+    const entry: LinkStatEntry = {
+      connectionState: pc.connectionState,
+      localType: null,
+      remoteType: null,
+      framesDecoded: null,
+      framesEncoded: null,
+      bytesReceived: null,
+    };
+    const byId = new Map<string, RawStatRecord>();
+    report.forEach((statItem: unknown, id: string) => byId.set(id, statItem as RawStatRecord));
+    for (const statRecord of byId.values()) {
+      applyRecord(entry, statRecord, byId);
     }
     out.push(entry);
   }
@@ -48,19 +94,20 @@ const readStats = async () => {
 };
 
 /** Frames decoded so far across every live inbound video stream on the page. */
-const decodedFrames = async () => {
+const decodedFrames = async (): Promise<number> => {
   let total = 0;
   for (const pc of window.__pcs) {
     if (pc.connectionState === "closed") continue;
     const report = await pc.getStats();
-    report.forEach((s) => {
-      if (s.type === "inbound-rtp" && s.kind === "video") total += s.framesDecoded ?? 0;
+    report.forEach((s: unknown) => {
+      const rec = s as RawStatRecord;
+      if (rec.type === "inbound-rtp" && rec.kind === "video") total += rec.framesDecoded ?? 0;
     });
   }
   return total;
 };
 
-describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
+await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
   before(async () => {
     server = await startServer(PORT);
     browser = await launchBrowser();
@@ -73,8 +120,15 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     sharer = await ctxA.newPage();
     viewer = await ctxB.newPage();
     viewer2 = await ctxC.newPage();
-    for (const [name, p] of [["sharer", sharer], ["viewer", viewer], ["viewer2", viewer2]]) {
-      p.on("console", (m) => { if (m.type() === "error") console.error(`[${name}]`, m.text()); });
+    const pages: Array<[string, Page]> = [
+      ["sharer", sharer],
+      ["viewer", viewer],
+      ["viewer2", viewer2],
+    ];
+    for (const [name, p] of pages) {
+      p.on("console", (m) => {
+        if (m.type() === "error") console.error(`[${name}]`, m.text());
+      });
     }
   });
 
@@ -83,14 +137,14 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     await stopServer(server);
   });
 
-  it("serves the app and mints a room code", async () => {
+  await it("serves the app and mints a room code", async () => {
     const res = await fetch(`${BASE_URL}/api/room`);
     assert.equal(res.status, 200);
-    const { code } = await res.json();
+    const { code } = (await res.json()) as { code: string };
     assert.match(code, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/);
   });
 
-  it("routes /ws and /api past the static assets", async () => {
+  await it("routes /ws and /api past the static assets", async () => {
     // not_found_handling must not swallow these into index.html.
     const ws = await fetch(`${BASE_URL}/ws/${ROOM}`);
     assert.equal(ws.status, 426, "expected websocket-only endpoint to reject a plain GET");
@@ -98,15 +152,21 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(bad.status, 400);
   });
 
-  it("joins straight from a room link, without pressing Join", async () => {
+  await it("joins straight from a room link, without pressing Join", async () => {
     // One at a time, so the sharer is first in and becomes the room's host.
-    for (const [name, page] of [["sharer", sharer], ["viewer", viewer], ["viewer2", viewer2]]) {
+    const pages: Array<[string, Page]> = [
+      ["sharer", sharer],
+      ["viewer", viewer],
+      ["viewer2", viewer2],
+    ];
+    for (const [name, page] of pages) {
       await page.goto(BASE_URL);
       await page.evaluate((n) => localStorage.setItem("name", n), name);
-      // A fresh load, not a same-document hash change: this is someone opening a link.
+      // Navigate via about:blank so opening /#ROOM is a genuine document navigation
+      // (a same-origin hash change in Chromium does not re-run the page's load init).
+      await page.goto("about:blank");
       await page.goto(`${BASE_URL}/#${ROOM}`);
-      await page.reload();
-      await waitFor(page, () => document.getElementById("status")?.textContent?.includes("In room"), {
+      await waitFor(page, () => Boolean(document.getElementById("status")?.textContent?.includes("In room")), {
         label: `${name} to join from the link`,
       });
       assert.equal(await page.inputValue("#room-code"), ROOM);
@@ -119,17 +179,17 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     }
   });
 
-  it("does not connect anyone while nobody is sharing", async () => {
+  await it("does not connect anyone while nobody is sharing", async () => {
     await new Promise((r) => setTimeout(r, 1500));
     for (const page of [sharer, viewer, viewer2]) {
       assert.equal(await page.evaluate(() => window.__pcs.length), 0, "a peer connection exists with nobody sharing");
     }
   });
 
-  it("delivers video from the sharer to the viewer", async () => {
+  await it("delivers video from the sharer to the viewer", async () => {
     await sharer.click("#share");
 
-    const check = () => window.__pcs.some((pc) => pc.connectionState === "connected");
+    const check = (): boolean => window.__pcs.some((pc) => pc.connectionState === "connected");
     await waitFor(sharer, check, { label: "sharer peer connection" });
     await waitFor(viewer, check, { label: "viewer peer connection" });
 
@@ -137,8 +197,8 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     await waitFor(
       viewer,
       () => {
-        const vids = [...document.querySelectorAll(".tile video")];
-        return vids.some((v) => v.srcObject && v.srcObject.getVideoTracks().length > 0);
+        const vids = [...document.querySelectorAll<HTMLVideoElement>(".tile video")];
+        return vids.some((v) => v.srcObject instanceof MediaStream && v.srcObject.getVideoTracks().length > 0);
       },
       { label: "viewer to receive a remote video track", timeout: 45_000 },
     );
@@ -150,8 +210,11 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
         for (const pc of window.__pcs) {
           const report = await pc.getStats();
           let decoded = 0;
-          report.forEach((s) => {
-            if (s.type === "inbound-rtp" && s.kind === "video") decoded = Math.max(decoded, s.framesDecoded ?? 0);
+          report.forEach((s: unknown) => {
+            const rec = s as RawStatRecord;
+            if (rec.type === "inbound-rtp" && rec.kind === "video") {
+              decoded = Math.max(decoded, rec.framesDecoded ?? 0);
+            }
           });
           if (decoded > 0) return decoded;
         }
@@ -162,7 +225,7 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
 
     const decoding = (await viewer.evaluate(readStats)).filter((s) => (s.framesDecoded ?? 0) > 0);
     assert.ok(decoding.length > 0, "no decoded frames");
-    assert.ok(decoding[0].bytesReceived > 0, "no bytes received");
+    assert.ok((decoding[0]?.bytesReceived ?? 0) > 0, "no bytes received");
 
     // The sharer must be encoding too, or we would be measuring a stalled stream.
     const encoding = (await sharer.evaluate(readStats)).filter((s) => (s.framesEncoded ?? 0) > 0);
@@ -172,29 +235,31 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
   // Regression: tiles relied on the `autoplay` attribute while unmuted, which Chrome
   // blocks without a user gesture — a shared deep link produced a permanently black
   // tile. This suite used to relax the autoplay policy, hiding exactly that.
-  it("actually plays the received video, not just receives it", async () => {
+  await it("actually plays the received video, not just receives it", async () => {
     const playing = await waitFor(
       viewer,
       () => {
-        const v = [...document.querySelectorAll(".tile video")].find((el) => el.srcObject);
-        if (!v) return null;
-        return { paused: v.paused, readyState: v.readyState, t: v.currentTime };
+        const videoEl = [...document.querySelectorAll<HTMLVideoElement>(".tile video")].find((el) => el.srcObject);
+        if (!videoEl) return null;
+        return { paused: videoEl.paused, readyState: videoEl.readyState, t: videoEl.currentTime };
       },
       { label: "a tile with a stream", timeout: 30_000 },
     );
     assert.equal(playing.paused, false, `video element is paused: ${JSON.stringify(playing)}`);
 
     // currentTime must advance — a non-paused element that never renders is still broken.
-    const t0 = await viewer.evaluate(() =>
-      [...document.querySelectorAll(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0);
+    const t0 = await viewer.evaluate(
+      () => [...document.querySelectorAll<HTMLVideoElement>(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0,
+    );
     await new Promise((r) => setTimeout(r, 1500));
-    const t1 = await viewer.evaluate(() =>
-      [...document.querySelectorAll(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0);
+    const t1 = await viewer.evaluate(
+      () => [...document.querySelectorAll<HTMLVideoElement>(".tile video")].find((v) => v.srcObject)?.currentTime ?? 0,
+    );
     assert.ok(t1 > t0, `playback did not advance: ${t0} -> ${t1}`);
   });
 
-  it("connects each viewer to the sharer only, never to each other", async () => {
-    const live = () => window.__pcs.filter((pc) => pc.connectionState !== "closed").length;
+  await it("connects each viewer to the sharer only, never to each other", async () => {
+    const live = (): number => window.__pcs.filter((pc) => pc.connectionState !== "closed").length;
     await waitFor(viewer2, () => window.__pcs.some((pc) => pc.connectionState === "connected"), {
       label: "second viewer connected to the sharer",
     });
@@ -203,11 +268,15 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(await viewer2.evaluate(live), 1, "second viewer should hold only the link to the sharer");
   });
 
-  it("connects directly rather than through a TURN relay", async () => {
+  await it("connects directly rather than through a TURN relay", async () => {
     // The premise of the whole design: media must not pass through a server.
     // On loopback both ends are host candidates; the assertion that matters is
     // that neither side selected a relay.
-    for (const [name, page] of [["sharer", sharer], ["viewer", viewer]]) {
+    const pages: Array<[string, Page]> = [
+      ["sharer", sharer],
+      ["viewer", viewer],
+    ];
+    for (const [name, page] of pages) {
       const stats = await page.evaluate(readStats);
       const connected = stats.filter((s) => s.connectionState === "connected");
       assert.ok(connected.length > 0, `${name} had no connected peer connection`);
@@ -217,25 +286,32 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
       const withPair = connected.filter((s) => s.localType !== null);
       assert.ok(withPair.length > 0, `${name} had no selected candidate pair to inspect`);
       for (const s of withPair) {
-        assert.ok(DIRECT.includes(s.localType), `${name} local candidate was ${s.localType}, expected a direct type`);
-        assert.ok(DIRECT.includes(s.remoteType), `${name} remote candidate was ${s.remoteType}, expected a direct type`);
+        assert.ok(
+          s.localType !== null && DIRECT.includes(s.localType),
+          `${name} local candidate was ${String(s.localType)}, expected a direct type`,
+        );
+        assert.ok(
+          s.remoteType !== null && DIRECT.includes(s.remoteType),
+          `${name} remote candidate was ${String(s.remoteType)}, expected a direct type`,
+        );
       }
     }
   });
 
-  it("lets a viewer turn a stream down, and pause it so the sharer stops sending", async () => {
+  await it("lets a viewer turn a stream down, and pause it so the sharer stops sending", async () => {
     const tile = ".tile:has(.tile-controls)";
     // Whether each of the sharer's live video senders is encoding. Self-contained,
     // because page.evaluate ships the function's source to the browser.
-    const videoSendsActive = () =>
+    const videoSendsActive = (): boolean[] =>
       window.__pcs
         .filter((pc) => pc.connectionState !== "closed")
         .flatMap((pc) => pc.getSenders())
         .filter((s) => s.track?.kind === "video")
-        .map((s) => s.getParameters().encodings?.[0]?.active !== false);
-    const remote = () => {
-      const v = document.querySelector(".tile:has(.tile-controls) video");
-      return { paused: v.paused, muted: v.muted, volume: v.volume };
+        .map((s) => s.getParameters().encodings[0]?.active !== false);
+    const remote = (): { paused: boolean; muted: boolean; volume: number } => {
+      const videoEl = document.querySelector<HTMLVideoElement>(".tile:has(.tile-controls) video");
+      if (!videoEl) throw new Error("Missing tile video");
+      return { paused: videoEl.paused, muted: videoEl.muted, volume: videoEl.volume };
     };
 
     await viewer.hover(tile);
@@ -248,15 +324,15 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(pausedState.muted, true, "a paused stream should be silent");
     // Pausing is not just local: the sharer stops encoding for this viewer, and only this one.
     const deadline = Date.now() + 15_000;
-    let active = [];
+    let active: boolean[] = [];
     while (Date.now() < deadline) {
       active = await sharer.evaluate(videoSendsActive);
       if (active.length === 2 && active.filter((a) => !a).length === 1) break;
       await new Promise((r) => setTimeout(r, 500));
     }
-    assert.deepEqual([...active].sort(), [false, true], "sharer should stop sending to the paused viewer only");
+    assert.deepEqual([...active].sort((a, b) => Number(a) - Number(b)), [false, true], "sharer should stop sending to the paused viewer only");
 
-    const before = await viewer.evaluate(decodedFrames);
+    const beforeCount = await viewer.evaluate(decodedFrames);
     await viewer.click(`${tile} .tile-paused`);
     const resumeDeadline = Date.now() + 15_000;
     while (Date.now() < resumeDeadline) {
@@ -267,12 +343,12 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.deepEqual(active, [true, true], "sharer should resume sending after the viewer resumes");
 
     const framesDeadline = Date.now() + 30_000;
-    let now = before;
-    while (Date.now() < framesDeadline && now <= before + 10) {
+    let now = beforeCount;
+    while (Date.now() < framesDeadline && now <= beforeCount + 10) {
       await new Promise((r) => setTimeout(r, 1000));
       now = await viewer.evaluate(decodedFrames);
     }
-    assert.ok(now > before + 10, `frames did not flow again after resuming: ${before} -> ${now}`);
+    assert.ok(now > beforeCount + 10, `frames did not flow again after resuming: ${beforeCount} -> ${now}`);
 
     const resumed = await viewer.evaluate(remote);
     assert.equal(resumed.paused, false);
@@ -282,13 +358,14 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     // Volume boost past 100% up to 200%:
     await viewer.fill(`${tile} .tile-volume`, "150");
     const boosted = await viewer.evaluate(() => {
-      const v = document.querySelector(".tile:has(.tile-controls) video");
-      const input = document.querySelector(".tile:has(.tile-controls) .tile-volume");
+      const videoEl = document.querySelector<HTMLVideoElement>(".tile:has(.tile-controls) video");
+      const input = document.querySelector<HTMLInputElement>(".tile:has(.tile-controls) .tile-volume");
+      if (!videoEl || !input) throw new Error("Missing tile controls");
       return {
-        volume: v.volume,
+        volume: videoEl.volume,
         inputValue: input.value,
         inputTitle: input.title,
-        boostedAttr: input.dataset.boosted,
+        boostedAttr: input.dataset["boosted"],
       };
     });
     assert.equal(boosted.volume, 1.0, "HTMLMediaElement volume should be clamped to 1.0");
@@ -299,12 +376,13 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     // Dragging back to standard range resets boost styling:
     await viewer.fill(`${tile} .tile-volume`, "75");
     const restored = await viewer.evaluate(() => {
-      const v = document.querySelector(".tile:has(.tile-controls) video");
-      const input = document.querySelector(".tile:has(.tile-controls) .tile-volume");
+      const videoEl = document.querySelector<HTMLVideoElement>(".tile:has(.tile-controls) video");
+      const input = document.querySelector<HTMLInputElement>(".tile:has(.tile-controls) .tile-volume");
+      if (!videoEl || !input) throw new Error("Missing tile controls");
       return {
-        volume: v.volume,
+        volume: videoEl.volume,
         inputValue: input.value,
-        boostedAttr: input.dataset.boosted,
+        boostedAttr: input.dataset["boosted"],
       };
     });
     assert.equal(restored.volume, 0.75);
@@ -324,11 +402,12 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(await viewer.getAttribute(fitBtn, "aria-pressed"), "false");
     await viewer.click(fitBtn);
     const coverState = await viewer.evaluate(() => {
-      const t = document.querySelector(".tile:has(.tile-controls)");
-      const v = t.querySelector("video");
+      const tileEl = document.querySelector<HTMLElement>(".tile:has(.tile-controls)");
+      const videoEl = tileEl?.querySelector<HTMLVideoElement>("video");
+      if (!tileEl || !videoEl) throw new Error("Missing tile or video");
       return {
-        fitAttr: t.dataset.fit,
-        objectFit: window.getComputedStyle(v).objectFit,
+        fitAttr: tileEl.dataset["fit"],
+        objectFit: window.getComputedStyle(videoEl).objectFit,
       };
     });
     assert.equal(coverState.fitAttr, "cover");
@@ -338,11 +417,12 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     // Toggle back to contain (fit):
     await viewer.click(fitBtn);
     const containState = await viewer.evaluate(() => {
-      const t = document.querySelector(".tile:has(.tile-controls)");
-      const v = t.querySelector("video");
+      const tileEl = document.querySelector<HTMLElement>(".tile:has(.tile-controls)");
+      const videoEl = tileEl?.querySelector<HTMLVideoElement>("video");
+      if (!tileEl || !videoEl) throw new Error("Missing tile or video");
       return {
-        fitAttr: t.dataset.fit,
-        objectFit: window.getComputedStyle(v).objectFit,
+        fitAttr: tileEl.dataset["fit"],
+        objectFit: window.getComputedStyle(videoEl).objectFit,
       };
     });
     assert.equal(containState.fitAttr, "contain");
@@ -350,11 +430,14 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     assert.equal(await viewer.getAttribute(fitBtn, "aria-pressed"), "false");
   });
 
-  it("removes the viewer's tile when the sharer stops", async () => {
+  await it("removes the viewer's tile when the sharer stops", async () => {
     await sharer.click("#share");
     await waitFor(
       viewer,
-      () => [...document.querySelectorAll(".tile video")].every((v) => !v.srcObject || v.srcObject.getVideoTracks().length === 0),
+      () =>
+        [...document.querySelectorAll<HTMLVideoElement>(".tile video")].every(
+          (v) => !(v.srcObject instanceof MediaStream) || v.srcObject.getVideoTracks().length === 0,
+        ),
       { label: "viewer tile to clear", timeout: 30_000 },
     );
     // With nobody sharing, the links have no reason to exist: they are torn down.
@@ -365,15 +448,16 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     );
   });
 
-  it("lets only the room's creator remove people and lock the room", async () => {
+  await it("lets only the room's creator remove people and lock the room", async () => {
     // The sharer joined first, so it created the room and is its host.
-    const removeButtons = (page) => page.evaluate(() => document.querySelectorAll("#roster-list button").length);
+    const removeButtons = (page: Page): Promise<number> =>
+      page.evaluate(() => document.querySelectorAll("#roster-list button").length);
     assert.equal(await removeButtons(sharer), 2, "host should see a Remove button per other person");
     assert.equal(await removeButtons(viewer), 0);
     assert.equal(await viewer.isVisible("#lock-btn"), false);
 
     await sharer.click("#roster-list li:has-text('viewer2') button");
-    await waitFor(viewer2, () => document.getElementById("status")?.textContent?.includes("removed"), {
+    await waitFor(viewer2, () => Boolean(document.getElementById("status")?.textContent?.includes("removed")), {
       label: "viewer2 to be told it was removed",
     });
     for (const page of [sharer, viewer]) {
@@ -383,7 +467,7 @@ describe("peer-to-peer screen sharing", { concurrency: 1 }, () => {
     }
 
     await sharer.click("#lock-btn");
-    await waitFor(viewer, () => document.getElementById("roster-title")?.textContent?.includes("locked"), {
+    await waitFor(viewer, () => Boolean(document.getElementById("roster-title")?.textContent?.includes("locked")), {
       label: "viewer to see the room locked",
     });
     await waitFor(sharer, () => document.getElementById("lock-btn")?.textContent === "Unlock room", {

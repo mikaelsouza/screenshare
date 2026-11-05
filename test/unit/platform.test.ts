@@ -144,7 +144,7 @@ describe("desktop capture", () => {
   };
   let video: FakeTrack;
   let audio: FakeTrack;
-  let deps: ElectronCaptureDeps & { captureSource: ReturnType<typeof vi.fn>; captureScreen: ReturnType<typeof vi.fn> };
+  let deps: ElectronCaptureDeps & { captureSource: ReturnType<typeof vi.fn<ElectronCaptureDeps["captureSource"]>>; captureScreen: ReturnType<typeof vi.fn<ElectronCaptureDeps["captureScreen"]>> };
 
   const update = (u: Partial<FollowUpdate>): FollowUpdate => ({
     role: "lobby",
@@ -464,7 +464,7 @@ describe("desktop capture defaults", () => {
     vi.stubGlobal("navigator", {
       mediaDevices: { getDisplayMedia: vi.fn().mockResolvedValue(stream([video])), getUserMedia },
     });
-    vi.stubGlobal("MediaStream", class { constructor(readonly t: MediaStreamTrack[]) {} getTracks() { return this.t; } });
+    vi.stubGlobal("MediaStream", class { readonly t: MediaStreamTrack[]; constructor(t: MediaStreamTrack[]) { this.t = t; } getTracks() { return this.t; } });
     const audio = track("audio");
     (navigator.mediaDevices.getDisplayMedia as ReturnType<typeof vi.fn>).mockResolvedValue(stream([video, audio]));
     let listener: ((u: FollowUpdate) => void) | null = null;
@@ -560,16 +560,16 @@ describe("desktop WASAPI audio integration", () => {
     const { deps } = makeDeps();
     expect(createElectronCaptureController(full, callbacks(), deps).hasPerAppAudio).toBe(true);
     expect(
-      createElectronCaptureController({ ...full, startWindowAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ startWindowAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, startSystemAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ startSystemAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, stopAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ stopAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
     expect(
-      createElectronCaptureController({ ...full, onAudioPcm: undefined }, callbacks(), deps).hasPerAppAudio,
+      createElectronCaptureController((({ onAudioPcm: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
     ).toBe(false);
   });
 
@@ -661,7 +661,7 @@ describe("desktop WASAPI audio integration", () => {
     });
     expect(winAudio?.stream.getTracks()).toEqual([pcmTrack]);
     expect(winAudio).toEqual({
-      stream: expect.anything(),
+      stream: expect.any(Object) as unknown as MediaStream,
       track: pcmTrack,
       kind: "window",
       label: "Discord",
@@ -670,7 +670,7 @@ describe("desktop WASAPI audio integration", () => {
     bridge.pickWindowAudio.mockResolvedValueOnce({ ok: false, label: null });
     expect(await c.captureAudioOnly("window")).toBeNull();
 
-    const noPickBridge = { ...bridge, pickWindowAudio: undefined };
+    const { pickWindowAudio: _unusedPickWindowAudio, ...noPickBridge } = bridge;
     expect(await createElectronCaptureController(noPickBridge, callbacks(), deps).captureAudioOnly("window")).toBeNull();
 
     (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockClear();
@@ -682,7 +682,7 @@ describe("desktop WASAPI audio integration", () => {
     });
     expect(sysAudio?.stream.getTracks()).toEqual([pcmTrack]);
     expect(sysAudio).toEqual({
-      stream: expect.anything(),
+      stream: expect.any(Object) as unknown as MediaStream,
       track: pcmTrack,
       kind: "system",
       label: null,
