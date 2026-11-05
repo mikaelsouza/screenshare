@@ -522,22 +522,16 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     clientMsg: ClientMessage,
   ): Promise<void> {
-    switch (clientMsg.t) {
-      case "join":
-        await this.onJoinMessage(ws, attachment, clientMsg);
-        return;
-      case "kick":
-        await this.handleKick(ws, attachment, clientMsg);
-        return;
-      case "lock":
-        await this.handleLock(ws, attachment, clientMsg);
-        return;
-      case "signal":
-        this.handleSignal(ws, attachment, clientMsg);
-        return;
-      case "state":
-        await this.handleState(ws, attachment, clientMsg);
-        return;
+    if (clientMsg.t === "join") {
+      await this.onJoinMessage(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "kick") {
+      await this.handleKick(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "lock") {
+      await this.handleLock(ws, attachment, clientMsg);
+    } else if (clientMsg.t === "signal") {
+      this.handleSignal(ws, attachment, clientMsg);
+    } else {
+      await this.handleState(ws, attachment, clientMsg);
     }
   }
 
@@ -574,8 +568,10 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
     const now = Date.now();
-    const members = await this.getMembers(now);
-    if (target.att.rejoinHash) delete members[target.att.rejoinHash];
+    const rawMembers = await this.getMembers(now);
+    const members = target.att.rejoinHash
+      ? Object.fromEntries(Object.entries(rawMembers).filter(([hash]) => hash !== target.att.rejoinHash))
+      : rawMembers;
     const writes: Record<string, unknown> = { [MEMBERS_KEY]: members };
     if (target.att.ip) {
       const deny = await this.getDenyList(now);
@@ -587,7 +583,9 @@ export class RoomDO extends DurableObject<Env> {
     await this.handleLeave(target.ws);
     try {
       target.ws.close(1008, "Kicked");
-    } catch {}
+    } catch {
+      /* socket already closed */
+    }
   }
 
   private async handleLock(
@@ -647,7 +645,9 @@ export class RoomDO extends DurableObject<Env> {
     attachment.sharing = clientMsg.sharing;
     try {
       ws.serializeAttachment(attachment);
-    } catch {}
+    } catch {
+      /* ignore attachment serialization failure */
+    }
     if (attachment.rejoinHash) {
       const now = Date.now();
       const members = await this.getMembers(now);
