@@ -5,13 +5,13 @@
   "plugins": ["@stryker-mutator/vitest-runner"],
   "tsconfigFile": "",
   "mutate": [
-    "electron/follow/**/*.js",
-    "electron/audio/**/*.js",
-    "electron/picker.js",
+    "electron/follow/**/*.ts",
+    "electron/audio/**/*.ts",
+    "electron/picker.ts",
     "src/platform/**/*.ts",
     "src/mesh.ts"
   ],
-  "ignorePatterns": ["release/**", "dist/**", "reports/**", ".wrangler/**", ".stryker-tmp/**"],
+  "ignorePatterns": ["release/**", "dist/**", "dist-electron/**", "reports/**", ".wrangler/**", ".stryker-tmp/**"],
   "vitest": {
     "configFile": "vitest.config.ts"
   },

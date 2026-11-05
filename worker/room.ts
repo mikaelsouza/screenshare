@@ -158,7 +158,7 @@ interface PeerAttachment {
   sharing: boolean;
   joined: boolean;
   /** Rate-limit key for the client address: IPv4 as is, IPv6 as its /64. */
-  ip?: string;
+  ip?: string | undefined;
   /** When the socket was accepted, for the join deadline. */
   openedAt?: number;
   /** Presented the room's host token. */
@@ -202,7 +202,7 @@ function sanitiseName(raw: string): string {
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
     .replace(/\s+/gu, " ")
     .trim();
-  return [...cleaned].slice(0, 32).join("").trim() || "Anonymous";
+  return Array.from(cleaned).slice(0, 32).join("").trim() || "Anonymous";
 }
 
 function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
@@ -376,7 +376,7 @@ export class RoomDO extends DurableObject<Env> {
    * Erase an abandoned room. Armed when the last peer leaves and cancelled the moment
    * anyone joins, so a reconnect never trips it.
    */
-  async alarm(): Promise<void> {
+  override async alarm(): Promise<void> {
     for (const s of this.ctx.getWebSockets()) {
       const att = getAttachment(s);
       if (att?.joined) {
@@ -388,7 +388,7 @@ export class RoomDO extends DurableObject<Env> {
     await this.ctx.storage.deleteAll();
   }
 
-  async fetch(request: Request): Promise<Response> {
+  override async fetch(request: Request): Promise<Response> {
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
@@ -462,7 +462,7 @@ export class RoomDO extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client });
   }
 
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+  override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
     const attachment = getAttachment(ws);
     if (!attachment) {
       return;
@@ -925,7 +925,7 @@ export class RoomDO extends DurableObject<Env> {
         isHost: boolean;
         locked: boolean;
         returning: boolean;
-        memberTicket?: MemberEntry;
+        memberTicket?: MemberEntry | undefined;
       }
     | { ok: false; code: ErrorCode; message: string }
   > {
@@ -998,7 +998,7 @@ export class RoomDO extends DurableObject<Env> {
     return live;
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
+  override async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {
     this.forgetBudget(ws);
     await this.handleLeave(ws);
     // Cloudflare's hibernation contract requires the server to complete the closing
@@ -1013,7 +1013,7 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
+  override async webSocketError(ws: WebSocket, _error: unknown): Promise<void> {
     this.forgetBudget(ws);
     await this.handleLeave(ws);
     try {

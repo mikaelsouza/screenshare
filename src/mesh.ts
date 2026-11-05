@@ -30,9 +30,9 @@ export interface MeshOptions {
 }
 
 export interface MeshCallbacks {
-  onRemoteStream(peerId: PeerId, stream: MediaStream): void;
-  onRemoteStreamGone(peerId: PeerId): void;
-  onConnectionState(peerId: PeerId, state: RTCPeerConnectionState): void;
+  onRemoteStream: (peerId: PeerId, stream: MediaStream) => void;
+  onRemoteStreamGone: (peerId: PeerId) => void;
+  onConnectionState: (peerId: PeerId, state: RTCPeerConnectionState) => void;
 }
 
 /** Peer-to-peer control traffic. Deliberately NOT routed through the server. */
@@ -58,8 +58,8 @@ export function parseControlMessage(data: unknown): ControlMessage | null {
   }
   if (typeof msg !== "object" || msg === null) return null;
   const rec = msg as Record<string, unknown>;
-  if (rec.c !== "view" || typeof rec.want !== "boolean") return null;
-  return { c: "view", want: rec.want };
+  if (rec["c"] !== "view" || typeof rec["want"] !== "boolean") return null;
+  return { c: "view", want: rec["want"] };
 }
 
 class PeerLink {
@@ -89,16 +89,26 @@ class PeerLink {
   private audioSender: RTCRtpSender | null = null;
   private adapter: BitrateAdapter | null = null;
   private remoteStream: MediaStream | null = null;
+  readonly selfId: PeerId;
+  readonly peerId: PeerId;
+  private readonly opts: MeshOptions;
+  private readonly send: (data: SignalData) => void;
+  private readonly cb: MeshCallbacks;
 
   constructor(
-    readonly selfId: PeerId,
-    readonly peerId: PeerId,
-    private readonly opts: MeshOptions,
-    private readonly send: (data: SignalData) => void,
-    private readonly cb: MeshCallbacks,
+    selfId: PeerId,
+    peerId: PeerId,
+    opts: MeshOptions,
+    send: (data: SignalData) => void,
+    cb: MeshCallbacks,
     /** Whether this side opens the control channel; see Mesh.addPeer. */
     createsControl: boolean = selfId >= peerId,
   ) {
+    this.selfId = selfId;
+    this.peerId = peerId;
+    this.opts = opts;
+    this.send = send;
+    this.cb = cb;
     this.polite = selfId < peerId;
     this.pc = new RTCPeerConnection({
       iceServers: opts.iceServers,
@@ -430,13 +440,22 @@ export class Mesh {
    * other's IP for no reason.
    */
   private readonly members = new Map<PeerId, { sharing: boolean }>();
+  private readonly selfId: PeerId;
+  private readonly opts: MeshOptions;
+  private readonly sendSignal: (to: PeerId, data: SignalData) => void;
+  private readonly cb: MeshCallbacks;
 
   constructor(
-    private readonly selfId: PeerId,
-    private readonly opts: MeshOptions,
-    private readonly sendSignal: (to: PeerId, data: SignalData) => void,
-    private readonly cb: MeshCallbacks,
-  ) {}
+    selfId: PeerId,
+    opts: MeshOptions,
+    sendSignal: (to: PeerId, data: SignalData) => void,
+    cb: MeshCallbacks,
+  ) {
+    this.selfId = selfId;
+    this.opts = opts;
+    this.sendSignal = sendSignal;
+    this.cb = cb;
+  }
 
   /**
    * Open a link to a peer. Only the side that is sharing does this; the other side's

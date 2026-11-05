@@ -14,9 +14,10 @@ class FakeDataChannel {
   onmessage: ((ev: { data: string }) => void) | null = null;
   sent: string[] = [];
 
-  constructor(readonly label: string) {}
+  readonly label: string;
+  constructor(label: string) { this.label = label; }
 
-  send(data: string): void {
+  send: (data: string) => void = (data: string): void => {
     this.sent.push(data);
   }
   close(): void {
@@ -44,7 +45,9 @@ class FakeRTCPeerConnection {
   addedCandidates: RTCIceCandidateInit[] = [];
   closed = false;
 
-  constructor(readonly config: RTCConfiguration) {
+  readonly config: RTCConfiguration;
+  constructor(config: RTCConfiguration) {
+    this.config = config;
     FakeRTCPeerConnection.instances.push(this);
   }
 

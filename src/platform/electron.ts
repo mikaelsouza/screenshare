@@ -83,7 +83,7 @@ const defaultDeps: ElectronCaptureDeps = {
 function hasAudioBridge(
   api: FollowAPI,
 ): api is FollowAPI &
-  Required<Pick<ElectronAPI, "startWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm">> {
+  { startWindowAudio: NonNullable<ElectronAPI["startWindowAudio"]>; startSystemAudio: NonNullable<ElectronAPI["startSystemAudio"]>; stopAudio: NonNullable<ElectronAPI["stopAudio"]>; onAudioPcm: NonNullable<ElectronAPI["onAudioPcm"]> } {
   return Boolean(api.startWindowAudio && api.startSystemAudio && api.stopAudio && api.onAudioPcm);
 }
 

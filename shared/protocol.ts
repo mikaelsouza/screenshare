@@ -22,7 +22,7 @@ export const ROOM_CODE_LENGTH = 8;
  * the victim's socket, which is server-mediated amplification against a peer plus
  * unbounded object CPU and wall-clock billing.
  */
-export const MAX_SDP_LENGTH = 64 * 1024;
+export const MAX_SDP_LENGTH: number = 64 * 1024;
 
 /** Largest ICE candidate line accepted. Real ones are a couple of hundred bytes. */
 export const MAX_CANDIDATE_LENGTH = 1024;
@@ -175,28 +175,34 @@ export function parseClientMessage(raw: string): ClientMessage | null {
 
     const record = data as Record<string, unknown>;
 
-    switch (record.t) {
+    switch (record["t"]) {
       case "join": {
-        if (typeof record.room === "string" && typeof record.displayName === "string") {
+        const room = record["room"];
+        const displayName = record["displayName"];
+        if (typeof room === "string" && typeof displayName === "string") {
           const joinMsg: ClientMessage = {
             t: "join",
-            room: record.room,
-            displayName: record.displayName,
+            room,
+            displayName,
           };
-          if (typeof record.password === "string") {
-            joinMsg.password = record.password;
+          const password = record["password"];
+          if (typeof password === "string") {
+            joinMsg.password = password;
           }
-          if (typeof record.hostToken === "string" && record.hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
-            joinMsg.hostToken = record.hostToken;
+          const hostToken = record["hostToken"];
+          if (typeof hostToken === "string" && hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.hostToken = hostToken;
           }
-          if (typeof record.rejoinToken === "string" && record.rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
-            joinMsg.rejoinToken = record.rejoinToken;
+          const rejoinToken = record["rejoinToken"];
+          if (typeof rejoinToken === "string" && rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
+            joinMsg.rejoinToken = rejoinToken;
           }
-          if (record.resume === true) {
+          if (record["resume"] === true) {
             joinMsg.resume = true;
           }
-          if (typeof record.sharing === "boolean") {
-            joinMsg.sharing = record.sharing;
+          const sharing = record["sharing"];
+          if (typeof sharing === "boolean") {
+            joinMsg.sharing = sharing;
           }
           return joinMsg;
         }
@@ -204,72 +210,82 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       }
 
       case "signal": {
+        const to = record["to"];
+        const sigData = record["data"];
         if (
-          typeof record.to !== "string" ||
-          !PEER_ID.test(record.to) ||
-          typeof record.data !== "object" ||
-          record.data === null ||
-          Array.isArray(record.data)
+          typeof to !== "string" ||
+          !PEER_ID.test(to) ||
+          typeof sigData !== "object" ||
+          sigData === null ||
+          Array.isArray(sigData)
         ) {
           return null;
         }
 
-        const sig = record.data as Record<string, unknown>;
+        const sig = sigData as Record<string, unknown>;
+        const k = sig["k"];
+        const sdp = sig["sdp"];
 
-        if (sig.k === "offer" && typeof sig.sdp === "string" && sig.sdp.length <= MAX_SDP_LENGTH) {
+        if (k === "offer" && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
           return {
             t: "signal",
-            to: record.to,
-            data: { k: "offer", sdp: sig.sdp },
+            to,
+            data: { k: "offer", sdp },
           };
         }
 
-        if (sig.k === "answer" && typeof sig.sdp === "string" && sig.sdp.length <= MAX_SDP_LENGTH) {
+        if (k === "answer" && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
           return {
             t: "signal",
-            to: record.to,
-            data: { k: "answer", sdp: sig.sdp },
+            to,
+            data: { k: "answer", sdp },
           };
         }
 
+        const rawCandidate = sig["candidate"];
         if (
-          sig.k === "ice" &&
-          typeof sig.candidate === "object" &&
-          sig.candidate !== null &&
-          !Array.isArray(sig.candidate)
+          k === "ice" &&
+          typeof rawCandidate === "object" &&
+          rawCandidate !== null &&
+          !Array.isArray(rawCandidate)
         ) {
-          const cand = sig.candidate as Record<string, unknown>;
-          if (typeof cand.candidate !== "string" || cand.candidate.length > MAX_CANDIDATE_LENGTH) {
+          const cand = rawCandidate as Record<string, unknown>;
+          const candidateStr = cand["candidate"];
+          if (typeof candidateStr !== "string" || candidateStr.length > MAX_CANDIDATE_LENGTH) {
             return null;
           }
 
-          const sdpMidValid = typeof cand.sdpMid === "string" || cand.sdpMid === null || cand.sdpMid === undefined;
+          const sdpMid = cand["sdpMid"];
+          const sdpMLineIndex = cand["sdpMLineIndex"];
+          const usernameFragment = cand["usernameFragment"];
+
+          const sdpMidValid = typeof sdpMid === "string" || sdpMid === null || sdpMid === undefined;
           const sdpMLineIndexValid =
-            typeof cand.sdpMLineIndex === "number" || cand.sdpMLineIndex === null || cand.sdpMLineIndex === undefined;
+            typeof sdpMLineIndex === "number" || sdpMLineIndex === null || sdpMLineIndex === undefined;
           const usernameFragmentValid =
-            cand.usernameFragment === undefined ||
-            cand.usernameFragment === null ||
-            typeof cand.usernameFragment === "string";
+            usernameFragment === undefined ||
+            usernameFragment === null ||
+            typeof usernameFragment === "string";
 
           if (!sdpMidValid || !sdpMLineIndexValid || !usernameFragmentValid) {
             return null;
           }
 
           const iceCandidate: IceCandidateInit = {
-            candidate: cand.candidate,
-            sdpMid: typeof cand.sdpMid === "string" ? cand.sdpMid : null,
-            sdpMLineIndex: typeof cand.sdpMLineIndex === "number" ? cand.sdpMLineIndex : null,
+            candidate: candidateStr,
+            sdpMid: typeof sdpMid === "string" ? sdpMid : null,
+            sdpMLineIndex: typeof sdpMLineIndex === "number" ? sdpMLineIndex : null,
           };
 
-          if (typeof cand.usernameFragment === "string") {
-            iceCandidate.usernameFragment = cand.usernameFragment;
-          } else if (cand.usernameFragment === null) {
+          if (typeof usernameFragment === "string") {
+            iceCandidate.usernameFragment = usernameFragment;
+          } else if (usernameFragment === null) {
             iceCandidate.usernameFragment = null;
           }
 
           return {
             t: "signal",
-            to: record.to,
+            to,
             data: {
               k: "ice",
               candidate: iceCandidate,
@@ -281,24 +297,27 @@ export function parseClientMessage(raw: string): ClientMessage | null {
       }
 
       case "kick": {
-        if (typeof record.id === "string" && PEER_ID.test(record.id)) {
-          return { t: "kick", id: record.id };
+        const id = record["id"];
+        if (typeof id === "string" && PEER_ID.test(id)) {
+          return { t: "kick", id };
         }
         return null;
       }
 
       case "lock": {
-        if (typeof record.locked === "boolean") {
-          return { t: "lock", locked: record.locked };
+        const locked = record["locked"];
+        if (typeof locked === "boolean") {
+          return { t: "lock", locked };
         }
         return null;
       }
 
       case "state": {
-        if (typeof record.sharing === "boolean") {
+        const sharing = record["sharing"];
+        if (typeof sharing === "boolean") {
           return {
             t: "state",
-            sharing: record.sharing,
+            sharing,
           };
         }
         return null;

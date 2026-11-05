@@ -1,26 +1,55 @@
-import { spawn } from "node:child_process";
-import { chromium } from "playwright-core";
+import { spawn, type ChildProcess } from "node:child_process";
+import { chromium, type Browser, type Page } from "playwright-core";
+
+export interface ServerHandle {
+  proc: ChildProcess;
+  log: () => string;
+}
+
+interface WaitForOptions {
+  timeout?: number;
+  interval?: number;
+  label?: string;
+}
+
+declare global {
+  interface Window {
+    __pcs: RTCPeerConnection[];
+    __csp: string[];
+    __gdmOpts: DisplayMediaStreamOptions[];
+    __gdmStreams?: MediaStream[] | undefined;
+  }
+}
 
 /**
  * Each test file gets its own port: `node --test` runs files in separate processes
  * concurrently, so a shared port would make them collide.
  */
-export function baseUrl(port) {
+export function baseUrl(port: number): string {
   return `http://127.0.0.1:${port}`;
 }
 
 /** Start `wrangler dev` on `port` and wait until it actually answers. */
-export async function startServer(port) {
+export async function startServer(port: number): Promise<ServerHandle> {
   const BASE_URL = baseUrl(port);
   const cmd = process.platform === "win32" ? "npx.cmd" : "npx";
   const proc = spawn(
     cmd,
     ["wrangler", "dev", "--port", String(port), "--ip", "127.0.0.1", "--log-level", "warn"],
-    { stdio: ["ignore", "pipe", "pipe"], env: process.env, shell: process.platform === "win32", detached: process.platform !== "win32" },
+    {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+      shell: process.platform === "win32",
+      detached: process.platform !== "win32",
+    },
   );
   let log = "";
-  proc.stdout.on("data", (d) => { log += d; });
-  proc.stderr.on("data", (d) => { log += d; });
+  proc.stdout?.on("data", (d: Buffer) => {
+    log += d.toString();
+  });
+  proc.stderr?.on("data", (d: Buffer) => {
+    log += d.toString();
+  });
 
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
@@ -28,29 +57,49 @@ export async function startServer(port) {
     try {
       const res = await fetch(`${BASE_URL}/api/room`);
       if (res.ok) return { proc, log: () => log };
-    } catch { /* not up yet */ }
+    } catch {
+      /* not up yet */
+    }
     await new Promise((r) => setTimeout(r, 400));
   }
   if (process.platform === "win32") {
     proc.kill("SIGKILL");
-  } else {
-    try { process.kill(-proc.pid, "SIGKILL"); } catch {}
+  } else if (proc.pid !== undefined) {
+    try {
+      process.kill(-proc.pid, "SIGKILL");
+    } catch {
+      /* process already exited */
+    }
   }
   throw new Error(`wrangler dev never became ready:\n${log}`);
 }
 
 /** Stop the wrangler dev server and its child process tree. */
-export async function stopServer(server) {
+export async function stopServer(server: ServerHandle | undefined): Promise<void> {
   if (!server) return;
   if (process.platform === "win32") {
     try {
       const killer = spawn("taskkill", ["/F", "/T", "/PID", String(server.proc.pid)], { stdio: "ignore" });
       await new Promise((r) => killer.on("close", r));
-    } catch {}
+    } catch {
+      /* ignore teardown error */
+    }
   } else {
-    try { process.kill(-server.proc.pid, "SIGTERM"); } catch {}
+    if (server.proc.pid !== undefined) {
+      try {
+        process.kill(-server.proc.pid, "SIGTERM");
+      } catch {
+        /* ignore */
+      }
+    }
     await new Promise((r) => setTimeout(r, 300));
-    if (server.proc.exitCode === null) { try { process.kill(-server.proc.pid, "SIGKILL"); } catch {} }
+    if (server.proc.exitCode === null && server.proc.pid !== undefined) {
+      try {
+        process.kill(-server.proc.pid, "SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }
     server.proc.stdout?.destroy();
     server.proc.stderr?.destroy();
     server.proc.unref();
@@ -58,9 +107,9 @@ export async function stopServer(server) {
 }
 
 /** Launch headless Chromium with fake WebRTC media devices and strict autoplay. */
-export async function launchBrowser() {
+export async function launchBrowser(): Promise<Browser> {
   const executablePath =
-    process.env.CHROMIUM_BIN ??
+    process.env["CHROMIUM_BIN"] ??
     (process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" : undefined);
   if (!executablePath) throw new Error("CHROMIUM_BIN is unset — run inside 'nix develop'.");
   return chromium.launch({
@@ -94,7 +143,7 @@ export async function launchBrowser() {
  * 2. Records every RTCPeerConnection so the test can inspect real getStats() output,
  *    without the app having to export anything for testability.
  */
-export const INSTRUMENT = () => {
+export const INSTRUMENT = (): void => {
   window.__pcs = [];
   // Every CSP or Trusted Types violation, so a suite can fail on one instead of the
   // page quietly losing a script or a style.
@@ -105,20 +154,23 @@ export const INSTRUMENT = () => {
   // What the app asks the screen picker for; the privacy defaults live there.
   window.__gdmOpts = [];
   const Native = window.RTCPeerConnection;
-  window.RTCPeerConnection = function (...args) {
+  const WrappedPC = function (this: RTCPeerConnection, ...args: ConstructorParameters<typeof RTCPeerConnection>) {
     const pc = new Native(...args);
     window.__pcs.push(pc);
     return pc;
-  };
-  window.RTCPeerConnection.prototype = Native.prototype;
-  Object.setPrototypeOf(window.RTCPeerConnection, Native);
+  } as unknown as typeof RTCPeerConnection;
+  WrappedPC.prototype = Native.prototype;
+  Object.setPrototypeOf(WrappedPC, Native);
+  window.RTCPeerConnection = WrappedPC;
 
-  navigator.mediaDevices.getDisplayMedia = async (options) => {
-    window.__gdmOpts.push(JSON.parse(JSON.stringify(options ?? {})));
+  navigator.mediaDevices.getDisplayMedia = (
+    options?: DisplayMediaStreamOptions,
+  ): Promise<MediaStream> => {
+    window.__gdmOpts.push(JSON.parse(JSON.stringify(options ?? {})) as DisplayMediaStreamOptions);
     const canvas = document.createElement("canvas");
     canvas.width = 1280;
     canvas.height = 720;
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d")!;
     let frame = 0;
     // Content must actually change every frame, or the encoder sends almost nothing
     // and framesDecoded on the far side stays flat.
@@ -139,17 +191,21 @@ export const INSTRUMENT = () => {
     osc.start();
     for (const track of dest.stream.getAudioTracks()) stream.addTrack(track);
     (window.__gdmStreams ??= []).push(stream);
-    return stream;
+    return Promise.resolve(stream);
   };
 };
 
 /** Poll an in-page predicate until it returns truthy. */
-export async function waitFor(page, fn, { timeout = 30_000, interval = 500, label = "condition" } = {}) {
+export async function waitFor<T>(
+  page: Page,
+  fn: () => T | Promise<T>,
+  { timeout = 30_000, interval = 500, label = "condition" }: WaitForOptions = {},
+): Promise<NonNullable<T>> {
   const deadline = Date.now() + timeout;
-  let last;
+  let last: T | undefined;
   while (Date.now() < deadline) {
     last = await page.evaluate(fn);
-    if (last) return last;
+    if (last) return last as NonNullable<T>;
     await new Promise((r) => setTimeout(r, interval));
   }
   throw new Error(`timed out waiting for ${label}; last value: ${JSON.stringify(last)}`);

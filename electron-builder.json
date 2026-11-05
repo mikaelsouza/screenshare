@@ -7,7 +7,7 @@
   },
   "files": [
     "dist/**/*",
-    "electron/**/*",
+    "dist-electron/**/*",
     "package.json"
   ],
   "asar": true,

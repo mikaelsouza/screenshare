@@ -1,39 +1,49 @@
 import assert from "node:assert/strict";
 import { after, afterEach, before, describe, it } from "node:test";
-import { baseUrl, INSTRUMENT, launchBrowser, startServer, stopServer, waitFor } from "./helpers.mjs";
+import type { Browser, BrowserContext, Page } from "playwright-core";
+import {
+  baseUrl,
+  INSTRUMENT,
+  launchBrowser,
+  startServer,
+  stopServer,
+  waitFor,
+  type ServerHandle,
+} from "./helpers.ts";
 
 /**
- * The paths p2p.test.mjs does not walk: a password-protected room made with Create,
+ * The paths p2p.test.ts does not walk: a password-protected room made with Create,
  * joining after sharing has started, stopping and sharing again, two people sharing
  * at once, the host refreshing, and removal and locking.
  */
 const PORT = 8891;
 const BASE_URL = baseUrl(PORT);
 
-let server;
-let browser;
-let host;
-let late;
-let other;
-let contexts = [];
+let server: ServerHandle | undefined;
+let browser: Browser | undefined;
+let host: Page;
+let late: Page;
+let other: Page;
+const contexts: BrowserContext[] = [];
 
-const status = (page) => page.textContent("#status");
+const status = async (page: Page): Promise<string> => (await page.textContent("#status")) ?? "";
 
 /** Frames decoded so far across every inbound video stream on the page. */
-const decodedFrames = async () => {
+const decodedFrames = async (): Promise<number> => {
   let total = 0;
   for (const pc of window.__pcs) {
     if (pc.connectionState === "closed") continue;
     const report = await pc.getStats();
-    report.forEach((s) => {
-      if (s.type === "inbound-rtp" && s.kind === "video") total += s.framesDecoded ?? 0;
+    report.forEach((s: unknown) => {
+      const rec = s as { type?: string; kind?: string; framesDecoded?: number };
+      if (rec.type === "inbound-rtp" && rec.kind === "video") total += rec.framesDecoded ?? 0;
     });
   }
   return total;
 };
 
 /** Wait until the page's decoded frame count grows past `from`: video is flowing now. */
-async function framesGrow(page, label, from = null) {
+async function framesGrow(page: Page, label: string, from: number | null = null): Promise<number> {
   const start = from ?? (await page.evaluate(decodedFrames));
   await waitFor(page, decodedFrames, { label: `${label}: any decoded frames`, timeout: 45_000, interval: 1000 });
   const deadline = Date.now() + 45_000;
@@ -45,28 +55,31 @@ async function framesGrow(page, label, from = null) {
   throw new Error(`${label}: decoded frames stuck at ${start}`);
 }
 
-async function newPage(name) {
+async function newPage(name: string): Promise<Page> {
+  if (!browser) throw new Error("Browser not initialized");
   const ctx = await browser.newContext();
   await ctx.addInitScript(INSTRUMENT);
   contexts.push(ctx);
   const page = await ctx.newPage();
-  page.on("console", (m) => { if (m.type() === "error") console.error(`[${name}]`, m.text()); });
+  page.on("console", (m) => {
+    if (m.type() === "error") console.error(`[${name}]`, m.text());
+  });
   await page.goto(BASE_URL);
   await page.fill("#display-name", name);
   return page;
 }
 
-async function joinWith(page, code, password) {
+async function joinWith(page: Page, code: string, password?: string): Promise<void> {
   await page.fill("#room-code", code);
   await page.fill("#room-pass", password ?? "");
   await page.click("#join");
 }
 
-const inRoom = () => document.getElementById("status")?.textContent?.includes("In room");
+const inRoom = (): boolean => Boolean(document.getElementById("status")?.textContent?.includes("In room"));
 
-describe("edge cases in a real browser", { concurrency: 1 }, () => {
-  let code;
-  let password;
+void describe("edge cases in a real browser", { concurrency: 1 }, () => {
+  let code = "";
+  let password = "";
 
   before(async () => {
     server = await startServer(PORT);
@@ -78,8 +91,13 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
 
   afterEach(async (t) => {
     // On failure, show what each page was saying: the status line is the app's own account.
-    if (process.env.E2E_DEBUG) {
-      for (const [n, p] of [["host", host], ["late", late], ["other", other]]) {
+    if (process.env["E2E_DEBUG"]) {
+      const pages: Array<[string, Page]> = [
+        ["host", host],
+        ["late", late],
+        ["other", other],
+      ];
+      for (const [n, p] of pages) {
         const st = await p.textContent("#status").catch(() => "?");
         const roster = await p.textContent("#roster").catch(() => "?");
         console.log(`# ${t.name} :: ${n}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
@@ -92,7 +110,7 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await stopServer(server);
   });
 
-  it("creates a password-protected room with Generate and Create", async () => {
+  void it("creates a password-protected room with Generate and Create", async () => {
     await host.click("#gen-pass");
     password = await host.inputValue("#room-pass");
     assert.ok(password.length >= 8, `generated password too short: ${password}`);
@@ -103,7 +121,7 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     assert.equal(await host.isVisible("#lock-btn"), true, "the creator should be host");
   });
 
-  it("turns away a wrong password and lets the right one in", async () => {
+  void it("turns away a wrong password and lets the right one in", async () => {
     await joinWith(other, code, "wrong-password");
     await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
       label: "wrong password to be reported",
@@ -114,20 +132,22 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await waitFor(other, inRoom, { label: "other in the room with the right password" });
   });
 
-  it("delivers video to someone who joins after sharing started", async () => {
+  void it("delivers video to someone who joins after sharing started", async () => {
     await host.click("#share");
     // The picker is asked for a window and never this tab, so a share does not
     // default to the whole screen or show the app to itself.
     const [opts] = await host.evaluate(() => window.__gdmOpts);
-    assert.equal(opts.selfBrowserSurface, "exclude");
-    assert.equal(opts.video?.displaySurface, "window");
+    const optsRecord = opts as Record<string, unknown> | undefined;
+    assert.equal(optsRecord?.["selfBrowserSurface"], "exclude");
+    const videoOpts = opts?.video as MediaTrackConstraints | undefined;
+    assert.equal(videoOpts?.displaySurface, "window");
     await framesGrow(other, "other viewer");
     await joinWith(late, code, password);
     await waitFor(late, inRoom, { label: "late joiner in the room" });
     await framesGrow(late, "late joiner");
   });
 
-  it("delivers video again after the sharer stops and shares again", async () => {
+  void it("delivers video again after the sharer stops and shares again", async () => {
     await host.click("#share"); // stop
     await waitFor(host, () => window.__pcs.every((pc) => pc.connectionState === "closed"), {
       label: "links to close after stopping",
@@ -137,7 +157,7 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     await framesGrow(other, "other viewer after re-share", 0);
   });
 
-  it("carries video both ways when two people share at once", async () => {
+  void it("carries video both ways when two people share at once", async () => {
     await late.click("#share");
     // The host now receives from late while still sending to everyone.
     await framesGrow(host, "host receiving from the second sharer");
@@ -145,13 +165,16 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     // The viewer who does not share gets both.
     await waitFor(
       other,
-      () => [...document.querySelectorAll(".tile video")].filter((v) => v.srcObject?.getVideoTracks().length).length >= 2,
+      () =>
+        [...document.querySelectorAll<HTMLVideoElement>(".tile video")].filter(
+          (v) => v.srcObject instanceof MediaStream && v.srcObject.getVideoTracks().length > 0,
+        ).length >= 2,
       { label: "viewer to show two shared screens", timeout: 45_000 },
     );
     await late.click("#share"); // stop again for the rest of the suite
   });
 
-  it("keeps the host a host across a page refresh", async () => {
+  void it("keeps the host a host across a page refresh", async () => {
     await host.reload();
     // A refresh lands on /#CODE and joins at once, but without the password, so it is
     // asked for; entering it and pressing Join gets back in.
@@ -165,12 +188,14 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     // The others see exactly one host, not a ghost of the old socket.
     await waitFor(
       other,
-      () => [...document.querySelectorAll("#roster-list li")].filter((li) => li.textContent.includes("(host)")).length === 1,
+      () =>
+        [...document.querySelectorAll("#roster-list li")].filter((li) => (li.textContent ?? "").includes("(host)"))
+          .length === 1,
       { label: "one host in the viewer's list" },
     );
   });
 
-  it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
+  void it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
     // The refresh above ended the host's share; nobody is sharing now.
     assert.equal(await host.textContent("#share"), "Share screen");
     await waitFor(host, () => document.querySelectorAll("#roster-list button").length === 2, {
@@ -211,7 +236,7 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
-  it("lets a member back into the locked room after a refresh", async () => {
+  void it("lets a member back into the locked room after a refresh", async () => {
     // A refresh is a reconnect. The locked room must recognise a member who was
     // already in, even though every page here shares the removed person's address.
     await other.reload();
@@ -226,7 +251,7 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
   });
 
-  it("stops sharing when the sharer is removed", async () => {
+  void it("stops sharing when the sharer is removed", async () => {
     await host.click("#lock-btn"); // unlock, so a fresh page can come in to be removed
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Lock room", { label: "unlocked" });
     // The removal ban is by address and every page here is 127.0.0.1, so the second
@@ -245,13 +270,18 @@ describe("edge cases in a real browser", { concurrency: 1 }, () => {
     });
     await waitFor(
       other,
-      () => window.__gdmStreams.every((st) => st.getTracks().every((t) => t.readyState === "ended")),
+      () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((t) => t.readyState === "ended")),
       { label: "every captured track to be stopped" },
     );
   });
 
-  it("raised no CSP or Trusted Types violation on any page", async () => {
-    for (const [name, page] of [["host", host], ["late", late], ["other", other]]) {
+  void it("raised no CSP or Trusted Types violation on any page", async () => {
+    const pages: Array<[string, Page]> = [
+      ["host", host],
+      ["late", late],
+      ["other", other],
+    ];
+    for (const [name, page] of pages) {
       assert.deepEqual(await page.evaluate(() => window.__csp), [], `${name} hit a CSP violation`);
     }
   });

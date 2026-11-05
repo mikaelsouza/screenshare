@@ -1,4 +1,3 @@
-// @ts-check
 /**
  * Manages the desktop app's WASAPI / PipeWire audio capture session.
  *
@@ -10,35 +9,40 @@
  *     excluding this app's own process tree, so viewers never hear themselves echo.
  */
 
-/**
- * @typedef {object} LoopbackDevice
- * @property {(pid: number, onData: (chunk: Uint8Array) => void) => void} start
- * @property {(onData: (chunk: Uint8Array) => void, excludePid?: number) => void} startSystemAudio
- * @property {() => void} stop
- */
+interface LoopbackDevice {
+  start: (pid: number, onData: (chunk: Uint8Array) => void) => void;
+  startSystemAudio: (onData: (chunk: Uint8Array) => void, excludePid?: number) => void;
+  stop: () => void;
+}
+
+interface AudioSessionDeps {
+  createCapture: () => LoopbackDevice;
+  resolvePid: (sourceId: string) => number | null;
+  selfPid: number;
+  sendPcm: (chunk: Uint8Array) => void;
+}
+
+type AudioSessionMode = "off" | "window" | "system";
+
+interface AudioSessionController {
+  startForWindow: (sourceId: string, options?: { follow?: boolean }) => boolean;
+  startForSystem: () => boolean;
+  switchWindow: (sourceId: string) => boolean;
+  stop: () => void;
+  currentMode: () => AudioSessionMode;
+}
 
 /**
- * @typedef {object} AudioSessionDeps
- * @property {() => LoopbackDevice} createCapture
- * @property {(sourceId: string) => number | null} resolvePid
- * @property {number} selfPid
- * @property {(chunk: Uint8Array) => void} sendPcm
+ * Create a controller for WASAPI / PipeWire per-window and system audio loopback.
  */
-
-/**
- * @param {AudioSessionDeps} deps
- */
-export function createAudioSessionController(deps) {
-  /** @type {LoopbackDevice | null} */
-  let device = null;
-  /** @type {"off" | "window" | "system"} */
-  let mode = "off";
-  /** @type {number | null} */
-  let activePid = null;
+export function createAudioSessionController(deps: AudioSessionDeps): AudioSessionController {
+  let device: LoopbackDevice | null = null;
+  let mode: AudioSessionMode = "off";
+  let activePid: number | null = null;
   let followWindowAudio = false;
 
   /** Stop the currently active WASAPI loopback device, if any. */
-  function stopDevice() {
+  function stopDevice(): void {
     try {
       // Stryker disable next-line OptionalChaining: catch block swallows null TypeError when device is null
       device?.stop();
@@ -50,11 +54,8 @@ export function createAudioSessionController(deps) {
 
   /**
    * Capture only the process tree that owns `sourceId`.
-   * @param {string} sourceId
-   * @param {{ follow?: boolean }} [options]
-   * @returns {boolean}
    */
-  function startForWindow(sourceId, { follow = true } = {}) {
+  function startForWindow(sourceId: string, { follow = true }: { follow?: boolean } = {}): boolean {
     const pid = deps.resolvePid(sourceId);
     if (pid === null) return false;
     followWindowAudio = follow;
@@ -76,9 +77,8 @@ export function createAudioSessionController(deps) {
 
   /**
    * Capture all system audio except our own process tree.
-   * @returns {boolean}
    */
-  function startForSystem() {
+  function startForSystem(): boolean {
     if (mode === "system") return true;
     followWindowAudio = false;
     stopDevice();
@@ -103,24 +103,21 @@ export function createAudioSessionController(deps) {
     /**
      * Follow a game's audio when its window changes (lobby ↔ match). No-op when not
      * in per-window audio mode.
-     * @param {string} sourceId
-     * @returns {boolean}
      */
-    switchWindow(sourceId) {
+    switchWindow(sourceId: string): boolean {
       if (!followWindowAudio) return false;
       return startForWindow(sourceId);
     },
 
     /** Stop any active audio capture session and reset to "off". */
-    stop() {
+    stop(): void {
       stopDevice();
       followWindowAudio = false;
       mode = "off";
       activePid = null;
     },
 
-    /** @returns {"off" | "window" | "system"} */
-    currentMode() {
+    currentMode(): AudioSessionMode {
       return mode;
     },
   };

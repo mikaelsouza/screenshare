@@ -125,7 +125,7 @@ const tileControls = new Map<
     fitBtn: HTMLButtonElement;
     focusBtn: HTMLButtonElement;
     fullscreenBtn: HTMLButtonElement;
-    pipBtn?: HTMLButtonElement;
+    pipBtn?: HTMLButtonElement | undefined;
   }
 >();
 
@@ -422,7 +422,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   });
 
   let pipBtn: HTMLButtonElement | undefined;
-  if ("pictureInPictureEnabled" in document && (document as any).pictureInPictureEnabled) {
+  if ("pictureInPictureEnabled" in document && document.pictureInPictureEnabled) {
     const video = tiles.get(peerId);
     pipBtn = document.createElement("button");
     pipBtn.type = "button";
