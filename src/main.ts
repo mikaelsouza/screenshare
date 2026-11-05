@@ -13,7 +13,6 @@ import {
   type PeerInfo,
 } from "@shared/protocol";
 import {
-  captureAudioOnly,
   isAudioMode,
   stopAudioSource,
   systemAudioSupport,
@@ -827,8 +826,9 @@ function currentAudioMode(): AudioMode {
 function audioDescription(): { text: string; kind: "ok" | "warn" | "off" } {
   if (audioLost) return { text: "Audio stopped: that window closed", kind: "warn" };
   if (!capture?.audio) return { text: "No audio", kind: "off" };
-  // The desktop app can only capture everything the PC plays (Electron's loopback).
-  if (captureController.kind === "electron") {
+  // Older desktop app builds without the WASAPI per-app audio bridge fall back to
+  // Electron's system loopback.
+  if (captureController.kind === "electron" && !captureController.hasPerAppAudio) {
     return currentAudioMode() === "app"
       ? { text: "All system audio: the desktop app can't isolate one game yet", kind: "warn" }
       : { text: "All system audio", kind: "ok" };
@@ -925,7 +925,7 @@ async function pickAudio(kind: "window" | "system"): Promise<void> {
   try {
     let source: AudioSource | null;
     try {
-      source = await captureAudioOnly(kind);
+      source = await captureController.captureAudioOnly(kind);
     } catch (err) {
       // Usually the user cancelling the picker. Leave everything as it was.
       console.warn("[main] audio pick cancelled or failed", err);

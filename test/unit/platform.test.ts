@@ -124,6 +124,15 @@ describe("web capture", () => {
     (navigator.mediaDevices.getDisplayMedia as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("NotAllowedError"));
     await expect(createWebCaptureController(callbacks()).start(preset, "app")).rejects.toThrow("NotAllowedError");
   });
+
+  it("reports per-app audio support and delegates captureAudioOnly to the browser", async () => {
+    const c = createWebCaptureController(callbacks());
+    expect(c.hasPerAppAudio).toBe(true);
+    const picked = await c.captureAudioOnly("window");
+    expect(picked?.track).toBe(audio);
+    expect(picked?.kind).toBe("window");
+    expect(video.enabled).toBe(false);
+  });
 });
 
 describe("desktop capture", () => {
@@ -158,6 +167,8 @@ describe("desktop capture", () => {
       captureScreen: vi.fn(async (): Promise<CaptureResult> => ({ stream: stream([video, audio]), video, audio, surface: "window" })),
       captureSource: vi.fn(async () => track("video", "swapped")),
       makeStream: (tracks) => stream(tracks),
+      createPcmTrack: vi.fn(() => track("audio", "pcm")),
+      webCaptureAudioOnly: vi.fn(async () => null),
       audioSource: async (capture) => capture.audio,
     };
   });
@@ -509,5 +520,184 @@ describe("desktop capture defaults", () => {
     expect(warn.mock.calls[0]?.[0]).toContain("window:2:0");
     expect(String(warn.mock.calls[0]?.[1])).toContain("no video track for source window:2:0");
     warn.mockRestore();
+  });
+});
+
+describe("desktop WASAPI audio integration", () => {
+  function makeAudioBridge() {
+    return {
+      onFollowUpdate: vi.fn(() => () => {}),
+      stopFollow: vi.fn(),
+      startWindowAudio: vi.fn(async () => true),
+      pickWindowAudio: vi.fn<() => Promise<{ ok: boolean; label: string | null }>>(async () => ({ ok: true, label: "Discord" })),
+      startSystemAudio: vi.fn(async () => true),
+      stopAudio: vi.fn(),
+      onAudioPcm: vi.fn(() => () => {}),
+    };
+  }
+
+  function makeDeps(surface: "window" | "monitor" = "window", withDisplayAudio = true) {
+    const video = track("video");
+    const displayAudio = withDisplayAudio ? track("audio", "display") : null;
+    const pcmTrack = track("audio", "pcm");
+    const deps: ElectronCaptureDeps = {
+      captureScreen: vi.fn(async (): Promise<CaptureResult> => ({
+        stream: stream(displayAudio ? [video, displayAudio] : [video]),
+        video,
+        audio: displayAudio,
+        surface,
+      })),
+      captureSource: vi.fn(async () => track("video", "swapped")),
+      makeStream: (tracks) => stream(tracks),
+      createPcmTrack: vi.fn(() => pcmTrack),
+      webCaptureAudioOnly: vi.fn(async () => null),
+    };
+    return { deps, video, displayAudio, pcmTrack };
+  }
+
+  it("reports hasPerAppAudio only when all four audio bridge methods are present", () => {
+    const full = makeAudioBridge();
+    const { deps } = makeDeps();
+    expect(createElectronCaptureController(full, callbacks(), deps).hasPerAppAudio).toBe(true);
+    expect(
+      createElectronCaptureController({ ...full, startWindowAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+    ).toBe(false);
+    expect(
+      createElectronCaptureController({ ...full, startSystemAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+    ).toBe(false);
+    expect(
+      createElectronCaptureController({ ...full, stopAudio: undefined }, callbacks(), deps).hasPerAppAudio,
+    ).toBe(false);
+    expect(
+      createElectronCaptureController({ ...full, onAudioPcm: undefined }, callbacks(), deps).hasPerAppAudio,
+    ).toBe(false);
+  });
+
+  it("uses per-window WASAPI audio when sharing a window in 'app' mode", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, displayAudio, pcmTrack } = makeDeps("window");
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const result = await c.start(preset, "app");
+    expect(bridge.startWindowAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.startSystemAudio).not.toHaveBeenCalled();
+    expect(displayAudio!.stopped).toBe(true);
+    expect(deps.createPcmTrack).toHaveBeenCalledWith({
+      onAudioPcm: bridge.onAudioPcm,
+      stopAudio: bridge.stopAudio,
+    });
+    expect(result.audio).toBe(pcmTrack);
+    expect(result.stream.getTracks()).toEqual([video, pcmTrack]);
+  });
+
+  it("uses system WASAPI audio when sharing an entire monitor in 'app' mode or any surface in 'system' mode", async () => {
+    const bridge = makeAudioBridge();
+    const { deps: monitorDeps, pcmTrack: monitorPcm } = makeDeps("monitor", false);
+    const cMonitor = createElectronCaptureController(bridge, callbacks(), monitorDeps);
+    const res1 = await cMonitor.start(preset, "app");
+    expect(bridge.startSystemAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.startWindowAudio).not.toHaveBeenCalled();
+    expect(res1.audio).toBe(monitorPcm);
+
+    const { deps: winDeps, pcmTrack: winPcm } = makeDeps("window");
+    const cWinSystem = createElectronCaptureController(bridge, callbacks(), winDeps);
+    const res2 = await cWinSystem.start(preset, "system");
+    expect(bridge.startSystemAudio).toHaveBeenCalledTimes(2);
+    expect(bridge.startWindowAudio).not.toHaveBeenCalled();
+    expect(res2.audio).toBe(winPcm);
+  });
+
+  it("does not start WASAPI audio in 'none' mode or when the bridge is missing or fails", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, displayAudio } = makeDeps("window", false);
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const resNone = await c.start(preset, "none");
+    expect(bridge.startWindowAudio).not.toHaveBeenCalled();
+    expect(bridge.startSystemAudio).not.toHaveBeenCalled();
+    expect(resNone.audio).toBeNull();
+    expect(displayAudio).toBeNull();
+
+    // When startWindowAudio returns false, keep the original capture.audio without stopping it.
+    bridge.startWindowAudio.mockResolvedValueOnce(false);
+    const { deps: failDeps, displayAudio: fallbackAudio } = makeDeps("window", true);
+    const cFail = createElectronCaptureController(bridge, callbacks(), failDeps);
+    const resFail = await cFail.start(preset, "app");
+    expect(resFail.audio).toBe(fallbackAudio);
+    expect(fallbackAudio!.stopped).toBe(false);
+  });
+
+  it("rebuilds the stream with video-only if an audio provider returns null to replace existing audio", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video } = makeDeps("window", true);
+    deps.audioSource = async () => null;
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const result = await c.start(preset, "app");
+    expect(result.audio).toBeNull();
+    expect(result.stream.getTracks()).toEqual([video]);
+  });
+
+  it("stops the captured video and main-process audio if audio setup throws after captureScreen", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, displayAudio } = makeDeps("window", true);
+    (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockImplementationOnce(() => {
+      throw new Error("AudioContext failed");
+    });
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    await expect(c.start(preset, "app")).rejects.toThrow("AudioContext failed");
+    expect(video.stopped).toBe(true);
+    expect(displayAudio!.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+  });
+
+  it("supports captureAudioOnly for window and system via the WASAPI bridge, and falls back when absent", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, pcmTrack } = makeDeps();
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+
+    const winAudio = await c.captureAudioOnly("window");
+    expect(bridge.pickWindowAudio).toHaveBeenCalledTimes(1);
+    expect(deps.createPcmTrack).toHaveBeenLastCalledWith({
+      onAudioPcm: bridge.onAudioPcm,
+      stopAudio: bridge.stopAudio,
+    });
+    expect(winAudio?.stream.getTracks()).toEqual([pcmTrack]);
+    expect(winAudio).toEqual({
+      stream: expect.anything(),
+      track: pcmTrack,
+      kind: "window",
+      label: "Discord",
+    });
+
+    bridge.pickWindowAudio.mockResolvedValueOnce({ ok: false, label: null });
+    expect(await c.captureAudioOnly("window")).toBeNull();
+
+    const noPickBridge = { ...bridge, pickWindowAudio: undefined };
+    expect(await createElectronCaptureController(noPickBridge, callbacks(), deps).captureAudioOnly("window")).toBeNull();
+
+    (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockClear();
+    const sysAudio = await c.captureAudioOnly("system");
+    expect(bridge.startSystemAudio).toHaveBeenCalledTimes(1);
+    expect(deps.createPcmTrack).toHaveBeenLastCalledWith({
+      onAudioPcm: bridge.onAudioPcm,
+      stopAudio: bridge.stopAudio,
+    });
+    expect(sysAudio?.stream.getTracks()).toEqual([pcmTrack]);
+    expect(sysAudio).toEqual({
+      stream: expect.anything(),
+      track: pcmTrack,
+      kind: "system",
+      label: null,
+    });
+
+    bridge.startSystemAudio.mockResolvedValueOnce(false);
+    expect(await c.captureAudioOnly("system")).toBeNull();
+
+    // Without the WASAPI bridge, falls back to webCaptureAudioOnly.
+    const legacyController = createElectronCaptureController(
+      { onFollowUpdate: () => () => {}, stopFollow: () => {} },
+      callbacks(),
+      deps,
+    );
+    await legacyController.captureAudioOnly("window");
+    expect(deps.webCaptureAudioOnly).toHaveBeenCalledWith("window");
   });
 });

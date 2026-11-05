@@ -22,6 +22,7 @@
     "src/**/*.ts",
     "shared/**/*.ts",
     "electron/follow/**/*.js",
+    "electron/audio/**/*.js",
     "electron/picker.js",
     "test/unit/**/*.ts",
     "test/formal/**/*.ts",

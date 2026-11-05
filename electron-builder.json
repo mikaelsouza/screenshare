@@ -11,6 +11,10 @@
     "package.json"
   ],
   "asar": true,
+  "asarUnpack": [
+    "**/*.node"
+  ],
+  "npmRebuild": false,
   "win": {
     "target": [
       {

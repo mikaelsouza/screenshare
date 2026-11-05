@@ -3,6 +3,10 @@ import { app, BrowserWindow, Menu, session, desktopCapturer, ipcMain, shell } fr
 import { matchProfile } from './follow/profiles.js';
 import { createFollower } from './follow/follower.js';
 import { buildPickerTemplate } from './picker.js';
+import { createPidResolver } from './audio/pid.js';
+import { createAudioSessionController } from './audio/capture.js';
+import koffi from 'koffi';
+import loopback from 'loopback-capture';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -83,8 +87,10 @@ function setupMediaHandlers() {
         return;
       }
       stopFollow();
+      audioSession.stop();
+      lastPickedSource = source;
       try {
-        callback({ video: source, audio: request.audioRequested ? 'loopback' : undefined });
+        callback({ video: source });
       } catch (err) {
         console.error('[main] setDisplayMediaRequestHandler callback failed:', err);
         return;
@@ -114,6 +120,64 @@ function setupMediaHandlers() {
     if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) stopFollow();
   });
 
+  ipcMain.handle('audio:start-window', (event, sourceId) => {
+    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    const targetId = lastPickedSource?.id;
+    if (typeof sourceId === 'string' && sourceId && sourceId !== targetId) return false;
+    return Boolean(targetId && audioSession.startForWindow(targetId));
+  });
+
+  ipcMain.handle('audio:start-system', (event) => {
+    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    return audioSession.startForSystem();
+  });
+
+  ipcMain.handle('audio:pick-window', async (event) => {
+    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) {
+      return { ok: false, label: null };
+    }
+    let sources;
+    try {
+      sources = await desktopCapturer.getSources({
+        types: ['window'],
+        fetchWindowIcons: true,
+        thumbnailSize: { width: 0, height: 0 },
+      });
+    } catch (err) {
+      console.error('[main] audio:pick-window getSources failed:', err);
+      return { ok: false, label: null };
+    }
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (picked) => {
+        if (settled) return;
+        settled = true;
+        if (!picked) {
+          resolve({ ok: false, label: null });
+          return;
+        }
+        const ok = audioSession.startForWindow(picked.id, { follow: false });
+        resolve({ ok, label: ok ? picked.name : null });
+      };
+      const template = buildPickerTemplate(sources, finish, {
+        excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
+        windowsOnly: true,
+      });
+      if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
+        finish(null);
+        return;
+      }
+      Menu.buildFromTemplate(template).popup({
+        window: mainWindow,
+        callback: () => setTimeout(() => finish(null), 100),
+      });
+    });
+  });
+
+  ipcMain.on('audio:stop', (event) => {
+    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
+  });
+
   // 2. Permission request handler for display-capture & media (trusted origin only,
   //    since the app now loads remote content)
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
@@ -127,6 +191,38 @@ function setupMediaHandlers() {
     return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL());
   });
 }
+
+// ---- audio capture ---------------------------------------------------------
+
+let lastPickedSource = null;
+
+let lookupWin32Pid = () => 0;
+if (process.platform === 'win32') {
+  try {
+    const user32 = koffi.load('user32.dll');
+    const GetWindowThreadProcessId = user32.func(
+      'uint32 __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32 *lpdwProcessId)',
+    );
+    lookupWin32Pid = (hwnd) => {
+      const out = [0];
+      GetWindowThreadProcessId(hwnd, out);
+      return out[0];
+    };
+  } catch (err) {
+    console.warn('[main] could not load user32.dll via koffi:', err);
+  }
+}
+
+const audioSession = createAudioSessionController({
+  createCapture: () => new loopback.LoopbackCapture(),
+  resolvePid: createPidResolver(lookupWin32Pid),
+  selfPid: process.pid,
+  sendPcm: (chunk) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('audio:pcm', chunk);
+    }
+  },
+});
 
 // ---- game follow -----------------------------------------------------------
 
@@ -161,6 +257,7 @@ function startFollow(profile, source) {
       if (follow !== state) return;
       const status = follower.evaluate(windows);
       if (!status) return;
+      if (status.sourceId) audioSession.switchWindow(status.sourceId);
       sendFollowUpdate(profile, status);
       if (status.role === 'ended') stopFollow();
     } catch (err) {
@@ -266,6 +363,7 @@ async function initApplication() {
   mainWindow.on('closed', () => {
     clearTimeout(retryTimer);
     stopFollow();
+    audioSession.stop();
     mainWindow = null;
   });
 

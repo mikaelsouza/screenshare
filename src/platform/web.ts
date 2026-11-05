@@ -1,6 +1,6 @@
 /** Browser capture: the browser's own picker, and the share ends with its source. */
 
-import { captureScreen, onCaptureEnded, stopCapture, type CaptureResult } from "../capture";
+import { captureAudioOnly, captureScreen, onCaptureEnded, stopCapture, type CaptureResult } from "../capture";
 import type { CaptureCallbacks, CaptureController } from "./types";
 
 export function createWebCaptureController(cb: CaptureCallbacks): CaptureController {
@@ -9,11 +9,15 @@ export function createWebCaptureController(cb: CaptureCallbacks): CaptureControl
 
   return {
     kind: "web",
+    hasPerAppAudio: true,
     async start(preset, mode) {
       const result = await captureScreen(preset, mode);
       capture = result;
       unlisten = onCaptureEnded(result, () => cb.onEnded("source-closed"));
       return result;
+    },
+    captureAudioOnly(kind) {
+      return captureAudioOnly(kind);
     },
     setPreset() {
       // Nothing to do: the browser never re-captures mid-share.
