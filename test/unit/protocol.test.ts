@@ -7,6 +7,8 @@ import {
   generateRoomCode,
   isValidRoomCode,
   parseClientMessage,
+  parseNewRoomResponse,
+  parseServerMessage,
 } from "@shared/protocol";
 
 const P1 = "3f2c1a9e-8b4d-4c1e-9a7f-0e5d6c4b3a21";
@@ -260,6 +262,76 @@ describe("parseClientMessage join options", () => {
       room: "ABCDEFGH",
       displayName: "alice",
     });
+  });
+});
+
+describe("parseServerMessage", () => {
+  it("parses welcome, peer-joined, peer-left, signal, peer-state, room-state, and error messages", () => {
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          t: "welcome",
+          selfId: P1,
+          peers: [{ id: "p2", name: "bob", sharing: true, host: true }],
+          host: true,
+          hostToken: "htok",
+          rejoinToken: "rtok",
+          locked: false,
+        }),
+      ),
+    ).toEqual({
+      t: "welcome",
+      selfId: P1,
+      peers: [{ id: "p2", name: "bob", sharing: true, host: true }],
+      host: true,
+      hostToken: "htok",
+      rejoinToken: "rtok",
+      locked: false,
+    });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false } })),
+    ).toEqual({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false } });
+
+    expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "p2" }))).toEqual({
+      t: "peer-left",
+      id: "p2",
+    });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "signal", from: "p2", data: { k: "offer", sdp: "v=0" } })),
+    ).toEqual({ t: "signal", from: "p2", data: { k: "offer", sdp: "v=0" } });
+
+    expect(parseServerMessage(JSON.stringify({ t: "peer-state", id: "p2", sharing: true }))).toEqual({
+      t: "peer-state",
+      id: "p2",
+      sharing: true,
+    });
+
+    expect(parseServerMessage(JSON.stringify({ t: "room-state", locked: true }))).toEqual({
+      t: "room-state",
+      locked: true,
+    });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "error", code: "room-full", message: "Room is full" })),
+    ).toEqual({ t: "error", code: "room-full", message: "Room is full" });
+  });
+
+  it("rejects malformed or invalid server messages", () => {
+    expect(parseServerMessage("not json")).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ t: "unknown" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ t: "error", code: "not-a-code", message: "x" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "" }))).toBeNull();
+  });
+});
+
+describe("parseNewRoomResponse", () => {
+  it("accepts a valid room code response and rejects malformed responses", () => {
+    const code = generateRoomCode();
+    expect(parseNewRoomResponse({ code })).toEqual({ code });
+    expect(parseNewRoomResponse({ code: "bad" })).toBeNull();
+    expect(parseNewRoomResponse(null)).toBeNull();
   });
 });
 

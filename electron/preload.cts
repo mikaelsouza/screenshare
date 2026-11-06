@@ -1,6 +1,8 @@
 import type { IpcRendererEvent } from "electron";
 
-const { contextBridge, ipcRenderer } = require("electron") as typeof import("electron");
+declare function require(id: "electron"): typeof import("electron");
+
+const { contextBridge, ipcRenderer } = require("electron");
 
 interface FollowUpdatePayload {
   role: "lobby" | "game" | "waiting" | "ended";
@@ -27,12 +29,18 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.send("follow:stop");
   },
   // Per-app & system audio capture (see electron/audio).
-  startWindowAudio: (sourceId?: string): Promise<boolean> =>
-    ipcRenderer.invoke("audio:start-window", sourceId) as Promise<boolean>,
-  pickWindowAudio: (): Promise<{ ok: boolean; label: string | null }> =>
-    ipcRenderer.invoke("audio:pick-window") as Promise<{ ok: boolean; label: string | null }>,
-  startSystemAudio: (): Promise<boolean> =>
-    ipcRenderer.invoke("audio:start-system") as Promise<boolean>,
+  startWindowAudio: async (sourceId?: string): Promise<boolean> =>
+    (await ipcRenderer.invoke("audio:start-window", sourceId)) === true,
+  pickWindowAudio: async (): Promise<{ ok: boolean; label: string | null }> => {
+    const res: unknown = await ipcRenderer.invoke("audio:pick-window");
+    if (typeof res === "object" && res !== null && "ok" in res && typeof res.ok === "boolean") {
+      const label = "label" in res && typeof res.label === "string" ? res.label : null;
+      return { ok: res.ok, label };
+    }
+    return { ok: false, label: null };
+  },
+  startSystemAudio: async (): Promise<boolean> =>
+    (await ipcRenderer.invoke("audio:start-system")) === true,
   stopAudio: (): void => {
     ipcRenderer.send("audio:stop");
   },

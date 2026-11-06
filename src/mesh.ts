@@ -9,7 +9,7 @@
  * sharer's uplink. See MAX_ROOM_SIZE.
  */
 
-import type { IceCandidateInit, PeerId, SignalData } from "@shared/protocol";
+import { z, type IceCandidateInit, type PeerId, type SignalData } from "@shared/protocol";
 import type { CaptureResult, QualityPreset } from "./capture";
 import {
   applyAudioEncoding,
@@ -41,6 +41,11 @@ type ControlMessage = { c: "view"; want: boolean };
 /** Real control messages are ~25 bytes. Anything far larger is not ours. */
 const MAX_CONTROL_MESSAGE_LENGTH = 256;
 
+const ControlMessageSchema: z.ZodType<ControlMessage> = z.object({
+  c: z.literal("view"),
+  want: z.boolean(),
+});
+
 /**
  * Parse a control message from the far end, or null if it is not one.
  *
@@ -50,16 +55,12 @@ const MAX_CONTROL_MESSAGE_LENGTH = 256;
  */
 export function parseControlMessage(data: unknown): ControlMessage | null {
   if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
-  let msg: unknown;
   try {
-    msg = JSON.parse(data);
+    const parsed = ControlMessageSchema.safeParse(JSON.parse(data));
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
-  if (typeof msg !== "object" || msg === null) return null;
-  const rec = msg as Record<string, unknown>;
-  if (rec["c"] !== "view" || typeof rec["want"] !== "boolean") return null;
-  return { c: "view", want: rec["want"] };
 }
 
 class PeerLink {

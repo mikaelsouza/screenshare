@@ -4,18 +4,20 @@
  * it can be tested without Electron; main.ts turns it into a Menu.
  */
 
+import type { NativeImage } from "electron";
+
 export interface PickerSource {
   /** "window:…" or "screen:…", as desktopCapturer reports. */
   id: string;
   name: string;
-  appIcon?: { isEmpty(): boolean; resize(options: { width: number; height: number }): unknown } | null;
+  appIcon?: { isEmpty(): boolean; resize(options: { width: number; height: number }): NativeImage | string } | null;
 }
 
 export interface PickerItem {
   label?: string;
   type?: "separator";
   enabled?: boolean;
-  icon?: unknown;
+  icon?: NativeImage | string;
   click?: () => void;
 }
 

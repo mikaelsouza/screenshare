@@ -43,12 +43,12 @@ async function refusal(res: Response): Promise<{ code: string; closeCode: number
     let code = "";
     const timer = setTimeout(() => reject(new Error("no close received")), 2000);
     ws.addEventListener("message", (ev) => {
-      const msg = JSON.parse(String((ev as MessageEvent).data)) as ServerMessage;
+      const msg = JSON.parse(String(ev.data)) as ServerMessage;
       if (msg.t === "error") code = msg.code;
     });
     ws.addEventListener("close", (ev) => {
       clearTimeout(timer);
-      resolve({ code, closeCode: (ev as CloseEvent).code });
+      resolve({ code, closeCode: ev.code });
     });
   });
 }
@@ -62,7 +62,7 @@ function closeCodeOf(ws: WebSocket, timeoutMs = 3000): Promise<number> {
     const timer = setTimeout(() => reject(new Error("socket was not closed")), timeoutMs);
     ws.addEventListener("close", (ev) => {
       clearTimeout(timer);
-      resolve((ev as CloseEvent).code);
+      resolve(ev.code);
     });
   });
 }
@@ -80,7 +80,7 @@ class Client {
   private constructor(ws: WebSocket) {
     this.ws = ws;
     ws.addEventListener("message", (ev) => {
-      const raw = String((ev as MessageEvent).data);
+      const raw = String(ev.data);
       if (raw === PONG || raw === PING) return;
       const msg = JSON.parse(raw) as ServerMessage;
       const waiter = this.waiters.shift();
@@ -189,7 +189,7 @@ describe("HTTP routing", () => {
   it("mints a valid room code", async () => {
     const res = await SELF.fetch("https://example.com/api/room");
     expect(res.status).toBe(200);
-    const { code } = (await res.json()) as { code: string };
+    const { code } = await res.json<{ code: string }>();
     expect(code).toMatch(/^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/);
   });
 
@@ -263,7 +263,7 @@ describe("HTTP routing", () => {
     });
     expect(limited.status).toBe(429);
     expect(limited.headers.get("Retry-After")).toBe("60");
-    const body = (await limited.json()) as { error: string };
+    const body = await limited.json<{ error: string }>();
     expect(body.error).toBe("Rate limit exceeded");
 
     // A different IP should still be allowed
@@ -511,7 +511,7 @@ describe("RoomDO membership", () => {
       const timer = setTimeout(() => reject(new Error("never closed")), 2000);
       ws.addEventListener("close", (ev) => {
         clearTimeout(timer);
-        resolve((ev as CloseEvent).code);
+        resolve(ev.code);
       });
     });
     expect(closeCode).toBe(1013);
@@ -1359,7 +1359,7 @@ describe("RoomDO final review fixes", () => {
 
     const pongs: string[] = [];
     a.ws.addEventListener("message", (ev) => {
-      const data = String((ev as MessageEvent).data);
+      const data = String(ev.data);
       if (data === PONG) pongs.push(data);
     });
 

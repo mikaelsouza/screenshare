@@ -2,18 +2,29 @@
  * getStats() extraction for inbound (viewer tile) and outbound (sharer-to-viewer) links.
  */
 
+import { z } from "@shared/protocol";
 import type { LinkHealth } from "./quality";
 
-/** Narrow a raw stats entry to a plain record so index access is checkable. */
-type Stat = Record<string, unknown>;
+const NullableFiniteNumber = z.number().nullable().catch(null);
 
-function num(val: unknown): number | null {
-  return typeof val === "number" && Number.isFinite(val) ? val : null;
-}
+const StatSchema = z.object({
+  type: z.string().optional().catch(undefined),
+  kind: z.string().optional().catch(undefined),
+  selectedCandidatePairId: z.string().optional().catch(undefined),
+  state: z.string().optional().catch(undefined),
+  nominated: z.boolean().optional().catch(undefined),
+  currentRoundTripTime: NullableFiniteNumber,
+  bytesSent: NullableFiniteNumber,
+  bytesReceived: NullableFiniteNumber,
+  packetsSent: NullableFiniteNumber,
+  packetsReceived: NullableFiniteNumber,
+  packetsLost: NullableFiniteNumber,
+  framesPerSecond: NullableFiniteNumber,
+  frameWidth: NullableFiniteNumber,
+  frameHeight: NullableFiniteNumber,
+});
 
-function str(val: unknown): string | null {
-  return typeof val === "string" ? val : null;
-}
+type Stat = z.infer<typeof StatSchema>;
 
 interface Sample {
   bytes: number | null;
@@ -24,13 +35,13 @@ interface Sample {
 
 function findSelectedPair(byId: Map<string, Stat>): Stat | null {
   for (const stat of byId.values()) {
-    if (stat["type"] !== "transport") continue;
-    const sel = str(stat["selectedCandidatePairId"]);
+    if (stat.type !== "transport") continue;
+    const sel = stat.selectedCandidatePairId;
     const found = sel ? byId.get(sel) : undefined;
     if (found) return found;
   }
   for (const stat of byId.values()) {
-    if (stat["type"] === "candidate-pair" && stat["state"] === "succeeded" && stat["nominated"] === true) {
+    if (stat.type === "candidate-pair" && stat.state === "succeeded" && stat.nominated === true) {
       return stat;
     }
   }
@@ -44,11 +55,11 @@ function findVideoStats(
   let rtp: Stat | null = null;
   let remoteInbound: Stat | null = null;
   for (const stat of byId.values()) {
-    if (stat["kind"] !== "video") continue;
+    if (stat.kind !== "video") continue;
     if (direction === "outbound") {
-      if (stat["type"] === "outbound-rtp") rtp = stat;
-      else if (stat["type"] === "remote-inbound-rtp") remoteInbound = stat;
-    } else if (stat["type"] === "inbound-rtp") {
+      if (stat.type === "outbound-rtp") rtp = stat;
+      else if (stat.type === "remote-inbound-rtp") remoteInbound = stat;
+    } else if (stat.type === "inbound-rtp") {
       rtp = stat;
     }
   }
@@ -107,17 +118,18 @@ export class LinkMonitor {
     }
 
     const byId = new Map<string, Stat>();
-    report.forEach((entry, id) => byId.set(id, entry as unknown as Stat));
+    report.forEach((entry, id) => {
+      const parsed = StatSchema.safeParse(entry);
+      if (parsed.success) byId.set(id, parsed.data);
+    });
 
     const pair = findSelectedPair(byId);
     const { rtp, lostSource } = findVideoStats(byId, this.direction);
-    const bytesKey = this.direction === "outbound" ? "bytesSent" : "bytesReceived";
-    const packetsKey = this.direction === "outbound" ? "packetsSent" : "packetsReceived";
 
     const sample: Sample = {
-      bytes: rtp ? num(rtp[bytesKey]) : null,
-      packets: rtp ? num(rtp[packetsKey]) : null,
-      packetsLost: lostSource ? num(lostSource["packetsLost"]) : null,
+      bytes: rtp ? (this.direction === "outbound" ? rtp.bytesSent : rtp.bytesReceived) : null,
+      packets: rtp ? (this.direction === "outbound" ? rtp.packetsSent : rtp.packetsReceived) : null,
+      packetsLost: lostSource ? lostSource.packetsLost : null,
       timestampMs: performance.now(),
     };
 
@@ -126,15 +138,15 @@ export class LinkMonitor {
     const packetLossRatio = prev ? computeLossRatio(sample, prev, this.direction) : null;
     this.prev = sample;
 
-    const rttSec = pair ? num(pair["currentRoundTripTime"]) : null;
+    const rttSec = pair ? pair.currentRoundTripTime : null;
 
     return {
       rttMs: rttSec === null ? null : rttSec * 1000,
       packetLossRatio,
       bitrate,
-      framesPerSecond: rtp ? num(rtp["framesPerSecond"]) : null,
-      frameWidth: rtp ? num(rtp["frameWidth"]) : null,
-      frameHeight: rtp ? num(rtp["frameHeight"]) : null,
+      framesPerSecond: rtp ? rtp.framesPerSecond : null,
+      frameWidth: rtp ? rtp.frameWidth : null,
+      frameHeight: rtp ? rtp.frameHeight : null,
     };
   }
 }

@@ -48,7 +48,7 @@ export interface ElectronCaptureDeps {
 
 /** Electron's (Chromium's) desktop-source constraints. Not in TypeScript's DOM lib. */
 async function captureDesktopSource(sourceId: string, preset: QualityPreset): Promise<MediaStreamTrack> {
-  const constraints = {
+  const constraints: MediaStreamConstraints = {
     audio: false,
     video: {
       mandatory: {
@@ -59,7 +59,7 @@ async function captureDesktopSource(sourceId: string, preset: QualityPreset): Pr
         maxFrameRate: preset.frameRate,
       },
     },
-  } as unknown as MediaStreamConstraints;
+  };
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
   const track = stream.getVideoTracks()[0];
   if (!track) {

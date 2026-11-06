@@ -51,6 +51,15 @@ declare global {
   interface Window {
     electronAPI?: ElectronAPI;
   }
+  interface MediaTrackConstraints {
+    mandatory?: {
+      chromeMediaSource: string;
+      chromeMediaSourceId: string;
+      maxWidth: number;
+      maxHeight: number;
+      maxFrameRate: number;
+    };
+  }
 }
 
 /** Why a share ended by itself (as opposed to the user pressing Stop). */

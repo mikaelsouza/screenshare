@@ -7,6 +7,7 @@
 import {
   MAX_ROOM_SIZE,
   isValidRoomCode,
+  parseNewRoomResponse,
   type PeerId,
   type PeerInfo,
 } from "@shared/protocol";
@@ -41,9 +42,10 @@ import {
 } from "./ui-model";
 
 function el<T extends HTMLElement>(id: string): T {
-  const node = document.getElementById(id);
+  const selector = typeof CSS !== "undefined" && typeof CSS.escape === "function" ? `#${CSS.escape(id)}` : `#${id}`;
+  const node = document.querySelector<T>(selector);
   if (!node) throw new Error(`missing element #${id}`);
-  return node as T;
+  return node;
 }
 
 const ui = {
@@ -340,12 +342,12 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   video.addEventListener("loadedmetadata", updateAspect);
   video.addEventListener("resize", updateAspect);
   wrap.addEventListener("dblclick", (ev) => {
-    if ((ev.target as HTMLElement).closest("button, input")) return;
+    if (ev.target instanceof Element && ev.target.closest("button, input")) return;
     if (visibleTileCount() >= 2) setFocusedTile(peerId);
   });
   wrap.addEventListener("click", (ev) => {
     if (focusedPeerId !== null && focusedPeerId !== peerId) {
-      if ((ev.target as HTMLElement).closest("button, input")) return;
+      if (ev.target instanceof Element && ev.target.closest("button, input")) return;
       setFocusedTile(peerId);
     }
   });
@@ -604,7 +606,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
       if (document.pictureInPictureElement === v) {
         void document.exitPictureInPicture().catch(() => {});
       } else if (typeof v.requestPictureInPicture === "function") {
-        void v.requestPictureInPicture().catch((err) => {
+        void v.requestPictureInPicture().catch((err: unknown) => {
           console.warn(`[main] PiP request failed for ${peerId}`, err);
         });
       }
@@ -1081,9 +1083,13 @@ function renderRoster(): void {
 
 // ---- sharing -------------------------------------------------------------
 
+function isQualityPresetName(val: string | null): val is QualityPresetName {
+  return val !== null && Object.hasOwn(QUALITY_PRESETS, val);
+}
+
 function currentPreset(): QualityPresetName {
   const stored = localStorage.getItem("preset");
-  return stored && stored in QUALITY_PRESETS ? (stored as QualityPresetName) : DEFAULT_PRESET;
+  return isQualityPresetName(stored) ? stored : DEFAULT_PRESET;
 }
 
 const CODEC_NAMES = ["h264", "vp9", "av1", "vp8"] as const;
@@ -1518,7 +1524,7 @@ async function joinRoom(code: string): Promise<void> {
 
       onPeerJoined: (peer: PeerInfo) => {
         if (peerLeftTimers.has(peer.id)) {
-          clearTimeout(peerLeftTimers.get(peer.id)!);
+          clearTimeout(peerLeftTimers.get(peer.id));
           peerLeftTimers.delete(peer.id);
         }
         names.set(peer.id, peer.name);
@@ -1530,7 +1536,7 @@ async function joinRoom(code: string): Promise<void> {
       onPeerLeft: (id) => {
         if (mesh?.hasConnectedLink(id)) {
           if (peerLeftTimers.has(id)) {
-            clearTimeout(peerLeftTimers.get(id)!);
+            clearTimeout(peerLeftTimers.get(id));
           }
           const timer = setTimeout(() => {
             teardownPeer(id);
@@ -1543,7 +1549,7 @@ async function joinRoom(code: string): Promise<void> {
       onSignal: (from, data) => void mesh?.handleSignal(from, data),
       onPeerState: (id, sharing) => {
         if (peerLeftTimers.has(id)) {
-          clearTimeout(peerLeftTimers.get(id)!);
+          clearTimeout(peerLeftTimers.get(id));
           peerLeftTimers.delete(id);
         }
         if (!sharing) removeTile(id);
@@ -1643,8 +1649,8 @@ function initQualityControls(): void {
   ui.codec.value = currentCodec();
 
   ui.preset.addEventListener("change", () => {
-    const name = ui.preset.value as QualityPresetName;
-    if (!(name in QUALITY_PRESETS)) return;
+    const name = ui.preset.value;
+    if (!isQualityPresetName(name)) return;
     localStorage.setItem("preset", name);
     captureController.setPreset(QUALITY_PRESETS[name]);
     if (mesh) runBackground(mesh.setPreset(QUALITY_PRESETS[name]));
@@ -1703,8 +1709,7 @@ ui.rosterBtn.addEventListener("click", () => {
 
 document.addEventListener("click", (ev) => {
   if (!rosterOpen) return;
-  const target = ev.target as HTMLElement | null;
-  if (target?.closest(".roster-anchor")) return;
+  if (ev.target instanceof Element && ev.target.closest(".roster-anchor")) return;
   rosterOpen = false;
   ui.roster.hidden = true;
   ui.rosterBtn.setAttribute("aria-expanded", "false");
@@ -1785,8 +1790,9 @@ ui.createBtn.addEventListener("click", () => {
       try {
         const res = await fetch("/api/room");
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const { code } = (await res.json()) as { code: string };
-        if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
+        const parsed = parseNewRoomResponse(await res.json());
+        if (!parsed) throw new Error("server returned an invalid room code");
+        const { code } = parsed;
         ui.roomInput.value = code;
         await joinRoom(code);
       } catch (err) {
