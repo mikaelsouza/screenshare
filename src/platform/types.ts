@@ -6,7 +6,7 @@
  * process, which can also follow a game from its lobby window to its game window.
  */
 
-import type { AudioMode, AudioSource, CaptureResult, QualityPreset } from "../capture";
+import type { CaptureResult, QualityPreset } from "../capture";
 
 /**
  * Where a follow currently is. "lobby" and "game" are the two windows of a game
@@ -41,7 +41,6 @@ export interface ElectronAPI {
   onFollowUpdate?: (cb: (update: FollowUpdate) => void) => () => void;
   stopFollow?: () => void;
   startWindowAudio?: (sourceId?: string) => Promise<boolean>;
-  pickWindowAudio?: () => Promise<{ ok: boolean; label: string | null }>;
   startSystemAudio?: () => Promise<boolean>;
   stopAudio?: () => void;
   onAudioPcm?: (cb: (pcm: Uint8Array) => void) => () => void;
@@ -75,12 +74,8 @@ export interface CaptureCallbacks {
 
 export interface CaptureController {
   readonly kind: "web" | "electron";
-  /** Whether the desktop app has the WASAPI per-app audio bridge. */
-  readonly hasPerAppAudio: boolean;
   /** Opens the picker. Rejects when the user cancels. */
-  start(preset: QualityPreset, mode: AudioMode): Promise<CaptureResult>;
-  /** Switch audio mid-share (either to a specific window or to all system audio). */
-  captureAudioOnly(kind: "window" | "system"): Promise<AudioSource | null>;
+  start(preset: QualityPreset): Promise<CaptureResult>;
   /** The preset to use for windows captured later in this share. */
   setPreset(preset: QualityPreset): void;
   stop(): void;
@@ -90,4 +85,4 @@ export interface CaptureController {
  * Picks the audio track a share sends. The default keeps whatever came back with
  * the screen capture; per-app audio capture plugs in here.
  */
-export type AudioSourceProvider = (capture: CaptureResult, mode: AudioMode) => Promise<MediaStreamTrack | null>;
+export type AudioSourceProvider = (capture: CaptureResult) => Promise<MediaStreamTrack | null>;

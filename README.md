@@ -59,11 +59,13 @@ Known limitations and open defects are tracked in
 
 ## Audio
 
-The **Audio** selector defaults to **Game only**, which never sends system audio, so
-Discord and music stay private. Sharing a window captures that window's sound. Sharing a
-whole screen in Game only mode asks for a second, windows-only pick, so you can choose the
-game. The chip next to **Stop sharing** shows the source and can swap it live without
-reconnecting.
+Screen and window sharing always enables Chrome's native audio toggle: per-application
+audio on the **Window** tab (`windowAudio: "window"`) and system audio (excluding this
+browser's own playback via `restrictOwnAudio: true`) on the **Entire Screen** tab. In the
+desktop app, WASAPI captures the shared window's process tree (following games between
+lobby and match windows) or system audio excluding the app itself. While streaming, the
+**Mute audio** button next to **Stop sharing** mutes or unmutes your outbound audio track
+in place.
 
 ## Deploy
 

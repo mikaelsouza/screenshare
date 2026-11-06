@@ -62,9 +62,4 @@ describe("buildPickerTemplate", () => {
     expect(buildPickerTemplate([lol], () => {}).map((i) => i.label)).toEqual(["Windows", "League of Legends"]);
     expect(buildPickerTemplate([], () => {})).toEqual([]);
   });
-
-  it("omits screens when windowsOnly is true", () => {
-    const items = buildPickerTemplate([screen1, lol, screen2], () => {}, { windowsOnly: true });
-    expect(items.map((i) => i.type ?? i.label)).toEqual(["Windows", "League of Legends"]);
-  });
 });

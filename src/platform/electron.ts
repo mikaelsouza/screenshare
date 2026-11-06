@@ -3,20 +3,15 @@
  * and getDisplayMedia goes through it, so starting a share works as on the web.
  *
  * Audio rules in the desktop app (when the WASAPI audio bridge is present):
- *  - Sharing a window in "Game only" ("app") mode captures only that window's
- *    process tree, and follows the window automatically when a game moves between
- *    its lobby and match windows.
- *  - Sharing a whole screen, or choosing "All system audio", captures system audio
- *    excluding this app's own process tree.
- *  - "No audio" captures video only.
+ *  - Sharing a window captures only that window's process tree, and follows the
+ *    window automatically when a game moves between its lobby and match windows.
+ *  - Sharing a whole screen captures system audio excluding this app's own
+ *    process tree.
  */
 
 import {
-  captureAudioOnly,
   captureScreen,
   stopCapture,
-  type AudioMode,
-  type AudioSource,
   type CaptureResult,
   type QualityPreset,
 } from "../capture";
@@ -33,16 +28,15 @@ import type {
 export type FollowAPI = Required<Pick<ElectronAPI, "onFollowUpdate" | "stopFollow">> &
   Pick<
     ElectronAPI,
-    "startWindowAudio" | "pickWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm"
+    "startWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm"
   >;
 
 export interface ElectronCaptureDeps {
-  captureScreen: (preset: QualityPreset, mode: AudioMode) => Promise<CaptureResult>;
+  captureScreen: (preset: QualityPreset) => Promise<CaptureResult>;
   /** Captures one desktop source by id, with no picker and no user gesture. */
   captureSource: (sourceId: string, preset: QualityPreset) => Promise<MediaStreamTrack>;
   makeStream: (tracks: MediaStreamTrack[]) => MediaStream;
   createPcmTrack: (bridge: PcmAudioBridge) => MediaStreamTrack;
-  webCaptureAudioOnly: (kind: "window" | "system") => Promise<AudioSource | null>;
   audioSource?: AudioSourceProvider;
 }
 
@@ -76,7 +70,6 @@ const defaultDeps: ElectronCaptureDeps = {
   captureSource: captureDesktopSource,
   makeStream: (tracks) => new MediaStream(tracks),
   createPcmTrack: createPcmAudioTrack,
-  webCaptureAudioOnly: captureAudioOnly,
 };
 
 /** Check whether the preload bridge exposes all required WASAPI audio IPC methods. */
@@ -89,17 +82,17 @@ function hasAudioBridge(
 
 /**
  * Default Electron audio provider: uses per-window WASAPI capture when a window was
- * picked in "app" mode, and system audio (excluding our own app) when a screen was
- * picked or "system" mode is chosen. Falls back to whatever came with getDisplayMedia
- * if the main process doesn't have the WASAPI bridge.
+ * picked, and system audio (excluding our own app) when a screen was picked. Falls
+ * back to whatever came with getDisplayMedia if the main process doesn't have the
+ * WASAPI bridge.
  */
 function buildDefaultAudioProvider(
   api: FollowAPI,
   deps: ElectronCaptureDeps,
 ): AudioSourceProvider {
-  return async (capture, mode) => {
-    if (mode === "none" || !hasAudioBridge(api)) return capture.audio;
-    const useWindow = mode === "app" && capture.surface === "window";
+  return async (capture) => {
+    if (!hasAudioBridge(api)) return capture.audio;
+    const useWindow = capture.surface === "window";
     const ok = useWindow ? await api.startWindowAudio() : await api.startSystemAudio();
     if (!ok) return capture.audio;
     capture.audio?.stop();
@@ -190,8 +183,7 @@ export function createElectronCaptureController(
 
   return {
     kind: "electron",
-    hasPerAppAudio: hasAudioBridge(api),
-    async start(p, mode) {
+    async start(p) {
       // following, sourceId and pending are already clear: they start that way and
       // stop() (or a failed start) clears them again.
       preset = p;
@@ -200,8 +192,8 @@ export function createElectronCaptureController(
       unsubscribe = api.onFollowUpdate(handle);
       let result: CaptureResult | null = null;
       try {
-        result = await deps.captureScreen(p, mode);
-        const chosenAudio = await audioProvider(result, mode);
+        result = await deps.captureScreen(p);
+        const chosenAudio = await audioProvider(result);
         if (chosenAudio !== result.audio) {
           result.audio = chosenAudio;
           result.stream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
@@ -218,20 +210,6 @@ export function createElectronCaptureController(
       pending = null;
       if (early) handle(early);
       return result;
-    },
-    async captureAudioOnly(kind) {
-      if (!hasAudioBridge(api)) return deps.webCaptureAudioOnly(kind);
-      if (kind === "window") {
-        if (!api.pickWindowAudio) return null;
-        const picked = await api.pickWindowAudio();
-        if (!picked.ok) return null;
-        const track = deps.createPcmTrack({ onAudioPcm: api.onAudioPcm, stopAudio: api.stopAudio });
-        return { stream: deps.makeStream([track]), track, kind: "window", label: picked.label };
-      }
-      const ok = await api.startSystemAudio();
-      if (!ok) return null;
-      const track = deps.createPcmTrack({ onAudioPcm: api.onAudioPcm, stopAudio: api.stopAudio });
-      return { stream: deps.makeStream([track]), track, kind: "system", label: null };
     },
     setPreset(p) {
       preset = p;

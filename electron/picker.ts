@@ -40,12 +40,12 @@ export function menuLabel(name: string): string {
 export function buildPickerTemplate<S extends PickerSource>(
   sources: readonly S[],
   onPick: (source: S) => void,
-  { excludeId = null, windowsOnly = false }: { excludeId?: string | null; windowsOnly?: boolean } = {},
+  { excludeId = null }: { excludeId?: string | null } = {},
 ): PickerItem[] {
   const windows = sources.filter(
     (s) => s.id.startsWith("window:") && s.id !== excludeId && s.name.trim() !== "",
   );
-  const screens = windowsOnly ? [] : sources.filter((s) => s.id.startsWith("screen:"));
+  const screens = sources.filter((s) => s.id.startsWith("screen:"));
 
   const items: PickerItem[] = [];
   if (windows.length > 0) {

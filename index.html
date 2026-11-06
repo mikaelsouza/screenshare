@@ -64,10 +64,9 @@
         box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
       }
 
-      /* Primitive 3: Controls (.ui-btn / .ui-input / .ui-select) */
+      /* Primitive 3: Controls (.ui-btn / .ui-input) */
       .ui-btn,
-      .ui-input,
-      .ui-select {
+      .ui-input {
         height: 32px;
         padding: 0 12px;
         border-radius: var(--radius);
@@ -83,12 +82,17 @@
         gap: 6px;
         white-space: nowrap;
         flex-shrink: 0;
+        font-variant-numeric: tabular-nums;
       }
       .ui-btn {
         cursor: pointer;
         transition: background-color 0.12s, border-color 0.12s, color 0.12s;
       }
       .ui-btn:hover:not(:disabled) {
+        background-color: #27272e;
+      }
+      .ui-btn[aria-expanded="true"] {
+        border-color: var(--accent-color);
         background-color: #27272e;
       }
       .ui-btn:disabled {
@@ -112,14 +116,13 @@
       .ui-btn.danger:hover:not(:disabled) {
         background-color: rgba(220, 38, 38, 0.26);
       }
-      .ui-btn.ghost {
-        background-color: transparent;
-        border-color: transparent;
-        color: var(--text-secondary);
+      .ui-btn.muted-active {
+        background-color: rgba(245, 158, 11, 0.16);
+        border-color: rgba(245, 158, 11, 0.45);
+        color: #fcd34d;
       }
-      .ui-btn.ghost:hover:not(:disabled) {
-        background-color: var(--surface-hover);
-        color: var(--text-primary);
+      .ui-btn.muted-active:hover:not(:disabled) {
+        background-color: rgba(245, 158, 11, 0.26);
       }
       .ui-btn.copied {
         background-color: #047857;
@@ -130,14 +133,9 @@
         background-color: var(--bg-color);
         cursor: text;
       }
-      .ui-input:focus,
-      .ui-select:focus {
+      .ui-input:focus {
         outline: none;
         border-color: var(--accent-color);
-      }
-      .ui-select {
-        cursor: pointer;
-        padding-right: 8px;
       }
 
       /* Primitive 4: Status Dot */
@@ -154,6 +152,9 @@
       .ui-dot[data-state="warn"] {
         background-color: #f59e0b;
       }
+      .ui-dot[data-state="active"] {
+        background-color: var(--accent-color);
+      }
 
       /* Header */
       .brand {
@@ -168,6 +169,29 @@
         letter-spacing: -0.01em;
         line-height: 20px;
         white-space: nowrap;
+        display: flex;
+        align-items: center;
+      }
+      #brand-home {
+        appearance: none;
+        background: transparent;
+        border: 0;
+        padding: 0;
+        margin: 0;
+        color: inherit;
+        font: inherit;
+        letter-spacing: inherit;
+        line-height: inherit;
+        cursor: pointer;
+        border-radius: 4px;
+        transition: opacity 0.12s;
+      }
+      #brand-home:hover:not(:disabled) {
+        opacity: 0.82;
+      }
+      #brand-home:disabled {
+        cursor: default;
+        opacity: 1;
       }
       #copy-link {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -207,12 +231,11 @@
         margin-left: auto;
       }
 
-      /* Roster Popover */
+      /* Shared Popover Anchors & Menus (Roster, Stream Quality, Video Codec) */
+      .popover-anchor,
       .roster-anchor {
         position: relative;
-      }
-      #roster-btn {
-        font-variant-numeric: tabular-nums;
+        display: inline-flex;
       }
       #roster {
         position: absolute;
@@ -226,11 +249,32 @@
         gap: 10px;
         padding: 12px;
       }
+      .popover-up {
+        position: absolute;
+        bottom: calc(100% + 8px);
+        left: 0;
+        z-index: 30;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+      }
+      #preset-menu {
+        width: 224px;
+      }
+      #codec-menu {
+        width: 268px;
+      }
+      .popover-head,
       .roster-head {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-variant-numeric: tabular-nums;
       }
       #roster-title {
         font-size: 12px;
@@ -243,15 +287,19 @@
         padding: 0 8px;
         font-size: 12px;
       }
+      .popover-list,
       #roster-list {
         list-style: none;
         display: flex;
         flex-direction: column;
         gap: 4px;
-        max-height: 280px;
-        overflow-y: auto;
         font-variant-numeric: tabular-nums;
       }
+      #roster-list {
+        max-height: 280px;
+        overflow-y: auto;
+      }
+      .popover-item,
       #roster-list li {
         display: flex;
         align-items: center;
@@ -262,7 +310,33 @@
         border-radius: var(--radius);
         background-color: var(--bg-color);
         border: 1px solid var(--border-color);
+        font: inherit;
         font-size: 12px;
+        color: var(--text-primary);
+      }
+      .popover-item {
+        width: 100%;
+        text-align: left;
+        cursor: pointer;
+        transition: background-color 0.12s, border-color 0.12s;
+      }
+      .popover-item:hover {
+        background-color: var(--surface-hover);
+      }
+      .popover-item[aria-pressed="true"] {
+        border-color: var(--accent-color);
+        background-color: rgba(59, 130, 246, 0.08);
+      }
+      .popover-item-left {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 500;
+      }
+      .popover-item-right {
+        color: var(--text-secondary);
+        font-size: 11px;
+        white-space: nowrap;
       }
       .roster-peer {
         display: flex;
@@ -631,6 +705,7 @@
         opacity: 0.4;
         cursor: default;
       }
+      .ui-btn svg,
       .tile-controls svg,
       .tile-unmute svg {
         width: 15px;
@@ -676,45 +751,17 @@
         display: none;
       }
 
-      /* Audio Fallback Prompt */
-      #audio-prompt {
-        align-self: center;
-        width: min(460px, calc(100% - 32px));
-        margin: 0 auto 12px;
-        display: grid;
-        gap: 10px;
-      }
-      #audio-prompt h2 {
-        font-size: 14px;
-        font-weight: 600;
-      }
-      #audio-prompt p {
-        font-size: 12px;
-        color: var(--text-secondary);
-      }
-      #audio-prompt .row {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-      }
-
       /* Bottom Stream Controls Bar */
       #live-controls {
         display: flex;
         align-items: center;
         gap: 8px;
         min-width: 0;
-        overflow-x: auto;
       }
-      #controls .field {
-        font-size: 12px;
-        color: var(--text-secondary);
-        margin-left: 4px;
-      }
-      #controls .field:first-child {
-        margin-left: 0;
-      }
-      #share {
+      .share-actions {
+        display: flex;
+        align-items: center;
+        gap: 8px;
         margin-left: auto;
       }
     </style>
@@ -722,8 +769,7 @@
   <body>
     <header class="app-bar">
       <div class="brand">
-        <h1>Screenshare</h1>
-        <button type="button" id="copy-link" class="ui-btn" hidden title="Copy room invite link to clipboard"></button>
+        <h1><button type="button" id="brand-home" title="Return to lobby">Screenshare</button></h1>
         <span id="follow-chip" hidden>
           <span class="ui-dot" id="follow-dot" data-state="live"></span>
           <span id="follow-chip-text"></span>
@@ -733,7 +779,7 @@
       <span id="status" data-kind="info" aria-live="polite" hidden>Not connected</span>
 
       <div id="room-bar" hidden>
-        <div class="roster-anchor">
+        <div class="roster-anchor popover-anchor">
           <button type="button" id="roster-btn" class="ui-btn" aria-expanded="false" aria-controls="roster">
             1 in room · 0 sharing &#9662;
           </button>
@@ -751,7 +797,7 @@
             </div>
           </section>
         </div>
-        <button type="button" id="leave" class="ui-btn ghost">Leave</button>
+        <button type="button" id="copy-link" class="ui-btn" hidden title="Copy room invite link to clipboard"></button>
       </div>
     </header>
 
@@ -788,34 +834,32 @@
       </div>
     </main>
 
-    <section id="audio-prompt" class="app-card" hidden aria-labelledby="audio-prompt-title">
-      <h2 id="audio-prompt-title">Which app should viewers hear?</h2>
-      <p id="audio-prompt-text">
-        You're sharing your whole screen. Pick the game's window and only its sound is sent.
-        Discord and music stay private.
-      </p>
-      <div class="row">
-        <button type="button" id="audio-pick-app" class="ui-btn primary">Pick game window</button>
-        <button type="button" id="audio-pick-system" class="ui-btn">Use all system audio</button>
-        <button type="button" id="audio-pick-none" class="ui-btn">No audio</button>
-      </div>
-    </section>
-
     <footer id="controls" class="app-bar" hidden>
       <div id="live-controls" hidden>
-        <label class="field" for="audio-mode">Audio</label>
-        <select id="audio-mode" class="ui-select" title="Audio source sent with your stream">
-          <option value="app">Game only</option>
-          <option value="system">All system audio</option>
-          <option value="none">No audio</option>
-        </select>
-        <label class="field" for="preset">Quality</label>
-        <select id="preset" class="ui-select" title="Video resolution, frame rate, and bitrate"></select>
-        <label class="field" for="codec">Codec</label>
-        <select id="codec" class="ui-select" title="Video encoder preference"></select>
+        <div class="popover-anchor">
+          <button type="button" id="preset-btn" class="ui-btn" aria-expanded="false" aria-controls="preset-menu" title="Video resolution, frame rate, and bitrate">
+            <span id="preset-btn-label">1080p 60fps</span> &#9662;
+          </button>
+          <section id="preset-menu" class="app-card popover-up" hidden aria-labelledby="preset-menu-title">
+            <div class="popover-head" id="preset-menu-title">Stream quality</div>
+            <div id="preset-list" class="popover-list" role="group" aria-labelledby="preset-menu-title"></div>
+          </section>
+        </div>
+        <div class="popover-anchor">
+          <button type="button" id="codec-btn" class="ui-btn" aria-expanded="false" aria-controls="codec-menu" title="Video encoder preference">
+            <span id="codec-btn-label">H.264</span> &#9662;
+          </button>
+          <section id="codec-menu" class="app-card popover-up" hidden aria-labelledby="codec-menu-title">
+            <div class="popover-head" id="codec-menu-title">Video codec</div>
+            <div id="codec-list" class="popover-list" role="group" aria-labelledby="codec-menu-title"></div>
+          </section>
+        </div>
         <button type="button" id="toggle-preview" class="ui-btn" hidden>Show preview</button>
       </div>
-      <button type="button" id="share" class="ui-btn primary">Share screen</button>
+      <div class="share-actions">
+        <button type="button" id="mute-audio" class="ui-btn" hidden aria-pressed="false" title="Mute or unmute your shared audio"></button>
+        <button type="button" id="share" class="ui-btn primary">Share screen</button>
+      </div>
     </footer>
 
     <script type="module" src="/src/main.ts"></script>

@@ -12,15 +12,9 @@ import {
   type PeerInfo,
 } from "@shared/protocol";
 import {
-  isAudioMode,
-  stopAudioSource,
-  systemAudioSupport,
   windowAudioSupport,
-  DEFAULT_AUDIO_MODE,
   QUALITY_PRESETS,
   DEFAULT_PRESET,
-  type AudioMode,
-  type AudioSource,
   type CaptureResult,
   type QualityPresetName,
 } from "./capture";
@@ -32,9 +26,12 @@ import { SignalingClient } from "./signaling";
 import { LinkMonitor, summarize } from "./stats";
 import {
   computeVolumeState,
+  deriveOutboundAudioState,
   deriveViewState,
+  nextPopoverState,
   shouldRequestRemoteVideo,
   sortAndFormatRoster,
+  type PopoverKind,
   type RosterEntry,
   type RosterSummary,
   type ViewState,
@@ -55,9 +52,9 @@ const ui = {
   roomInput: el<HTMLInputElement>("room-code"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
+  brandHomeBtn: el<HTMLButtonElement>("brand-home"),
   roomBar: el<HTMLElement>("room-bar"),
   copyLinkBtn: el<HTMLButtonElement>("copy-link"),
-  leaveBtn: el<HTMLButtonElement>("leave"),
   rosterBtn: el<HTMLButtonElement>("roster-btn"),
   roster: el<HTMLElement>("roster"),
   rosterTitle: el<HTMLElement>("roster-title"),
@@ -71,17 +68,18 @@ const ui = {
   stageEmpty: el<HTMLElement>("stage-empty"),
   stageEmptyTitle: el<HTMLElement>("stage-empty-title"),
   stageEmptySub: el<HTMLElement>("stage-empty-sub"),
-  audioPrompt: el<HTMLElement>("audio-prompt"),
-  audioPromptText: el<HTMLElement>("audio-prompt-text"),
-  audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
-  audioPickSystemBtn: el<HTMLButtonElement>("audio-pick-system"),
-  audioPickNoneBtn: el<HTMLButtonElement>("audio-pick-none"),
   controls: el<HTMLElement>("controls"),
   liveControls: el<HTMLElement>("live-controls"),
-  audioMode: el<HTMLSelectElement>("audio-mode"),
-  preset: el<HTMLSelectElement>("preset"),
-  codec: el<HTMLSelectElement>("codec"),
+  presetBtn: el<HTMLButtonElement>("preset-btn"),
+  presetBtnLabel: el<HTMLElement>("preset-btn-label"),
+  presetMenu: el<HTMLElement>("preset-menu"),
+  presetList: el<HTMLElement>("preset-list"),
+  codecBtn: el<HTMLButtonElement>("codec-btn"),
+  codecBtnLabel: el<HTMLElement>("codec-btn-label"),
+  codecMenu: el<HTMLElement>("codec-menu"),
+  codecList: el<HTMLElement>("codec-list"),
   togglePreviewBtn: el<HTMLButtonElement>("toggle-preview"),
+  muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
   shareBtn: el<HTMLButtonElement>("share"),
 };
 
@@ -160,12 +158,10 @@ function setButtonIcon(btn: HTMLButtonElement, icon: IconName): void {
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
 let capture: CaptureResult | null = null;
-/** A second, audio-only capture (picker #2) whose audio replaced the screen's own. */
-let audioSource: AudioSource | null = null;
 /** Whether the sharer hid their own preview tile on stage. */
 let selfPreviewHidden = false;
-/** Whether the top-bar roster popover is open. */
-let rosterOpen = false;
+/** Which header or footer popover is currently open, if any. */
+let activePopover: PopoverKind | null = null;
 
 const names = new Map<PeerId, string>();
 /** Everyone else in the room and whether they are sharing, for the participant list. */
@@ -240,6 +236,8 @@ function syncViewState(): ViewState {
   const state = deriveViewState(connected, sharing, selfPreviewHidden, visibleTileCount());
 
   ui.lobby.hidden = state.lobbyHidden;
+  ui.brandHomeBtn.disabled = !state.lobbyHidden;
+  ui.brandHomeBtn.title = state.lobbyHidden ? "Return to lobby" : "";
   ui.stage.hidden = !state.lobbyHidden;
   ui.stageEmpty.hidden = state.stageEmptyHidden;
   ui.stageEmptyTitle.textContent = state.stageEmptyTitle;
@@ -248,14 +246,15 @@ function syncViewState(): ViewState {
   ui.copyLinkBtn.hidden = state.roomBarHidden;
   ui.controls.hidden = state.controlsHidden;
   ui.liveControls.hidden = state.liveControlsHidden;
+  ui.muteAudioBtn.hidden = state.muteAudioHidden;
   ui.togglePreviewBtn.hidden = state.togglePreviewHidden;
   ui.shareBtn.textContent = state.shareButtonText;
   ui.shareBtn.className = `ui-btn ${state.shareButtonVariant}`;
 
   if (client === null) {
-    rosterOpen = false;
-    ui.roster.hidden = true;
-    ui.rosterBtn.setAttribute("aria-expanded", "false");
+    applyPopoverState(null);
+  } else if (!sharing && (activePopover === "preset" || activePopover === "codec")) {
+    applyPopoverState(null);
   }
 
   for (const ctrl of tileControls.values()) {
@@ -1020,7 +1019,7 @@ function renderRoster(): void {
     members,
   );
 
-  ui.roster.hidden = !rosterOpen;
+  ui.roster.hidden = activePopover !== "roster";
   ui.rosterBtn.textContent = summary.buttonLabel;
   ui.rosterTitle.textContent = formatRosterHeaderTitle(summary.totalCount);
   ui.lockBtn.hidden = !isHost;
@@ -1115,52 +1114,20 @@ function captureBlockedReason(): string | null {
   return "This browser does not support getDisplayMedia. Chrome or Edge on desktop is required.";
 }
 
-function currentAudioMode(): AudioMode {
-  const stored = localStorage.getItem("audio_mode");
-  return isAudioMode(stored) ? stored : DEFAULT_AUDIO_MODE;
-}
-
-/** Determine the effective AudioMode currently active on the live capture. */
-function effectiveLiveAudioMode(): AudioMode {
-  if (!capture || !capture.audio) return "none";
-  if (audioSource) {
-    return audioSource.kind === "window" ? "app" : "system";
-  }
-  return currentAudioMode();
-}
-
-function syncAudioModeSelect(): void {
-  if (!capture) {
-    ui.audioMode.value = currentAudioMode();
-    return;
-  }
-  ui.audioMode.value = effectiveLiveAudioMode();
-}
-
-const AUDIO_PROMPT_TEXT = {
-  screen:
-    "You're sharing your whole screen. Pick the game's window and only its sound is sent. " +
-    "Discord and music stay private.",
-  missing:
-    "No audio came with that pick. Pick the game's window to send only its sound, or use all system audio.",
-  empty: "That window had no audio Chrome could share. Try another window, or use all system audio.",
-  lost: "The audio you were sharing stopped, probably because that window closed. Pick where it should come from now.",
-} as const;
-
-function showAudioPrompt(reason: keyof typeof AUDIO_PROMPT_TEXT): void {
-  ui.audioPromptText.textContent = AUDIO_PROMPT_TEXT[reason];
-  ui.audioPrompt.hidden = false;
-}
-
-/** Send `track` to every peer, replacing whatever audio was going before. */
-async function useAudioTrack(track: MediaStreamTrack | null): Promise<void> {
-  if (!capture) return;
-  const previous = capture.audio;
-  if (previous && previous !== track) previous.stop();
-  capture.audio = track;
-  if (mesh) await mesh.setAudioTrack(track);
-  if (track) watchAudioEnded(track);
-  syncAudioModeSelect();
+function syncMuteAudioButton(): void {
+  const audioState = deriveOutboundAudioState(
+    capture !== null,
+    Boolean(capture?.audio),
+    Boolean(capture?.audio?.enabled),
+  );
+  ui.muteAudioBtn.disabled = audioState.disabled;
+  ui.muteAudioBtn.classList.toggle("muted-active", audioState.muted);
+  ui.muteAudioBtn.setAttribute("aria-pressed", audioState.ariaPressed);
+  ui.muteAudioBtn.title = audioState.title;
+  ui.muteAudioBtn.replaceChildren(
+    createIcon(audioState.icon),
+    document.createTextNode(audioState.text),
+  );
 }
 
 function watchAudioEnded(track: MediaStreamTrack): void {
@@ -1168,58 +1135,8 @@ function watchAudioEnded(track: MediaStreamTrack): void {
     if (capture?.audio !== track) return;
     capture.audio = null;
     if (mesh) runBackground(mesh.setAudioTrack(null));
-    if (audioSource?.track === track) {
-      stopAudioSource(audioSource);
-      audioSource = null;
-    }
-    syncAudioModeSelect();
-    showAudioPrompt("lost");
+    syncMuteAudioButton();
   });
-}
-
-let audioPickPending = false;
-
-/** Picker #2. Must run straight from a click/change gesture. Returns true if audio was switched. */
-async function pickAudio(kind: "window" | "system"): Promise<boolean> {
-  if (!capture || audioPickPending) return false;
-  audioPickPending = true;
-  try {
-    let source: AudioSource | null;
-    try {
-      source = await captureController.captureAudioOnly(kind);
-    } catch (err) {
-      console.warn("[main] audio pick cancelled or failed", err);
-      syncAudioModeSelect();
-      return false;
-    }
-    if (!capture) {
-      if (source) stopAudioSource(source);
-      return false;
-    }
-    if (!source) {
-      showAudioPrompt("empty");
-      syncAudioModeSelect();
-      return false;
-    }
-    const old = audioSource;
-    audioSource = source;
-    localStorage.setItem("audio_mode", kind === "window" ? "app" : "system");
-    await useAudioTrack(source.track);
-    if (old) stopAudioSource(old);
-    ui.audioPrompt.hidden = true;
-    return true;
-  } finally {
-    audioPickPending = false;
-  }
-}
-
-async function chooseNoAudio(): Promise<void> {
-  const old = audioSource;
-  audioSource = null;
-  localStorage.setItem("audio_mode", "none");
-  await useAudioTrack(null);
-  if (old) stopAudioSource(old);
-  ui.audioPrompt.hidden = true;
 }
 
 const captureController = createCaptureController({
@@ -1274,14 +1191,13 @@ async function startSharingInner(): Promise<void> {
     return;
   }
 
-  const mode = currentAudioMode();
-  if (mode !== "none" && captureController.kind === "web") {
-    const audio = mode === "app" ? windowAudioSupport() : systemAudioSupport();
+  if (captureController.kind === "web") {
+    const audio = windowAudioSupport();
     if (!audio.supported && audio.reason) setStatus(audio.reason, "warn");
   }
 
   try {
-    capture = await captureController.start(QUALITY_PRESETS[currentPreset()], mode);
+    capture = await captureController.start(QUALITY_PRESETS[currentPreset()]);
   } catch (err) {
     console.warn("[main] capture cancelled or failed", err);
     return;
@@ -1301,13 +1217,9 @@ async function startSharingInner(): Promise<void> {
     return;
   }
 
-  syncAudioModeSelect();
+  syncMuteAudioButton();
   syncViewState();
   renderRoster();
-
-  if (mode !== "none" && !capture.audio && captureController.kind === "web") {
-    showAudioPrompt(capture.surface === "monitor" && mode === "app" ? "screen" : "missing");
-  }
 }
 
 let stoppingShare = false;
@@ -1322,16 +1234,13 @@ async function stopSharing(): Promise<void> {
     capture = null;
     stoppingShare = false;
   }
-  if (audioSource) stopAudioSource(audioSource);
-  audioSource = null;
   outboundMonitors.clear();
   peerOutboundText.clear();
   totalOutboundMbps = 0;
   activeViewerCount = 0;
-  ui.audioPrompt.hidden = true;
   renderSelfPreview(null);
   client?.setSharing(false);
-  syncAudioModeSelect();
+  syncMuteAudioButton();
   syncViewState();
   renderRoster();
 }
@@ -1360,6 +1269,7 @@ function syncNameInputs(value: string): void {
 }
 
 let joinGeneration = 0;
+let reopenRosterOnWelcome = false;
 
 const RECONNECT_GRACE_MS = 8_000;
 const peerLeftTimers = new Map<PeerId, ReturnType<typeof setTimeout>>();
@@ -1388,8 +1298,8 @@ async function joinRoom(code: string): Promise<void> {
 
   const codeToJoin = code;
   if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
-  const generation = ++joinGeneration;
   leaveRoom();
+  const generation = ++joinGeneration;
   if (generation !== joinGeneration) return;
   const displayName = currentName();
   lastJoin = { code };
@@ -1451,6 +1361,10 @@ async function joinRoom(code: string): Promise<void> {
           syncViewState();
           startHealthPolling();
           renderRoster();
+          if (reopenRosterOnWelcome) {
+            reopenRosterOnWelcome = false;
+            applyPopoverState("roster");
+          }
           return;
         }
 
@@ -1520,6 +1434,10 @@ async function joinRoom(code: string): Promise<void> {
         syncViewState();
         startHealthPolling();
         renderRoster();
+        if (reopenRosterOnWelcome) {
+          reopenRosterOnWelcome = false;
+          applyPopoverState("roster");
+        }
       },
 
       onPeerJoined: (peer: PeerInfo) => {
@@ -1596,6 +1514,8 @@ async function joinRoom(code: string): Promise<void> {
 }
 
 function leaveRoom(): void {
+  joinGeneration++;
+  reopenRosterOnWelcome = false;
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   stopHealthPolling();
@@ -1624,69 +1544,142 @@ function leaveRoom(): void {
 
 // ---- quality & audio controls --------------------------------------------
 
-const CODEC_LABELS: Record<CodecName, string> = {
-  h264: "H.264 (hardware, best for gaming)",
-  vp9: "VP9 (better quality, more CPU)",
-  av1: "AV1 (best quality, needs modern GPU)",
-  vp8: "VP8 (compatibility fallback)",
+const CODEC_META: Record<CodecName, { title: string; hint: string }> = {
+  h264: { title: "H.264", hint: "Hardware · Best for gaming" },
+  vp9: { title: "VP9", hint: "Higher quality · More CPU" },
+  av1: { title: "AV1", hint: "Best quality · Modern GPU" },
+  vp8: { title: "VP8", hint: "Compatibility fallback" },
 };
 
+function applyPopoverState(target: PopoverKind | null): void {
+  const previous = activePopover;
+  const state = nextPopoverState(
+    activePopover,
+    target,
+    selfId !== null && client !== null,
+    capture !== null,
+  );
+  activePopover = state.active;
+  ui.roster.hidden = !state.rosterOpen;
+  ui.presetMenu.hidden = !state.presetOpen;
+  ui.codecMenu.hidden = !state.codecOpen;
+  ui.rosterBtn.setAttribute("aria-expanded", String(state.rosterOpen));
+  ui.presetBtn.setAttribute("aria-expanded", String(state.presetOpen));
+  ui.codecBtn.setAttribute("aria-expanded", String(state.codecOpen));
+  if (previous !== null && previous !== state.active) {
+    const menu = previous === "roster" ? ui.roster : previous === "preset" ? ui.presetMenu : ui.codecMenu;
+    const trigger = previous === "roster" ? ui.rosterBtn : previous === "preset" ? ui.presetBtn : ui.codecBtn;
+    if (menu.contains(document.activeElement)) trigger.focus();
+  }
+}
+
+function closeAllPopovers(): void {
+  applyPopoverState(null);
+}
+
+function togglePopover(which: PopoverKind): void {
+  applyPopoverState(which);
+}
+
+function syncPresetMenuSelection(selected: QualityPresetName): void {
+  ui.presetBtnLabel.textContent = QUALITY_PRESETS[selected].label;
+  for (const btn of ui.presetList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
+    const active = btn.dataset["preset"] === selected;
+    btn.setAttribute("aria-pressed", String(active));
+    const dot = btn.querySelector<HTMLElement>(".ui-dot");
+    if (dot) {
+      if (active) dot.dataset["state"] = "active";
+      else delete dot.dataset["state"];
+    }
+  }
+}
+
+function syncCodecMenuSelection(selected: CodecName): void {
+  ui.codecBtnLabel.textContent = CODEC_META[selected].title;
+  for (const btn of ui.codecList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
+    const active = btn.dataset["codec"] === selected;
+    btn.setAttribute("aria-pressed", String(active));
+    const dot = btn.querySelector<HTMLElement>(".ui-dot");
+    if (dot) {
+      if (active) dot.dataset["state"] = "active";
+      else delete dot.dataset["state"];
+    }
+  }
+}
+
 function initQualityControls(): void {
+  localStorage.removeItem("audio_mode");
   for (const [name, preset] of Object.entries(QUALITY_PRESETS)) {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = `${preset.label} · ${(preset.maxBitrate / 1e6).toFixed(0)} Mbps`;
-    ui.preset.append(opt);
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "popover-item";
+    btn.dataset["preset"] = name;
+
+    const left = document.createElement("span");
+    left.className = "popover-item-left";
+    const dot = document.createElement("span");
+    dot.className = "ui-dot";
+    left.append(dot, document.createTextNode(preset.label));
+
+    const right = document.createElement("span");
+    right.className = "popover-item-right";
+    right.textContent = `${(preset.maxBitrate / 1e6).toFixed(0)} Mbps`;
+
+    btn.append(left, right);
+    btn.addEventListener("click", () => {
+      if (!isQualityPresetName(name)) return;
+      localStorage.setItem("preset", name);
+      syncPresetMenuSelection(name);
+      closeAllPopovers();
+      captureController.setPreset(QUALITY_PRESETS[name]);
+      if (mesh) runBackground(mesh.setPreset(QUALITY_PRESETS[name]));
+    });
+    ui.presetList.append(btn);
   }
-  ui.preset.value = currentPreset();
+  syncPresetMenuSelection(currentPreset());
 
-  for (const [name, label] of Object.entries(CODEC_LABELS)) {
-    const opt = document.createElement("option");
-    opt.value = name;
-    opt.textContent = label;
-    ui.codec.append(opt);
+  for (const [name, meta] of Object.entries(CODEC_META)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "popover-item";
+    btn.dataset["codec"] = name;
+
+    const left = document.createElement("span");
+    left.className = "popover-item-left";
+    const dot = document.createElement("span");
+    dot.className = "ui-dot";
+    left.append(dot, document.createTextNode(meta.title));
+
+    const right = document.createElement("span");
+    right.className = "popover-item-right";
+    right.textContent = meta.hint;
+
+    btn.append(left, right);
+    btn.addEventListener("click", () => {
+      if (!isCodecName(name)) return;
+      localStorage.setItem("codec", name);
+      syncCodecMenuSelection(name);
+      closeAllPopovers();
+      mesh?.setCodec(name);
+    });
+    ui.codecList.append(btn);
   }
-  ui.codec.value = currentCodec();
+  syncCodecMenuSelection(currentCodec());
 
-  ui.preset.addEventListener("change", () => {
-    const name = ui.preset.value;
-    if (!isQualityPresetName(name)) return;
-    localStorage.setItem("preset", name);
-    captureController.setPreset(QUALITY_PRESETS[name]);
-    if (mesh) runBackground(mesh.setPreset(QUALITY_PRESETS[name]));
+  ui.presetBtn.addEventListener("click", () => {
+    togglePopover("preset");
   });
 
-  ui.codec.addEventListener("change", () => {
-    const chosen = ui.codec.value;
-    if (!isCodecName(chosen)) return;
-    localStorage.setItem("codec", chosen);
-    mesh?.setCodec(chosen);
+  ui.codecBtn.addEventListener("click", () => {
+    togglePopover("codec");
   });
 
-  ui.audioMode.value = currentAudioMode();
-  ui.audioMode.addEventListener("change", () => {
-    const chosen = ui.audioMode.value;
-    if (!isAudioMode(chosen)) return;
-    if (!capture) {
-      localStorage.setItem("audio_mode", chosen);
-      return;
-    }
-    if (chosen === "none") {
-      runBackground(chooseNoAudio());
-    } else {
-      runBackground(pickAudio(chosen === "app" ? "window" : "system"));
-    }
+  ui.muteAudioBtn.addEventListener("click", () => {
+    if (!capture?.audio) return;
+    capture.audio.enabled = !capture.audio.enabled;
+    syncMuteAudioButton();
   });
-
-  ui.audioPickAppBtn.addEventListener("click", () => {
-    runBackground(pickAudio("window"));
-  });
-  ui.audioPickSystemBtn.addEventListener("click", () => {
-    runBackground(pickAudio("system"));
-  });
-  ui.audioPickNoneBtn.addEventListener("click", () => {
-    runBackground(chooseNoAudio());
-  });
+  syncMuteAudioButton();
 
   ui.togglePreviewBtn.addEventListener("click", () => {
     selfPreviewHidden = false;
@@ -1702,24 +1695,18 @@ initQualityControls();
 // ---- roster & header controls --------------------------------------------
 
 ui.rosterBtn.addEventListener("click", () => {
-  rosterOpen = !rosterOpen;
-  ui.roster.hidden = !rosterOpen;
-  ui.rosterBtn.setAttribute("aria-expanded", String(rosterOpen));
+  togglePopover("roster");
 });
 
 document.addEventListener("click", (ev) => {
-  if (!rosterOpen) return;
-  if (ev.target instanceof Element && ev.target.closest(".roster-anchor")) return;
-  rosterOpen = false;
-  ui.roster.hidden = true;
-  ui.rosterBtn.setAttribute("aria-expanded", "false");
+  if (activePopover === null) return;
+  if (ev.target instanceof Element && ev.target.closest(".popover-anchor")) return;
+  closeAllPopovers();
 });
 
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && rosterOpen) {
-    rosterOpen = false;
-    ui.roster.hidden = true;
-    ui.rosterBtn.setAttribute("aria-expanded", "false");
+  if (ev.key === "Escape" && activePopover !== null) {
+    closeAllPopovers();
   }
 });
 
@@ -1727,7 +1714,9 @@ ui.lockBtn.addEventListener("click", () => {
   client?.setLocked(!roomLocked);
 });
 
-ui.leaveBtn.addEventListener("click", () => {
+ui.brandHomeBtn.addEventListener("click", () => {
+  if (!client && !lastJoin && !capture) return;
+  closeAllPopovers();
   runBackground(stopSharing());
   lastJoin = null;
   leaveRoom();
@@ -1754,12 +1743,9 @@ ui.roomNameInput.addEventListener("change", () => {
   syncNameInputs(ui.roomNameInput.value);
   // Only reconnect in place when not actively sharing so renaming never interrupts an active stream.
   if (client && lastJoin && !capture) {
-    const wasOpen = rosterOpen;
+    const wasOpen = activePopover === "roster";
     runBackground(joinRoom(lastJoin.code));
-    if (wasOpen) {
-      rosterOpen = true;
-      ui.rosterBtn.setAttribute("aria-expanded", "true");
-    }
+    reopenRosterOnWelcome = wasOpen;
   }
 });
 

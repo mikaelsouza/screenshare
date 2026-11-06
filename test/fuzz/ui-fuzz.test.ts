@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 import fc from "fast-check";
 import {
   computeVolumeState,
+  deriveOutboundAudioState,
+  nextPopoverState,
   sortAndFormatRoster,
+  type PopoverKind,
 } from "@src/ui-model";
 
-describe("Fuzzing Suite: UI Model Volume & Roster Formatting", () => {
+describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
   it("computeVolumeState never produces NaN, out-of-range volume, or inconsistent flags", () => {
     fc.assert(
       fc.property(fc.double(), fc.double(), (sliderValue, fallback) => {
@@ -21,6 +24,39 @@ describe("Fuzzing Suite: UI Model Volume & Roster Formatting", () => {
         return true;
       }),
       { numRuns: 1000 },
+    );
+  });
+
+  it("nextPopoverState and deriveOutboundAudioState preserve invariants across random action traces", () => {
+    const stepArb = fc.record({
+      target: fc.constantFrom<PopoverKind | null>(null, "roster", "preset", "codec"),
+      connected: fc.boolean(),
+      sharing: fc.boolean(),
+      hasAudio: fc.boolean(),
+      trackEnabled: fc.boolean(),
+    });
+
+    fc.assert(
+      fc.property(fc.array(stepArb, { minLength: 1, maxLength: 50 }), (steps) => {
+        let current: PopoverKind | null = null;
+        for (const step of steps) {
+          const pop = nextPopoverState(current, step.target, step.connected, step.sharing);
+          const openCount = Number(pop.rosterOpen) + Number(pop.presetOpen) + Number(pop.codecOpen);
+          expect(openCount).toBeLessThanOrEqual(1);
+          if (!step.connected) expect(pop.active).toBeNull();
+          if (!step.sharing) {
+            expect(pop.presetOpen).toBe(false);
+            expect(pop.codecOpen).toBe(false);
+          }
+          current = pop.active;
+
+          const audio = deriveOutboundAudioState(step.sharing, step.hasAudio, step.trackEnabled);
+          expect(audio.disabled && audio.muted).toBe(false);
+          expect(audio.ariaPressed).toBe(audio.muted ? "true" : "false");
+        }
+        return true;
+      }),
+      { numRuns: 500 },
     );
   });
 

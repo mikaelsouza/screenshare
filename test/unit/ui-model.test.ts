@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   computeVolumeState,
+  deriveOutboundAudioState,
   deriveViewState,
+  nextPopoverState,
   shouldRequestRemoteVideo,
   sortAndFormatRoster,
 } from "@src/ui-model";
@@ -15,6 +17,7 @@ describe("deriveViewState", () => {
       controlsHidden: true,
       liveControlsHidden: true,
       togglePreviewHidden: true,
+      muteAudioHidden: true,
       stageEmptyHidden: true,
       stageEmptyTitle: "No one is sharing right now",
       stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
@@ -31,6 +34,7 @@ describe("deriveViewState", () => {
     expect(state.controlsHidden).toBe(true);
     expect(state.liveControlsHidden).toBe(true);
     expect(state.togglePreviewHidden).toBe(true);
+    expect(state.muteAudioHidden).toBe(true);
     expect(state.stageEmptyHidden).toBe(true);
     expect(state.showFocusButtons).toBe(false);
   });
@@ -43,6 +47,7 @@ describe("deriveViewState", () => {
       controlsHidden: false,
       liveControlsHidden: true,
       togglePreviewHidden: true,
+      muteAudioHidden: true,
       stageEmptyHidden: true,
       stageEmptyTitle: "No one is sharing right now",
       stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
@@ -76,6 +81,7 @@ describe("deriveViewState", () => {
       controlsHidden: false,
       liveControlsHidden: false,
       togglePreviewHidden: true,
+      muteAudioHidden: false,
       stageEmptyHidden: true,
       stageEmptyTitle: "No one is sharing right now",
       stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
@@ -89,6 +95,102 @@ describe("deriveViewState", () => {
     expect(deriveViewState(true, true, true, 1).togglePreviewHidden).toBe(false);
     expect(deriveViewState(true, true, false, 1).togglePreviewHidden).toBe(true);
     expect(deriveViewState(true, false, true, 1).togglePreviewHidden).toBe(true);
+  });
+});
+
+describe("deriveOutboundAudioState", () => {
+  it("returns default ready state when not sharing", () => {
+    expect(deriveOutboundAudioState(false, false, false)).toEqual({
+      disabled: false,
+      muted: false,
+      ariaPressed: "false",
+      icon: "volumeOn",
+      text: "Mute audio",
+      title: "Mute or unmute your shared audio",
+    });
+    expect(deriveOutboundAudioState(false, true, true).disabled).toBe(false);
+  });
+
+  it("returns disabled No audio state when sharing without an audio track", () => {
+    expect(deriveOutboundAudioState(true, false, false)).toEqual({
+      disabled: true,
+      muted: false,
+      ariaPressed: "false",
+      icon: "volumeOff",
+      text: "No audio",
+      title: "No audio source was shared",
+    });
+  });
+
+  it("returns unmuted Mute audio state when sharing with an enabled audio track", () => {
+    expect(deriveOutboundAudioState(true, true, true)).toEqual({
+      disabled: false,
+      muted: false,
+      ariaPressed: "false",
+      icon: "volumeOn",
+      text: "Mute audio",
+      title: "Mute your shared audio",
+    });
+  });
+
+  it("returns active muted state with constant Mute audio label when sharing with a disabled (muted) audio track", () => {
+    expect(deriveOutboundAudioState(true, true, false)).toEqual({
+      disabled: false,
+      muted: true,
+      ariaPressed: "true",
+      icon: "volumeOff",
+      text: "Mute audio",
+      title: "Unmute your shared audio",
+    });
+  });
+});
+
+describe("nextPopoverState", () => {
+  it("opens a popover when closed and closes it when toggled again", () => {
+    const opened = nextPopoverState(null, "roster", true, false);
+    expect(opened).toEqual({
+      active: "roster",
+      rosterOpen: true,
+      presetOpen: false,
+      codecOpen: false,
+    });
+    const closed = nextPopoverState("roster", "roster", true, false);
+    expect(closed).toEqual({
+      active: null,
+      rosterOpen: false,
+      presetOpen: false,
+      codecOpen: false,
+    });
+  });
+
+  it("switches directly between popovers while closing the previous one", () => {
+    const preset = nextPopoverState("roster", "preset", true, true);
+    expect(preset).toEqual({
+      active: "preset",
+      rosterOpen: false,
+      presetOpen: true,
+      codecOpen: false,
+    });
+    const codec = nextPopoverState("preset", "codec", true, true);
+    expect(codec).toEqual({
+      active: "codec",
+      rosterOpen: false,
+      presetOpen: false,
+      codecOpen: true,
+    });
+    const closedAll = nextPopoverState("codec", null, true, true);
+    expect(closedAll).toEqual({
+      active: null,
+      rosterOpen: false,
+      presetOpen: false,
+      codecOpen: false,
+    });
+  });
+
+  it("refuses to open roster when disconnected or preset/codec when not sharing", () => {
+    expect(nextPopoverState(null, "roster", false, true).active).toBeNull();
+    expect(nextPopoverState(null, "preset", true, false).active).toBeNull();
+    expect(nextPopoverState(null, "codec", true, false).active).toBeNull();
   });
 });
 
