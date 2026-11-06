@@ -575,6 +575,110 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
+  private findSupersededPeers(
+    ws: WebSocket,
+    offeredRejoinHash: string | null,
+    isHost: boolean,
+  ): Array<{ ws: WebSocket; att: PeerAttachment }> {
+    return this.joinedPeers(ws).filter(
+      ({ att }) =>
+        (offeredRejoinHash !== null &&
+          att.rejoinHash !== undefined &&
+          timingSafeEqual(att.rejoinHash, offeredRejoinHash)) ||
+        (isHost && att.host === true),
+    );
+  }
+
+  private applyResumeAttachment(
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "join" }>,
+    supersededSocket: { ws: WebSocket; att: PeerAttachment } | undefined,
+    memberTicket: MemberEntry | undefined,
+  ): void {
+    const preservedId = supersededSocket?.att.id ?? memberTicket?.id;
+    if (preservedId) {
+      attachment.id = preservedId;
+      this.gone.delete(preservedId);
+    }
+    if (typeof clientMsg.sharing === "boolean") {
+      attachment.sharing = clientMsg.sharing;
+    } else if (supersededSocket?.att.sharing !== undefined) {
+      attachment.sharing = supersededSocket.att.sharing;
+    } else if (memberTicket?.sharing !== undefined) {
+      attachment.sharing = memberTicket.sharing;
+    }
+  }
+
+  private async evictSupersededPeers(
+    attachment: PeerAttachment,
+    isResume: boolean,
+    superseded: Array<{ ws: WebSocket; att: PeerAttachment }>,
+  ): Promise<void> {
+    if (isResume && superseded.length > 0) {
+      for (const { ws: oldWs, att: oldAtt } of superseded) {
+        oldAtt.id = crypto.randomUUID();
+        this.forgetBudget(oldWs);
+        oldAtt.joined = false;
+        try {
+          oldWs.serializeAttachment(oldAtt);
+        } catch {
+          /* ignore */
+        }
+        try {
+          oldWs.close(1008, "Session replaced");
+        } catch {
+          /* ignore */
+        }
+      }
+      this.gone.delete(attachment.id);
+      return;
+    }
+    for (const { ws: oldWs } of superseded) {
+      this.forgetBudget(oldWs);
+      await this.handleLeave(oldWs);
+      try {
+        oldWs.close(1008, "Session replaced");
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private broadcastJoinOutcome(
+    attachment: PeerAttachment,
+    isResume: boolean,
+    supersededCount: number,
+    supersededSocket: { ws: WebSocket; att: PeerAttachment } | undefined,
+    isHost: boolean,
+    others: Array<{ ws: WebSocket; att: PeerAttachment }>,
+  ): void {
+    if (isResume && supersededCount > 0) {
+      if (supersededSocket && attachment.sharing !== supersededSocket.att.sharing) {
+        const stateMsg: ServerMessage = {
+          t: "peer-state",
+          id: attachment.id,
+          sharing: attachment.sharing,
+        };
+        for (const { ws: peerWs } of others) {
+          sendSafe(peerWs, stateMsg);
+        }
+      }
+      return;
+    }
+    const joinedMsg: ServerMessage = {
+      t: "peer-joined",
+      peer: {
+        id: attachment.id,
+        name: attachment.name,
+        sharing: attachment.sharing,
+        ...(isHost ? { host: true } : {}),
+      },
+    };
+    for (const { ws: peerWs } of others) {
+      sendSafe(peerWs, joinedMsg);
+    }
+  }
+
   /** The join handshake, split out of webSocketMessage; see the call site. */
   private async handleJoin(
     ws: WebSocket,
@@ -603,62 +707,20 @@ export class RoomDO extends DurableObject<Env> {
       this.refuse(ws, admission.code, admission.message);
       return;
     }
-    const superseded = this.joinedPeers(ws).filter(
+    const superseded = this.findSupersededPeers(ws, offeredRejoinHash, admission.isHost);
+    const hasMatchingRejoin = superseded.some(
       ({ att }) =>
-        (offeredRejoinHash !== null &&
-          att.rejoinHash !== undefined &&
-          timingSafeEqual(att.rejoinHash, offeredRejoinHash)) ||
-        (admission.isHost && att.host === true),
+        offeredRejoinHash !== null &&
+        att.rejoinHash !== undefined &&
+        timingSafeEqual(att.rejoinHash, offeredRejoinHash),
     );
-
-    const isResume =
-      clientMsg.resume === true &&
-      (admission.returning ||
-        superseded.some(
-          ({ att }) =>
-            offeredRejoinHash !== null &&
-            att.rejoinHash !== undefined &&
-            timingSafeEqual(att.rejoinHash, offeredRejoinHash),
-        ));
-
+    const isResume = clientMsg.resume === true && (admission.returning || hasMatchingRejoin);
     const supersededSocket = superseded[0];
     if (isResume) {
-      const preservedId = supersededSocket?.att.id ?? admission.memberTicket?.id;
-      if (preservedId) {
-        attachment.id = preservedId;
-        this.gone.delete(preservedId);
-      }
-      if (typeof clientMsg.sharing === "boolean") {
-        attachment.sharing = clientMsg.sharing;
-      } else if (supersededSocket?.att.sharing !== undefined) {
-        attachment.sharing = supersededSocket.att.sharing;
-      } else if (admission.memberTicket?.sharing !== undefined) {
-        attachment.sharing = admission.memberTicket.sharing;
-      }
+      this.applyResumeAttachment(attachment, clientMsg, supersededSocket, admission.memberTicket);
     }
 
-    if (isResume && superseded.length > 0) {
-      for (const { ws: oldWs, att: oldAtt } of superseded) {
-        oldAtt.id = crypto.randomUUID();
-        this.forgetBudget(oldWs);
-        oldAtt.joined = false;
-        try {
-          oldWs.serializeAttachment(oldAtt);
-        } catch {}
-        try {
-          oldWs.close(1008, "Session replaced");
-        } catch {}
-      }
-      this.gone.delete(attachment.id);
-    } else {
-      for (const { ws: oldWs } of superseded) {
-        this.forgetBudget(oldWs);
-        await this.handleLeave(oldWs);
-        try {
-          oldWs.close(1008, "Session replaced");
-        } catch {}
-      }
-    }
+    await this.evictSupersededPeers(attachment, isResume, superseded);
 
     const others = this.joinedPeers(ws);
     if (others.length >= MAX_ROOM_SIZE) {
@@ -718,33 +780,14 @@ export class RoomDO extends DurableObject<Env> {
       locked: admission.locked,
     });
 
-    if (isResume && superseded.length > 0) {
-      if (supersededSocket && attachment.sharing !== supersededSocket.att.sharing) {
-        const stateMsg: ServerMessage = {
-          t: "peer-state",
-          id: attachment.id,
-          sharing: attachment.sharing,
-        };
-        for (const { ws: s } of others) {
-          sendSafe(s, stateMsg);
-        }
-      }
-    } else {
-      // After the welcome, so the newcomer is set up before anyone signals it.
-      const joinedMsg: ServerMessage = {
-        t: "peer-joined",
-        peer: {
-          id: attachment.id,
-          name: attachment.name,
-          sharing: attachment.sharing,
-          ...(admission.isHost ? { host: true } : {}),
-        },
-      };
-      for (const { ws: s } of others) {
-        sendSafe(s, joinedMsg);
-      }
-    }
-    return;
+    this.broadcastJoinOutcome(
+      attachment,
+      isResume,
+      superseded.length,
+      supersededSocket,
+      admission.isHost,
+      others,
+    );
   }
 
   /**

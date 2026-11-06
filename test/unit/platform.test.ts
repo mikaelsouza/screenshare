@@ -9,23 +9,23 @@ type FakeTrack = MediaStreamTrack & { end(): void; stopped: boolean; applyConstr
 
 function track(kind: "video" | "audio", label: string = kind): FakeTrack {
   const listeners: Array<() => void> = [];
-  const t = {
+  const trackObj = {
     kind,
     label,
     readyState: "live" as MediaStreamTrackState,
     stopped: false,
     contentHint: "",
     getSettings: () => ({}),
-    applyConstraints: vi.fn().mockResolvedValue(undefined),
+    applyConstraints: vi.fn(() => Promise.resolve()),
     addEventListener: (ev: string, fn: () => void) => { if (ev === "ended") listeners.push(fn); },
     removeEventListener: (ev: string, fn: () => void) => {
-      const i = listeners.indexOf(fn);
-      if (ev === "ended" && i !== -1) listeners.splice(i, 1);
+      const idx = listeners.indexOf(fn);
+      if (ev === "ended" && idx !== -1) listeners.splice(idx, 1);
     },
-    stop() { t.stopped = true; t.readyState = "ended"; },
-    end() { t.readyState = "ended"; for (const fn of [...listeners]) fn(); },
+    stop() { trackObj.stopped = true; trackObj.readyState = "ended"; },
+    end() { trackObj.readyState = "ended"; for (const fn of [...listeners]) fn(); },
   };
-  return t as unknown as FakeTrack;
+  return trackObj as unknown as FakeTrack;
 }
 
 function stream(tracks: MediaStreamTrack[]): MediaStream {

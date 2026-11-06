@@ -151,6 +151,84 @@ export function isValidRoomCode(s: string): boolean {
   return true;
 }
 
+function isPlainRecord(val: unknown): val is Record<string, unknown> {
+  return typeof val === "object" && val !== null && !Array.isArray(val);
+}
+
+function parseJoinMessage(record: Record<string, unknown>): ClientMessage | null {
+  const room = record["room"];
+  const displayName = record["displayName"];
+  if (typeof room !== "string" || typeof displayName !== "string") {
+    return null;
+  }
+  const joinMsg: ClientMessage = { t: "join", room, displayName };
+  const hostToken = record["hostToken"];
+  if (typeof hostToken === "string" && hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
+    joinMsg.hostToken = hostToken;
+  }
+  const rejoinToken = record["rejoinToken"];
+  if (typeof rejoinToken === "string" && rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
+    joinMsg.rejoinToken = rejoinToken;
+  }
+  if (record["resume"] === true) {
+    joinMsg.resume = true;
+  }
+  const sharing = record["sharing"];
+  if (typeof sharing === "boolean") {
+    joinMsg.sharing = sharing;
+  }
+  return joinMsg;
+}
+
+function isOptionalString(val: unknown): val is string | null | undefined {
+  return typeof val === "string" || val === null || val === undefined;
+}
+
+function isOptionalNumber(val: unknown): val is number | null | undefined {
+  return typeof val === "number" || val === null || val === undefined;
+}
+
+function parseIceCandidate(rawCandidate: unknown): IceCandidateInit | null {
+  if (!isPlainRecord(rawCandidate)) return null;
+  const candidateStr = rawCandidate["candidate"];
+  if (typeof candidateStr !== "string" || candidateStr.length > MAX_CANDIDATE_LENGTH) {
+    return null;
+  }
+  const sdpMid = rawCandidate["sdpMid"];
+  const sdpMLineIndex = rawCandidate["sdpMLineIndex"];
+  const usernameFragment = rawCandidate["usernameFragment"];
+  if (!isOptionalString(sdpMid) || !isOptionalNumber(sdpMLineIndex) || !isOptionalString(usernameFragment)) {
+    return null;
+  }
+  const iceCandidate: IceCandidateInit = {
+    candidate: candidateStr,
+    sdpMid: typeof sdpMid === "string" ? sdpMid : null,
+    sdpMLineIndex: typeof sdpMLineIndex === "number" ? sdpMLineIndex : null,
+  };
+  if (usernameFragment !== undefined) {
+    iceCandidate.usernameFragment = usernameFragment;
+  }
+  return iceCandidate;
+}
+
+function parseSignalMessage(record: Record<string, unknown>): ClientMessage | null {
+  const to = record["to"];
+  const sigData = record["data"];
+  if (typeof to !== "string" || !PEER_ID.test(to) || !isPlainRecord(sigData)) {
+    return null;
+  }
+  const kind = sigData["k"];
+  const sdp = sigData["sdp"];
+  if ((kind === "offer" || kind === "answer") && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
+    return { t: "signal", to, data: { k: kind, sdp } };
+  }
+  if (kind === "ice") {
+    const candidate = parseIceCandidate(sigData["candidate"]);
+    return candidate ? { t: "signal", to, data: { k: "ice", candidate } } : null;
+  }
+  return null;
+}
+
 /**
  * Safely parse and validate an incoming client WebSocket message string.
  * Returns null if the JSON is malformed or does not match any ClientMessage variant.
@@ -159,156 +237,25 @@ export function isValidRoomCode(s: string): boolean {
 export function parseClientMessage(raw: string): ClientMessage | null {
   try {
     const data: unknown = JSON.parse(raw);
-    if (typeof data !== "object" || data === null || Array.isArray(data)) {
-      return null;
-    }
+    if (!isPlainRecord(data)) return null;
 
-    const record = data as Record<string, unknown>;
-
-    switch (record["t"]) {
-      case "join": {
-        const room = record["room"];
-        const displayName = record["displayName"];
-        if (typeof room === "string" && typeof displayName === "string") {
-          const joinMsg: ClientMessage = {
-            t: "join",
-            room,
-            displayName,
-          };
-          const hostToken = record["hostToken"];
-          if (typeof hostToken === "string" && hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
-            joinMsg.hostToken = hostToken;
-          }
-          const rejoinToken = record["rejoinToken"];
-          if (typeof rejoinToken === "string" && rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
-            joinMsg.rejoinToken = rejoinToken;
-          }
-          if (record["resume"] === true) {
-            joinMsg.resume = true;
-          }
-          const sharing = record["sharing"];
-          if (typeof sharing === "boolean") {
-            joinMsg.sharing = sharing;
-          }
-          return joinMsg;
-        }
-        return null;
-      }
-
-      case "signal": {
-        const to = record["to"];
-        const sigData = record["data"];
-        if (
-          typeof to !== "string" ||
-          !PEER_ID.test(to) ||
-          typeof sigData !== "object" ||
-          sigData === null ||
-          Array.isArray(sigData)
-        ) {
-          return null;
-        }
-
-        const sig = sigData as Record<string, unknown>;
-        const k = sig["k"];
-        const sdp = sig["sdp"];
-
-        if (k === "offer" && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
-          return {
-            t: "signal",
-            to,
-            data: { k: "offer", sdp },
-          };
-        }
-
-        if (k === "answer" && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
-          return {
-            t: "signal",
-            to,
-            data: { k: "answer", sdp },
-          };
-        }
-
-        const rawCandidate = sig["candidate"];
-        if (
-          k === "ice" &&
-          typeof rawCandidate === "object" &&
-          rawCandidate !== null &&
-          !Array.isArray(rawCandidate)
-        ) {
-          const cand = rawCandidate as Record<string, unknown>;
-          const candidateStr = cand["candidate"];
-          if (typeof candidateStr !== "string" || candidateStr.length > MAX_CANDIDATE_LENGTH) {
-            return null;
-          }
-
-          const sdpMid = cand["sdpMid"];
-          const sdpMLineIndex = cand["sdpMLineIndex"];
-          const usernameFragment = cand["usernameFragment"];
-
-          const sdpMidValid = typeof sdpMid === "string" || sdpMid === null || sdpMid === undefined;
-          const sdpMLineIndexValid =
-            typeof sdpMLineIndex === "number" || sdpMLineIndex === null || sdpMLineIndex === undefined;
-          const usernameFragmentValid =
-            usernameFragment === undefined ||
-            usernameFragment === null ||
-            typeof usernameFragment === "string";
-
-          if (!sdpMidValid || !sdpMLineIndexValid || !usernameFragmentValid) {
-            return null;
-          }
-
-          const iceCandidate: IceCandidateInit = {
-            candidate: candidateStr,
-            sdpMid: typeof sdpMid === "string" ? sdpMid : null,
-            sdpMLineIndex: typeof sdpMLineIndex === "number" ? sdpMLineIndex : null,
-          };
-
-          if (typeof usernameFragment === "string") {
-            iceCandidate.usernameFragment = usernameFragment;
-          } else if (usernameFragment === null) {
-            iceCandidate.usernameFragment = null;
-          }
-
-          return {
-            t: "signal",
-            to,
-            data: {
-              k: "ice",
-              candidate: iceCandidate,
-            },
-          };
-        }
-
-        return null;
-      }
-
-      case "kick": {
-        const id = record["id"];
-        if (typeof id === "string" && PEER_ID.test(id)) {
-          return { t: "kick", id };
-        }
-        return null;
-      }
-
-      case "lock": {
-        const locked = record["locked"];
-        if (typeof locked === "boolean") {
-          return { t: "lock", locked };
-        }
-        return null;
-      }
-
-      case "state": {
-        const sharing = record["sharing"];
-        if (typeof sharing === "boolean") {
-          return {
-            t: "state",
-            sharing,
-          };
-        }
-        return null;
-      }
-
+    switch (data["t"]) {
+      case "join":
+        return parseJoinMessage(data);
+      case "signal":
+        return parseSignalMessage(data);
+      case "kick":
+        return typeof data["id"] === "string" && PEER_ID.test(data["id"])
+          ? { t: "kick", id: data["id"] }
+          : null;
+      case "lock":
+        return typeof data["locked"] === "boolean"
+          ? { t: "lock", locked: data["locked"] }
+          : null;
+      case "state":
+        return typeof data["sharing"] === "boolean"
+          ? { t: "state", sharing: data["sharing"] }
+          : null;
       default:
         return null;
     }

@@ -647,66 +647,93 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   renderTileControls(peerId);
 }
 
-function renderTileControls(peerId: PeerId): void {
-  const c = tileControls.get(peerId);
-  if (!c) return;
-  const s = listeningFor(peerId);
-  const isPaused = paused.has(peerId);
-  const name = names.get(peerId) ?? "this stream";
-  c.wrap.dataset["paused"] = String(isPaused);
+type TileControlElements = {
+  wrap: HTMLElement;
+  pauseBtn: HTMLButtonElement;
+  muteBtn: HTMLButtonElement;
+  volume: HTMLInputElement;
+  fitBtn: HTMLButtonElement;
+  focusBtn: HTMLButtonElement;
+  statsBtn: HTMLButtonElement;
+  fullscreenBtn: HTMLButtonElement;
+  pipBtn?: HTMLButtonElement | undefined;
+};
 
-  setButtonIcon(c.pauseBtn, isPaused ? "play" : "pause");
-  c.pauseBtn.title = isPaused ? `Resume ${name}` : `Pause ${name}. Stops their video being sent to you.`;
-  c.pauseBtn.setAttribute("aria-label", isPaused ? `Resume ${name}` : `Pause ${name}`);
+function renderTileAudioControls(
+  ctrl: TileControlElements,
+  audioState: { volume: number; muted: boolean },
+  isPaused: boolean,
+  name: string,
+): void {
+  setButtonIcon(ctrl.pauseBtn, isPaused ? "play" : "pause");
+  ctrl.pauseBtn.title = isPaused ? `Resume ${name}` : `Pause ${name}. Stops their video being sent to you.`;
+  ctrl.pauseBtn.setAttribute("aria-label", isPaused ? `Resume ${name}` : `Pause ${name}`);
 
-  const silent = s.muted || isPaused;
-  setButtonIcon(c.muteBtn, silent ? "volumeOff" : "volumeOn");
-  c.muteBtn.title = isPaused ? `${name} is paused` : s.muted ? `Unmute ${name}` : `Mute ${name}`;
-  c.muteBtn.setAttribute("aria-label", c.muteBtn.title);
-  c.muteBtn.disabled = isPaused;
+  const silent = audioState.muted || isPaused;
+  setButtonIcon(ctrl.muteBtn, silent ? "volumeOff" : "volumeOn");
+  let muteTitle = `Mute ${name}`;
+  if (isPaused) muteTitle = `${name} is paused`;
+  else if (audioState.muted) muteTitle = `Unmute ${name}`;
+  ctrl.muteBtn.title = muteTitle;
+  ctrl.muteBtn.setAttribute("aria-label", ctrl.muteBtn.title);
+  ctrl.muteBtn.disabled = isPaused;
 
-  const sliderVal = s.muted ? 0 : Math.round(s.volume * 100);
-  const volState = computeVolumeState(sliderVal, s.volume);
-  c.volume.value = String(sliderVal);
+  const sliderVal = audioState.muted ? 0 : Math.round(audioState.volume * 100);
+  const volState = computeVolumeState(sliderVal, audioState.volume);
+  ctrl.volume.value = String(sliderVal);
   const isBoosted = !isPaused && volState.boosted;
-  c.volume.dataset["boosted"] = String(isBoosted);
-  c.volume.title = `${name} ${volState.label.toLowerCase()}${isBoosted ? " (boosted)" : ""}`;
-  c.volume.setAttribute("aria-label", `${name} volume`);
-  c.volume.disabled = isPaused;
+  ctrl.volume.dataset["boosted"] = String(isBoosted);
+  ctrl.volume.title = `${name} ${volState.label.toLowerCase()}${isBoosted ? " (boosted)" : ""}`;
+  ctrl.volume.setAttribute("aria-label", `${name} volume`);
+  ctrl.volume.disabled = isPaused;
+}
 
-  const isCover = c.wrap.dataset["fit"] === "cover";
-  setButtonIcon(c.fitBtn, isCover ? "fitContain" : "fitCover");
-  c.fitBtn.title = isCover ? `Fit ${name} to window (show whole screen)` : `Fill window with ${name} (crop black bars)`;
-  c.fitBtn.setAttribute("aria-label", c.fitBtn.title);
-  c.fitBtn.setAttribute("aria-pressed", String(isCover));
+function renderTileViewControls(ctrl: TileControlElements, peerId: PeerId, name: string): void {
+  const isCover = ctrl.wrap.dataset["fit"] === "cover";
+  setButtonIcon(ctrl.fitBtn, isCover ? "fitContain" : "fitCover");
+  ctrl.fitBtn.title = isCover ? `Fit ${name} to window (show whole screen)` : `Fill window with ${name} (crop black bars)`;
+  ctrl.fitBtn.setAttribute("aria-label", ctrl.fitBtn.title);
+  ctrl.fitBtn.setAttribute("aria-pressed", String(isCover));
 
   const isFocused = focusedPeerId === peerId;
-  setButtonIcon(c.focusBtn, isFocused ? "unfocus" : "focus");
-  c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
-  c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
-  c.focusBtn.setAttribute("aria-pressed", String(isFocused));
-  c.focusBtn.hidden = visibleTileCount() < 2;
+  setButtonIcon(ctrl.focusBtn, isFocused ? "unfocus" : "focus");
+  ctrl.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
+  ctrl.focusBtn.setAttribute("aria-label", ctrl.focusBtn.title);
+  ctrl.focusBtn.setAttribute("aria-pressed", String(isFocused));
+  ctrl.focusBtn.hidden = visibleTileCount() < 2;
 
-  if (c.pipBtn) {
-    const v = tiles.get(peerId);
-    const isPip = document.pictureInPictureElement === v;
-    setButtonIcon(c.pipBtn, "pip");
-    c.pipBtn.title = isPip ? `Exit Picture-in-Picture for ${name}` : `Picture-in-Picture for ${name}`;
-    c.pipBtn.setAttribute("aria-label", c.pipBtn.title);
-    c.pipBtn.setAttribute("aria-pressed", String(isPip));
+  if (ctrl.pipBtn) {
+    const videoEl = tiles.get(peerId);
+    const isPip = document.pictureInPictureElement === videoEl;
+    setButtonIcon(ctrl.pipBtn, "pip");
+    ctrl.pipBtn.title = isPip ? `Exit Picture-in-Picture for ${name}` : `Picture-in-Picture for ${name}`;
+    ctrl.pipBtn.setAttribute("aria-label", ctrl.pipBtn.title);
+    ctrl.pipBtn.setAttribute("aria-pressed", String(isPip));
   }
 
   const isStats = statsOpen.has(peerId);
-  setButtonIcon(c.statsBtn, "stats");
-  c.statsBtn.title = isStats ? `Hide stream stats for ${name}` : `Show stream stats for ${name}`;
-  c.statsBtn.setAttribute("aria-label", c.statsBtn.title);
-  c.statsBtn.setAttribute("aria-pressed", String(isStats));
+  setButtonIcon(ctrl.statsBtn, "stats");
+  ctrl.statsBtn.title = isStats ? `Hide stream stats for ${name}` : `Show stream stats for ${name}`;
+  ctrl.statsBtn.setAttribute("aria-label", ctrl.statsBtn.title);
+  ctrl.statsBtn.setAttribute("aria-pressed", String(isStats));
 
-  const isFs = document.fullscreenElement === c.wrap;
-  setButtonIcon(c.fullscreenBtn, isFs ? "exitFullscreen" : "fullscreen");
-  c.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
-  c.fullscreenBtn.setAttribute("aria-label", c.fullscreenBtn.title);
-  c.fullscreenBtn.setAttribute("aria-pressed", String(isFs));
+  const isFs = document.fullscreenElement === ctrl.wrap;
+  setButtonIcon(ctrl.fullscreenBtn, isFs ? "exitFullscreen" : "fullscreen");
+  ctrl.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
+  ctrl.fullscreenBtn.setAttribute("aria-label", ctrl.fullscreenBtn.title);
+  ctrl.fullscreenBtn.setAttribute("aria-pressed", String(isFs));
+}
+
+function renderTileControls(peerId: PeerId): void {
+  const ctrl = tileControls.get(peerId);
+  if (!ctrl) return;
+  const audioState = listeningFor(peerId);
+  const isPaused = paused.has(peerId);
+  const name = names.get(peerId) ?? "this stream";
+  ctrl.wrap.dataset["paused"] = String(isPaused);
+
+  renderTileAudioControls(ctrl, audioState, isPaused, name);
+  renderTileViewControls(ctrl, peerId, name);
 }
 
 function setPaused(peerId: PeerId, value: boolean): void {
