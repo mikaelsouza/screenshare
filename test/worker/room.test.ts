@@ -29,17 +29,6 @@ beforeEach(() => {
 });
 
 /**
- * Mirrors RoomDO.hashPassword, so a test can seed storage the way the object would.
- * The Durable Object id is the salt, which is what stops the same password producing
- * the same hash in two different rooms.
- */
-async function passwordHash(room: string, password: string): Promise<string> {
-  const id = env.ROOMS.idFromName(room).toString();
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`${id}:${password}`));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/**
  * Read a refusal spoken over a completed handshake.
  *
  * A refusal answers 101 and then closes, so that the close code and an error frame can
@@ -483,36 +472,6 @@ describe("RoomDO membership", () => {
     b.close();
   });
 
-  it("enforces room password when configured by first peer", async () => {
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
-    const wa = await a.nextOf("welcome");
-    expect(wa.selfId).toBeDefined();
-
-    // Second peer joins with wrong password -> rejected
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob", password: "wrong-password" });
-    const err = await b.nextOf("error");
-    expect(err.code).toBe("bad-password");
-    b.close();
-
-    // Second peer joins with missing password -> rejected
-    const c = await Client.connect();
-    c.send({ t: "join", room: CODE, displayName: "charlie" });
-    const err2 = await c.nextOf("error");
-    expect(err2.code).toBe("bad-password");
-    c.close();
-
-    // Second peer joins with correct password -> accepted
-    const d = await Client.connect();
-    d.send({ t: "join", room: CODE, displayName: "dave", password: "super-secret" });
-    const wd = await d.nextOf("welcome");
-    expect(wd.selfId).toBeDefined();
-
-    a.close();
-    d.close();
-  });
-
   it("caps total sockets per IP address to prevent mesh/uplink flooding", async () => {
     const ip = "203.0.113.88";
     const sockets: Client[] = [];
@@ -534,12 +493,6 @@ describe("RoomDO membership", () => {
   });
 
   it("refuses an over-cap connection with 1013, not a failed handshake", async () => {
-    // A non-101 answer reaches the page as close code 1006, which SignalingClient
-    // cannot distinguish from a network blip: it would reconnect forever at the
-    // backoff cap. The handshake must complete so the close code can carry meaning —
-    // and 1013 rather than 1008, because capacity is transient: half-open sockets the
-    // runtime has not reaped yet make a full room briefly over-cap, and 1008 would
-    // permanently strand a user who did nothing wrong.
     const ip = "203.0.113.90";
     const sockets: Client[] = [];
     for (let i = 0; i < PER_IP_CAP; i++) {
@@ -566,268 +519,26 @@ describe("RoomDO membership", () => {
     for (const s of sockets) s.close();
   });
 
-  it("persists the password to durable storage, not just to the instance", async () => {
-    // The whole point: this object hibernates as soon as signalling quiets down, which
-    // is seconds after ICE completes. A password held only in an instance field is
-    // gone on the next wake, and because it is re-armed only for an *empty* room it
-    // would never come back — the room would be permanently open.
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
-    await a.nextOf("welcome");
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("passwordHash"),
-    );
-    expect(stored).toBe(await passwordHash(CODE, "super-secret"));
-    // And the plaintext is nowhere in storage: room passwords come out of users'
-    // ordinary password habits, so they are worth more than this one room.
-    expect(stored).not.toContain("super-secret");
-    a.close();
-  });
-
-  it("salts the hash per room, so the same password differs between rooms", async () => {
-    const other = freshRoom();
-    expect(await passwordHash(CODE, "same")).not.toBe(await passwordHash(other, "same"));
-  });
-
-  it("enforces a password that only exists in storage, as it would after a wake", async () => {
-    // Seeding storage without ever setting the password over a socket reproduces the
-    // state a woken object is in: durable storage has it, instance memory does not.
-    // The old code read an instance field and would have waved this join straight in.
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const hash = await passwordHash(CODE, "from-storage");
-    await runInDurableObject(stub, (_instance, state) => state.storage.put("passwordHash", hash));
-
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice" });
-    const err = await a.nextOf("error");
-    expect(err.code).toBe("bad-password");
-    a.close();
-
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob", password: "from-storage" });
-    const wb = await b.nextOf("welcome");
-    expect(wb.selfId).toBeDefined();
-    b.close();
-  });
-
-  it("keeps the password when the room momentarily empties", async () => {
-    // A lone peer's socket blipping empties the room for the length of a reconnect.
-    // Clearing the password there would let whoever connects next claim the room and
-    // set their own, and the returning owner — closed 1008, which the client treats as
-    // terminal — would be locked out of a room they created.
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "initial-password" });
-    await a.nextOf("welcome");
-
-    a.close();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const mallory = await Client.connect();
-    mallory.send({ t: "join", room: CODE, displayName: "mallory", password: "pwned" });
-    const err = await mallory.nextOf("error");
-    expect(err.code).toBe("bad-password");
-    mallory.close();
-
-    // The original owner still gets back in.
-    const back = await Client.connect();
-    back.send({ t: "join", room: CODE, displayName: "alice", password: "initial-password" });
-    const w = await back.nextOf("welcome");
-    expect(w.selfId).toBeDefined();
-    back.close();
-  });
-
-  it("does not let a stranger claim an unprotected room", async () => {
-    // The hijack the "first peer in an empty room" rule allowed: an unprotected room
-    // is empty for the length of every reconnect, and permanently once the session
-    // ends while its code lives on in location.hash and in whatever link was shared.
-    // Setting a password there would lock the real occupants out for the full TTL.
-    const alice = await Client.connect();
-    await alice.join("alice");
-    alice.close();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const mallory = await Client.connect();
-    mallory.send({ t: "join", room: CODE, displayName: "mallory", password: "pwned" });
-    await mallory.nextOf("welcome");
-    mallory.close();
-    await new Promise((r) => setTimeout(r, 100));
-
-    // Alice comes back with no password and is let straight in.
-    const back = await Client.connect();
-    const w = await back.join("alice");
-    expect(w.selfId).toBeDefined();
-    back.close();
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("passwordHash"),
-    );
-    expect(stored).toBeUndefined();
-  });
-
-  it("throttles repeated wrong-password attempts", async () => {
-    // Refusing a guess only closes that one socket, and MAX_SOCKETS_PER_IP bounds
-    // concurrency rather than attempts over time, so without a throttle an attacker
-    // holding the room code can guess as fast as they can open sockets.
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
-    await a.nextOf("welcome");
-
-    const started = Date.now();
-    for (let i = 0; i < 4; i++) {
-      const guess = await Client.connect();
-      guess.send({ t: "join", room: CODE, displayName: "mallory", password: `guess-${i}` });
-      const err = await guess.nextOf("error");
-      expect(err.code).toBe("bad-password");
-      guess.close();
-    }
-    // 250ms + 500 + 750 + 1000 = 2.5s of enforced delay. Allow slack for scheduling.
-    expect(Date.now() - started).toBeGreaterThan(1_500);
-
-    a.close();
-  });
-
-  it("clamps an oversized password instead of failing the storage write", async () => {
-    // A Durable Object value tops out at 128 KiB while a WebSocket frame may be 1 MiB,
-    // so an unclamped password made storage.put reject; the rejection escaped
-    // webSocketMessage, the peer never got `welcome`, and the socket died with 1006 —
-    // which the client then retried, reproducing the same failure forever. Frames are
-    // now capped well below that too, so this uses the largest password that still fits
-    // in one: the clamp is what keeps it to 128 characters.
-    const huge = "x".repeat(70_000);
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: huge });
-    const wa = await a.nextOf("welcome");
-    expect(wa.selfId).toBeDefined();
-
-    // Only the first 128 characters count, so that prefix is the password now.
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob", password: "x".repeat(128) });
-    expect((await b.nextOf("welcome")).selfId).toBeDefined();
-
-    a.close();
-    b.close();
-  });
-
-  it("does not count a missing password as a brute-force attempt", async () => {
-    // Every deep-link open and every refresh of a protected room arrives with no
-    // password. Charging those to the counter made eight friends reloading a few
-    // times each throttle their own room, and eventually trip the hard limit.
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "super-secret" });
-    await a.nextOf("welcome");
-
-    const started = Date.now();
-    for (let i = 0; i < 5; i++) {
-      const c = await Client.connect();
-      c.send({ t: "join", room: CODE, displayName: "bob" });
-      expect((await c.nextOf("error")).code).toBe("bad-password");
-      c.close();
-    }
-    // No delay was served, unlike the wrong-password path.
-    expect(Date.now() - started).toBeLessThan(1_000);
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const fails = await runInDurableObject(stub, (_i, state) => state.storage.get("pwFail"));
-    expect(fails).toBeUndefined();
-    a.close();
-  });
-
-  it("refuses rather than speeds up once past the brute-force hard limit", async () => {
-    // The throttle used to invert here: past the limit it returned null and the caller
-    // skipped the delay, so crossing it made guessing faster than being throttled.
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const hash = await passwordHash(CODE, "real");
-    await runInDurableObject(stub, async (_i, state) => {
-      await state.storage.put("passwordHash", hash);
-      await state.storage.put("pwFail", { count: 999, resetAt: Date.now() + 60_000 });
-    });
-
-    const started = Date.now();
-    const c = await Client.connect();
-    c.send({ t: "join", room: CODE, displayName: "mallory", password: "wrong" });
-    const err = await c.nextOf("error");
-    expect(err.code).toBe("rate-limited");
-    // Refused outright: no delay served.
-    expect(Date.now() - started).toBeLessThan(1_000);
-    c.close();
-
-    // 1013, not 1008: the window expires, and the real password must work afterwards.
-    const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
-      headers: { Upgrade: "websocket" },
-    });
-    res.webSocket!.accept();
-    res.webSocket!.send(JSON.stringify({ t: "join", room: CODE, displayName: "m", password: "x" }));
-    const closeCode = await new Promise<number>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("never closed")), 2000);
-      res.webSocket!.addEventListener("close", (ev) => {
-        clearTimeout(timer);
-        resolve((ev as CloseEvent).code);
-      });
-    });
-    expect(closeCode).toBe(1013);
-  });
-
-  it("tells a peer their password was ignored on an unprotected room", async () => {
-    // Dropping it silently let someone believe they had protected a room that was in
-    // fact open to anyone holding the code.
-    const a = await Client.connect();
-    await a.join("alice");
-    a.close();
-    await new Promise((r) => setTimeout(r, 100));
-
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob", password: "too-late" });
-    const err = await b.nextOf("error");
-    expect(err.code).toBe("password-ignored");
-    // The join still succeeds; this is a warning, not a rejection.
-    expect((await b.nextOf("welcome")).selfId).toBeDefined();
-    b.close();
-  });
-
   it("erases an abandoned room when the alarm fires", async () => {
-    // The password is kept indefinitely for reconnects, so something has to reclaim it
-    // eventually or every room code ever used costs storage forever.
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "initial-password" });
-    await a.nextOf("welcome");
-    a.close();
-    await new Promise((r) => setTimeout(r, 100));
+    const aliceClient = await Client.connect();
+    await aliceClient.join("alice");
+    aliceClient.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
     const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("passwordHash"),
+      state.storage.get<boolean>("claimed"),
     );
     expect(stored).toBeUndefined();
 
-    const c = await Client.connect();
-    c.send({ t: "join", room: CODE, displayName: "charlie" });
-    const wc = await c.nextOf("welcome");
+    const charlieClient = await Client.connect();
+    charlieClient.send({ t: "join", room: CODE, displayName: "charlie" });
+    const wc = await charlieClient.nextOf("welcome");
     expect(wc.selfId).toBeDefined();
-    c.close();
-  });
-
-  it("does not let a later peer overwrite the room password", async () => {
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "initial-password" });
-    await a.nextOf("welcome");
-
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "bob", password: "initial-password" });
-    await b.nextOf("welcome");
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("passwordHash"),
-    );
-    expect(stored).toBe(await passwordHash(CODE, "initial-password"));
-
-    a.close();
-    b.close();
+    expect(wc.host).toBe(true);
+    charlieClient.close();
   });
 });
 
@@ -1020,41 +731,6 @@ describe("RoomDO message limits", () => {
   });
 });
 
-describe("RoomDO room claim", () => {
-  // This does not reliably reproduce the interleaving that the fix in the join handler
-  // removes (it passes against the old code too): whether a crypto.subtle await lets
-  // another event in depends on timing the test cannot control. It pins the invariant
-  // instead: whichever join wins, no one ends up inside a room whose stored password
-  // they never supplied.
-  it("keeps password state consistent when two joins race on a fresh room", async () => {
-    const a = await Client.connect();
-    const b = await Client.connect();
-    // Sent back to back, so the second join arrives while the first is mid-flight.
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "race-password" });
-    b.send({ t: "join", room: CODE, displayName: "bob" });
-
-    const ra = await a.next();
-    const rb = await b.nextOf(ra.t === "welcome" ? "error" : "welcome").catch(() => null);
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const stored = await runInDurableObject(stub, (_instance, state) =>
-      state.storage.get<string>("passwordHash"),
-    );
-
-    if (stored === undefined) {
-      // Bob claimed an open room first; Alice was told her password was ignored.
-      expect(ra.t === "error" && ra.code === "password-ignored" || ra.t === "welcome").toBe(true);
-    } else {
-      // Alice claimed it with a password: Bob, who sent none, must not be in.
-      expect(stored).toBe(await passwordHash(CODE, "race-password"));
-      expect(rb?.t).toBe("error");
-      if (rb?.t === "error") expect(rb.code).toBe("bad-password");
-    }
-    a.close();
-    b.close();
-  });
-});
-
 describe("RoomDO abuse limits (batch B)", () => {
   it("frees the slot of a socket that never joined once the deadline passes", async () => {
     const idle = await Client.connect();
@@ -1110,42 +786,6 @@ describe("RoomDO abuse limits (batch B)", () => {
     });
     expect(await refusal(res)).toEqual({ code: "rate-limited", closeCode: 1013 });
     for (const s of sockets) s.close();
-  });
-
-  it("refuses a new room with a short password and leaves it unclaimed", async () => {
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "1234" });
-    expect((await a.nextOf("error")).code).toBe("weak-password");
-
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const claimed = await runInDurableObject(stub, (_i, state) => state.storage.get("claimed"));
-    expect(claimed).toBeUndefined();
-
-    // A second try with a proper password creates the room.
-    const b = await Client.connect();
-    b.send({ t: "join", room: CODE, displayName: "alice", password: "long-enough" });
-    expect((await b.nextOf("welcome")).selfId).toBeTruthy();
-    b.close();
-  });
-
-  it("caps wrong guesses per day, and the real password still gets in", async () => {
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    const hash = await passwordHash(CODE, "the-real-one");
-    await runInDurableObject(stub, async (_i, state) => {
-      await state.storage.put("passwordHash", hash);
-      await state.storage.put("claimed", true);
-      // Under the 15-minute limit, at the daily one.
-      await state.storage.put("pwFailDay", { count: 200, resetAt: Date.now() + 3_600_000 });
-    });
-
-    const m = await Client.connect();
-    m.send({ t: "join", room: CODE, displayName: "mallory", password: "guess-201" });
-    expect((await m.nextOf("error")).code).toBe("rate-limited");
-
-    const a = await Client.connect();
-    a.send({ t: "join", room: CODE, displayName: "alice", password: "the-real-one" });
-    expect((await a.nextOf("welcome")).selfId).toBeTruthy();
-    a.close();
   });
 });
 
@@ -1634,41 +1274,6 @@ describe("RoomDO final review fixes", () => {
 
     h2.close();
     b.close();
-  });
-
-  it("evicts previous socket on rejoin with rejoinToken in a password-protected room while sharing", async () => {
-    const a = await Client.connect();
-    await a.join("alice", "super-secret");
-
-    const b1 = await Client.connect();
-    const wb1 = await b1.join("bob", "super-secret");
-    await a.nextOf("peer-joined");
-
-    // Bob starts sharing
-    b1.send({ t: "state", sharing: true });
-    expect((await a.nextOf("peer-state")).sharing).toBe(true);
-
-    const b1Closed = closeCodeOf(b1.ws);
-
-    // Bob reconnects with password and rejoinToken while b1 is still open
-    const b2 = await Client.connect();
-    b2.send({
-      t: "join",
-      room: CODE,
-      displayName: "bob",
-      password: "super-secret",
-      rejoinToken: wb1.rejoinToken,
-    });
-
-    // Alice sees bob's old socket leave before new socket joins
-    expect((await a.nextOf("peer-left")).id).toBe(wb1.selfId);
-    const wb2 = await b2.nextOf("welcome");
-    expect((await a.nextOf("peer-joined")).peer.id).toBe(wb2.selfId);
-    expect(wb2.peers.some((p) => p.id === wb1.selfId)).toBe(false);
-    expect(await b1Closed).toBe(1008);
-
-    a.close();
-    b2.close();
   });
 
   it("in-place resume (resume: true + rejoinToken) with old socket open preserves selfId without broadcasting peer-left", async () => {

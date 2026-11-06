@@ -3,6 +3,19 @@
 import { captureAudioOnly, captureScreen, onCaptureEnded, stopCapture, type CaptureResult } from "../capture";
 import type { CaptureCallbacks, CaptureController } from "./types";
 
+const pendingTasks = new Set<Promise<unknown>>();
+
+function runBackground(task: Promise<unknown>): void {
+  const tracked = task
+    .catch((err: unknown) => {
+      console.warn("[web] applyConstraints failed", err);
+    })
+    .finally(() => {
+      pendingTasks.delete(tracked);
+    });
+  pendingTasks.add(tracked);
+}
+
 export function createWebCaptureController(cb: CaptureCallbacks): CaptureController {
   let capture: CaptureResult | null = null;
   let unlisten: (() => void) | null = null;
@@ -19,8 +32,15 @@ export function createWebCaptureController(cb: CaptureCallbacks): CaptureControl
     captureAudioOnly(kind) {
       return captureAudioOnly(kind);
     },
-    setPreset() {
-      // Nothing to do: the browser never re-captures mid-share.
+    setPreset(preset) {
+      if (!capture) return;
+      runBackground(
+        capture.video.applyConstraints({
+          width: { ideal: preset.width },
+          height: { ideal: preset.height },
+          frameRate: { ideal: preset.frameRate, max: preset.frameRate },
+        }),
+      );
     },
     stop() {
       unlisten?.();

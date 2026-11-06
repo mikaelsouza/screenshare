@@ -1,8 +1,5 @@
 /**
- * getStats() extraction.
- *
- * The one number that matters most here is `candidateType`: "srflx" or "host" means
- * the connection is direct peer-to-peer.
+ * getStats() extraction for inbound (viewer tile) and outbound (sharer-to-viewer) links.
  */
 
 import type { LinkHealth } from "./quality";
@@ -10,32 +7,96 @@ import type { LinkHealth } from "./quality";
 /** Narrow a raw stats entry to a plain record so index access is checkable. */
 type Stat = Record<string, unknown>;
 
-function num(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+function num(val: unknown): number | null {
+  return typeof val === "number" && Number.isFinite(val) ? val : null;
 }
 
-function str(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
+function str(val: unknown): string | null {
+  return typeof val === "string" ? val : null;
 }
 
 interface Sample {
-  bytesSent: number | null;
-  packetsSent: number | null;
+  bytes: number | null;
+  packets: number | null;
   packetsLost: number | null;
   timestampMs: number;
+}
+
+function findSelectedPair(byId: Map<string, Stat>): Stat | null {
+  for (const stat of byId.values()) {
+    if (stat["type"] !== "transport") continue;
+    const sel = str(stat["selectedCandidatePairId"]);
+    const found = sel ? byId.get(sel) : undefined;
+    if (found) return found;
+  }
+  for (const stat of byId.values()) {
+    if (stat["type"] === "candidate-pair" && stat["state"] === "succeeded" && stat["nominated"] === true) {
+      return stat;
+    }
+  }
+  return null;
+}
+
+function findVideoStats(
+  byId: Map<string, Stat>,
+  direction: "inbound" | "outbound",
+): { rtp: Stat | null; lostSource: Stat | null } {
+  let rtp: Stat | null = null;
+  let remoteInbound: Stat | null = null;
+  for (const stat of byId.values()) {
+    if (stat["kind"] !== "video") continue;
+    if (direction === "outbound") {
+      if (stat["type"] === "outbound-rtp") rtp = stat;
+      else if (stat["type"] === "remote-inbound-rtp") remoteInbound = stat;
+    } else if (stat["type"] === "inbound-rtp") {
+      rtp = stat;
+    }
+  }
+  return { rtp, lostSource: direction === "outbound" ? remoteInbound : rtp };
+}
+
+function computeBitrate(curr: Sample, prev: Sample): number | null {
+  const dt = (curr.timestampMs - prev.timestampMs) / 1000;
+  if (dt <= 0 || curr.bytes === null || prev.bytes === null) return null;
+  return Math.max(0, ((curr.bytes - prev.bytes) * 8) / dt);
+}
+
+function computeLossRatio(
+  curr: Sample,
+  prev: Sample,
+  direction: "inbound" | "outbound",
+): number | null {
+  if (
+    curr.packets === null || prev.packets === null ||
+    curr.packetsLost === null || prev.packetsLost === null
+  ) {
+    return null;
+  }
+  const dPackets = curr.packets - prev.packets;
+  const dLost = curr.packetsLost - prev.packetsLost;
+  const denom = direction === "inbound" ? dPackets + Math.max(0, dLost) : dPackets;
+  return denom > 0 ? Math.max(0, dLost) / denom : null;
 }
 
 /**
  * Polls one RTCPeerConnection and turns raw stats into LinkHealth.
  *
  * Stateful because the interesting quantities are rates, not counters: WebRTC reports
- * cumulative `bytesSent`, so bitrate only exists as a delta between two samples.
+ * cumulative byte/packet counts, so bitrate and loss only exist as deltas between two samples.
  */
 export class LinkMonitor {
   private prev: Sample | null = null;
 
   private readonly pc: RTCPeerConnection;
-  constructor(pc: RTCPeerConnection) { this.pc = pc; }
+  private readonly direction: "inbound" | "outbound";
+
+  constructor(
+    pc: RTCPeerConnection,
+    direction: "inbound" | "outbound" = "outbound",
+  ) {
+    this.pc = pc;
+    this.direction = direction;
+  }
 
   async read(): Promise<LinkHealth | null> {
     let report: RTCStatsReport;
@@ -48,118 +109,48 @@ export class LinkMonitor {
     const byId = new Map<string, Stat>();
     report.forEach((entry, id) => byId.set(id, entry as unknown as Stat));
 
-    // Prefer the transport's nominated pair; fall back to scanning for a succeeded
-    // one, because the transport entry isn't present in every browser version.
-    let pair: Stat | null = null;
-    for (const s of byId.values()) {
-      if (s["type"] === "transport") {
-        const sel = str(s["selectedCandidatePairId"]);
-        const found = sel ? byId.get(sel) : undefined;
-        if (found) {
-          pair = found;
-          break;
-        }
-      }
-    }
-    if (!pair) {
-      for (const s of byId.values()) {
-        if (s["type"] === "candidate-pair" && s["state"] === "succeeded" && s["nominated"] === true) {
-          pair = s;
-          break;
-        }
-      }
-    }
+    const pair = findSelectedPair(byId);
+    const { rtp, lostSource } = findVideoStats(byId, this.direction);
+    const bytesKey = this.direction === "outbound" ? "bytesSent" : "bytesReceived";
+    const packetsKey = this.direction === "outbound" ? "packetsSent" : "packetsReceived";
 
-    const localId = pair ? str(pair["localCandidateId"]) : null;
-    const remoteId = pair ? str(pair["remoteCandidateId"]) : null;
-    const local = localId ? byId.get(localId) : undefined;
-    const remote = remoteId ? byId.get(remoteId) : undefined;
-
-    let outbound: Stat | null = null;
-    let remoteInbound: Stat | null = null;
-    for (const s of byId.values()) {
-      if (s["kind"] !== "video") continue;
-      if (s["type"] === "outbound-rtp") outbound = s;
-      else if (s["type"] === "remote-inbound-rtp") remoteInbound = s;
-    }
-
-    // Rates from counter deltas.
-    const now = performance.now();
     const sample: Sample = {
-      bytesSent: outbound ? num(outbound["bytesSent"]) : null,
-      packetsSent: outbound ? num(outbound["packetsSent"]) : null,
-      packetsLost: remoteInbound ? num(remoteInbound["packetsLost"]) : null,
-      timestampMs: now,
+      bytes: rtp ? num(rtp[bytesKey]) : null,
+      packets: rtp ? num(rtp[packetsKey]) : null,
+      packetsLost: lostSource ? num(lostSource["packetsLost"]) : null,
+      timestampMs: performance.now(),
     };
 
-    let outboundBitrate: number | null = null;
-    let packetLossRatio: number | null = null;
     const prev = this.prev;
-    if (prev) {
-      const dt = (sample.timestampMs - prev.timestampMs) / 1000;
-      if (dt > 0 && sample.bytesSent !== null && prev.bytesSent !== null) {
-        outboundBitrate = Math.max(0, ((sample.bytesSent - prev.bytesSent) * 8) / dt);
-      }
-      if (
-        sample.packetsSent !== null && prev.packetsSent !== null &&
-        sample.packetsLost !== null && prev.packetsLost !== null
-      ) {
-        const dSent = sample.packetsSent - prev.packetsSent;
-        const dLost = sample.packetsLost - prev.packetsLost;
-        if (dSent > 0) packetLossRatio = Math.max(0, dLost) / dSent;
-      }
-    }
+    const bitrate = prev ? computeBitrate(sample, prev) : null;
+    const packetLossRatio = prev ? computeLossRatio(sample, prev, this.direction) : null;
     this.prev = sample;
 
     const rttSec = pair ? num(pair["currentRoundTripTime"]) : null;
 
     return {
-      candidateType: (local ? str(local["candidateType"]) : null) ?? "unknown",
-      remoteCandidateType: (remote ? str(remote["candidateType"]) : null) ?? "unknown",
       rttMs: rttSec === null ? null : rttSec * 1000,
       packetLossRatio,
-      outboundBitrate,
-      framesPerSecond: outbound ? num(outbound["framesPerSecond"]) : null,
-      frameWidth: outbound ? num(outbound["frameWidth"]) : null,
-      frameHeight: outbound ? num(outbound["frameHeight"]) : null,
+      bitrate,
+      framesPerSecond: rtp ? num(rtp["framesPerSecond"]) : null,
+      frameWidth: rtp ? num(rtp["frameWidth"]) : null,
+      frameHeight: rtp ? num(rtp["frameHeight"]) : null,
     };
   }
 }
 
-/** Candidate types that represent a genuine peer-to-peer path. */
-const DIRECT_CANDIDATE_TYPES = ["host", "srflx", "prflx"];
-
-/**
- * True when the connection is provably direct — the outcome this project exists for.
- *
- * Requires a positively direct candidate type rather than merely "not relay": both
- * fields fall back to the sentinel "unknown" before ICE nominates a pair, and
- * treating that as direct would render `direct (unknown)`.
- */
-export function isDirect(h: LinkHealth): boolean {
-  return (
-    DIRECT_CANDIDATE_TYPES.includes(h.candidateType) &&
-    DIRECT_CANDIDATE_TYPES.includes(h.remoteCandidateType)
-  );
-}
-
-/** True when the route is not yet known. */
-export function isRouteUnknown(h: LinkHealth): boolean {
-  return h.candidateType === "unknown" || h.remoteCandidateType === "unknown";
-}
-
-/** Compact one-line summary for a tile label or console log. */
-export function summarize(h: LinkHealth): string {
+/** Compact one-line summary for a tile overlay or roster row. */
+export function summarize(health: LinkHealth, includeResolution = true): string {
   const bits: string[] = [];
-  bits.push(
-    isRouteUnknown(h) ? "connecting…" : isDirect(h) ? `direct (${h.candidateType})` : "relayed",
-  );
-  if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms rtt`);
-  if (h.outboundBitrate !== null) bits.push(`${(h.outboundBitrate / 1e6).toFixed(1)} Mbps`);
-  if (h.framesPerSecond !== null) bits.push(`${Math.round(h.framesPerSecond)}fps`);
-  if (h.frameWidth !== null && h.frameHeight !== null) bits.push(`${h.frameWidth}x${h.frameHeight}`);
-  if (h.packetLossRatio !== null && h.packetLossRatio > 0.001) {
-    bits.push(`${(h.packetLossRatio * 100).toFixed(1)}% loss`);
+  if (health.rttMs !== null) bits.push(`${Math.round(health.rttMs)}ms`);
+  if (health.bitrate !== null) bits.push(`${(health.bitrate / 1e6).toFixed(1)} Mbps`);
+  if (health.framesPerSecond !== null) bits.push(`${Math.round(health.framesPerSecond)}fps`);
+  if (includeResolution && health.frameWidth !== null && health.frameHeight !== null) {
+    bits.push(`${health.frameWidth}x${health.frameHeight}`);
   }
+  if (health.packetLossRatio !== null && health.packetLossRatio > 0.001) {
+    bits.push(`${(health.packetLossRatio * 100).toFixed(1)}% loss`);
+  }
+  if (bits.length === 0) return "connecting…";
   return bits.join(" · ");
 }

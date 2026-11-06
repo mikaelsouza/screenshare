@@ -70,7 +70,6 @@ export class SignalingClient {
   private readonly room: string;
   private readonly displayName: string;
   private readonly handlers: SignalingHandlers;
-  private readonly password: string | undefined;
   /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
   private readonly tokens:
     | (() => { hostToken?: string | undefined; rejoinToken?: string | undefined })
@@ -80,13 +79,11 @@ export class SignalingClient {
     room: string,
     displayName: string,
     handlers: SignalingHandlers,
-    password?: string,
     tokens?: () => { hostToken?: string | undefined; rejoinToken?: string | undefined },
   ) {
     this.room = room;
     this.displayName = displayName;
     this.handlers = handlers;
-    this.password = password;
     this.tokens = tokens;
     if (typeof document !== "undefined") {
       document.addEventListener("visibilitychange", this.onVisibilityChange);
@@ -132,9 +129,6 @@ export class SignalingClient {
         room: this.room,
         displayName: this.displayName,
       };
-      if (this.password) {
-        joinMsg.password = this.password;
-      }
       const { hostToken, rejoinToken } = this.tokens?.() ?? {};
       if (hostToken) joinMsg.hostToken = hostToken;
       if (rejoinToken) joinMsg.rejoinToken = rejoinToken;

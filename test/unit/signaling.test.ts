@@ -162,8 +162,8 @@ describe("SignalingClient reconnection", () => {
   });
 
   it("sends signals and state updates", () => {
-    const c = new SignalingClient("ABCDEFGH", "alice", handlers(), "my-password");
-    c.connect();
+    const sigClient = new SignalingClient("ABCDEFGH", "alice", handlers());
+    sigClient.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
 
@@ -171,17 +171,16 @@ describe("SignalingClient reconnection", () => {
       t: "join",
       room: "ABCDEFGH",
       displayName: "alice",
-      password: "my-password",
     });
 
-    c.signal("p1", { k: "answer", sdp: "v=0" });
+    sigClient.signal("p1", { k: "answer", sdp: "v=0" });
     expect(JSON.parse(ws.sent[1]!)).toEqual({
       t: "signal",
       to: "p1",
       data: { k: "answer", sdp: "v=0" },
     });
 
-    c.setSharing(true);
+    sigClient.setSharing(true);
     expect(JSON.parse(ws.sent[2]!)).toEqual({
       t: "state",
       sharing: true,
@@ -384,10 +383,10 @@ describe("SignalingClient capacity refusals", () => {
   });
 
   it("sends the host token on every connect and passes the room state on", () => {
-    const h = { ...handlers(), onRoomState: vi.fn() };
+    const handlerMock = { ...handlers(), onRoomState: vi.fn() };
     let token: string | undefined;
-    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ hostToken: token }));
-    c.connect();
+    const sigClient = new SignalingClient("ABCDEFGH", "alice", handlerMock, () => ({ hostToken: token }));
+    sigClient.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
     expect(JSON.parse(ws.sent[0]!)).not.toHaveProperty("hostToken");
@@ -395,51 +394,51 @@ describe("SignalingClient capacity refusals", () => {
     ws.onmessage?.({
       data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], host: true, hostToken: "tok", locked: false }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [], { host: true, hostToken: "tok", locked: false });
+    expect(handlerMock.onWelcome).toHaveBeenCalledWith("me", [], { host: true, hostToken: "tok", locked: false });
     token = "tok";
 
     ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
-    expect(h.onRoomState).toHaveBeenCalledWith(true);
+    expect(handlerMock.onRoomState).toHaveBeenCalledWith(true);
 
     ws.serverClose(1006);
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
     expect((JSON.parse(ws2.sent[0] ?? "{}") as { hostToken: string }).hostToken).toBe("tok");
-    c.close();
+    sigClient.close();
   });
 
   it("leaves the server's reason on screen when it refuses us", () => {
-    const h = handlers();
-    const c = new SignalingClient("ABCDEFGH", "alice", h);
-    c.connect();
+    const handlerMock = handlers();
+    const sigClient = new SignalingClient("ABCDEFGH", "alice", handlerMock);
+    sigClient.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
-    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "bad-password", message: "This room needs a password" }) });
+    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "room-locked", message: "This room is locked" }) });
     ws.serverClose(1008);
-    expect(h.onError).toHaveBeenCalledWith("bad-password", "This room needs a password");
+    expect(handlerMock.onError).toHaveBeenCalledWith("room-locked", "This room is locked");
     // Reporting "closed" after the error replaced the explanation with "Connection closed…".
-    expect(h.onStatus).not.toHaveBeenCalledWith("closed");
+    expect(handlerMock.onStatus).not.toHaveBeenCalledWith("closed");
   });
 
   it("sends the rejoin ticket from the last welcome on the next join", () => {
-    const h = handlers();
+    const handlerMock = handlers();
     let rejoin: string | undefined;
-    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ rejoinToken: rejoin }));
-    c.connect();
+    const sigClient = new SignalingClient("ABCDEFGH", "alice", handlerMock, () => ({ rejoinToken: rejoin }));
+    sigClient.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
     ws.onmessage?.({
       data: JSON.stringify({ t: "welcome", selfId: "me", peers: [], host: false, rejoinToken: "r1", locked: true }),
     });
-    expect(h.onWelcome).toHaveBeenCalledWith("me", [], { host: false, rejoinToken: "r1", locked: true });
+    expect(handlerMock.onWelcome).toHaveBeenCalledWith("me", [], { host: false, rejoinToken: "r1", locked: true });
     rejoin = "r1";
     ws.serverClose(1006);
     vi.advanceTimersByTime(20_000);
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.open();
     expect((JSON.parse(ws2.sent[0] ?? "{}") as { rejoinToken: string }).rejoinToken).toBe("r1");
-    c.close();
+    sigClient.close();
   });
 });
 

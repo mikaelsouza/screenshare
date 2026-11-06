@@ -5,26 +5,27 @@ import { createElectronCaptureController, type ElectronCaptureDeps } from "@src/
 import type { CaptureCallbacks, FollowUpdate } from "@src/platform/types";
 import { createWebCaptureController } from "@src/platform/web";
 
-type FakeTrack = MediaStreamTrack & { end(): void; stopped: boolean };
+type FakeTrack = MediaStreamTrack & { end(): void; stopped: boolean; applyConstraints: ReturnType<typeof vi.fn> };
 
 function track(kind: "video" | "audio", label: string = kind): FakeTrack {
   const listeners: Array<() => void> = [];
-  const t = {
+  const trackObj = {
     kind,
     label,
     readyState: "live" as MediaStreamTrackState,
     stopped: false,
     contentHint: "",
     getSettings: () => ({}),
+    applyConstraints: vi.fn(() => Promise.resolve()),
     addEventListener: (ev: string, fn: () => void) => { if (ev === "ended") listeners.push(fn); },
     removeEventListener: (ev: string, fn: () => void) => {
-      const i = listeners.indexOf(fn);
-      if (ev === "ended" && i !== -1) listeners.splice(i, 1);
+      const idx = listeners.indexOf(fn);
+      if (ev === "ended" && idx !== -1) listeners.splice(idx, 1);
     },
-    stop() { t.stopped = true; t.readyState = "ended"; },
-    end() { t.readyState = "ended"; for (const fn of [...listeners]) fn(); },
+    stop() { trackObj.stopped = true; trackObj.readyState = "ended"; },
+    end() { trackObj.readyState = "ended"; for (const fn of [...listeners]) fn(); },
   };
-  return t as unknown as FakeTrack;
+  return trackObj as unknown as FakeTrack;
 }
 
 function stream(tracks: MediaStreamTrack[]): MediaStream {
@@ -107,17 +108,30 @@ describe("web capture", () => {
     expect(cb.onEnded).toHaveBeenCalledWith("source-closed");
   });
 
-  it("stops every track and stops listening on stop", async () => {
+  it("stops every track and stops listening on stop, and applies constraints on live setPreset", async () => {
     const cb = callbacks();
-    const c = createWebCaptureController(cb);
-    await c.start(preset, "app");
-    c.setPreset(QUALITY_PRESETS["720p30"]);
-    c.stop();
+    const controller = createWebCaptureController(cb);
+    controller.setPreset(QUALITY_PRESETS["720p30"]); // before start is a no-op
+    expect(video.applyConstraints).not.toHaveBeenCalled();
+
+    await controller.start(preset, "app");
+    controller.setPreset(QUALITY_PRESETS["720p30"]);
+    expect(video.applyConstraints).toHaveBeenCalledWith({
+      width: { ideal: 1280 },
+      height: { ideal: 720 },
+      frameRate: { ideal: 30, max: 30 },
+    });
+
+    // Rejecting applyConstraints is caught safely
+    video.applyConstraints.mockRejectedValueOnce(new Error("OverconstrainedError"));
+    expect(() => controller.setPreset(QUALITY_PRESETS["1080p30"])).not.toThrow();
+
+    controller.stop();
     expect(video.stopped).toBe(true);
     expect(audio.stopped).toBe(true);
     video.end();
     expect(cb.onEnded).not.toHaveBeenCalled();
-    c.stop(); // twice is harmless
+    controller.stop(); // twice is harmless
   });
 
   it("passes on a cancelled picker", async () => {

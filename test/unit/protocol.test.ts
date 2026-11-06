@@ -120,12 +120,12 @@ describe("parseClientMessage", () => {
     expect(msg).not.toHaveProperty("isAdmin");
   });
 
-  it("accepts a join message with a password", () => {
+  it("strips unknown fields from a join message", () => {
     expect(
       parseClientMessage(
-        JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: "mik", password: "secret" }),
+        JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: "mik", extra: "ignored" }),
       ),
-    ).toEqual({ t: "join", room: "ABCDEFGH", displayName: "mik", password: "secret" });
+    ).toEqual({ t: "join", room: "ABCDEFGH", displayName: "mik" });
   });
 
   it("handles usernameFragment explicitly set to null", () => {
