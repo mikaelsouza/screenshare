@@ -531,7 +531,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   muteBtn.addEventListener("click", () => {
     const s = listeningFor(peerId);
     s.muted = !s.muted;
-    dismissUnmutePrompt(peerId);
+    dismissUnmutePrompt(peerId, false);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -551,7 +551,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
       s.volume = volState.volume;
       s.muted = false;
     }
-    dismissUnmutePrompt(peerId);
+    dismissUnmutePrompt(peerId, false);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -791,6 +791,7 @@ function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId, playbackBlock
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
+  btn.dataset["blocked"] = String(playbackBlocked);
   const pill = document.createElement("span");
   pill.className = "tile-unmute-pill";
   pill.append(createIcon(playbackBlocked ? "play" : "volumeOff"));
@@ -806,14 +807,17 @@ function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId, playbackBlock
     }
     applyAudio(peerId);
     renderTileControls(peerId);
-    runBackground(video.play());
+    startPlayback(video, peerId);
   });
   wrap.append(btn);
   unmutePrompts.set(peerId, btn);
 }
 
-function dismissUnmutePrompt(peerId: PeerId): void {
-  unmutePrompts.get(peerId)?.remove();
+function dismissUnmutePrompt(peerId: PeerId, includeBlocked = true): void {
+  const btn = unmutePrompts.get(peerId);
+  if (!btn) return;
+  if (!includeBlocked && btn.dataset["blocked"] === "true") return;
+  btn.remove();
   unmutePrompts.delete(peerId);
 }
 
