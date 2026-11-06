@@ -768,38 +768,42 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.pause();
     return;
   }
-  const promptIfCurrent = (): void => {
-    if (tiles.get(peerId) === video) {
-      showUnmutePrompt(video, peerId);
-    }
-  };
   runBackground(
     video.play().catch(() => {
       video.muted = true;
-      return video.play().then(promptIfCurrent, promptIfCurrent);
+      return video.play().then(
+        () => {
+          if (tiles.get(peerId) === video) showUnmutePrompt(video, peerId, false);
+        },
+        () => {
+          if (tiles.get(peerId) === video) showUnmutePrompt(video, peerId, true);
+        },
+      );
     }),
   );
 }
 
-function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
+function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId, playbackBlocked = false): void {
   const wrap = video.closest(".tile");
   if (!wrap || wrap.querySelector(".tile-unmute")) return;
-  if (listeningFor(peerId).muted) return;
+  if (!playbackBlocked && listeningFor(peerId).muted) return;
 
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
   const pill = document.createElement("span");
   pill.className = "tile-unmute-pill";
-  pill.append(createIcon("volumeOff"));
+  pill.append(createIcon(playbackBlocked ? "play" : "volumeOff"));
   const txt = document.createElement("span");
-  txt.textContent = "Click to unmute";
+  txt.textContent = playbackBlocked ? "Click to play" : "Click to unmute";
   pill.append(txt);
   btn.append(pill);
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
-    const audioState = listeningFor(peerId);
-    audioState.muted = false;
+    if (!playbackBlocked) {
+      const audioState = listeningFor(peerId);
+      audioState.muted = false;
+    }
     applyAudio(peerId);
     renderTileControls(peerId);
     runBackground(video.play());
