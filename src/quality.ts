@@ -4,7 +4,7 @@
  * smoothness rather than latency. Everything here overrides that.
  */
 
-import { z } from "zod";
+import { z } from "@shared/protocol";
 import type { QualityPreset } from "./capture";
 
 export type CodecName = "h264" | "vp9" | "av1" | "vp8";

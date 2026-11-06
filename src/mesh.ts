@@ -9,8 +9,7 @@
  * sharer's uplink. See MAX_ROOM_SIZE.
  */
 
-import { z } from "zod";
-import type { IceCandidateInit, PeerId, SignalData } from "@shared/protocol";
+import { z, type IceCandidateInit, type PeerId, type SignalData } from "@shared/protocol";
 import type { CaptureResult, QualityPreset } from "./capture";
 import {
   applyAudioEncoding,

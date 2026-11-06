@@ -137,19 +137,46 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
   });
 
   it("parseServerMessage never crashes on arbitrary strings or JSON payloads", () => {
+    const validTypes = [
+      "welcome",
+      "peer-joined",
+      "peer-left",
+      "signal",
+      "peer-state",
+      "room-state",
+      "error",
+    ];
+
     fc.assert(
       fc.property(fc.string(), (raw) => {
         const res = parseServerMessage(raw);
         if (res !== null) {
-          expect([
-            "welcome",
-            "peer-joined",
-            "peer-left",
-            "signal",
-            "peer-state",
-            "room-state",
-            "error",
-          ]).toContain(res.t);
+          expect(validTypes).toContain(res.t);
+        }
+        return true;
+      }),
+      { numRuns: 300 },
+    );
+
+    const serverMessageArb = fc.oneof(
+      fc.jsonValue(),
+      fc.record({
+        t: fc.constantFrom(...validTypes, "unknown"),
+        selfId: fc.string(),
+        id: fc.string(),
+        from: fc.string(),
+        locked: fc.boolean(),
+        sharing: fc.boolean(),
+        code: fc.constantFrom("room-full", "bad-message", "invalid-code"),
+        message: fc.string(),
+      }),
+    );
+
+    fc.assert(
+      fc.property(serverMessageArb, (payload) => {
+        const res = parseServerMessage(JSON.stringify(payload));
+        if (res !== null) {
+          expect(validTypes).toContain(res.t);
         }
         return true;
       }),

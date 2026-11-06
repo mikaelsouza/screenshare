@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { z } from "zod";
 import {
+  z,
   MAX_ROOM_SIZE,
   PING,
   PONG,

@@ -1,5 +1,11 @@
 import { z } from "zod";
 
+// Disable Zod v4's `new Function` JIT probe once in the shared protocol entry so
+// strict CSP + Trusted Types (`require-trusted-types-for 'script'`) never sees a
+// `securitypolicyviolation`. Other modules import `{ z }` from `@shared/protocol`.
+z.config({ jitless: true });
+export { z };
+
 /**
  * Hard room cap.
  *
@@ -225,8 +231,13 @@ const ErrorCodeSchema: z.ZodType<ErrorCode> = z.enum([
 const WelcomeServerMessageSchema = z
   .object({
     t: z.literal("welcome"),
+    // Server-side peer IDs intentionally accept any non-empty string (`z.string().min(1)`)
+    // rather than strict UUIDs, preserving compatibility with synthetic unit-test IDs on
+    // the trusted-server boundary.
     selfId: z.string().min(1),
     peers: z.array(PeerInfoSchema).max(MAX_ROOM_SIZE),
+    // Omitted `host` and `locked` fields intentionally resolve to `false` for backward
+    // compatibility with older welcome payloads and unit tests; do not make them required.
     host: z.boolean().optional().default(false),
     hostToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
     rejoinToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
@@ -242,6 +253,8 @@ const WelcomeServerMessageSchema = z
     locked,
   }));
 
+// Server-originated peer IDs (`id`, `from`) intentionally accept any non-empty string
+// to preserve backward compatibility with existing signaling tests.
 const ServerMessageSchema: z.ZodType<ServerMessage> = z.discriminatedUnion("t", [
   WelcomeServerMessageSchema,
   z.object({

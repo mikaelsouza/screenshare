@@ -2,7 +2,7 @@
  * getStats() extraction for inbound (viewer tile) and outbound (sharer-to-viewer) links.
  */
 
-import { z } from "zod";
+import { z } from "@shared/protocol";
 import type { LinkHealth } from "./quality";
 
 const NullableFiniteNumber = z.number().nullable().catch(null);

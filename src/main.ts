@@ -42,7 +42,8 @@ import {
 } from "./ui-model";
 
 function el<T extends HTMLElement>(id: string): T {
-  const node = document.querySelector<T>(`#${id}`);
+  const selector = typeof CSS !== "undefined" && typeof CSS.escape === "function" ? `#${CSS.escape(id)}` : `#${id}`;
+  const node = document.querySelector<T>(selector);
   if (!node) throw new Error(`missing element #${id}`);
   return node;
 }
@@ -1083,7 +1084,7 @@ function renderRoster(): void {
 // ---- sharing -------------------------------------------------------------
 
 function isQualityPresetName(val: string | null): val is QualityPresetName {
-  return val !== null && val in QUALITY_PRESETS;
+  return val !== null && Object.hasOwn(QUALITY_PRESETS, val);
 }
 
 function currentPreset(): QualityPresetName {
