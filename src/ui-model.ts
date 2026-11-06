@@ -68,7 +68,7 @@ export interface OutboundAudioState {
   muted: boolean;
   ariaPressed: "true" | "false";
   icon: "volumeOn" | "volumeOff";
-  text: "Mute audio" | "Unmute audio" | "No audio";
+  text: "Mute audio" | "No audio";
   title: string;
 }
 
@@ -106,7 +106,7 @@ export function deriveOutboundAudioState(
     muted,
     ariaPressed: muted ? "true" : "false",
     icon: muted ? "volumeOff" : "volumeOn",
-    text: muted ? "Unmute audio" : "Mute audio",
+    text: "Mute audio",
     title: muted ? "Unmute your shared audio" : "Mute your shared audio",
   };
 }

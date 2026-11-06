@@ -236,6 +236,8 @@ function syncViewState(): ViewState {
   const state = deriveViewState(connected, sharing, selfPreviewHidden, visibleTileCount());
 
   ui.lobby.hidden = state.lobbyHidden;
+  ui.brandHomeBtn.disabled = !state.lobbyHidden;
+  ui.brandHomeBtn.title = state.lobbyHidden ? "Return to lobby" : "";
   ui.stage.hidden = !state.lobbyHidden;
   ui.stageEmpty.hidden = state.stageEmptyHidden;
   ui.stageEmptyTitle.textContent = state.stageEmptyTitle;
@@ -1267,6 +1269,7 @@ function syncNameInputs(value: string): void {
 }
 
 let joinGeneration = 0;
+let reopenRosterOnWelcome = false;
 
 const RECONNECT_GRACE_MS = 8_000;
 const peerLeftTimers = new Map<PeerId, ReturnType<typeof setTimeout>>();
@@ -1295,8 +1298,8 @@ async function joinRoom(code: string): Promise<void> {
 
   const codeToJoin = code;
   if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
-  const generation = ++joinGeneration;
   leaveRoom();
+  const generation = ++joinGeneration;
   if (generation !== joinGeneration) return;
   const displayName = currentName();
   lastJoin = { code };
@@ -1358,6 +1361,10 @@ async function joinRoom(code: string): Promise<void> {
           syncViewState();
           startHealthPolling();
           renderRoster();
+          if (reopenRosterOnWelcome) {
+            reopenRosterOnWelcome = false;
+            applyPopoverState("roster");
+          }
           return;
         }
 
@@ -1427,6 +1434,10 @@ async function joinRoom(code: string): Promise<void> {
         syncViewState();
         startHealthPolling();
         renderRoster();
+        if (reopenRosterOnWelcome) {
+          reopenRosterOnWelcome = false;
+          applyPopoverState("roster");
+        }
       },
 
       onPeerJoined: (peer: PeerInfo) => {
@@ -1503,6 +1514,8 @@ async function joinRoom(code: string): Promise<void> {
 }
 
 function leaveRoom(): void {
+  joinGeneration++;
+  reopenRosterOnWelcome = false;
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   stopHealthPolling();
@@ -1539,6 +1552,7 @@ const CODEC_META: Record<CodecName, { title: string; hint: string }> = {
 };
 
 function applyPopoverState(target: PopoverKind | null): void {
+  const previous = activePopover;
   const state = nextPopoverState(
     activePopover,
     target,
@@ -1552,6 +1566,11 @@ function applyPopoverState(target: PopoverKind | null): void {
   ui.rosterBtn.setAttribute("aria-expanded", String(state.rosterOpen));
   ui.presetBtn.setAttribute("aria-expanded", String(state.presetOpen));
   ui.codecBtn.setAttribute("aria-expanded", String(state.codecOpen));
+  if (previous !== null && previous !== state.active) {
+    const menu = previous === "roster" ? ui.roster : previous === "preset" ? ui.presetMenu : ui.codecMenu;
+    const trigger = previous === "roster" ? ui.rosterBtn : previous === "preset" ? ui.presetBtn : ui.codecBtn;
+    if (menu.contains(document.activeElement)) trigger.focus();
+  }
 }
 
 function closeAllPopovers(): void {
@@ -1566,7 +1585,7 @@ function syncPresetMenuSelection(selected: QualityPresetName): void {
   ui.presetBtnLabel.textContent = QUALITY_PRESETS[selected].label;
   for (const btn of ui.presetList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
     const active = btn.dataset["preset"] === selected;
-    btn.setAttribute("aria-selected", String(active));
+    btn.setAttribute("aria-pressed", String(active));
     const dot = btn.querySelector<HTMLElement>(".ui-dot");
     if (dot) {
       if (active) dot.dataset["state"] = "active";
@@ -1579,7 +1598,7 @@ function syncCodecMenuSelection(selected: CodecName): void {
   ui.codecBtnLabel.textContent = CODEC_META[selected].title;
   for (const btn of ui.codecList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
     const active = btn.dataset["codec"] === selected;
-    btn.setAttribute("aria-selected", String(active));
+    btn.setAttribute("aria-pressed", String(active));
     const dot = btn.querySelector<HTMLElement>(".ui-dot");
     if (dot) {
       if (active) dot.dataset["state"] = "active";
@@ -1589,11 +1608,11 @@ function syncCodecMenuSelection(selected: CodecName): void {
 }
 
 function initQualityControls(): void {
+  localStorage.removeItem("audio_mode");
   for (const [name, preset] of Object.entries(QUALITY_PRESETS)) {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "popover-item";
-    btn.setAttribute("role", "option");
     btn.dataset["preset"] = name;
 
     const left = document.createElement("span");
@@ -1623,7 +1642,6 @@ function initQualityControls(): void {
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "popover-item";
-    btn.setAttribute("role", "option");
     btn.dataset["codec"] = name;
 
     const left = document.createElement("span");
@@ -1727,10 +1745,7 @@ ui.roomNameInput.addEventListener("change", () => {
   if (client && lastJoin && !capture) {
     const wasOpen = activePopover === "roster";
     runBackground(joinRoom(lastJoin.code));
-    if (wasOpen) {
-      activePopover = "roster";
-      ui.rosterBtn.setAttribute("aria-expanded", "true");
-    }
+    reopenRosterOnWelcome = wasOpen;
   }
 });
 

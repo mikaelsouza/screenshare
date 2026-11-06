@@ -60,7 +60,9 @@ export function systemAudioSupport(): { supported: boolean; reason?: string } {
   const ua = navigator.userAgent;
   const platform =
     (navigator as Navigator & { userAgentData?: { platform?: string } }).userAgentData?.platform ??
-    navigator.platform;
+    navigator.platform ??
+    // Stryker disable next-line StringLiteral: defensive fallback when navigator.platform is absent
+    "";
 
   if (/Mac/i.test(platform) || /Macintosh/i.test(ua)) {
     return {
@@ -110,22 +112,30 @@ export function windowAudioSupport(): { supported: boolean; reason?: string } {
   return { supported: true };
 }
 
+interface ChromeAudioTrackConstraints extends MediaTrackConstraints {
+  /** Chromium screen-capture constraint excluding this browser's own audio playback. */
+  restrictOwnAudio?: boolean;
+}
+
 /**
- * All three OFF. These are voice-call DSP: echo cancellation eats game audio as
+ * All three voice-call DSP flags OFF: echo cancellation eats game audio as
  * "echo", noise suppression strips ambience, and AGC pumps the volume on every
- * explosion. They are the usual cause of "the audio sounds underwater".
+ * explosion. `restrictOwnAudio: true` excludes this browser's own playback so
+ * whole-screen shares never loop remote peers' audio back to them.
  */
-const GAME_AUDIO: MediaTrackConstraints = {
+const GAME_AUDIO: ChromeAudioTrackConstraints = {
   channelCount: 2,
   sampleRate: 48000,
   echoCancellation: false,
   noiseSuppression: false,
   autoGainControl: false,
+  restrictOwnAudio: true,
 };
 
 function surfaceOf(track: MediaStreamTrack): Surface {
-  const s = (track.getSettings() as MediaTrackSettings & { displaySurface?: string })
-    .displaySurface;
+  // Stryker disable next-line OptionalChaining: defensive guard for partial/fake MediaStreamTrack objects
+  const s = (track.getSettings?.() as MediaTrackSettings & { displaySurface?: string } | undefined)
+    ?.displaySurface;
   return s === "monitor" || s === "window" || s === "browser" ? s : "unknown";
 }
 

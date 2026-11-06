@@ -342,12 +342,18 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   });
 
   await it("returns to the lobby when clicking the top-left Screenshare brand title", async () => {
+    assert.equal(
+      await host.evaluate(() => (document.getElementById("brand-home") as HTMLButtonElement | null)?.disabled),
+      false,
+      "#brand-home must be enabled while in a room",
+    );
     await host.click("#brand-home");
     await waitFor(
       host,
       () =>
         document.getElementById("lobby")?.hidden === false &&
         document.getElementById("room-bar")?.hidden === true &&
+        (document.getElementById("brand-home") as HTMLButtonElement | null)?.disabled === true &&
         window.location.hash === "",
       { label: "host to return to the lobby when clicking #brand-home" },
     );

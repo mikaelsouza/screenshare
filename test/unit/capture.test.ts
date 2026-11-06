@@ -266,6 +266,7 @@ describe("captureScreen and track helpers", () => {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
+      restrictOwnAudio: true,
     });
     expect(callArgs.video).toMatchObject({ displaySurface: "window" });
     expect(callArgs).toMatchObject({

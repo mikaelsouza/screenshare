@@ -407,8 +407,14 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
 
     // Verify outbound audio mute toggle (#mute-audio):
     assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "false");
+    assert.equal(await sharer.textContent("#mute-audio"), "Mute audio");
     await sharer.click("#mute-audio");
     assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "true");
+    assert.equal(await sharer.textContent("#mute-audio"), "Mute audio");
+    assert.equal(
+      await sharer.evaluate(() => document.getElementById("mute-audio")?.classList.contains("muted-active")),
+      true,
+    );
     assert.equal(
       await sharer.evaluate(() => window.__gdmStreams?.[0]?.getAudioTracks()[0]?.enabled),
       false,
@@ -417,16 +423,33 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     await sharer.click("#mute-audio");
     assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "false");
     assert.equal(
+      await sharer.evaluate(() => document.getElementById("mute-audio")?.classList.contains("muted-active")),
+      false,
+    );
+    assert.equal(
       await sharer.evaluate(() => window.__gdmStreams?.[0]?.getAudioTracks()[0]?.enabled),
       true,
       "clicking #mute-audio again must re-enable the outbound audio track",
     );
 
-    // Verify live Quality (#preset-btn) and Codec (#codec-btn) popover changes while streaming keep the stream alive:
+    // Verify live Quality (#preset-btn) and Codec (#codec-btn) popover changes while streaming keep the stream alive
+    // and restore keyboard focus to the trigger button when closed:
     await sharer.click("#preset-btn");
+    await sharer.focus('#preset-list button[data-preset="720p30"]');
     await sharer.click('#preset-list button[data-preset="720p30"]');
+    assert.equal(
+      await sharer.evaluate(() => document.activeElement?.id),
+      "preset-btn",
+      "selecting a preset option must restore focus to #preset-btn",
+    );
     await sharer.click("#codec-btn");
+    await sharer.focus('#codec-list button[data-codec="vp8"]');
     await sharer.click('#codec-list button[data-codec="vp8"]');
+    assert.equal(
+      await sharer.evaluate(() => document.activeElement?.id),
+      "codec-btn",
+      "selecting a codec option must restore focus to #codec-btn",
+    );
     const beforeSwitch = await viewer.evaluate(decodedFrames);
     const switchDeadline = Date.now() + 30_000;
     let afterSwitch = beforeSwitch;

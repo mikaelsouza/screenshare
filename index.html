@@ -186,8 +186,12 @@
         border-radius: 4px;
         transition: opacity 0.12s;
       }
-      #brand-home:hover {
+      #brand-home:hover:not(:disabled) {
         opacity: 0.82;
+      }
+      #brand-home:disabled {
+        cursor: default;
+        opacity: 1;
       }
       #copy-link {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -319,7 +323,7 @@
       .popover-item:hover {
         background-color: var(--surface-hover);
       }
-      .popover-item[aria-selected="true"] {
+      .popover-item[aria-pressed="true"] {
         border-color: var(--accent-color);
         background-color: rgba(59, 130, 246, 0.08);
       }
@@ -838,7 +842,7 @@
           </button>
           <section id="preset-menu" class="app-card popover-up" hidden aria-labelledby="preset-menu-title">
             <div class="popover-head" id="preset-menu-title">Stream quality</div>
-            <div id="preset-list" class="popover-list" role="listbox"></div>
+            <div id="preset-list" class="popover-list" role="group" aria-labelledby="preset-menu-title"></div>
           </section>
         </div>
         <div class="popover-anchor">
@@ -847,7 +851,7 @@
           </button>
           <section id="codec-menu" class="app-card popover-up" hidden aria-labelledby="codec-menu-title">
             <div class="popover-head" id="codec-menu-title">Video codec</div>
-            <div id="codec-list" class="popover-list" role="listbox"></div>
+            <div id="codec-list" class="popover-list" role="group" aria-labelledby="codec-menu-title"></div>
           </section>
         </div>
         <button type="button" id="toggle-preview" class="ui-btn" hidden>Show preview</button>

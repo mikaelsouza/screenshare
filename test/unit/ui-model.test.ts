@@ -133,13 +133,13 @@ describe("deriveOutboundAudioState", () => {
     });
   });
 
-  it("returns active Unmute audio state when sharing with a disabled (muted) audio track", () => {
+  it("returns active muted state with constant Mute audio label when sharing with a disabled (muted) audio track", () => {
     expect(deriveOutboundAudioState(true, true, false)).toEqual({
       disabled: false,
       muted: true,
       ariaPressed: "true",
       icon: "volumeOff",
-      text: "Unmute audio",
+      text: "Mute audio",
       title: "Unmute your shared audio",
     });
   });

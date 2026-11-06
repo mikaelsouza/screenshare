@@ -327,11 +327,10 @@ class PeerLink {
     // which stopped the whole share. So a viewer could not share back to a sharer.
     const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
     this.videoSender = this.pc.addTransceiver(capture.video, send).sender;
-    // Always open an audio sender, even while silent. A whole-screen share starts
-    // with no audio and gets the game's audio from a second pick moments later, and
-    // the user can swap sources mid-share. With the sender already negotiated, each
-    // of those is a replaceTrack with no renegotiation. Tagging it with the video's
-    // stream keeps the two in one MediaStream on the far end, so they play in sync.
+    // Always open an audio sender, even when capture.audio is null, so attaching or
+    // replacing an audio track later never requires SDP renegotiation. Tagging it
+    // with the video's stream keeps the two in one MediaStream on the far end, so
+    // they play in sync.
     this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
     await applyAudioEncoding(this.audioSender);
 

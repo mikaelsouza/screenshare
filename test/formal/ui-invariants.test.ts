@@ -71,7 +71,7 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
             expect(st.text).toBe("No audio");
           } else if (st.muted) {
             expect(st.icon).toBe("volumeOff");
-            expect(st.text).toBe("Unmute audio");
+            expect(st.text).toBe("Mute audio");
           } else {
             expect(st.icon).toBe("volumeOn");
             expect(st.text).toBe("Mute audio");

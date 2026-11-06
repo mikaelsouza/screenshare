@@ -5,8 +5,8 @@
  *  1. Sharing a window captures only that window's process tree.
  *  2. Sharing a followed game switches the captured process automatically whenever
  *     the followed window switches between lobby and match.
- *  3. Sharing a whole screen (or choosing "All system audio") captures system audio
- *     excluding this app's own process tree, so viewers never hear themselves echo.
+ *  3. Sharing a whole screen captures system audio excluding this app's own
+ *     process tree, so viewers never hear themselves echo.
  */
 
 interface LoopbackDevice {
