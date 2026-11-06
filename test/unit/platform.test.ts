@@ -73,7 +73,7 @@ describe("createCaptureController", () => {
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: vi.fn().mockResolvedValue(stream([video])) } });
     const api = { isElectron: true, platform: "win32", version: "35", onFollowUpdate: vi.fn(() => () => {}), stopFollow: vi.fn() };
     const c = createCaptureController(callbacks(), api);
-    await c.start(preset, "none");
+    await c.start(preset);
     c.stop();
     expect(api.onFollowUpdate).toHaveBeenCalledTimes(1);
     expect(api.stopFollow).toHaveBeenCalledTimes(1);
@@ -101,7 +101,7 @@ describe("web capture", () => {
   it("captures with the browser picker and ends with the source", async () => {
     const cb = callbacks();
     const c = createWebCaptureController(cb);
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     expect(result.video).toBe(video);
     expect(result.audio).toBe(audio);
     video.end();
@@ -114,7 +114,7 @@ describe("web capture", () => {
     controller.setPreset(QUALITY_PRESETS["720p30"]); // before start is a no-op
     expect(video.applyConstraints).not.toHaveBeenCalled();
 
-    await controller.start(preset, "app");
+    await controller.start(preset);
     controller.setPreset(QUALITY_PRESETS["720p30"]);
     expect(video.applyConstraints).toHaveBeenCalledWith({
       width: { ideal: 1280 },
@@ -123,8 +123,13 @@ describe("web capture", () => {
     });
 
     // Rejecting applyConstraints is caught safely
-    video.applyConstraints.mockRejectedValueOnce(new Error("OverconstrainedError"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const err = new Error("OverconstrainedError");
+    video.applyConstraints.mockRejectedValueOnce(err);
     expect(() => controller.setPreset(QUALITY_PRESETS["1080p30"])).not.toThrow();
+    await flush();
+    expect(warn).toHaveBeenCalledWith("[web] applyConstraints failed", err);
+    warn.mockRestore();
 
     controller.stop();
     expect(video.stopped).toBe(true);
@@ -136,16 +141,12 @@ describe("web capture", () => {
 
   it("passes on a cancelled picker", async () => {
     (navigator.mediaDevices.getDisplayMedia as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("NotAllowedError"));
-    await expect(createWebCaptureController(callbacks()).start(preset, "app")).rejects.toThrow("NotAllowedError");
+    await expect(createWebCaptureController(callbacks()).start(preset)).rejects.toThrow("NotAllowedError");
   });
 
-  it("reports per-app audio support and delegates captureAudioOnly to the browser", async () => {
+  it("reports kind as web", () => {
     const c = createWebCaptureController(callbacks());
-    expect(c.hasPerAppAudio).toBe(true);
-    const picked = await c.captureAudioOnly("window");
-    expect(picked?.track).toBe(audio);
-    expect(picked?.kind).toBe("window");
-    expect(video.enabled).toBe(false);
+    expect(c.kind).toBe("web");
   });
 });
 
@@ -182,7 +183,6 @@ describe("desktop capture", () => {
       captureSource: vi.fn(async () => track("video", "swapped")),
       makeStream: (tracks) => stream(tracks),
       createPcmTrack: vi.fn(() => track("audio", "pcm")),
-      webCaptureAudioOnly: vi.fn(async () => null),
       audioSource: async (capture) => capture.audio,
     };
   });
@@ -193,9 +193,9 @@ describe("desktop capture", () => {
 
   it("works like the web when the picked window is not a game", async () => {
     const { cb, c } = make();
-    const result = await c.start(preset, "system");
+    const result = await c.start(preset);
     expect(c.kind).toBe("electron");
-    expect(deps.captureScreen).toHaveBeenCalledWith(preset, "system");
+    expect(deps.captureScreen).toHaveBeenCalledWith(preset);
     expect(result.audio).toBe(audio);
     video.end();
     expect(cb.onEnded).toHaveBeenCalledWith("source-closed");
@@ -204,7 +204,7 @@ describe("desktop capture", () => {
 
   it("adopts the picked window on the first update without re-capturing it", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     expect(cb.onFollowState).toHaveBeenCalledWith({ role: "lobby", profile: "League of Legends", title: "League of Legends" });
     expect(deps.captureSource).not.toHaveBeenCalled();
@@ -216,7 +216,7 @@ describe("desktop capture", () => {
     let resolve!: (r: CaptureResult) => void;
     deps.captureScreen.mockImplementation(() => new Promise<CaptureResult>((r) => { resolve = r; }));
     const { cb, c } = make();
-    const started = c.start(preset, "app");
+    const started = c.start(preset);
     listener!(update({}));
     expect(cb.onFollowState).not.toHaveBeenCalled();
     resolve({ stream: stream([video, audio]), video, audio });
@@ -226,7 +226,7 @@ describe("desktop capture", () => {
 
   it("swaps to the game window, keeping the audio and the share", async () => {
     const { cb, c } = make();
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0", title: "League of Legends (TM) Client" }));
     await flush();
@@ -245,7 +245,7 @@ describe("desktop capture", () => {
 
   it("does not end the share when the followed window closes", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     video.end();
     listener!(update({ role: "waiting", sourceId: null, title: null }));
@@ -257,7 +257,7 @@ describe("desktop capture", () => {
 
   it("re-captures a window whose track ended, even with the same id", async () => {
     const { c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     video.end();
     listener!(update({}));
@@ -267,7 +267,7 @@ describe("desktop capture", () => {
 
   it("re-captures when the very first update finds the picked window already gone", async () => {
     const { c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     (video as { readyState: MediaStreamTrackState }).readyState = "ended";
     listener!(update({}));
     await flush();
@@ -276,7 +276,7 @@ describe("desktop capture", () => {
 
   it("uses the latest preset for windows captured later", async () => {
     const { c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     c.setPreset(QUALITY_PRESETS["720p30"]);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
@@ -286,7 +286,7 @@ describe("desktop capture", () => {
 
   it("ends the share when the follow ends", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "ended", sourceId: null, title: null }));
     expect(cb.onFollowState).toHaveBeenLastCalledWith(null);
@@ -298,7 +298,7 @@ describe("desktop capture", () => {
 
   it("ignores the source ending once the share has stopped", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     c.stop();
     video.end();
     expect(cb.onEnded).not.toHaveBeenCalled();
@@ -307,20 +307,20 @@ describe("desktop capture", () => {
   it("tolerates stop before start and stop twice", async () => {
     const { c } = make();
     expect(() => c.stop()).not.toThrow();
-    await c.start(preset, "app");
+    await c.start(preset);
     c.stop();
     expect(() => c.stop()).not.toThrow();
   });
 
   it("starts a second share fresh after a followed one", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     c.stop();
 
     const video2 = track("video");
     deps.captureScreen.mockResolvedValue({ stream: stream([video2]), video: video2, audio: null });
-    await c.start(preset, "app");
+    await c.start(preset);
     // Not following any more: the window closing ends this share as on the web.
     video2.end();
     expect(cb.onEnded).toHaveBeenCalledWith("source-closed");
@@ -330,14 +330,14 @@ describe("desktop capture", () => {
     const resolvers: Array<(t: MediaStreamTrack) => void> = [];
     deps.captureSource.mockImplementation(() => new Promise<MediaStreamTrack>((r) => resolvers.push(r)));
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     c.stop();
 
     const video2 = track("video");
     deps.captureScreen.mockResolvedValue({ stream: stream([video2]), video: video2, audio: null });
-    const second = await c.start(preset, "app");
+    const second = await c.start(preset);
     listener!(update({ sourceId: "window:5:0" }));
     listener!(update({ role: "game", sourceId: "window:6:0" }));
 
@@ -358,7 +358,7 @@ describe("desktop capture", () => {
     deps.captureSource.mockRejectedValue(new Error("gone"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const { cb, c } = make();
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     await flush();
@@ -372,7 +372,7 @@ describe("desktop capture", () => {
     let resolve!: (t: MediaStreamTrack) => void;
     deps.captureSource.mockImplementation(() => new Promise<MediaStreamTrack>((r) => { resolve = r; }));
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     c.stop();
@@ -387,7 +387,7 @@ describe("desktop capture", () => {
     const resolvers: Array<(t: MediaStreamTrack) => void> = [];
     deps.captureSource.mockImplementation(() => new Promise<MediaStreamTrack>((r) => resolvers.push(r)));
     const { cb, c } = make();
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     listener!(update({ role: "lobby", sourceId: "window:3:0" }));
@@ -403,7 +403,7 @@ describe("desktop capture", () => {
 
   it("ignores the old track ending after a swap", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     await flush();
@@ -413,7 +413,7 @@ describe("desktop capture", () => {
 
   it("stops the follow, the tracks and the subscription on stop", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     listener!(update({}));
     c.stop();
     expect(api.stopFollow).toHaveBeenCalledTimes(1);
@@ -425,14 +425,14 @@ describe("desktop capture", () => {
 
   it("does not report a follow state on stop when none was active", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     c.stop();
     expect(cb.onFollowState).not.toHaveBeenCalled();
   });
 
   it("ignores updates after stop", async () => {
     const { cb, c } = make();
-    await c.start(preset, "app");
+    await c.start(preset);
     c.stop();
     listener!(update({}));
     expect(cb.onFollowState).not.toHaveBeenCalled();
@@ -441,7 +441,7 @@ describe("desktop capture", () => {
   it("unsubscribes and rethrows when the picker is cancelled", async () => {
     deps.captureScreen.mockRejectedValue(new Error("cancelled"));
     const { cb, c } = make();
-    await expect(c.start(preset, "app")).rejects.toThrow("cancelled");
+    await expect(c.start(preset)).rejects.toThrow("cancelled");
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     listener!(update({}));
     expect(cb.onFollowState).not.toHaveBeenCalled();
@@ -451,15 +451,15 @@ describe("desktop capture", () => {
     const other = track("audio", "per-app");
     deps.audioSource = vi.fn(async () => other);
     const { c } = make();
-    const result = await c.start(preset, "app");
-    expect(deps.audioSource).toHaveBeenCalledWith(expect.objectContaining({ video }), "app");
+    const result = await c.start(preset);
+    expect(deps.audioSource).toHaveBeenCalledWith(expect.objectContaining({ video }));
     expect(result.audio).toBe(other);
   });
 
   it("keeps a share with no audio silent across a swap", async () => {
     deps.captureScreen.mockResolvedValue({ stream: stream([video]), video, audio: null });
     const { c } = make();
-    const result = await c.start(preset, "none");
+    const result = await c.start(preset);
     listener!(update({}));
     listener!(update({ role: "game", sourceId: "window:2:0" }));
     await flush();
@@ -487,7 +487,7 @@ describe("desktop capture defaults", () => {
       { onFollowUpdate: (fn) => { listener = fn; return () => {}; }, stopFollow: () => {} },
       cb,
     );
-    const result = await c.start(preset, "system");
+    const result = await c.start(preset);
     // By default the audio is whatever came with the capture.
     expect(result.audio).toBe(audio);
     const send = listener as unknown as (u: FollowUpdate) => void;
@@ -525,7 +525,7 @@ describe("desktop capture defaults", () => {
       { onFollowUpdate: (fn) => { listener = fn; return () => {}; }, stopFollow: () => {} },
       callbacks(),
     );
-    await c.start(preset, "none");
+    await c.start(preset);
     const send = listener as unknown as (u: FollowUpdate) => void;
     send({ role: "lobby", sourceId: "window:1:0", title: "a", profile: "P" });
     send({ role: "game", sourceId: "window:2:0", title: "b", profile: "P" });
@@ -543,7 +543,6 @@ describe("desktop WASAPI audio integration", () => {
       onFollowUpdate: vi.fn(() => () => {}),
       stopFollow: vi.fn(),
       startWindowAudio: vi.fn(async () => true),
-      pickWindowAudio: vi.fn<() => Promise<{ ok: boolean; label: string | null }>>(async () => ({ ok: true, label: "Discord" })),
       startSystemAudio: vi.fn(async () => true),
       stopAudio: vi.fn(),
       onAudioPcm: vi.fn(() => () => {}),
@@ -564,34 +563,27 @@ describe("desktop WASAPI audio integration", () => {
       captureSource: vi.fn(async () => track("video", "swapped")),
       makeStream: (tracks) => stream(tracks),
       createPcmTrack: vi.fn(() => pcmTrack),
-      webCaptureAudioOnly: vi.fn(async () => null),
     };
     return { deps, video, displayAudio, pcmTrack };
   }
 
-  it("reports hasPerAppAudio only when all four audio bridge methods are present", () => {
+  it("falls back to capture.audio when any of the four audio bridge methods is missing", async () => {
     const full = makeAudioBridge();
-    const { deps } = makeDeps();
-    expect(createElectronCaptureController(full, callbacks(), deps).hasPerAppAudio).toBe(true);
-    expect(
-      createElectronCaptureController((({ startWindowAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
-    ).toBe(false);
-    expect(
-      createElectronCaptureController((({ startSystemAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
-    ).toBe(false);
-    expect(
-      createElectronCaptureController((({ stopAudio: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
-    ).toBe(false);
-    expect(
-      createElectronCaptureController((({ onAudioPcm: _u, ...rest }) => rest)(full), callbacks(), deps).hasPerAppAudio,
-    ).toBe(false);
+    for (const key of ["startWindowAudio", "startSystemAudio", "stopAudio", "onAudioPcm"] as const) {
+      const { [key]: _omitted, ...partial } = full;
+      const { deps, displayAudio } = makeDeps("window", true);
+      const c = createElectronCaptureController(partial, callbacks(), deps);
+      const res = await c.start(preset);
+      expect(res.audio).toBe(displayAudio);
+      expect(displayAudio!.stopped).toBe(false);
+    }
   });
 
-  it("uses per-window WASAPI audio when sharing a window in 'app' mode", async () => {
+  it("uses per-window WASAPI audio when sharing a window", async () => {
     const bridge = makeAudioBridge();
     const { deps, video, displayAudio, pcmTrack } = makeDeps("window");
     const c = createElectronCaptureController(bridge, callbacks(), deps);
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     expect(bridge.startWindowAudio).toHaveBeenCalledTimes(1);
     expect(bridge.startSystemAudio).not.toHaveBeenCalled();
     expect(displayAudio!.stopped).toBe(true);
@@ -603,38 +595,22 @@ describe("desktop WASAPI audio integration", () => {
     expect(result.stream.getTracks()).toEqual([video, pcmTrack]);
   });
 
-  it("uses system WASAPI audio when sharing an entire monitor in 'app' mode or any surface in 'system' mode", async () => {
+  it("uses system WASAPI audio when sharing an entire monitor", async () => {
     const bridge = makeAudioBridge();
     const { deps: monitorDeps, pcmTrack: monitorPcm } = makeDeps("monitor", false);
     const cMonitor = createElectronCaptureController(bridge, callbacks(), monitorDeps);
-    const res1 = await cMonitor.start(preset, "app");
+    const res1 = await cMonitor.start(preset);
     expect(bridge.startSystemAudio).toHaveBeenCalledTimes(1);
     expect(bridge.startWindowAudio).not.toHaveBeenCalled();
     expect(res1.audio).toBe(monitorPcm);
-
-    const { deps: winDeps, pcmTrack: winPcm } = makeDeps("window");
-    const cWinSystem = createElectronCaptureController(bridge, callbacks(), winDeps);
-    const res2 = await cWinSystem.start(preset, "system");
-    expect(bridge.startSystemAudio).toHaveBeenCalledTimes(2);
-    expect(bridge.startWindowAudio).not.toHaveBeenCalled();
-    expect(res2.audio).toBe(winPcm);
   });
 
-  it("does not start WASAPI audio in 'none' mode or when the bridge is missing or fails", async () => {
+  it("falls back to capture.audio when WASAPI audio returns false", async () => {
     const bridge = makeAudioBridge();
-    const { deps, displayAudio } = makeDeps("window", false);
-    const c = createElectronCaptureController(bridge, callbacks(), deps);
-    const resNone = await c.start(preset, "none");
-    expect(bridge.startWindowAudio).not.toHaveBeenCalled();
-    expect(bridge.startSystemAudio).not.toHaveBeenCalled();
-    expect(resNone.audio).toBeNull();
-    expect(displayAudio).toBeNull();
-
-    // When startWindowAudio returns false, keep the original capture.audio without stopping it.
     bridge.startWindowAudio.mockResolvedValueOnce(false);
     const { deps: failDeps, displayAudio: fallbackAudio } = makeDeps("window", true);
     const cFail = createElectronCaptureController(bridge, callbacks(), failDeps);
-    const resFail = await cFail.start(preset, "app");
+    const resFail = await cFail.start(preset);
     expect(resFail.audio).toBe(fallbackAudio);
     expect(fallbackAudio!.stopped).toBe(false);
   });
@@ -644,7 +620,7 @@ describe("desktop WASAPI audio integration", () => {
     const { deps, video } = makeDeps("window", true);
     deps.audioSource = async () => null;
     const c = createElectronCaptureController(bridge, callbacks(), deps);
-    const result = await c.start(preset, "app");
+    const result = await c.start(preset);
     expect(result.audio).toBeNull();
     expect(result.stream.getTracks()).toEqual([video]);
   });
@@ -656,62 +632,9 @@ describe("desktop WASAPI audio integration", () => {
       throw new Error("AudioContext failed");
     });
     const c = createElectronCaptureController(bridge, callbacks(), deps);
-    await expect(c.start(preset, "app")).rejects.toThrow("AudioContext failed");
+    await expect(c.start(preset)).rejects.toThrow("AudioContext failed");
     expect(video.stopped).toBe(true);
     expect(displayAudio!.stopped).toBe(true);
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
-  });
-
-  it("supports captureAudioOnly for window and system via the WASAPI bridge, and falls back when absent", async () => {
-    const bridge = makeAudioBridge();
-    const { deps, pcmTrack } = makeDeps();
-    const c = createElectronCaptureController(bridge, callbacks(), deps);
-
-    const winAudio = await c.captureAudioOnly("window");
-    expect(bridge.pickWindowAudio).toHaveBeenCalledTimes(1);
-    expect(deps.createPcmTrack).toHaveBeenLastCalledWith({
-      onAudioPcm: bridge.onAudioPcm,
-      stopAudio: bridge.stopAudio,
-    });
-    expect(winAudio?.stream.getTracks()).toEqual([pcmTrack]);
-    expect(winAudio).toEqual({
-      stream: expect.any(Object) as unknown as MediaStream,
-      track: pcmTrack,
-      kind: "window",
-      label: "Discord",
-    });
-
-    bridge.pickWindowAudio.mockResolvedValueOnce({ ok: false, label: null });
-    expect(await c.captureAudioOnly("window")).toBeNull();
-
-    const { pickWindowAudio: _unusedPickWindowAudio, ...noPickBridge } = bridge;
-    expect(await createElectronCaptureController(noPickBridge, callbacks(), deps).captureAudioOnly("window")).toBeNull();
-
-    (deps.createPcmTrack as ReturnType<typeof vi.fn>).mockClear();
-    const sysAudio = await c.captureAudioOnly("system");
-    expect(bridge.startSystemAudio).toHaveBeenCalledTimes(1);
-    expect(deps.createPcmTrack).toHaveBeenLastCalledWith({
-      onAudioPcm: bridge.onAudioPcm,
-      stopAudio: bridge.stopAudio,
-    });
-    expect(sysAudio?.stream.getTracks()).toEqual([pcmTrack]);
-    expect(sysAudio).toEqual({
-      stream: expect.any(Object) as unknown as MediaStream,
-      track: pcmTrack,
-      kind: "system",
-      label: null,
-    });
-
-    bridge.startSystemAudio.mockResolvedValueOnce(false);
-    expect(await c.captureAudioOnly("system")).toBeNull();
-
-    // Without the WASAPI bridge, falls back to webCaptureAudioOnly.
-    const legacyController = createElectronCaptureController(
-      { onFollowUpdate: () => () => {}, stopFollow: () => {} },
-      callbacks(),
-      deps,
-    );
-    await legacyController.captureAudioOnly("window");
-    expect(deps.webCaptureAudioOnly).toHaveBeenCalledWith("window");
   });
 });

@@ -2,11 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_PRESET,
   QUALITY_PRESETS,
-  captureAudioOnly,
   captureScreen,
-  isAudioMode,
   onCaptureEnded,
-  stopAudioSource,
   stopCapture,
   systemAudioSupport,
   windowAudioSupport,
@@ -15,9 +12,6 @@ import {
 describe("QUALITY_PRESETS", () => {
   it("defines standard resolution and framerate presets", () => {
     expect(DEFAULT_PRESET).toBe("1080p60");
-    expect(isAudioMode("app")).toBe(true);
-    expect(isAudioMode("invalid")).toBe(false);
-    expect(isAudioMode(null)).toBe(false);
     expect(QUALITY_PRESETS["1080p60"]).toEqual({
       label: "1080p 60fps",
       width: 1920,
@@ -25,12 +19,26 @@ describe("QUALITY_PRESETS", () => {
       frameRate: 60,
       maxBitrate: 8_000_000,
     });
+    expect(QUALITY_PRESETS["1080p30"]).toEqual({
+      label: "1080p 30fps",
+      width: 1920,
+      height: 1080,
+      frameRate: 30,
+      maxBitrate: 6_000_000,
+    });
     expect(QUALITY_PRESETS["720p60"]).toEqual({
       label: "720p 60fps",
       width: 1280,
       height: 720,
       frameRate: 60,
       maxBitrate: 6_000_000,
+    });
+    expect(QUALITY_PRESETS["720p30"]).toEqual({
+      label: "720p 30fps",
+      width: 1280,
+      height: 720,
+      frameRate: 30,
+      maxBitrate: 4_000_000,
     });
   });
 });
@@ -46,12 +54,12 @@ describe("systemAudioSupport", () => {
     });
   });
 
-  it("detects macOS platform via userAgentData", () => {
+  it("detects macOS platform via userAgentData even without Macintosh in userAgent", () => {
     Object.defineProperty(globalThis, "navigator", {
       value: {
-        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0",
+        userAgent: "Mozilla/5.0 Chrome/150.0.0.0",
         userAgentData: { platform: "macOS" },
-        platform: "MacIntel",
+        platform: "Win32",
       },
       configurable: true,
       writable: true,
@@ -59,13 +67,31 @@ describe("systemAudioSupport", () => {
 
     const res = systemAudioSupport();
     expect(res.supported).toBe(false);
-    expect(res.reason).toContain("macOS");
+    expect(res.reason).toBe(
+      "On macOS, Chrome can only capture audio from a browser tab, not from a game or the system. " +
+        "Your screen will share fine, but without game audio.",
+    );
   });
 
-  it("detects macOS platform via navigator.platform fallback", () => {
+  it("detects macOS platform via userAgent even when platform is not Mac", () => {
     Object.defineProperty(globalThis, "navigator", {
       value: {
         userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    const res = systemAudioSupport();
+    expect(res.supported).toBe(false);
+    expect(res.reason).toContain("without game audio.");
+  });
+
+  it("detects macOS platform via navigator.platform fallback when userAgentData.platform is undefined", () => {
+    Object.defineProperty(globalThis, "navigator", {
+      value: {
+        userAgent: "Mozilla/5.0 Chrome/150.0.0.0",
+        userAgentData: {},
         platform: "MacIntel",
       },
       configurable: true,
@@ -90,7 +116,10 @@ describe("systemAudioSupport", () => {
 
     const res = systemAudioSupport();
     expect(res.supported).toBe(false);
-    expect(res.reason).toContain("Linux");
+    expect(res.reason).toBe(
+      "On Linux, screen capture goes through PipeWire and system audio is usually unavailable. " +
+        "Video will work; audio probably won't.",
+    );
   });
 
   it("detects non-Chromium browsers", () => {
@@ -106,7 +135,7 @@ describe("systemAudioSupport", () => {
 
     const res = systemAudioSupport();
     expect(res.supported).toBe(false);
-    expect(res.reason).toContain("requires Chrome or Edge");
+    expect(res.reason).toBe("System audio capture requires Chrome or Edge on Windows.");
   });
 
   it("reports supported for Windows Chrome", () => {
@@ -140,16 +169,22 @@ describe("windowAudioSupport", () => {
     expect(windowAudioSupport()).toEqual({ supported: true });
   });
 
-  it("supports Edge, which carries Chromium's version", () => {
+  it("supports Edge, which carries Chromium's version, and rejects Edg without Chrome token", () => {
     stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0");
     expect(windowAudioSupport().supported).toBe(true);
+
+    stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Edg/150.0.0.0");
+    expect(windowAudioSupport().supported).toBe(false);
   });
 
   it("asks older Chrome to update", () => {
     stubUa("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0.0.0 Safari/537.36");
     const res = windowAudioSupport();
     expect(res.supported).toBe(false);
-    expect(res.reason).toContain("141");
+    expect(res.reason).toBe(
+      "Sharing only a game's audio needs Chrome or Edge 141 or newer. " +
+        "Update your browser, or share your screen with system audio.",
+    );
   });
 
   it("passes on the system-audio reason where there is no audio at all", () => {
@@ -165,7 +200,7 @@ describe("windowAudioSupport", () => {
 });
 
 describe("captureScreen and track helpers", () => {
-  function makeTrack(kind: "video" | "audio", settings: Record<string, unknown> = {}, label = "") {
+  function makeTrack(kind: "video" | "audio", settings: Record<string, unknown> | undefined = {}, label = "") {
     let endedHandler: (() => void) | null = null;
     let stopped = false;
     return {
@@ -219,7 +254,7 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    const result = await captureScreen(QUALITY_PRESETS["1080p60"], "app");
+    const result = await captureScreen(QUALITY_PRESETS["1080p60"]);
     expect(result.stream).toBe(stream);
     expect(result.video).toBe(vTrack);
     expect(result.audio).toBe(aTrack);
@@ -232,11 +267,17 @@ describe("captureScreen and track helpers", () => {
       noiseSuppression: false,
       autoGainControl: false,
     });
-    // The picker opens on windows, not the whole screen.
     expect(callArgs.video).toMatchObject({ displaySurface: "window" });
+    expect(callArgs).toMatchObject({
+      windowAudio: "window",
+      systemAudio: "include",
+      selfBrowserSurface: "exclude",
+      monitorTypeSurfaces: "include",
+      surfaceSwitching: "include",
+    });
   });
 
-  it("supports capture without audio when requested", async () => {
+  it("returns null audio when the user did not share audio in the picker", async () => {
     const vTrack = makeTrack("video");
     const stream = makeStream(vTrack, null);
 
@@ -244,10 +285,8 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    const result = await captureScreen(QUALITY_PRESETS["720p30"], "none");
+    const result = await captureScreen(QUALITY_PRESETS["720p30"]);
     expect(result.audio).toBeNull();
-    const callArgs = getDisplayMediaMock.mock.calls[0]?.[0] as DisplayMediaStreamOptions;
-    expect(callArgs.audio).toBe(false);
   });
 
   it("throws and stops tracks if getDisplayMedia returned no video track", async () => {
@@ -258,7 +297,7 @@ describe("captureScreen and track helpers", () => {
     (navigator.mediaDevices as unknown as { getDisplayMedia: typeof getDisplayMediaMock }).getDisplayMedia =
       getDisplayMediaMock;
 
-    await expect(captureScreen(QUALITY_PRESETS["1080p60"], "app")).rejects.toThrow(
+    await expect(captureScreen(QUALITY_PRESETS["1080p60"])).rejects.toThrow(
       "getDisplayMedia returned no video track",
     );
     expect((aTrack as unknown as { stopped: boolean }).stopped).toBe(true);
@@ -293,65 +332,20 @@ describe("captureScreen and track helpers", () => {
     return mock;
   }
 
-  it("asks for only the window's audio in app mode, and no system audio for screens", async () => {
-    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), null));
-    await captureScreen(QUALITY_PRESETS["1080p60"], "app");
-    expect(mock.mock.calls[0]?.[0]).toMatchObject({ windowAudio: "window", systemAudio: "exclude" });
-  });
-
-  it("offers system audio for screens and windows in system mode", async () => {
-    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), null));
-    await captureScreen(QUALITY_PRESETS["1080p60"], "system");
-    expect(mock.mock.calls[0]?.[0]).toMatchObject({ windowAudio: "system", systemAudio: "include" });
-  });
-
-  it("reports which surface was picked", async () => {
+  it("reports which surface was picked across monitor, window, browser, and unknown", async () => {
     stubGetDisplayMedia(makeStream(makeTrack("video", { displaySurface: "monitor" }), null));
-    const result = await captureScreen(QUALITY_PRESETS["1080p60"], "app");
-    expect(result.surface).toBe("monitor");
-  });
+    expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("monitor");
 
-  it("captures a window's audio alone and keeps its thumbnail running but disabled", async () => {
-    const video = makeTrack("video", {}, "League of Legends (TM) Client");
-    const audio = makeTrack("audio");
-    const mock = stubGetDisplayMedia(makeStream(video, audio));
+    stubGetDisplayMedia(makeStream(makeTrack("video", { displaySurface: "window" }), null));
+    expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("window");
 
-    const source = await captureAudioOnly("window");
-    expect(mock.mock.calls[0]?.[0]).toMatchObject({
-      video: { displaySurface: "window" },
-      monitorTypeSurfaces: "exclude",
-      windowAudio: "window",
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-    });
-    expect(source?.track).toBe(audio);
-    expect(source?.kind).toBe("window");
-    expect(source?.label).toBe("League of Legends (TM) Client");
-    expect(audio.contentHint).toBe("music");
-    expect(video.enabled).toBe(false);
-    expect((video as unknown as { stopped: boolean }).stopped).toBe(false);
+    stubGetDisplayMedia(makeStream(makeTrack("video", { displaySurface: "browser" }), null));
+    expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("browser");
 
-    stopAudioSource(source!);
-    expect((video as unknown as { stopped: boolean }).stopped).toBe(true);
-    expect((audio as unknown as { stopped: boolean }).stopped).toBe(true);
-  });
+    stubGetDisplayMedia(makeStream(makeTrack("video", { displaySurface: "other" }), null));
+    expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("unknown");
 
-  it("hides Chrome's opaque window ids instead of showing them as a name", async () => {
-    stubGetDisplayMedia(makeStream(makeTrack("video", {}, "window:1234:0"), makeTrack("audio")));
-    const source = await captureAudioOnly("window");
-    expect(source?.label).toBeNull();
-  });
-
-  it("asks for a screen with system audio for the system fallback", async () => {
-    const mock = stubGetDisplayMedia(makeStream(makeTrack("video"), makeTrack("audio")));
-    const source = await captureAudioOnly("system");
-    expect(mock.mock.calls[0]?.[0]).toMatchObject({ video: { displaySurface: "monitor" }, systemAudio: "include" });
-    expect(source?.kind).toBe("system");
-  });
-
-  it("returns null and releases the capture when the pick had no audio", async () => {
-    const video = makeTrack("video");
-    stubGetDisplayMedia(makeStream(video, null));
-    expect(await captureAudioOnly("window")).toBeNull();
-    expect((video as unknown as { stopped: boolean }).stopped).toBe(true);
+    stubGetDisplayMedia(makeStream(makeTrack("video", {}), null));
+    expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("unknown");
   });
 });

@@ -258,50 +258,6 @@ function setupMediaHandlers(): void {
     return audioSession.startForSystem();
   });
 
-  ipcMain.handle("audio:pick-window", async (event): Promise<{ ok: boolean; label: string | null }> => {
-    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) {
-      return { ok: false, label: null };
-    }
-    let sources: DesktopCapturerSource[];
-    try {
-      sources = await desktopCapturer.getSources({
-        types: ["window"],
-        fetchWindowIcons: true,
-        thumbnailSize: { width: 0, height: 0 },
-      });
-    } catch (err) {
-      console.error("[main] audio:pick-window getSources failed:", err);
-      return { ok: false, label: null };
-    }
-    return new Promise<{ ok: boolean; label: string | null }>((resolve) => {
-      let settled = false;
-      const finish = (picked: DesktopCapturerSource | null): void => {
-        if (settled) return;
-        settled = true;
-        if (!picked) {
-          resolve({ ok: false, label: null });
-          return;
-        }
-        const ok = audioSession.startForWindow(picked.id, { follow: false });
-        resolve({ ok, label: ok ? picked.name : null });
-      };
-      const template = buildPickerTemplate(sources, finish, {
-        excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
-        windowsOnly: true,
-      });
-      if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
-        finish(null);
-        return;
-      }
-      Menu.buildFromTemplate(template).popup({
-        window: mainWindow,
-        callback: () => {
-          setTimeout(() => finish(null), 100);
-        },
-      });
-    });
-  });
-
   ipcMain.on("audio:stop", (event) => {
     if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
   });

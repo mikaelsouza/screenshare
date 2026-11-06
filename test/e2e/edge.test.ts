@@ -148,6 +148,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     const [opts] = await host.evaluate(() => window.__gdmOpts);
     const optsRecord = opts as Record<string, unknown> | undefined;
     assert.equal(optsRecord?.["selfBrowserSurface"], "exclude");
+    assert.equal(optsRecord?.["windowAudio"], "window");
+    assert.equal(optsRecord?.["systemAudio"], "include");
     const videoOpts = opts?.video as MediaTrackConstraints | undefined;
     assert.equal(videoOpts?.displaySurface, "window");
     await framesGrow(other, "other viewer");
@@ -337,6 +339,18 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         `horizontal overflow at ${String(width)}x${String(height)}: ${String(metrics.scrollWidth)} > ${String(metrics.innerWidth)}`,
       );
     }
+  });
+
+  await it("returns to the lobby when clicking the top-left Screenshare brand title", async () => {
+    await host.click("#brand-home");
+    await waitFor(
+      host,
+      () =>
+        document.getElementById("lobby")?.hidden === false &&
+        document.getElementById("room-bar")?.hidden === true &&
+        window.location.hash === "",
+      { label: "host to return to the lobby when clicking #brand-home" },
+    );
   });
 
   await it("raised no CSP or Trusted Types violation on any page", async () => {

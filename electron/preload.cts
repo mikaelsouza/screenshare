@@ -31,14 +31,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Per-app & system audio capture (see electron/audio).
   startWindowAudio: async (sourceId?: string): Promise<boolean> =>
     (await ipcRenderer.invoke("audio:start-window", sourceId)) === true,
-  pickWindowAudio: async (): Promise<{ ok: boolean; label: string | null }> => {
-    const res: unknown = await ipcRenderer.invoke("audio:pick-window");
-    if (typeof res === "object" && res !== null && "ok" in res && typeof res.ok === "boolean") {
-      const label = "label" in res && typeof res.label === "string" ? res.label : null;
-      return { ok: res.ok, label };
-    }
-    return { ok: false, label: null };
-  },
   startSystemAudio: async (): Promise<boolean> =>
     (await ipcRenderer.invoke("audio:start-system")) === true,
   stopAudio: (): void => {

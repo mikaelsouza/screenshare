@@ -5,6 +5,7 @@ export interface ViewState {
   roomBarHidden: boolean;
   controlsHidden: boolean;
   liveControlsHidden: boolean;
+  muteAudioHidden: boolean;
   togglePreviewHidden: boolean;
   stageEmptyHidden: boolean;
   stageEmptyTitle: string;
@@ -35,6 +36,7 @@ export function deriveViewState(
       roomBarHidden: true,
       controlsHidden: true,
       liveControlsHidden: true,
+      muteAudioHidden: true,
       togglePreviewHidden: true,
       stageEmptyHidden: true,
       stageEmptyTitle: DEFAULT_EMPTY_TITLE,
@@ -50,6 +52,7 @@ export function deriveViewState(
     roomBarHidden: false,
     controlsHidden: false,
     liveControlsHidden: !sharing,
+    muteAudioHidden: !sharing,
     togglePreviewHidden: !hiddenPreview,
     stageEmptyHidden: visibleTileCount > 0,
     stageEmptyTitle: hiddenPreview ? HIDDEN_PREVIEW_TITLE : DEFAULT_EMPTY_TITLE,
@@ -58,6 +61,87 @@ export function deriveViewState(
     shareButtonVariant: sharing ? "danger" : "primary",
     showFocusButtons: visibleTileCount >= 2,
   };
+}
+
+export interface OutboundAudioState {
+  disabled: boolean;
+  muted: boolean;
+  ariaPressed: "true" | "false";
+  icon: "volumeOn" | "volumeOff";
+  text: "Mute audio" | "Unmute audio" | "No audio";
+  title: string;
+}
+
+/**
+ * Pure derivation of the outbound audio mute button (`#mute-audio`) state.
+ */
+export function deriveOutboundAudioState(
+  sharing: boolean,
+  hasAudioTrack: boolean,
+  trackEnabled: boolean,
+): OutboundAudioState {
+  if (!sharing) {
+    return {
+      disabled: false,
+      muted: false,
+      ariaPressed: "false",
+      icon: "volumeOn",
+      text: "Mute audio",
+      title: "Mute or unmute your shared audio",
+    };
+  }
+  if (!hasAudioTrack) {
+    return {
+      disabled: true,
+      muted: false,
+      ariaPressed: "false",
+      icon: "volumeOff",
+      text: "No audio",
+      title: "No audio source was shared",
+    };
+  }
+  const muted = !trackEnabled;
+  return {
+    disabled: false,
+    muted,
+    ariaPressed: muted ? "true" : "false",
+    icon: muted ? "volumeOff" : "volumeOn",
+    text: muted ? "Unmute audio" : "Mute audio",
+    title: muted ? "Unmute your shared audio" : "Mute your shared audio",
+  };
+}
+
+export type PopoverKind = "roster" | "preset" | "codec";
+
+export interface PopoverVisibility {
+  active: PopoverKind | null;
+  rosterOpen: boolean;
+  presetOpen: boolean;
+  codecOpen: boolean;
+}
+
+/**
+ * Pure state-machine transition for header & footer popovers (`roster`, `preset`, `codec`).
+ * Guarantees at most one popover is open at any time and only when its parent bar is visible.
+ */
+export function nextPopoverState(
+  current: PopoverKind | null,
+  target: PopoverKind | null,
+  connected: boolean,
+  sharing: boolean,
+): PopoverVisibility {
+  const requested = current !== target ? target : null;
+  const rosterOpen = connected && requested === "roster";
+  const presetOpen = connected && sharing && requested === "preset";
+  const codecOpen = connected && sharing && requested === "codec";
+  const active: PopoverKind | null = rosterOpen
+    ? "roster"
+    : presetOpen
+      ? "preset"
+      : codecOpen
+        ? "codec"
+        : null;
+  return { active, rosterOpen, presetOpen, codecOpen };
 }
 
 /**

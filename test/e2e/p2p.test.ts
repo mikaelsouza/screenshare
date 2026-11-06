@@ -235,7 +235,17 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       const h1Rect = document.querySelector("header.app-bar h1")?.getBoundingClientRect();
       const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
       const shareRect = document.getElementById("share")?.getBoundingClientRect();
-      if (!headerRect || !h1Rect || !controlsRect || !shareRect) throw new Error("Missing room bar elements");
+      const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
+      const copyLinkRect = document.getElementById("copy-link")?.getBoundingClientRect();
+      if (!headerRect || !h1Rect || !controlsRect || !shareRect || !rosterBtnRect || !copyLinkRect) {
+        throw new Error("Missing room bar elements");
+      }
+      if (rosterBtnRect.right > copyLinkRect.left) {
+        throw new Error("#roster-btn must be positioned to the left of #copy-link");
+      }
+      if (document.getElementById("leave") !== null) {
+        throw new Error("#leave button must not exist");
+      }
       return {
         header: { x: headerRect.x, y: headerRect.y, width: headerRect.width, height: headerRect.height },
         h1: { x: h1Rect.x, y: h1Rect.y, width: h1Rect.width, height: h1Rect.height },
@@ -292,9 +302,14 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
       const shareEl = document.getElementById("share");
       const shareRect = shareEl?.getBoundingClientRect();
+      const muteEl = document.getElementById("mute-audio");
+      const muteRect = muteEl?.getBoundingClientRect();
       const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
-      if (!headerRect || !h1Rect || !controlsRect || !shareEl || !shareRect || !rosterBtnRect) {
+      if (!headerRect || !h1Rect || !controlsRect || !shareEl || !shareRect || !muteEl || !muteRect || !rosterBtnRect) {
         throw new Error("Missing streaming elements");
+      }
+      if (muteEl.hidden || muteRect.right > shareRect.left) {
+        throw new Error("#mute-audio must be visible and positioned to the left of #share");
       }
       return {
         header: { x: headerRect.x, y: headerRect.y, width: headerRect.width, height: headerRect.height },
@@ -390,9 +405,28 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("toggle-preview")?.hidden)), true);
     assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("stage-empty")?.hidden)), true);
 
-    // Verify live Quality (#preset) and Codec (#codec) changes while streaming keep the stream alive:
-    await sharer.selectOption("#preset", "720p30");
-    await sharer.selectOption("#codec", "vp8");
+    // Verify outbound audio mute toggle (#mute-audio):
+    assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "false");
+    await sharer.click("#mute-audio");
+    assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "true");
+    assert.equal(
+      await sharer.evaluate(() => window.__gdmStreams?.[0]?.getAudioTracks()[0]?.enabled),
+      false,
+      "clicking #mute-audio must disable the outbound audio track",
+    );
+    await sharer.click("#mute-audio");
+    assert.equal(await sharer.getAttribute("#mute-audio", "aria-pressed"), "false");
+    assert.equal(
+      await sharer.evaluate(() => window.__gdmStreams?.[0]?.getAudioTracks()[0]?.enabled),
+      true,
+      "clicking #mute-audio again must re-enable the outbound audio track",
+    );
+
+    // Verify live Quality (#preset-btn) and Codec (#codec-btn) popover changes while streaming keep the stream alive:
+    await sharer.click("#preset-btn");
+    await sharer.click('#preset-list button[data-preset="720p30"]');
+    await sharer.click("#codec-btn");
+    await sharer.click('#codec-list button[data-codec="vp8"]');
     const beforeSwitch = await viewer.evaluate(decodedFrames);
     const switchDeadline = Date.now() + 30_000;
     let afterSwitch = beforeSwitch;

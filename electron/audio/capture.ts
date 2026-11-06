@@ -25,7 +25,7 @@ interface AudioSessionDeps {
 type AudioSessionMode = "off" | "window" | "system";
 
 interface AudioSessionController {
-  startForWindow: (sourceId: string, options?: { follow?: boolean }) => boolean;
+  startForWindow: (sourceId: string) => boolean;
   startForSystem: () => boolean;
   switchWindow: (sourceId: string) => boolean;
   stop: () => void;
@@ -55,10 +55,10 @@ export function createAudioSessionController(deps: AudioSessionDeps): AudioSessi
   /**
    * Capture only the process tree that owns `sourceId`.
    */
-  function startForWindow(sourceId: string, { follow = true }: { follow?: boolean } = {}): boolean {
+  function startForWindow(sourceId: string): boolean {
     const pid = deps.resolvePid(sourceId);
     if (pid === null) return false;
-    followWindowAudio = follow;
+    followWindowAudio = true;
     if (activePid === pid) return true;
     stopDevice();
     try {
