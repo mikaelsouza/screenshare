@@ -31,7 +31,7 @@ reviews:
         Focus on Cloudflare Workers and Durable Object correctness:
         - Verify WebSocket Hibernation state consistency (`serializeAttachment` / `deserializeAttachment` and `ctx.getWebSockets()`).
         - Check room capacity enforcement, password verification, and rate-limiting invariants.
-        - Ignore formatting, style, and unused-variable issues (handled by tsc, oxlint, knip, and DeepSource).
+        - Ignore formatting, style, and unused-variable issues (handled by tsc, oxlint, and knip).
     - path: "electron/**/*.{ts,cts}"
       instructions: |
         Focus on Electron security boundaries and native OS integration:
