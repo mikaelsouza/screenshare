@@ -104,10 +104,14 @@ describe("LinkMonitor", () => {
     expect(await new LinkMonitor(pc).read()).toBeNull();
   });
 
-  it("degrades gracefully on an empty report", async () => {
-    const health = await new LinkMonitor(fakePc([{}])).read();
-    expect(health?.rttMs).toBeNull();
-    expect(health?.bitrate).toBeNull();
+  it("degrades gracefully on an empty report across multiple samples", async () => {
+    const monitor = new LinkMonitor(fakePc([{}, {}]));
+    const first = await monitor.read();
+    const second = await monitor.read();
+    expect(first?.rttMs).toBeNull();
+    expect(first?.bitrate).toBeNull();
+    expect(second?.bitrate).toBeNull();
+    expect(second?.packetLossRatio).toBeNull();
   });
 
   it("sanitizes non-finite numbers (NaN, Infinity) to null", async () => {

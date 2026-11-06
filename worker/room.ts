@@ -200,6 +200,41 @@ interface MessageBudget {
   updatedAt: number;
 }
 
+function broadcastJoinOutcome(
+  attachment: PeerAttachment,
+  isResume: boolean,
+  supersededCount: number,
+  supersededSocket: { ws: WebSocket; att: PeerAttachment } | undefined,
+  isHost: boolean,
+  others: Array<{ ws: WebSocket; att: PeerAttachment }>,
+): void {
+  if (isResume && supersededCount > 0) {
+    if (supersededSocket && attachment.sharing !== supersededSocket.att.sharing) {
+      const stateMsg: ServerMessage = {
+        t: "peer-state",
+        id: attachment.id,
+        sharing: attachment.sharing,
+      };
+      for (const { ws: peerWs } of others) {
+        sendSafe(peerWs, stateMsg);
+      }
+    }
+    return;
+  }
+  const joinedMsg: ServerMessage = {
+    t: "peer-joined",
+    peer: {
+      id: attachment.id,
+      name: attachment.name,
+      sharing: attachment.sharing,
+      ...(isHost ? { host: true } : {}),
+    },
+  };
+  for (const { ws: peerWs } of others) {
+    sendSafe(peerWs, joinedMsg);
+  }
+}
+
 export class RoomDO extends DurableObject<Env> {
   private readonly budgets = new Map<string, MessageBudget>();
   /** Unparseable messages per socket. In memory, like the budgets, for the same reason. */
@@ -644,39 +679,33 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  private broadcastJoinOutcome(
+  private async persistMemberRecord(
     attachment: PeerAttachment,
-    isResume: boolean,
-    supersededCount: number,
-    supersededSocket: { ws: WebSocket; att: PeerAttachment } | undefined,
+    offeredRejoinHash: string | null,
+    newRejoinHash: string,
+    newHostHash: string,
+    creates: boolean,
     isHost: boolean,
-    others: Array<{ ws: WebSocket; att: PeerAttachment }>,
-  ): void {
-    if (isResume && supersededCount > 0) {
-      if (supersededSocket && attachment.sharing !== supersededSocket.att.sharing) {
-        const stateMsg: ServerMessage = {
-          t: "peer-state",
-          id: attachment.id,
-          sharing: attachment.sharing,
-        };
-        for (const { ws: peerWs } of others) {
-          sendSafe(peerWs, stateMsg);
-        }
-      }
-      return;
+    superseded: Array<{ ws: WebSocket; att: PeerAttachment }>,
+  ): Promise<void> {
+    const now = Date.now();
+    const members = await this.getMembers(now);
+    if (offeredRejoinHash) delete members[offeredRejoinHash];
+    for (const { att } of superseded) {
+      if (att.rejoinHash) delete members[att.rejoinHash];
     }
-    const joinedMsg: ServerMessage = {
-      t: "peer-joined",
-      peer: {
-        id: attachment.id,
-        name: attachment.name,
-        sharing: attachment.sharing,
-        ...(isHost ? { host: true } : {}),
-      },
+    members[newRejoinHash] = {
+      until: now + EMPTY_ROOM_TTL_MS,
+      id: attachment.id,
+      ...(attachment.sharing ? { sharing: true } : {}),
     };
-    for (const { ws: peerWs } of others) {
-      sendSafe(peerWs, joinedMsg);
-    }
+    await this.ctx.storage.put({
+      [MEMBERS_KEY]: members,
+      ...(creates ? { [HOST_KEY]: newHostHash, [CLAIMED_KEY]: true } : {}),
+    });
+    if (isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
+    // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
+    await this.ctx.storage.deleteAlarm();
   }
 
   /** The join handshake, split out of webSocketMessage; see the call site. */
@@ -697,12 +726,8 @@ export class RoomDO extends DurableObject<Env> {
     const newRejoinToken = crypto.randomUUID();
     const newRejoinHash = await this.hashSecret(newRejoinToken, "rejoin");
 
-    const tokens = { offeredHostHash, offeredRejoinHash, ip: attachment.ip };
-
-    // ---- commit. From here to the broadcast, only storage awaits: input gates
-    // hold across those, so nothing else in the room runs in between.
     if (this.gone.has(attachment.id)) return;
-    const admission = await this.admit(tokens);
+    const admission = await this.admit({ offeredHostHash, offeredRejoinHash, ip: attachment.ip });
     if (!admission.ok) {
       this.refuse(ws, admission.code, admission.message);
       return;
@@ -728,35 +753,19 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
 
-    const now = Date.now();
-    const members = await this.getMembers(now);
-    if (offeredRejoinHash) delete members[offeredRejoinHash];
-    for (const { att } of superseded) {
-      if (att.rejoinHash) delete members[att.rejoinHash];
-    }
-    members[newRejoinHash] = {
-      until: now + EMPTY_ROOM_TTL_MS,
-      id: attachment.id,
-      ...(attachment.sharing ? { sharing: true } : {}),
-    };
-    await this.ctx.storage.put({
-      [MEMBERS_KEY]: members,
-      ...(admission.creates
-        ? {
-            [HOST_KEY]: newHostHash,
-            [CLAIMED_KEY]: true,
-          }
-        : {}),
-    });
-    if (admission.isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
-    // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
-    await this.ctx.storage.deleteAlarm();
+    await this.persistMemberRecord(
+      attachment,
+      offeredRejoinHash,
+      newRejoinHash,
+      newHostHash,
+      admission.creates,
+      admission.isHost,
+      superseded,
+    );
 
     attachment.name = sanitiseName(clientMsg.displayName);
     attachment.joined = true;
-    if (!isResume) {
-      attachment.sharing = false;
-    }
+    if (!isResume) attachment.sharing = false;
     attachment.host = admission.isHost;
     attachment.rejoinHash = newRejoinHash;
     try {
@@ -780,7 +789,7 @@ export class RoomDO extends DurableObject<Env> {
       locked: admission.locked,
     });
 
-    this.broadcastJoinOutcome(
+    broadcastJoinOutcome(
       attachment,
       isResume,
       superseded.length,

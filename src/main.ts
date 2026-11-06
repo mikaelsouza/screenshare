@@ -100,8 +100,8 @@ const pendingTasks = new Set<Promise<unknown>>();
 
 function runBackground(task: Promise<unknown>): void {
   const tracked = task
-    .catch(() => {
-      /* errors handled by caller or intentionally ignored */
+    .catch((err: unknown) => {
+      console.warn("[main] background task failed", err);
     })
     .finally(() => {
       pendingTasks.delete(tracked);

@@ -7,8 +7,8 @@ const pendingTasks = new Set<Promise<unknown>>();
 
 function runBackground(task: Promise<unknown>): void {
   const tracked = task
-    .catch(() => {
-      /* ignore unsupported constraint errors */
+    .catch((err: unknown) => {
+      console.warn("[web] applyConstraints failed", err);
     })
     .finally(() => {
       pendingTasks.delete(tracked);
