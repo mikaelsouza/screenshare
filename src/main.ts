@@ -756,7 +756,7 @@ function setPaused(peerId: PeerId, value: boolean): void {
     if (value) {
       video.pause();
     } else {
-      void video.play().catch(() => {});
+      startPlayback(video, peerId);
     }
   }
   applyViewing(peerId);
