@@ -768,17 +768,15 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.pause();
     return;
   }
+  const promptIfCurrent = (): void => {
+    if (tiles.get(peerId) === video) {
+      showUnmutePrompt(video, peerId);
+    }
+  };
   runBackground(
     video.play().catch(() => {
       video.muted = true;
-      return video
-        .play()
-        .catch(() => {})
-        .then(() => {
-          if (tiles.get(peerId) === video) {
-            showUnmutePrompt(video, peerId);
-          }
-        });
+      return video.play().then(promptIfCurrent, promptIfCurrent);
     }),
   );
 }
