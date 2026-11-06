@@ -1,3 +1,5 @@
+import { z } from "zod";
+
 /**
  * Hard room cap.
  *
@@ -32,6 +34,8 @@ export const MAX_CANDIDATE_LENGTH = 1024;
  * cannot name a peer, so it is rejected at parse time rather than carried further.
  */
 const PEER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+const ROOM_CODE_REGEX = new RegExp(`^[${ROOM_CODE_ALPHABET}]{${ROOM_CODE_LENGTH}}$`);
 
 export const PING = "ping";
 export const PONG = "pong";
@@ -112,6 +116,167 @@ export type ErrorCode =
 /** Longest host token accepted. Real ones are UUIDs, 36 characters. */
 const MAX_HOST_TOKEN_LENGTH = 64;
 
+const RoomCodeSchema: z.ZodType<string> = z.string().regex(ROOM_CODE_REGEX);
+
+const PeerUuidSchema: z.ZodType<PeerId> = z.string().regex(PEER_ID);
+
+const IceCandidateInitSchema: z.ZodType<IceCandidateInit> = z
+  .object({
+    candidate: z.string().max(MAX_CANDIDATE_LENGTH),
+    sdpMid: z.string().nullable().optional(),
+    sdpMLineIndex: z.number().nullable().optional(),
+    usernameFragment: z.string().nullable().optional(),
+  })
+  .transform(
+    ({ candidate, sdpMid, sdpMLineIndex, usernameFragment }): IceCandidateInit => ({
+      candidate,
+      sdpMid: sdpMid ?? null,
+      sdpMLineIndex: sdpMLineIndex ?? null,
+      ...(usernameFragment !== undefined ? { usernameFragment } : {}),
+    }),
+  );
+
+const SignalDataSchema: z.ZodType<SignalData> = z.discriminatedUnion("k", [
+  z.object({
+    k: z.literal("offer"),
+    sdp: z.string().max(MAX_SDP_LENGTH),
+  }),
+  z.object({
+    k: z.literal("answer"),
+    sdp: z.string().max(MAX_SDP_LENGTH),
+  }),
+  z.object({
+    k: z.literal("ice"),
+    candidate: IceCandidateInitSchema,
+  }),
+]);
+
+const JoinClientMessageSchema = z
+  .object({
+    t: z.literal("join"),
+    room: z.string(),
+    displayName: z.string(),
+    hostToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
+    rejoinToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
+    resume: z.literal(true).optional().catch(undefined),
+    sharing: z.boolean().optional().catch(undefined),
+  })
+  .transform(({ t, room, displayName, hostToken, rejoinToken, resume, sharing }) => ({
+    t,
+    room,
+    displayName,
+    ...(hostToken !== undefined ? { hostToken } : {}),
+    ...(rejoinToken !== undefined ? { rejoinToken } : {}),
+    ...(resume === true ? { resume: true } : {}),
+    ...(sharing !== undefined ? { sharing } : {}),
+  }));
+
+const ClientMessageSchema: z.ZodType<ClientMessage> = z.discriminatedUnion("t", [
+  JoinClientMessageSchema,
+  z.object({
+    t: z.literal("signal"),
+    to: PeerUuidSchema,
+    data: SignalDataSchema,
+  }),
+  z.object({
+    t: z.literal("state"),
+    sharing: z.boolean(),
+  }),
+  z.object({
+    t: z.literal("kick"),
+    id: PeerUuidSchema,
+  }),
+  z.object({
+    t: z.literal("lock"),
+    locked: z.boolean(),
+  }),
+]);
+
+const PeerInfoSchema: z.ZodType<PeerInfo> = z
+  .object({
+    id: z.string().min(1),
+    name: z.string(),
+    sharing: z.boolean(),
+    host: z.boolean().optional(),
+  })
+  .transform(
+    ({ id, name, sharing, host }): PeerInfo => ({
+      id,
+      name,
+      sharing,
+      ...(host !== undefined ? { host } : {}),
+    }),
+  );
+
+const ErrorCodeSchema: z.ZodType<ErrorCode> = z.enum([
+  "room-full",
+  "bad-message",
+  "unknown-peer",
+  "bad-room-code",
+  "forbidden-origin",
+  "rate-limited",
+  "join-timeout",
+  "kicked",
+  "room-locked",
+  "not-host",
+  "not-sharing",
+]);
+
+const WelcomeServerMessageSchema = z
+  .object({
+    t: z.literal("welcome"),
+    selfId: z.string().min(1),
+    peers: z.array(PeerInfoSchema).max(MAX_ROOM_SIZE),
+    host: z.boolean().optional().default(false),
+    hostToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
+    rejoinToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
+    locked: z.boolean().optional().default(false),
+  })
+  .transform(({ t, selfId, peers, host, hostToken, rejoinToken, locked }) => ({
+    t,
+    selfId,
+    peers,
+    host,
+    ...(hostToken !== undefined ? { hostToken } : {}),
+    ...(rejoinToken !== undefined ? { rejoinToken } : {}),
+    locked,
+  }));
+
+const ServerMessageSchema: z.ZodType<ServerMessage> = z.discriminatedUnion("t", [
+  WelcomeServerMessageSchema,
+  z.object({
+    t: z.literal("peer-joined"),
+    peer: PeerInfoSchema,
+  }),
+  z.object({
+    t: z.literal("peer-left"),
+    id: z.string().min(1),
+  }),
+  z.object({
+    t: z.literal("signal"),
+    from: z.string().min(1),
+    data: SignalDataSchema,
+  }),
+  z.object({
+    t: z.literal("peer-state"),
+    id: z.string().min(1),
+    sharing: z.boolean(),
+  }),
+  z.object({
+    t: z.literal("room-state"),
+    locked: z.boolean(),
+  }),
+  z.object({
+    t: z.literal("error"),
+    code: ErrorCodeSchema,
+    message: z.string(),
+  }),
+]);
+
+const NewRoomResponseSchema: z.ZodType<{ code: string }> = z.object({
+  code: RoomCodeSchema,
+});
+
 /**
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.
  * Works in both Cloudflare Workers and modern browsers.
@@ -137,96 +302,10 @@ export function generateRoomCode(): string {
 }
 
 /**
- * Validate that a string conforms to the room code specification (exact length and valid alphabet).
+ * Validate that a value conforms to the room code specification (exact length and valid alphabet).
  */
-export function isValidRoomCode(s: string): boolean {
-  if (typeof s !== "string" || s.length !== ROOM_CODE_LENGTH) {
-    return false;
-  }
-  for (let i = 0; i < s.length; i++) {
-    if (!ROOM_CODE_ALPHABET.includes(s.charAt(i))) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function isPlainRecord(val: unknown): val is Record<string, unknown> {
-  return typeof val === "object" && val !== null && !Array.isArray(val);
-}
-
-function parseJoinMessage(record: Record<string, unknown>): ClientMessage | null {
-  const room = record["room"];
-  const displayName = record["displayName"];
-  if (typeof room !== "string" || typeof displayName !== "string") {
-    return null;
-  }
-  const joinMsg: ClientMessage = { t: "join", room, displayName };
-  const hostToken = record["hostToken"];
-  if (typeof hostToken === "string" && hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
-    joinMsg.hostToken = hostToken;
-  }
-  const rejoinToken = record["rejoinToken"];
-  if (typeof rejoinToken === "string" && rejoinToken.length <= MAX_HOST_TOKEN_LENGTH) {
-    joinMsg.rejoinToken = rejoinToken;
-  }
-  if (record["resume"] === true) {
-    joinMsg.resume = true;
-  }
-  const sharing = record["sharing"];
-  if (typeof sharing === "boolean") {
-    joinMsg.sharing = sharing;
-  }
-  return joinMsg;
-}
-
-function isOptionalString(val: unknown): val is string | null | undefined {
-  return typeof val === "string" || val === null || val === undefined;
-}
-
-function isOptionalNumber(val: unknown): val is number | null | undefined {
-  return typeof val === "number" || val === null || val === undefined;
-}
-
-function parseIceCandidate(rawCandidate: unknown): IceCandidateInit | null {
-  if (!isPlainRecord(rawCandidate)) return null;
-  const candidateStr = rawCandidate["candidate"];
-  if (typeof candidateStr !== "string" || candidateStr.length > MAX_CANDIDATE_LENGTH) {
-    return null;
-  }
-  const sdpMid = rawCandidate["sdpMid"];
-  const sdpMLineIndex = rawCandidate["sdpMLineIndex"];
-  const usernameFragment = rawCandidate["usernameFragment"];
-  if (!isOptionalString(sdpMid) || !isOptionalNumber(sdpMLineIndex) || !isOptionalString(usernameFragment)) {
-    return null;
-  }
-  const iceCandidate: IceCandidateInit = {
-    candidate: candidateStr,
-    sdpMid: typeof sdpMid === "string" ? sdpMid : null,
-    sdpMLineIndex: typeof sdpMLineIndex === "number" ? sdpMLineIndex : null,
-  };
-  if (usernameFragment !== undefined) {
-    iceCandidate.usernameFragment = usernameFragment;
-  }
-  return iceCandidate;
-}
-
-function parseSignalMessage(record: Record<string, unknown>): ClientMessage | null {
-  const to = record["to"];
-  const sigData = record["data"];
-  if (typeof to !== "string" || !PEER_ID.test(to) || !isPlainRecord(sigData)) {
-    return null;
-  }
-  const kind = sigData["k"];
-  const sdp = sigData["sdp"];
-  if ((kind === "offer" || kind === "answer") && typeof sdp === "string" && sdp.length <= MAX_SDP_LENGTH) {
-    return { t: "signal", to, data: { k: kind, sdp } };
-  }
-  if (kind === "ice") {
-    const candidate = parseIceCandidate(sigData["candidate"]);
-    return candidate ? { t: "signal", to, data: { k: "ice", candidate } } : null;
-  }
-  return null;
+export function isValidRoomCode(s: unknown): s is string {
+  return RoomCodeSchema.safeParse(s).success;
 }
 
 /**
@@ -236,30 +315,31 @@ function parseSignalMessage(record: Record<string, unknown>): ClientMessage | nu
  */
 export function parseClientMessage(raw: string): ClientMessage | null {
   try {
-    const data: unknown = JSON.parse(raw);
-    if (!isPlainRecord(data)) return null;
-
-    switch (data["t"]) {
-      case "join":
-        return parseJoinMessage(data);
-      case "signal":
-        return parseSignalMessage(data);
-      case "kick":
-        return typeof data["id"] === "string" && PEER_ID.test(data["id"])
-          ? { t: "kick", id: data["id"] }
-          : null;
-      case "lock":
-        return typeof data["locked"] === "boolean"
-          ? { t: "lock", locked: data["locked"] }
-          : null;
-      case "state":
-        return typeof data["sharing"] === "boolean"
-          ? { t: "state", sharing: data["sharing"] }
-          : null;
-      default:
-        return null;
-    }
+    const parsed = ClientMessageSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Safely parse and validate an incoming server WebSocket message string.
+ * Returns null if the JSON is malformed or does not match any ServerMessage variant.
+ * Guarantees no exceptions escape.
+ */
+export function parseServerMessage(raw: string): ServerMessage | null {
+  try {
+    const parsed = ServerMessageSchema.safeParse(JSON.parse(raw));
+    return parsed.success ? parsed.data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validate the JSON payload returned by POST /api/new-room.
+ */
+export function parseNewRoomResponse(data: unknown): { code: string } | null {
+  const parsed = NewRoomResponseSchema.safeParse(data);
+  return parsed.success ? parsed.data : null;
 }

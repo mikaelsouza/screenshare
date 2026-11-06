@@ -4,6 +4,7 @@
  * smoothness rather than latency. Everything here overrides that.
  */
 
+import { z } from "zod";
 import type { QualityPreset } from "./capture";
 
 export type CodecName = "h264" | "vp9" | "av1" | "vp8";
@@ -155,6 +156,19 @@ export interface LinkHealth {
   frameHeight: number | null;
 }
 
+const VideoLossStatSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("outbound-rtp"),
+    kind: z.literal("video"),
+    packetsSent: z.number().nullable().optional().catch(null),
+  }),
+  z.object({
+    type: z.literal("remote-inbound-rtp"),
+    kind: z.literal("video"),
+    packetsLost: z.number().nullable().optional().catch(null),
+  }),
+]);
+
 /**
  * Per-peer adaptive bitrate. Because mesh connections are independent, one friend
  * on bad wifi degrades only their own stream — everyone else is untouched.
@@ -238,12 +252,12 @@ export class BitrateAdapter {
     let packetsLost: number | null = null;
 
     stats.forEach((r) => {
-      const rec = r as unknown as Record<string, unknown>;
-      if (rec["type"] === "outbound-rtp" && rec["kind"] === "video") {
-        packetsSent = (rec["packetsSent"] as number) ?? null;
-      }
-      if (rec["type"] === "remote-inbound-rtp" && rec["kind"] === "video") {
-        packetsLost = (rec["packetsLost"] as number) ?? null;
+      const parsed = VideoLossStatSchema.safeParse(r);
+      if (!parsed.success) return;
+      if (parsed.data.type === "outbound-rtp") {
+        packetsSent = parsed.data.packetsSent ?? null;
+      } else {
+        packetsLost = parsed.data.packetsLost ?? null;
       }
     });
 

@@ -13,7 +13,6 @@
 import { _electron as electron, type Page } from "playwright-core";
 import fs from "node:fs";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -61,7 +60,11 @@ function startStaticDistServer(): Promise<StaticServer> {
     });
     server.on("error", reject);
     server.listen(0, "127.0.0.1", () => {
-      const addr = server.address() as AddressInfo;
+      const addr = server.address();
+      if (!addr || typeof addr === "string") {
+        reject(new Error("Unexpected server address format"));
+        return;
+      }
       resolve({ server, url: `http://127.0.0.1:${String(addr.port)}` });
     });
   });

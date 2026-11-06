@@ -15,7 +15,7 @@
     "build:electron": "tsc -p tsconfig.electron.json",
     "check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.worker.json && tsc --noEmit -p tsconfig.electron.json",
     "lint:knip": "knip --include-entry-exports --treat-config-hints-as-errors --max-issues 0 && knip --cycles",
-    "lint:deadcode": "oxlint -c .oxlintrc.json --type-aware --report-unused-disable-directives-severity error --ignore-path .gitignore --deny-warnings",
+    "lint:deadcode": "oxlint -c .oxlintrc.json --type-aware --type-check --report-unused-disable-directives-severity error --ignore-path .gitignore --deny-warnings",
     "lint:all": "npm run lint:knip && npm run lint:deadcode",
     "preview": "npm run build && wrangler dev",
     "deploy": "npm run build && wrangler deploy",
@@ -60,6 +60,7 @@
   },
   "dependencies": {
     "koffi": "^3.3.6",
-    "loopback-capture": "^4.0.0"
+    "loopback-capture": "^4.0.0",
+    "zod": "^4.6.7"
   }
 }

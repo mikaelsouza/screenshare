@@ -8,6 +8,7 @@
 import {
   PING,
   PONG,
+  parseServerMessage,
   type ClientMessage,
   type PeerId,
   type PeerInfo,
@@ -145,10 +146,8 @@ export class SignalingClient {
       this.lastReceivedAt = Date.now();
       const raw = String(ev.data);
       if (raw === PONG || raw === PING) return; // keepalive, not protocol traffic
-      let msg: ServerMessage;
-      try {
-        msg = JSON.parse(raw) as ServerMessage;
-      } catch {
+      const msg = parseServerMessage(raw);
+      if (!msg) {
         console.warn("[signaling] unparseable message", raw.slice(0, 120));
         return;
       }

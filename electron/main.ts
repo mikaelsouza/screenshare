@@ -7,7 +7,6 @@ import {
   ipcMain,
   shell,
   type DesktopCapturerSource,
-  type MenuItemConstructorOptions,
 } from "electron";
 import { matchProfile, type FollowProfile } from "./follow/profiles.js";
 import { createFollower, type Follower, type FollowStatus, type WindowSource } from "./follow/follower.js";
@@ -75,15 +74,15 @@ function offlinePage(url: string, description: string): string {
 
 let lastPickedSource: DesktopCapturerSource | null = null;
 
-type GetWindowThreadProcessIdFn = (hwnd: number, outPid: [number]) => number;
+type GetWindowThreadProcessIdFn = (hwnd: number, outPid: [number]) => unknown;
 
 let lookupWin32Pid: (hwnd: number) => number = () => 0;
 if (process.platform === "win32") {
   try {
     const user32 = koffi.load("user32.dll");
-    const GetWindowThreadProcessId = user32.func(
+    const GetWindowThreadProcessId: GetWindowThreadProcessIdFn = user32.func(
       "uint32 __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32 *lpdwProcessId)",
-    ) as unknown as GetWindowThreadProcessIdFn;
+    );
     lookupWin32Pid = (hwnd: number): number => {
       const out: [number] = [0];
       GetWindowThreadProcessId(hwnd, out);
@@ -225,7 +224,7 @@ async function handleDisplayMediaRequest(
     finish(null);
     return;
   }
-  Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
+  Menu.buildFromTemplate(template).popup({
     window: mainWindow,
     // Runs when the menu closes, which on Windows can be before the clicked
     // item's handler. Wait a moment so a real pick always wins over "cancelled".
@@ -294,7 +293,7 @@ function setupMediaHandlers(): void {
         finish(null);
         return;
       }
-      Menu.buildFromTemplate(template as MenuItemConstructorOptions[]).popup({
+      Menu.buildFromTemplate(template).popup({
         window: mainWindow,
         callback: () => {
           setTimeout(() => finish(null), 100);

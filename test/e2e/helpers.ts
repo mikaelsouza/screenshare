@@ -206,7 +206,7 @@ export async function waitFor<T>(
   let last: T | undefined;
   while (Date.now() < deadline) {
     last = await page.evaluate(fn);
-    if (last) return last as NonNullable<T>;
+    if (last) return last;
     await new Promise((r) => setTimeout(r, interval));
   }
   throw new Error(`timed out waiting for ${label}; last value: ${JSON.stringify(last)}`);

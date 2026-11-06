@@ -36,10 +36,25 @@
     "typescript/no-unsafe-function-type": "error",
     "typescript/no-wrapper-object-types": "error",
     "typescript/prefer-as-const": "error",
+    "typescript/no-unsafe-type-assertion": "error",
+    "typescript/no-unnecessary-type-assertion": "error",
+    "typescript/only-throw-error": "error",
+    "typescript/prefer-promise-reject-errors": "error",
+    "typescript/no-implied-eval": "error",
+    "typescript/restrict-plus-operands": "error",
+    "typescript/use-unknown-in-catch-callback-variable": "error",
     "vitest/expect-expect": "error",
     "vitest/valid-expect": "error",
     "unicorn/no-useless-spread": "allow",
     "vitest/require-mock-type-parameters": "allow",
     "vitest/no-conditional-expect": "allow"
-  }
+  },
+  "overrides": [
+    {
+      "files": ["test/**/*.ts"],
+      "rules": {
+        "typescript/no-unsafe-type-assertion": "allow"
+      }
+    }
+  ]
 }

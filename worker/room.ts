@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { z } from "zod";
 import {
   MAX_ROOM_SIZE,
   PING,
@@ -107,6 +108,20 @@ interface MemberEntry {
   sharing?: boolean;
 }
 
+const MemberEntrySchema: z.ZodType<MemberEntry> = z
+  .object({
+    until: z.number(),
+    id: z.string().optional(),
+    sharing: z.boolean().optional(),
+  })
+  .transform(
+    ({ until, id, sharing }): MemberEntry => ({
+      until,
+      ...(id !== undefined ? { id } : {}),
+      ...(sharing !== undefined ? { sharing } : {}),
+    }),
+  );
+
 interface PeerAttachment {
   id: string;
   name: string;
@@ -122,23 +137,38 @@ interface PeerAttachment {
   rejoinHash?: string;
 }
 
+const PeerAttachmentSchema: z.ZodType<PeerAttachment> = z
+  .object({
+    id: z.string(),
+    name: z.string(),
+    sharing: z.boolean(),
+    joined: z.boolean(),
+    ip: z.string().optional(),
+    openedAt: z.number().optional(),
+    host: z.boolean().optional(),
+    rejoinHash: z.string().optional(),
+  })
+  .transform(
+    ({ id, name, sharing, joined, ip, openedAt, host, rejoinHash }): PeerAttachment => ({
+      id,
+      name,
+      sharing,
+      joined,
+      ...(ip !== undefined ? { ip } : {}),
+      ...(openedAt !== undefined ? { openedAt } : {}),
+      ...(host !== undefined ? { host } : {}),
+      ...(rejoinHash !== undefined ? { rejoinHash } : {}),
+    }),
+  );
+
 function getAttachment(ws: WebSocket): PeerAttachment | null {
   try {
-    const att = ws.deserializeAttachment() as PeerAttachment | null;
-    if (
-      att &&
-      typeof att === "object" &&
-      typeof att.id === "string" &&
-      typeof att.name === "string" &&
-      typeof att.sharing === "boolean" &&
-      typeof att.joined === "boolean"
-    ) {
-      return att;
-    }
+    const parsed = PeerAttachmentSchema.safeParse(ws.deserializeAttachment());
+    return parsed.success ? parsed.data : null;
   } catch {
     // Corrupted or missing attachment
+    return null;
   }
-  return null;
 }
 
 /**
@@ -868,11 +898,12 @@ export class RoomDO extends DurableObject<Env> {
 
   /** Live rejoin tickets, hash to expiry, with expired ones dropped. */
   private async getMembers(now: number): Promise<Record<string, MemberEntry>> {
-    const all = (await this.ctx.storage.get<Record<string, MemberEntry>>(MEMBERS_KEY)) ?? {};
+    const all = (await this.ctx.storage.get<Record<string, unknown>>(MEMBERS_KEY)) ?? {};
     const live: Record<string, MemberEntry> = {};
     for (const [k, val] of Object.entries(all)) {
-      if (val && typeof val.until === "number" && val.until > now) {
-        live[k] = val;
+      const parsed = MemberEntrySchema.safeParse(val);
+      if (parsed.success && parsed.data.until > now) {
+        live[k] = parsed.data;
       }
     }
     return live;

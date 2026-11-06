@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import fc from "fast-check";
 import {
   parseClientMessage,
+  parseServerMessage,
   type ClientMessage,
   MAX_SDP_LENGTH,
   MAX_CANDIDATE_LENGTH,
@@ -132,6 +133,27 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         return true;
       }),
       { numRuns: 1000 },
+    );
+  });
+
+  it("parseServerMessage never crashes on arbitrary strings or JSON payloads", () => {
+    fc.assert(
+      fc.property(fc.string(), (raw) => {
+        const res = parseServerMessage(raw);
+        if (res !== null) {
+          expect([
+            "welcome",
+            "peer-joined",
+            "peer-left",
+            "signal",
+            "peer-state",
+            "room-state",
+            "error",
+          ]).toContain(res.t);
+        }
+        return true;
+      }),
+      { numRuns: 500 },
     );
   });
 });
