@@ -1,7 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   MAX_ROOM_SIZE,
-  MIN_PASSWORD_LENGTH,
   PING,
   PONG,
   type ErrorCode,
@@ -30,17 +29,10 @@ const MAX_SOCKETS = MAX_ROOM_SIZE * 4;
  */
 const MAX_SOCKETS_PER_IP = MAX_ROOM_SIZE * 2;
 
-/** Storage key holding the salted hash of the room password, if the room has one. */
-const PASSWORD_KEY = "passwordHash";
-
 /**
  * Storage key marking that this room has been joined at least once.
  *
- * Only the join that creates the room may set its password. Without this, an
- * *unprotected* room could be claimed by anyone holding the code: the room is empty
- * for the whole duration of any reconnect (and forever after the session ends, while
- * the code lives on in location.hash and in whatever link was shared), so a stranger
- * could join first, set a password, and lock the real occupants out.
+ * Only the join that creates the room becomes its host.
  */
 const CLAIMED_KEY = "claimed";
 
@@ -75,45 +67,8 @@ const DENY_KEY = "deny";
  */
 const KICK_BAN_MS = 15 * 60 * 1000;
 
-/** Storage key holding the room's failed-password-attempt counter. */
-const PW_FAIL_KEY = "pwFail";
-
-/** Longest password accepted. Bounds the storage write and the hashing work. */
-const MAX_PASSWORD_LENGTH = 128;
-
-/** Window over which failed password attempts accumulate. */
-const PW_FAIL_WINDOW_MS = 15 * 60 * 1000;
-
 /**
- * Failures after which joins are refused outright rather than merely delayed.
- *
- * The delay below is the real throttle; this exists so an attacker cannot convert the
- * delay into a billing attack by holding the object awake indefinitely. Far beyond
- * typo territory, so legitimate users never reach it.
- */
-const PW_FAIL_HARD_LIMIT = 50;
-
-/** Storage key and ceiling for wrong guesses per day, on top of the 15-minute window. */
-const PW_FAIL_DAY_KEY = "pwFailDay";
-const PW_FAIL_DAY_WINDOW_MS = 24 * 60 * 60 * 1000;
-/**
- * 50 per 15 minutes alone allows ~4,800 guesses a day, enough to walk through every
- * 4-digit PIN in two days. 200 a day is still far past anyone mistyping.
- */
-const PW_FAIL_DAY_LIMIT = 200;
-
-/** Ceiling on the per-attempt delay, for the same billing reason. */
-const PW_FAIL_MAX_DELAY_MS = 2_000;
-
-/**
- * How long an empty room keeps its password before the object erases itself.
- *
- * The password cannot be dropped the moment the room empties: a lone peer whose
- * socket blips leaves the room empty for the length of a reconnect, and clearing
- * then would let whoever connects next claim the room and lock the owner out (their
- * retry would fail the password check and be closed 1008, which the client treats
- * as terminal). Holding it for a generous window makes reconnects safe while still
- * bounding what a room code costs in storage.
+ * How long an empty room keeps its state before the object erases itself.
  */
 const EMPTY_ROOM_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -315,61 +270,14 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
-   * The room's password, or null if it has none.
-   *
-   * Read from durable storage on every join rather than held in an instance field.
-   * Everything here runs under the WebSocket Hibernation API — pings are auto-answered
-   * without waking the object, so a room goes dormant as soon as signalling quiets
-   * down, which is within seconds of ICE completing. An in-memory password would read
-   * back as null on the next wake while the original peers were still joined, and
-   * because the "first peer sets it" branch only fires on an empty room it would never
-   * be re-armed: the room would silently become permanently unprotected. Joins are
-   * rare and the read is cheap, so going to storage each time is the honest fix.
-   */
-  private async getRoomPasswordHash(): Promise<string | null> {
-    return (await this.ctx.storage.get<string>(PASSWORD_KEY)) ?? null;
-  }
-
-  /**
    * Salted SHA-256, hex. The Durable Object id is a stable, room-specific salt, and the
-   * host/rejoin tokens get their own prefix so they never equal a password hash.
+   * host/rejoin tokens get their own prefix.
    */
-  private async hashSecret(secret: string, kind?: "host" | "rejoin"): Promise<string> {
-    const prefix = kind ? `${this.ctx.id.toString()}:${kind}` : this.ctx.id.toString();
+  private async hashSecret(secret: string, kind: "host" | "rejoin"): Promise<string> {
+    const prefix = `${this.ctx.id.toString()}:${kind}`;
     const data = new TextEncoder().encode(`${prefix}:${secret}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-  }
-
-  /**
-   * Throttle for wrong-password joins.
-   *
-   * Refusing a guess only closes that one socket, so without this an attacker holding
-   * the room code can guess at whatever rate they can open sockets — MAX_SOCKETS_PER_IP
-   * bounds concurrency, never attempts over time. The password is the only thing
-   * between them and the room's media.
-   *
-   * Delay rather than lockout, so an attacker cannot deny the room to its actual users
-   * by burning attempts. A legitimate typo or two costs a few hundred milliseconds
-   * nobody notices; sustained guessing runs into the cap and then the hard limit.
-   *
-   * Returns the delay to serve before answering, or null to refuse immediately.
-   */
-  private async notePasswordFailure(): Promise<number | null> {
-    const now = Date.now();
-    const entry = (await this.ctx.storage.get<{ count: number; resetAt: number }>(PW_FAIL_KEY)) ?? null;
-    const next =
-      entry && entry.resetAt > now
-        ? { count: entry.count + 1, resetAt: entry.resetAt }
-        : { count: 1, resetAt: now + PW_FAIL_WINDOW_MS };
-    const day = (await this.ctx.storage.get<{ count: number; resetAt: number }>(PW_FAIL_DAY_KEY)) ?? null;
-    const nextDay =
-      day && day.resetAt > now
-        ? { count: day.count + 1, resetAt: day.resetAt }
-        : { count: 1, resetAt: now + PW_FAIL_DAY_WINDOW_MS };
-    await this.ctx.storage.put({ [PW_FAIL_KEY]: next, [PW_FAIL_DAY_KEY]: nextDay });
-    if (next.count > PW_FAIL_HARD_LIMIT || nextDay.count > PW_FAIL_DAY_LIMIT) return null;
-    return Math.min(next.count * 250, PW_FAIL_MAX_DELAY_MS);
   }
 
   /**
@@ -673,21 +581,9 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     clientMsg: Extract<ClientMessage, { t: "join" }>,
   ): Promise<void> {
-    // Clamp before anything touches storage. displayName is clamped below for the
-    // same reason; an unbounded password would exceed the 128 KiB Durable Object
-    // value limit, and the rejected put would propagate out of webSocketMessage
-    // and kill the socket with 1006 — which the client then retries forever.
-    const offered = clientMsg.password?.slice(0, MAX_PASSWORD_LENGTH);
-
     // Hash before touching storage, and never between a storage read and the write
     // that depends on it. Durable Object input gates only hold across storage
-    // operations; a crypto.subtle await lets another join run in the middle. With
-    // the hash computed between reading `claimed` and writing it, two joins racing
-    // on a fresh room could both see it unclaimed, so one could slip in without
-    // the password the other was setting, or a stranger's password could win.
-    // The same goes for the host and rejoin tokens: those offered, and those this
-    // join would be issued.
-    const offeredHash = offered ? await this.hashSecret(offered) : null;
+    // operations; a crypto.subtle await lets another join run in the middle.
     const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
     const offeredRejoinHash = clientMsg.rejoinToken
       ? await this.hashSecret(clientMsg.rejoinToken, "rejoin")
@@ -697,55 +593,7 @@ export class RoomDO extends DurableObject<Env> {
     const newRejoinToken = crypto.randomUUID();
     const newRejoinHash = await this.hashSecret(newRejoinToken, "rejoin");
 
-    // Verify room password if one has been set
-    const roomPasswordHash = await this.getRoomPasswordHash();
-    if (roomPasswordHash !== null) {
-      if (offeredHash === null) {
-        // No password supplied at all. This is the ordinary first contact — a
-        // shared /#CODE link, or a refresh — not an attempt at the password, so it
-        // must not feed the brute-force counter or pay its delay. Counting it made
-        // eight friends reloading a few times each throttle their own room.
-        sendSafe(ws, {
-          t: "error",
-          code: "bad-password",
-          message: "This room needs a password",
-        });
-        try {
-          ws.close(1008, "Password required");
-        } catch {}
-        return;
-      }
-      if (!timingSafeEqual(offeredHash, roomPasswordHash)) {
-        const delayMs = await this.notePasswordFailure();
-        if (delayMs === null) {
-          // Past the hard limit: refuse without delay and without hashing, so the
-          // throttle cannot be turned into a way to hold this object awake. 1013,
-          // not 1008, because the window expires and someone with the real
-          // password must be able to get in afterwards.
-          sendSafe(ws, {
-            t: "error",
-            code: "rate-limited",
-            message: "Too many password attempts. Try again later.",
-          });
-          try {
-            ws.close(TRY_AGAIN_LATER, "Too many password attempts");
-          } catch {}
-          return;
-        }
-        await scheduler.wait(delayMs);
-        sendSafe(ws, {
-          t: "error",
-          code: "bad-password",
-          message: "Incorrect or missing room password",
-        });
-        try {
-          ws.close(1008, "Incorrect password");
-        } catch {}
-        return;
-      }
-    }
-
-    const tokens = { offered, offeredHostHash, offeredRejoinHash, ip: attachment.ip };
+    const tokens = { offeredHostHash, offeredRejoinHash, ip: attachment.ip };
 
     // ---- commit. From here to the broadcast, only storage awaits: input gates
     // hold across those, so nothing else in the room runs in between.
@@ -831,10 +679,8 @@ export class RoomDO extends DurableObject<Env> {
     };
     await this.ctx.storage.put({
       [MEMBERS_KEY]: members,
-      // Only the join that creates the room may set its password (see CLAIMED_KEY).
       ...(admission.creates
         ? {
-            ...(offeredHash !== null ? { [PASSWORD_KEY]: offeredHash } : {}),
             [HOST_KEY]: newHostHash,
             [CLAIMED_KEY]: true,
           }
@@ -843,18 +689,6 @@ export class RoomDO extends DurableObject<Env> {
     if (admission.isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
     // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
     await this.ctx.storage.deleteAlarm();
-
-    if (!admission.creates && offered && roomPasswordHash === null) {
-      // The room already exists and has no password, and this peer supplied one.
-      // Silently dropping it let someone believe they had protected a room that
-      // was in fact open to anyone with the code — the worst possible outcome for
-      // a security control. Say so instead; the join itself still succeeds.
-      sendSafe(ws, {
-        t: "error",
-        code: "password-ignored",
-        message: "This room has no password. Yours was ignored — create a new room to set one.",
-      });
-    }
 
     attachment.name = sanitiseName(clientMsg.displayName);
     attachment.joined = true;
@@ -919,7 +753,6 @@ export class RoomDO extends DurableObject<Env> {
    * follows it see the same room state.
    */
   private async admit(tokens: {
-    offered: string | undefined;
     offeredHostHash: string | null;
     offeredRejoinHash: string | null;
     ip: string | undefined;
@@ -936,16 +769,6 @@ export class RoomDO extends DurableObject<Env> {
   > {
     const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
     if (!claimed) {
-      // Only a new room's password is checked: rooms created before this rule keep
-      // working with whatever they were given. Refused before anything is stored,
-      // so the room stays unclaimed and the creator can simply try again.
-      if (tokens.offered && tokens.offered.length < MIN_PASSWORD_LENGTH) {
-        return {
-          ok: false,
-          code: "weak-password",
-          message: `Room passwords need at least ${MIN_PASSWORD_LENGTH} characters.`,
-        };
-      }
       return { ok: true, creates: true, isHost: true, locked: false, returning: false };
     }
 

@@ -1,8 +1,5 @@
 /**
- * getStats() extraction.
- *
- * The one number that matters most here is `candidateType`: "srflx" or "host" means
- * the connection is direct peer-to-peer.
+ * getStats() extraction for inbound (viewer tile) and outbound (sharer-to-viewer) links.
  */
 
 import type { LinkHealth } from "./quality";
@@ -19,8 +16,8 @@ function str(v: unknown): string | null {
 }
 
 interface Sample {
-  bytesSent: number | null;
-  packetsSent: number | null;
+  bytes: number | null;
+  packets: number | null;
   packetsLost: number | null;
   timestampMs: number;
 }
@@ -29,13 +26,21 @@ interface Sample {
  * Polls one RTCPeerConnection and turns raw stats into LinkHealth.
  *
  * Stateful because the interesting quantities are rates, not counters: WebRTC reports
- * cumulative `bytesSent`, so bitrate only exists as a delta between two samples.
+ * cumulative byte/packet counts, so bitrate and loss only exist as deltas between two samples.
  */
 export class LinkMonitor {
   private prev: Sample | null = null;
 
   private readonly pc: RTCPeerConnection;
-  constructor(pc: RTCPeerConnection) { this.pc = pc; }
+  private readonly direction: "inbound" | "outbound";
+
+  constructor(
+    pc: RTCPeerConnection,
+    direction: "inbound" | "outbound" = "outbound",
+  ) {
+    this.pc = pc;
+    this.direction = direction;
+  }
 
   async read(): Promise<LinkHealth | null> {
     let report: RTCStatsReport;
@@ -70,43 +75,46 @@ export class LinkMonitor {
       }
     }
 
-    const localId = pair ? str(pair["localCandidateId"]) : null;
-    const remoteId = pair ? str(pair["remoteCandidateId"]) : null;
-    const local = localId ? byId.get(localId) : undefined;
-    const remote = remoteId ? byId.get(remoteId) : undefined;
-
-    let outbound: Stat | null = null;
+    let rtp: Stat | null = null;
     let remoteInbound: Stat | null = null;
     for (const s of byId.values()) {
       if (s["kind"] !== "video") continue;
-      if (s["type"] === "outbound-rtp") outbound = s;
-      else if (s["type"] === "remote-inbound-rtp") remoteInbound = s;
+      if (this.direction === "outbound") {
+        if (s["type"] === "outbound-rtp") rtp = s;
+        else if (s["type"] === "remote-inbound-rtp") remoteInbound = s;
+      } else {
+        if (s["type"] === "inbound-rtp") rtp = s;
+      }
     }
 
-    // Rates from counter deltas.
     const now = performance.now();
+    const bytesKey = this.direction === "outbound" ? "bytesSent" : "bytesReceived";
+    const packetsKey = this.direction === "outbound" ? "packetsSent" : "packetsReceived";
+    const lostSource = this.direction === "outbound" ? remoteInbound : rtp;
+
     const sample: Sample = {
-      bytesSent: outbound ? num(outbound["bytesSent"]) : null,
-      packetsSent: outbound ? num(outbound["packetsSent"]) : null,
-      packetsLost: remoteInbound ? num(remoteInbound["packetsLost"]) : null,
+      bytes: rtp ? num(rtp[bytesKey]) : null,
+      packets: rtp ? num(rtp[packetsKey]) : null,
+      packetsLost: lostSource ? num(lostSource["packetsLost"]) : null,
       timestampMs: now,
     };
 
-    let outboundBitrate: number | null = null;
+    let bitrate: number | null = null;
     let packetLossRatio: number | null = null;
     const prev = this.prev;
     if (prev) {
       const dt = (sample.timestampMs - prev.timestampMs) / 1000;
-      if (dt > 0 && sample.bytesSent !== null && prev.bytesSent !== null) {
-        outboundBitrate = Math.max(0, ((sample.bytesSent - prev.bytesSent) * 8) / dt);
+      if (dt > 0 && sample.bytes !== null && prev.bytes !== null) {
+        bitrate = Math.max(0, ((sample.bytes - prev.bytes) * 8) / dt);
       }
       if (
-        sample.packetsSent !== null && prev.packetsSent !== null &&
+        sample.packets !== null && prev.packets !== null &&
         sample.packetsLost !== null && prev.packetsLost !== null
       ) {
-        const dSent = sample.packetsSent - prev.packetsSent;
+        const dPackets = sample.packets - prev.packets;
         const dLost = sample.packetsLost - prev.packetsLost;
-        if (dSent > 0) packetLossRatio = Math.max(0, dLost) / dSent;
+        const denom = this.direction === "inbound" ? dPackets + Math.max(0, dLost) : dPackets;
+        if (denom > 0) packetLossRatio = Math.max(0, dLost) / denom;
       }
     }
     this.prev = sample;
@@ -114,52 +122,28 @@ export class LinkMonitor {
     const rttSec = pair ? num(pair["currentRoundTripTime"]) : null;
 
     return {
-      candidateType: (local ? str(local["candidateType"]) : null) ?? "unknown",
-      remoteCandidateType: (remote ? str(remote["candidateType"]) : null) ?? "unknown",
       rttMs: rttSec === null ? null : rttSec * 1000,
       packetLossRatio,
-      outboundBitrate,
-      framesPerSecond: outbound ? num(outbound["framesPerSecond"]) : null,
-      frameWidth: outbound ? num(outbound["frameWidth"]) : null,
-      frameHeight: outbound ? num(outbound["frameHeight"]) : null,
+      bitrate,
+      framesPerSecond: rtp ? num(rtp["framesPerSecond"]) : null,
+      frameWidth: rtp ? num(rtp["frameWidth"]) : null,
+      frameHeight: rtp ? num(rtp["frameHeight"]) : null,
     };
   }
 }
 
-/** Candidate types that represent a genuine peer-to-peer path. */
-const DIRECT_CANDIDATE_TYPES = ["host", "srflx", "prflx"];
-
-/**
- * True when the connection is provably direct — the outcome this project exists for.
- *
- * Requires a positively direct candidate type rather than merely "not relay": both
- * fields fall back to the sentinel "unknown" before ICE nominates a pair, and
- * treating that as direct would render `direct (unknown)`.
- */
-export function isDirect(h: LinkHealth): boolean {
-  return (
-    DIRECT_CANDIDATE_TYPES.includes(h.candidateType) &&
-    DIRECT_CANDIDATE_TYPES.includes(h.remoteCandidateType)
-  );
-}
-
-/** True when the route is not yet known. */
-export function isRouteUnknown(h: LinkHealth): boolean {
-  return h.candidateType === "unknown" || h.remoteCandidateType === "unknown";
-}
-
-/** Compact one-line summary for a tile label or console log. */
-export function summarize(h: LinkHealth): string {
+/** Compact one-line summary for a tile overlay or roster row. */
+export function summarize(h: LinkHealth, includeResolution = true): string {
   const bits: string[] = [];
-  bits.push(
-    isRouteUnknown(h) ? "connecting…" : isDirect(h) ? `direct (${h.candidateType})` : "relayed",
-  );
-  if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms rtt`);
-  if (h.outboundBitrate !== null) bits.push(`${(h.outboundBitrate / 1e6).toFixed(1)} Mbps`);
+  if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms`);
+  if (h.bitrate !== null) bits.push(`${(h.bitrate / 1e6).toFixed(1)} Mbps`);
   if (h.framesPerSecond !== null) bits.push(`${Math.round(h.framesPerSecond)}fps`);
-  if (h.frameWidth !== null && h.frameHeight !== null) bits.push(`${h.frameWidth}x${h.frameHeight}`);
+  if (includeResolution && h.frameWidth !== null && h.frameHeight !== null) {
+    bits.push(`${h.frameWidth}x${h.frameHeight}`);
+  }
   if (h.packetLossRatio !== null && h.packetLossRatio > 0.001) {
     bits.push(`${(h.packetLossRatio * 100).toFixed(1)}% loss`);
   }
+  if (bits.length === 0) return "connecting…";
   return bits.join(" · ");
 }

@@ -284,6 +284,10 @@ class PeerLink {
     return this.pc.connectionState;
   }
 
+  get isRemoteViewing(): boolean {
+    return this.remoteWantsVideo;
+  }
+
   /**
    * Re-apply encoder settings after a live quality change. The BitrateAdapter is
    * rebuilt because it captures the preset's ceiling as its recovery target — reusing
@@ -298,6 +302,17 @@ class PeerLink {
     await this.setSenderActive(this.remoteWantsVideo);
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
+  }
+
+  /**
+   * Re-apply codec preference and renegotiate in place so live codec changes take
+   * effect immediately without stopping the share.
+   */
+  reapplyCodec(codec: CodecName): void {
+    if (!this.videoSender) return;
+    const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
+    if (tx) preferCodec(tx, codec);
+    this.retryOffer();
   }
 
   async attachCapture(capture: CaptureResult): Promise<void> {
@@ -586,13 +601,26 @@ export class Mesh {
   }
 
   /**
-   * Change quality for every peer without renegotiating. Codec changes cannot work
-   * this way — setCodecPreferences only takes effect on the next offer — which is why
-   * the UI applies codec on the next share instead.
+   * Change quality for every peer without renegotiating.
    */
   async setPreset(preset: QualityPreset): Promise<void> {
     this.opts.preset = preset;
     await Promise.all([...this.links.values()].map((l) => l.reapplyEncoding()));
+  }
+
+  /**
+   * Change preferred video codec for every peer and renegotiate active links in place.
+   */
+  setCodec(codec: CodecName): void {
+    this.opts.codec = codec;
+    for (const l of this.links.values()) l.reapplyCodec(codec);
+  }
+
+  /**
+   * Whether the peer is currently requesting video frames over the control channel.
+   */
+  isPeerViewing(peerId: PeerId): boolean {
+    return this.links.get(peerId)?.isRemoteViewing === true;
   }
 
   getConnection(peerId: PeerId): RTCPeerConnection | undefined {

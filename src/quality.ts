@@ -147,11 +147,9 @@ export function mungeOpusSdp(sdp: string): string {
 }
 
 export interface LinkHealth {
-  candidateType: string;      // "host" | "srflx" | "relay" | "prflx"
-  remoteCandidateType: string;
   rttMs: number | null;
   packetLossRatio: number | null;
-  outboundBitrate: number | null;
+  bitrate: number | null;
   framesPerSecond: number | null;
   frameWidth: number | null;
   frameHeight: number | null;

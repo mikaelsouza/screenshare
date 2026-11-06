@@ -6,8 +6,6 @@
 
 import {
   MAX_ROOM_SIZE,
-  MIN_PASSWORD_LENGTH,
-  ROOM_CODE_ALPHABET,
   isValidRoomCode,
   type PeerId,
   type PeerInfo,
@@ -30,7 +28,17 @@ import { createCaptureController } from "./platform";
 import type { EndReason, FollowState } from "./platform/types";
 import { DEFAULT_CODEC, type CodecName } from "./quality";
 import { SignalingClient } from "./signaling";
-import { LinkMonitor, isDirect, summarize } from "./stats";
+import { LinkMonitor, summarize } from "./stats";
+import {
+  computeVolumeState,
+  deriveViewState,
+  shouldRequestRemoteVideo,
+  sortAndFormatRoster,
+  type RosterEntry,
+  type RosterSummary,
+  type ViewState,
+  type VolumeState,
+} from "./ui-model";
 
 function el<T extends HTMLElement>(id: string): T {
   const node = document.getElementById(id);
@@ -39,46 +47,123 @@ function el<T extends HTMLElement>(id: string): T {
 }
 
 const ui = {
+  lobby: el<HTMLElement>("lobby"),
   nameInput: el<HTMLInputElement>("display-name"),
+  roomNameInput: el<HTMLInputElement>("room-name"),
   roomInput: el<HTMLInputElement>("room-code"),
-  passInput: el<HTMLInputElement>("room-pass"),
-  genPassBtn: el<HTMLButtonElement>("gen-pass"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
+  roomBar: el<HTMLElement>("room-bar"),
   copyLinkBtn: el<HTMLButtonElement>("copy-link"),
-  shareBtn: el<HTMLButtonElement>("share"),
-  muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
-  audioMode: el<HTMLSelectElement>("audio-mode"),
-  audioChip: el<HTMLElement>("audio-chip"),
-  audioChipText: el<HTMLElement>("audio-chip-text"),
-  audioChangeBtn: el<HTMLButtonElement>("audio-change"),
+  leaveBtn: el<HTMLButtonElement>("leave"),
+  rosterBtn: el<HTMLButtonElement>("roster-btn"),
+  roster: el<HTMLElement>("roster"),
+  rosterTitle: el<HTMLElement>("roster-title"),
+  rosterList: el<HTMLUListElement>("roster-list"),
+  lockBtn: el<HTMLButtonElement>("lock-btn"),
   followChip: el<HTMLElement>("follow-chip"),
+  followDot: el<HTMLElement>("follow-dot"),
   followChipText: el<HTMLElement>("follow-chip-text"),
+  status: el<HTMLElement>("status"),
+  stage: el<HTMLDivElement>("stage"),
   audioPrompt: el<HTMLElement>("audio-prompt"),
   audioPromptText: el<HTMLElement>("audio-prompt-text"),
   audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
   audioPickSystemBtn: el<HTMLButtonElement>("audio-pick-system"),
   audioPickNoneBtn: el<HTMLButtonElement>("audio-pick-none"),
-  stage: el<HTMLDivElement>("stage"),
-  roster: el<HTMLElement>("roster"),
-  rosterTitle: el<HTMLElement>("roster-title"),
-  rosterList: el<HTMLUListElement>("roster-list"),
-  lockBtn: el<HTMLButtonElement>("lock-btn"),
-  surfaceWarning: el<HTMLElement>("surface-warning"),
-  status: el<HTMLElement>("status"),
+  controls: el<HTMLElement>("controls"),
+  liveControls: el<HTMLElement>("live-controls"),
+  audioMode: el<HTMLSelectElement>("audio-mode"),
   preset: el<HTMLSelectElement>("preset"),
   codec: el<HTMLSelectElement>("codec"),
+  togglePreviewBtn: el<HTMLButtonElement>("toggle-preview"),
+  shareBtn: el<HTMLButtonElement>("share"),
 };
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+type IconName =
+  | "play"
+  | "pause"
+  | "volumeOn"
+  | "volumeOff"
+  | "fitContain"
+  | "fitCover"
+  | "focus"
+  | "unfocus"
+  | "pip"
+  | "stats"
+  | "fullscreen"
+  | "exitFullscreen";
+
+/**
+ * Trusted-Types-safe SVG icon factory using createElementNS (never innerHTML).
+ */
+function createIcon(name: IconName): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+
+  const path = (d: string): SVGPathElement => {
+    const p = document.createElementNS(SVG_NS, "path");
+    p.setAttribute("d", d);
+    return p;
+  };
+
+  switch (name) {
+    case "play":
+      svg.append(path("M6 4l14 8-14 8V4z"));
+      break;
+    case "pause":
+      svg.append(path("M6 4h4v16H6zM14 4h4v16h-4z"));
+      break;
+    case "volumeOn":
+      svg.append(path("M11 5L6 9H2v6h4l5 4V5z"), path("M15.54 8.46a5 5 0 0 1 0 7.07"), path("M19.07 4.93a10 10 0 0 1 0 14.14"));
+      break;
+    case "volumeOff":
+      svg.append(path("M11 5L6 9H2v6h4l5 4V5z"), path("M22 9l-6 6"), path("M16 9l6 6"));
+      break;
+    case "fitContain":
+      svg.append(path("M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"));
+      break;
+    case "fitCover":
+      svg.append(path("M8 4v4H4M16 4v4h4M8 20v-4H4M16 20v-4h4"));
+      break;
+    case "focus":
+      svg.append(path("M12 2v8M8 6h8M6 14h12l-2 6H8l-2-6z"));
+      break;
+    case "unfocus":
+      svg.append(path("M4 12h16"));
+      break;
+    case "pip":
+      svg.append(path("M3 5h18v14H3z"), path("M12 11h7v6h-7z"));
+      break;
+    case "stats":
+      svg.append(path("M18 20V10M12 20V4M6 20v-6"));
+      break;
+    case "fullscreen":
+      svg.append(path("M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"));
+      break;
+    case "exitFullscreen":
+      svg.append(path("M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"));
+      break;
+  }
+  return svg;
+}
+
+function setButtonIcon(btn: HTMLButtonElement, icon: IconName): void {
+  btn.replaceChildren(createIcon(icon));
+}
 
 let client: SignalingClient | null = null;
 let mesh: Mesh | null = null;
 let capture: CaptureResult | null = null;
 /** A second, audio-only capture (picker #2) whose audio replaced the screen's own. */
 let audioSource: AudioSource | null = null;
-/** Survives audio swaps, so a new source doesn't unmute what the user muted. */
-let audioMuted = false;
-/** Set when the audio being sent ended by itself, e.g. the game window closed. */
-let audioLost = false;
+/** Whether the sharer hid their own preview tile on stage. */
+let selfPreviewHidden = false;
+/** Whether the top-bar roster popover is open. */
+let rosterOpen = false;
 
 const names = new Map<PeerId, string>();
 /** Everyone else in the room and whether they are sharing, for the participant list. */
@@ -88,11 +173,17 @@ let isHost = false;
 let roomLocked = false;
 /** Our own id in the current room, once welcomed. */
 let selfId: PeerId | null = null;
-/** The room and password of the current connection, so it can be redone in place. */
-let lastJoin: { code: string; password: string | undefined } | null = null;
+/** The room of the current connection, so it can be redone in place. */
+let lastJoin: { code: string } | null = null;
+
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
-const monitors = new Map<PeerId, LinkMonitor>();
+const inboundMonitors = new Map<PeerId, LinkMonitor>();
+const outboundMonitors = new Map<PeerId, LinkMonitor>();
+const peerOutboundText = new Map<PeerId, string>();
+let totalOutboundMbps = 0;
+let activeViewerCount = 0;
+const statsOpen = new Set<PeerId>();
 const observers = new Map<PeerId, IntersectionObserver>();
 const unmutePrompts = new Map<PeerId, HTMLElement>();
 let healthTimer: ReturnType<typeof setInterval> | null = null;
@@ -100,14 +191,11 @@ let healthTimer: ReturnType<typeof setInterval> | null = null;
 /**
  * Per-stream volume and mute, chosen by the viewer. Kept per peer rather than per tile,
  * so a sharer who stops and starts again comes back at the volume they were left at.
- * `volume` is never 0: dragging the slider to 0 sets `muted` instead, so unmuting
- * returns to where it was.
  */
 const listening = new Map<PeerId, { volume: number; muted: boolean }>();
 /**
  * Streams the viewer paused. The sharer is asked to stop sending us video (the same
- * send-side pause an off-screen tile gets) and the audio is silenced locally. Cleared
- * with the tile: a sharer who stops and shares again is a new stream.
+ * send-side pause an off-screen tile gets) and the audio is silenced locally.
  */
 const paused = new Set<PeerId>();
 /** Whether each tile is on screen, as last reported by its IntersectionObserver. */
@@ -124,10 +212,56 @@ const tileControls = new Map<
     volume: HTMLInputElement;
     fitBtn: HTMLButtonElement;
     focusBtn: HTMLButtonElement;
+    statsBtn: HTMLButtonElement;
     fullscreenBtn: HTMLButtonElement;
     pipBtn?: HTMLButtonElement | undefined;
   }
 >();
+
+/** Tile id of our own screen preview. */
+const SELF_TILE = "__self";
+
+function visibleTileCount(): number {
+  let count = 0;
+  for (const [id, video] of tiles.entries()) {
+    const wrap = video.closest<HTMLElement>(".tile");
+    if (wrap && !wrap.hidden && !(id === SELF_TILE && selfPreviewHidden)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function syncViewState(): ViewState {
+  const connected = selfId !== null && client !== null;
+  const sharing = capture !== null;
+  const state = deriveViewState(connected, sharing, selfPreviewHidden, visibleTileCount());
+
+  ui.lobby.hidden = state.lobbyHidden;
+  ui.stage.hidden = !state.lobbyHidden;
+  ui.roomBar.hidden = state.roomBarHidden;
+  ui.copyLinkBtn.hidden = state.roomBarHidden;
+  ui.controls.hidden = state.controlsHidden;
+  ui.liveControls.hidden = state.liveControlsHidden;
+  ui.togglePreviewBtn.hidden = state.togglePreviewHidden;
+  ui.shareBtn.textContent = state.shareButtonText;
+  ui.shareBtn.className = `ui-btn ${state.shareButtonVariant}`;
+
+  if (client === null) {
+    rosterOpen = false;
+    ui.roster.hidden = true;
+    ui.rosterBtn.setAttribute("aria-expanded", "false");
+  }
+
+  for (const c of tileControls.values()) {
+    c.focusBtn.hidden = !state.showFocusButtons;
+  }
+  if (!state.showFocusButtons && focusedPeerId !== null) {
+    setFocusedTile(null);
+  }
+
+  return state;
+}
 
 function setFocusedTile(peerId: PeerId | null): void {
   if (focusedPeerId === peerId) focusedPeerId = null;
@@ -150,6 +284,17 @@ function setFocusedTile(peerId: PeerId | null): void {
 function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void {
   ui.status.textContent = text;
   ui.status.dataset["kind"] = kind;
+  ui.status.hidden = kind === "info" || text.length === 0;
+}
+
+function defaultCopyLinkLabel(): string {
+  const code = lastJoin?.code ?? ui.roomInput.value.trim().toUpperCase();
+  return code ? `${code} · Copy link` : "Copy link";
+}
+
+function syncCopyLinkButton(): void {
+  if (copyFeedbackTimeout !== null) return;
+  ui.copyLinkBtn.textContent = defaultCopyLinkLabel();
 }
 
 /**
@@ -157,11 +302,7 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
  */
 const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
 
-
 // ---- tiles ---------------------------------------------------------------
-
-/** Tile id of our own screen preview. */
-const SELF_TILE = "__self";
 
 function tileFor(peerId: PeerId): HTMLVideoElement {
   const existing = tiles.get(peerId);
@@ -174,9 +315,7 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   const video = document.createElement("video");
   video.autoplay = true;
   video.playsInline = true;
-  // Remote audio must NOT be muted (it's the game audio); our own preview must be,
-  // or the sharer hears themselves.
-  video.muted = false;
+  video.muted = peerId === SELF_TILE;
 
   const label = document.createElement("span");
   label.className = "tile-label";
@@ -184,6 +323,7 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
 
   const health = document.createElement("span");
   health.className = "tile-health";
+  health.hidden = !statsOpen.has(peerId);
   healthEls.set(peerId, health);
 
   wrap.append(video, label, health);
@@ -196,7 +336,7 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
   video.addEventListener("resize", updateAspect);
   wrap.addEventListener("dblclick", (ev) => {
     if ((ev.target as HTMLElement).closest("button, input")) return;
-    setFocusedTile(peerId);
+    if (visibleTileCount() >= 2) setFocusedTile(peerId);
   });
   wrap.addEventListener("click", (ev) => {
     if (focusedPeerId !== null && focusedPeerId !== peerId) {
@@ -205,28 +345,50 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
     }
   });
   tiles.set(peerId, video);
-  // Our own preview is always muted and never paused, so it gets no controls.
-  if (peerId !== SELF_TILE) buildTileControls(peerId, wrap);
+  if (peerId === SELF_TILE) {
+    buildSelfTileControls(wrap);
+    wrap.hidden = selfPreviewHidden;
+  } else {
+    buildTileControls(peerId, wrap);
+  }
   ui.stage.append(wrap);
   applyAudio(peerId);
+  syncViewState();
 
-  // Send-side pausing: tell the sharer to stop encoding for us when their tile
-  // isn't on screen. This is the biggest bandwidth lever in a multi-sharer room.
-  // Ignore callbacks for a tile we have already torn down: removal itself queues an
-  // intersection change, and acting on it would tell a peer to pause a sender that a
-  // freshly-created tile has just asked to resume.
-  const io = new IntersectionObserver(
-    (entries) => {
-      if (observers.get(peerId) !== io) return;
-      for (const e of entries) onScreen.set(peerId, e.isIntersecting);
-      applyViewing(peerId);
-    },
-    { threshold: 0.1 },
-  );
-  io.observe(wrap);
-  observers.set(peerId, io);
+  if (peerId !== SELF_TILE) {
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (observers.get(peerId) !== io) return;
+        for (const e of entries) onScreen.set(peerId, e.isIntersecting);
+        applyViewing(peerId);
+      },
+      { threshold: 0.1 },
+    );
+    io.observe(wrap);
+    observers.set(peerId, io);
+  }
 
   return video;
+}
+
+function buildSelfTileControls(wrap: HTMLElement): void {
+  const bar = document.createElement("div");
+  bar.className = "tile-controls";
+
+  const hideBtn = document.createElement("button");
+  hideBtn.type = "button";
+  hideBtn.className = "tile-hide-self";
+  hideBtn.textContent = "Hide preview";
+  hideBtn.title = "Hide your local preview tile";
+  hideBtn.addEventListener("click", () => {
+    selfPreviewHidden = true;
+    wrap.hidden = true;
+    if (focusedPeerId === SELF_TILE) setFocusedTile(null);
+    syncViewState();
+  });
+
+  bar.append(hideBtn);
+  wrap.append(bar);
 }
 
 function listeningFor(peerId: PeerId): { volume: number; muted: boolean } {
@@ -240,15 +402,12 @@ function listeningFor(peerId: PeerId): { volume: number; muted: boolean } {
 
 /**
  * Ask the sharer for video only while the tile is both on screen and not paused.
- * One place decides, so scrolling a paused tile into view can't resume it, and
- * resuming a tile that is scrolled away doesn't start the upload either.
  */
 function applyViewing(peerId: PeerId): void {
   const isPip = document.pictureInPictureElement === tiles.get(peerId);
-  const visible = onScreen.get(peerId);
-  // Before the first observer callback, leave the far end at its default (sending).
-  if (visible === undefined && !isPip && !paused.has(peerId)) return;
-  mesh?.setViewing(peerId, (visible === true || isPip) && !paused.has(peerId));
+  const want = shouldRequestRemoteVideo(onScreen.get(peerId), isPip, paused.has(peerId));
+  if (want === null) return;
+  mesh?.setViewing(peerId, want);
 }
 
 interface BoostAudioPipe {
@@ -330,13 +489,11 @@ function applyAudio(peerId: PeerId): void {
   const isSilent = s.muted || paused.has(peerId) || unmutePrompts.has(peerId);
   const stream = video.srcObject instanceof MediaStream ? video.srcObject : null;
 
-  // HTMLMediaElement volume is strictly clamped to [0, 1].
   video.volume = Math.max(0, Math.min(1, s.volume));
 
   if (s.volume > 1 && !isSilent && stream && stream.getAudioTracks().length > 0) {
     const pipe = setupBoostPipe(peerId, stream);
     if (pipe) {
-      // Mute the video element so Web Audio is the single output path (avoids comb filtering / echo).
       video.muted = true;
       pipe.gain.gain.value = s.volume;
       const ctx = getSharedAudioContext();
@@ -347,7 +504,6 @@ function applyAudio(peerId: PeerId): void {
     }
   }
 
-  // Volume <= 1 or muted or paused: native video handles playback.
   video.muted = isSilent;
   const pipe = boostPipes.get(peerId);
   if (pipe) {
@@ -370,7 +526,6 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   muteBtn.addEventListener("click", () => {
     const s = listeningFor(peerId);
     s.muted = !s.muted;
-    // Any click on the tile is the gesture the autoplay policy was waiting for.
     dismissUnmutePrompt(peerId);
     applyAudio(peerId);
     renderTileControls(peerId);
@@ -384,11 +539,11 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   volume.step = "1";
   volume.addEventListener("input", () => {
     const s = listeningFor(peerId);
-    const v = Number(volume.value);
-    if (v === 0) {
+    const volState: VolumeState = computeVolumeState(Number(volume.value), s.volume);
+    if (volState.muted) {
       s.muted = true;
     } else {
-      s.volume = v / 100;
+      s.volume = volState.volume;
       s.muted = false;
     }
     dismissUnmutePrompt(peerId);
@@ -409,6 +564,17 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   focusBtn.type = "button";
   focusBtn.className = "tile-focus";
   focusBtn.addEventListener("click", () => setFocusedTile(peerId));
+
+  const statsBtn = document.createElement("button");
+  statsBtn.type = "button";
+  statsBtn.className = "tile-stats";
+  statsBtn.addEventListener("click", () => {
+    if (statsOpen.has(peerId)) statsOpen.delete(peerId);
+    else statsOpen.add(peerId);
+    const hEl = healthEls.get(peerId);
+    if (hEl) hEl.hidden = !statsOpen.has(peerId);
+    renderTileControls(peerId);
+  });
 
   const fullscreenBtn = document.createElement("button");
   fullscreenBtn.type = "button";
@@ -450,17 +616,35 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
     }
   }
 
-  bar.append(pauseBtn, muteBtn, volume, fitBtn, focusBtn, ...(pipBtn ? [pipBtn] : []), fullscreenBtn);
+  bar.append(
+    pauseBtn,
+    muteBtn,
+    volume,
+    fitBtn,
+    focusBtn,
+    ...(pipBtn ? [pipBtn] : []),
+    statsBtn,
+    fullscreenBtn,
+  );
 
-  // Over the frozen last frame while paused, so it is obvious why nothing moves.
   const resume = document.createElement("button");
   resume.type = "button";
   resume.className = "tile-paused";
-  resume.textContent = "Paused. Click to resume";
+  resume.textContent = "Paused · Click to resume";
   resume.addEventListener("click", () => setPaused(peerId, false));
 
   wrap.append(resume, bar);
-  tileControls.set(peerId, { wrap, pauseBtn, muteBtn, volume, fitBtn, focusBtn, fullscreenBtn, pipBtn });
+  tileControls.set(peerId, {
+    wrap,
+    pauseBtn,
+    muteBtn,
+    volume,
+    fitBtn,
+    focusBtn,
+    statsBtn,
+    fullscreenBtn,
+    pipBtn,
+  });
   renderTileControls(peerId);
 }
 
@@ -472,55 +656,60 @@ function renderTileControls(peerId: PeerId): void {
   const name = names.get(peerId) ?? "this stream";
   c.wrap.dataset["paused"] = String(isPaused);
 
-  c.pauseBtn.textContent = isPaused ? "▶" : "⏸";
+  setButtonIcon(c.pauseBtn, isPaused ? "play" : "pause");
   c.pauseBtn.title = isPaused ? `Resume ${name}` : `Pause ${name}. Stops their video being sent to you.`;
   c.pauseBtn.setAttribute("aria-label", isPaused ? `Resume ${name}` : `Pause ${name}`);
 
   const silent = s.muted || isPaused;
-  c.muteBtn.textContent = silent ? "🔇" : "🔊";
+  setButtonIcon(c.muteBtn, silent ? "volumeOff" : "volumeOn");
   c.muteBtn.title = isPaused ? `${name} is paused` : s.muted ? `Unmute ${name}` : `Mute ${name}`;
   c.muteBtn.setAttribute("aria-label", c.muteBtn.title);
   c.muteBtn.disabled = isPaused;
 
-  c.volume.value = String(s.muted ? 0 : Math.round(s.volume * 100));
-  const isBoosted = !s.muted && !isPaused && s.volume > 1;
+  const sliderVal = s.muted ? 0 : Math.round(s.volume * 100);
+  const volState = computeVolumeState(sliderVal, s.volume);
+  c.volume.value = String(sliderVal);
+  const isBoosted = !isPaused && volState.boosted;
   c.volume.dataset["boosted"] = String(isBoosted);
-  c.volume.title = `${name} volume: ${c.volume.value}%${isBoosted ? " (boosted)" : ""}`;
+  c.volume.title = `${name} ${volState.label.toLowerCase()}${isBoosted ? " (boosted)" : ""}`;
   c.volume.setAttribute("aria-label", `${name} volume`);
   c.volume.disabled = isPaused;
 
   const isCover = c.wrap.dataset["fit"] === "cover";
-  c.fitBtn.textContent = isCover ? "⊡" : "⤢";
+  setButtonIcon(c.fitBtn, isCover ? "fitContain" : "fitCover");
   c.fitBtn.title = isCover ? `Fit ${name} to window (show whole screen)` : `Fill window with ${name} (crop black bars)`;
   c.fitBtn.setAttribute("aria-label", c.fitBtn.title);
   c.fitBtn.setAttribute("aria-pressed", String(isCover));
 
   const isFocused = focusedPeerId === peerId;
-  c.focusBtn.textContent = isFocused ? "🗕" : "📌";
+  setButtonIcon(c.focusBtn, isFocused ? "unfocus" : "focus");
   c.focusBtn.title = isFocused ? `Unfocus ${name}` : `Focus ${name} (double-click also focuses)`;
   c.focusBtn.setAttribute("aria-label", c.focusBtn.title);
   c.focusBtn.setAttribute("aria-pressed", String(isFocused));
+  c.focusBtn.hidden = visibleTileCount() < 2;
 
   if (c.pipBtn) {
     const v = tiles.get(peerId);
     const isPip = document.pictureInPictureElement === v;
-    c.pipBtn.textContent = isPip ? "🗗" : "⧉";
+    setButtonIcon(c.pipBtn, "pip");
     c.pipBtn.title = isPip ? `Exit Picture-in-Picture for ${name}` : `Picture-in-Picture for ${name}`;
     c.pipBtn.setAttribute("aria-label", c.pipBtn.title);
     c.pipBtn.setAttribute("aria-pressed", String(isPip));
   }
 
+  const isStats = statsOpen.has(peerId);
+  setButtonIcon(c.statsBtn, "stats");
+  c.statsBtn.title = isStats ? `Hide stream stats for ${name}` : `Show stream stats for ${name}`;
+  c.statsBtn.setAttribute("aria-label", c.statsBtn.title);
+  c.statsBtn.setAttribute("aria-pressed", String(isStats));
+
   const isFs = document.fullscreenElement === c.wrap;
-  c.fullscreenBtn.textContent = isFs ? "🗗" : "⛶";
+  setButtonIcon(c.fullscreenBtn, isFs ? "exitFullscreen" : "fullscreen");
   c.fullscreenBtn.title = isFs ? `Exit full screen for ${name}` : `Full screen ${name}`;
   c.fullscreenBtn.setAttribute("aria-label", c.fullscreenBtn.title);
   c.fullscreenBtn.setAttribute("aria-pressed", String(isFs));
 }
 
-/**
- * Pause or resume one stream. Paused: the sharer stops encoding video for us, the
- * audio goes silent and the frame freezes. Nothing changes for anyone else.
- */
 function setPaused(peerId: PeerId, value: boolean): void {
   if (value) paused.add(peerId);
   else paused.delete(peerId);
@@ -528,7 +717,6 @@ function setPaused(peerId: PeerId, value: boolean): void {
   const target = healthEls.get(peerId);
   if (value && target) {
     target.textContent = "paused";
-    delete target.dataset["direct"];
   }
   dismissUnmutePrompt(peerId);
   applyAudio(peerId);
@@ -543,19 +731,7 @@ function setPaused(peerId: PeerId, value: boolean): void {
   renderTileControls(peerId);
 }
 
-/**
- * Start playback explicitly instead of relying on the `autoplay` attribute.
- *
- * Confirmed against the live deployment: opening a shared /#ROOMCODE link with no
- * prior user gesture gets unmuted play() rejected by Chrome's autoplay policy, so
- * the attribute alone yields a silently black tile. Retrying muted always succeeds,
- * and the viewer is offered an explicit click to restore audio.
- *
- * The prompt is its own overlay rather than text in the health badge, because the
- * stats poller rewrites that badge every two seconds and would erase it.
- */
 function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
-  // A paused stream stays paused even if its tracks are renegotiated.
   if (paused.has(peerId)) {
     video.pause();
     return;
@@ -565,8 +741,6 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     void video.play().then(
       () => showUnmutePrompt(video, peerId),
       () => {
-        // play() rejects when the tile is torn down mid-attempt, e.g. on being
-        // removed from the room; that must not overwrite the status saying so.
         if (tiles.get(peerId) !== video) return;
         setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
       },
@@ -574,17 +748,18 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
   });
 }
 
-/** Click-to-unmute affordance shown when the autoplay policy forced muted playback. */
 function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
   const wrap = video.closest(".tile");
   if (!wrap || wrap.querySelector(".tile-unmute")) return;
-  // The viewer muted this stream on purpose: there is nothing to unmute.
   if (listeningFor(peerId).muted) return;
 
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
-  btn.textContent = "Click to unmute";
+  btn.append(createIcon("volumeOff"));
+  const txt = document.createElement("span");
+  txt.textContent = "Click to unmute";
+  btn.append(txt);
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
     const s = listeningFor(peerId);
@@ -605,9 +780,6 @@ function dismissUnmutePrompt(peerId: PeerId): void {
 function removeTile(peerId: PeerId): void {
   const video = tiles.get(peerId);
   if (!video) return;
-  // Disconnect before removing: an observer left attached to a detached subtree
-  // leaks both the observer and the <video> with its former srcObject, and keeps
-  // firing stale callbacks.
   observers.get(peerId)?.disconnect();
   observers.delete(peerId);
   dismissUnmutePrompt(peerId);
@@ -619,11 +791,13 @@ function removeTile(peerId: PeerId): void {
   video.closest(".tile")?.remove();
   tiles.delete(peerId);
   healthEls.delete(peerId);
-  monitors.delete(peerId);
+  inboundMonitors.delete(peerId);
+  statsOpen.delete(peerId);
   tileControls.delete(peerId);
   onScreen.delete(peerId);
   paused.delete(peerId);
   if (focusedPeerId === peerId) setFocusedTile(null);
+  syncViewState();
 }
 
 document.addEventListener("fullscreenchange", () => {
@@ -631,31 +805,75 @@ document.addEventListener("fullscreenchange", () => {
 });
 
 /**
- * Surface per-peer link health on each tile (candidate type, bitrate, rtt, fps, packet loss).
+ * Poll inbound link health for each watched remote tile, and outbound link health
+ * for each connected viewer in the roster while we are streaming.
  */
 function startHealthPolling(): void {
   stopHealthPolling();
   healthTimer = setInterval(() => {
     if (!mesh) return;
-    for (const peerId of mesh.peers()) {
-      const pc = mesh.getConnection(peerId);
+    const activeMesh = mesh;
+
+    // 1. Inbound stats for watched tiles
+    for (const peerId of activeMesh.peers()) {
+      const pc = activeMesh.getConnection(peerId);
       const target = healthEls.get(peerId);
-      if (!pc || !target) continue;
-      if (paused.has(peerId)) {
-        target.textContent = "paused";
-        delete target.dataset["direct"];
-        continue;
+      if (pc && target) {
+        if (paused.has(peerId)) {
+          target.textContent = "paused";
+        } else {
+          let monitor = inboundMonitors.get(peerId);
+          if (!monitor) {
+            monitor = new LinkMonitor(pc, "inbound");
+            inboundMonitors.set(peerId, monitor);
+          }
+          void monitor.read().then((health) => {
+            if (!health || paused.has(peerId)) return;
+            target.textContent = summarize(health, true);
+          });
+        }
       }
-      let monitor = monitors.get(peerId);
-      if (!monitor) {
-        monitor = new LinkMonitor(pc);
-        monitors.set(peerId, monitor);
-      }
-      void monitor.read().then((health) => {
-        if (!health || paused.has(peerId)) return;
-        target.textContent = summarize(health);
-        target.dataset["direct"] = String(isDirect(health));
+    }
+
+    // 2. Outbound stats per viewer for the roster while streaming
+    if (capture) {
+      const peerIds = [...members.keys()];
+      void Promise.all(
+        peerIds.map(async (peerId) => {
+          const pc = activeMesh.getConnection(peerId);
+          if (!pc) {
+            peerOutboundText.delete(peerId);
+            return { viewing: false, bps: 0 };
+          }
+          const viewing = activeMesh.isPeerViewing(peerId);
+          if (!viewing) {
+            peerOutboundText.set(peerId, "↑ paused");
+            return { viewing: false, bps: 0 };
+          }
+          let outMon = outboundMonitors.get(peerId);
+          if (!outMon) {
+            outMon = new LinkMonitor(pc, "outbound");
+            outboundMonitors.set(peerId, outMon);
+          }
+          const h = await outMon.read();
+          if (!h) {
+            peerOutboundText.set(peerId, "↑ connecting…");
+            return { viewing: true, bps: 0 };
+          }
+          peerOutboundText.set(peerId, `↑ ${summarize(h, false)}`);
+          return { viewing: true, bps: h.bitrate ?? 0 };
+        }),
+      ).then((results) => {
+        if (!capture) return;
+        activeViewerCount = results.filter((r) => r.viewing).length;
+        const sumBps = results.reduce((acc, r) => acc + r.bps, 0);
+        totalOutboundMbps = sumBps / 1e6;
+        updateRosterStatsInPlace();
       });
+    } else {
+      peerOutboundText.clear();
+      totalOutboundMbps = 0;
+      activeViewerCount = 0;
     }
   }, 2000);
 }
@@ -668,25 +886,22 @@ function stopHealthPolling(): void {
 function renderSelfPreview(stream: MediaStream | null): void {
   const id = SELF_TILE;
   if (!stream) {
+    selfPreviewHidden = false;
     removeTile(id);
     return;
   }
   names.set(id, "You");
   const v = tileFor(id);
-  v.muted = true; // never monitor your own audio
+  v.muted = true;
   v.srcObject = stream;
-  // Muted playback is always permitted by the autoplay policy, but call play()
-  // explicitly so the preview does not depend on the attribute alone.
+  const wrap = v.closest<HTMLElement>(".tile");
+  if (wrap) wrap.hidden = selfPreviewHidden;
   void v.play().catch(() => {});
+  syncViewState();
 }
 
 // ---- participants --------------------------------------------------------
 
-/**
- * The host token for a room, kept per tab. sessionStorage survives a refresh, so the
- * host stays host; a new tab or a friend's browser does not have it, so a forwarded
- * link never makes anyone else the host.
- */
 function hostTokenFor(code: string): string | undefined {
   try {
     return sessionStorage.getItem(`host:${code}`) ?? undefined;
@@ -695,7 +910,6 @@ function hostTokenFor(code: string): string | undefined {
   }
 }
 
-/** The rejoin ticket from this tab's last welcome in a room; see RoomInfo.rejoinToken. */
 function rejoinTokenFor(code: string): string | undefined {
   try {
     return sessionStorage.getItem(`rejoin:${code}`) ?? undefined;
@@ -708,71 +922,108 @@ function saveRejoinToken(code: string, token: string | undefined): void {
   try {
     if (token) sessionStorage.setItem(`rejoin:${code}`, token);
     else sessionStorage.removeItem(`rejoin:${code}`);
-  } catch {
-    // Storage blocked: a reconnect into a locked room will be refused, nothing worse.
-  }
+  } catch {}
 }
 
 function saveHostToken(code: string, token: string): void {
   try {
     sessionStorage.setItem(`host:${code}`, token);
-  } catch {
-    // Storage blocked: still host for this connection, just not after a refresh.
+  } catch {}
+}
+
+function formatRosterHeaderTitle(totalCount: number): string {
+  const lockSuffix = roomLocked ? ", locked" : "";
+  if (capture) {
+    const othersCount = Math.max(0, totalCount - 1);
+    const mbpsPart = totalOutboundMbps > 0 ? ` · ↑ ${totalOutboundMbps.toFixed(1)} Mbps` : "";
+    return `In this room (${totalCount}${lockSuffix})${mbpsPart} (${activeViewerCount}/${othersCount} watching)`;
+  }
+  return `In this room (${totalCount}${lockSuffix})`;
+}
+
+function updateRosterStatsInPlace(): void {
+  if (!client || selfId === null) return;
+  ui.rosterTitle.textContent = formatRosterHeaderTitle(members.size + 1);
+  for (const elNode of ui.rosterList.querySelectorAll<HTMLElement>(".peer-stats")) {
+    const pid = elNode.dataset["peer"];
+    if (!pid) continue;
+    elNode.textContent = capture ? (peerOutboundText.get(pid) ?? "") : "";
   }
 }
 
-/** First four characters of a peer id, so two people with the same name can be told apart. */
-function shortId(id: PeerId): string {
-  return id.slice(0, 4);
-}
-
-/**
- * The participant list. Everyone in the room is on it, including people who only
- * watch: they never get a video tile, and before this list existed a sharer had no
- * way to know they were there.
- */
 function renderRoster(): void {
   if (!client || selfId === null) {
     ui.roster.hidden = true;
     ui.rosterList.replaceChildren();
     return;
   }
-  ui.roster.hidden = false;
-  const others = [...members.entries()];
-  const title = capture
-    ? `Sharing to ${others.length} ${others.length === 1 ? "person" : "people"}`
-    : `In this room (${others.length + 1})`;
-  ui.rosterTitle.textContent = `${title}${roomLocked ? ", locked" : ""}:`;
+  const summary: RosterSummary = sortAndFormatRoster(
+    selfId,
+    currentName(),
+    capture !== null,
+    isHost,
+    roomLocked,
+    members,
+  );
+
+  ui.roster.hidden = !rosterOpen;
+  ui.rosterBtn.textContent = summary.buttonLabel;
+  ui.rosterTitle.textContent = formatRosterHeaderTitle(summary.totalCount);
   ui.lockBtn.hidden = !isHost;
   ui.lockBtn.textContent = roomLocked ? "Unlock room" : "Lock room";
 
-  const items: HTMLLIElement[] = [];
-  const add = (id: PeerId, name: string, sharing: boolean, self: boolean, host: boolean): void => {
+  const items: HTMLLIElement[] = summary.entries.map((entry: RosterEntry) => {
     const li = document.createElement("li");
-    const label = document.createElement("span");
-    label.textContent = `${name}${self ? " (you)" : ""}${host ? " (host)" : ""}`;
+
+    const left = document.createElement("div");
+    left.className = "roster-peer";
+
+    const dot = document.createElement("span");
+    dot.className = "ui-dot";
+    if (entry.sharing) dot.dataset["state"] = "live";
+
+    const nameEl = document.createElement("span");
+    nameEl.className = "peer-name";
+    nameEl.textContent = `${entry.name}${entry.self ? " (you)" : ""}${entry.host ? " (host)" : ""}`;
+
     const idEl = document.createElement("span");
     idEl.className = "peer-id";
-    idEl.textContent = shortId(id);
-    li.append(label, idEl);
-    if (sharing) {
+    idEl.textContent = entry.shortId;
+
+    left.append(dot, nameEl, idEl);
+
+    if (entry.sharing) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "sharing";
-      li.append(badge);
+      left.append(badge);
     }
-    if (isHost && !self) {
+
+    const right = document.createElement("div");
+    right.className = "roster-meta";
+
+    if (!entry.self) {
+      const statsSpan = document.createElement("span");
+      statsSpan.className = "peer-stats";
+      statsSpan.dataset["peer"] = entry.id;
+      statsSpan.textContent = capture ? (peerOutboundText.get(entry.id) ?? "") : "";
+      right.append(statsSpan);
+    }
+
+    if (entry.canKick) {
       const kick = document.createElement("button");
       kick.type = "button";
+      kick.className = "ui-btn kick-btn";
       kick.textContent = "Remove";
-      kick.title = `Remove ${name} from the room. They can't rejoin for 15 minutes.`;
-      kick.addEventListener("click", () => client?.kick(id));
-      li.append(kick);
+      kick.title = `Remove ${entry.name} from the room. They can't rejoin for 15 minutes.`;
+      kick.addEventListener("click", () => client?.kick(entry.id));
+      right.append(kick);
     }
-    items.push(li);
-  };
-  add(selfId, currentName(), capture !== null, true, isHost);
-  for (const [id, m] of others) add(id, m.name, m.sharing, false, m.host);
+
+    li.append(left, right);
+    return li;
+  });
+
   ui.rosterList.replaceChildren(...items);
 }
 
@@ -790,19 +1041,10 @@ function isCodecName(v: string | null): v is CodecName {
 }
 
 function currentCodec(): CodecName {
-  // Unlike the preset, this used to be an unchecked cast. A stale or hand-edited
-  // value reached preferCodec, where the CODEC_MIME lookup returned undefined and
-  // threw mid-share — leaving the screen captured but no peer ever told.
   const stored = localStorage.getItem("codec");
   return isCodecName(stored) ? stored : DEFAULT_CODEC;
 }
 
-/**
- * Screen capture requires a secure context. localhost counts; a bare LAN IP over
- * plain HTTP does not, and Chrome then leaves navigator.mediaDevices undefined
- * entirely. Without this check the capture call throws and gets swallowed as a
- * cancelled picker, so the Share button just does nothing with no explanation.
- */
 function captureBlockedReason(): string | null {
   if (typeof navigator.mediaDevices?.getDisplayMedia === "function") return null;
   if (!window.isSecureContext) {
@@ -820,51 +1062,21 @@ function currentAudioMode(): AudioMode {
   return isAudioMode(stored) ? stored : DEFAULT_AUDIO_MODE;
 }
 
-// ---- audio source --------------------------------------------------------
-
-/** Describe the audio currently being sent, for the chip next to Stop sharing. */
-function audioDescription(): { text: string; kind: "ok" | "warn" | "off" } {
-  if (audioLost) return { text: "Audio stopped: that window closed", kind: "warn" };
-  if (!capture?.audio) return { text: "No audio", kind: "off" };
-  // Older desktop app builds without the WASAPI per-app audio bridge fall back to
-  // Electron's system loopback.
-  if (captureController.kind === "electron" && !captureController.hasPerAppAudio) {
-    return currentAudioMode() === "app"
-      ? { text: "All system audio: the desktop app can't isolate one game yet", kind: "warn" }
-      : { text: "All system audio", kind: "ok" };
-  }
+/** Determine the effective AudioMode currently active on the live capture. */
+function effectiveLiveAudioMode(): AudioMode {
+  if (!capture || !capture.audio) return "none";
   if (audioSource) {
-    return audioSource.kind === "window"
-      ? { text: `Game audio: ${audioSource.label ?? "game window"}`, kind: "ok" }
-      : { text: "All system audio", kind: "ok" };
+    return audioSource.kind === "window" ? "app" : "system";
   }
-  if (capture.surface === "browser") return { text: "Tab audio", kind: "ok" };
-  if (capture.surface === "window" && currentAudioMode() === "app") {
-    return { text: "Game audio: shared window", kind: "ok" };
-  }
-  return { text: "All system audio", kind: "ok" };
+  return currentAudioMode();
 }
 
-function renderAudioControls(): void {
+function syncAudioModeSelect(): void {
   if (!capture) {
-    ui.audioChip.hidden = true;
-    ui.audioPrompt.hidden = true;
-    ui.muteAudioBtn.style.display = "none";
-    ui.audioMode.disabled = false;
+    ui.audioMode.value = currentAudioMode();
     return;
   }
-  const { text, kind } = audioDescription();
-  ui.audioChip.hidden = false;
-  ui.audioChip.dataset["kind"] = kind;
-  ui.audioChipText.textContent = text;
-  ui.audioChangeBtn.textContent = audioLost ? "Pick again" : "Change";
-  ui.audioMode.disabled = true;
-  if (capture.audio) {
-    ui.muteAudioBtn.style.display = "inline-block";
-    ui.muteAudioBtn.textContent = audioMuted ? "Unmute audio" : "Mute audio";
-  } else {
-    ui.muteAudioBtn.style.display = "none";
-  }
+  ui.audioMode.value = effectiveLiveAudioMode();
 }
 
 const AUDIO_PROMPT_TEXT = {
@@ -875,7 +1087,6 @@ const AUDIO_PROMPT_TEXT = {
     "No audio came with that pick. Pick the game's window to send only its sound, or use all system audio.",
   empty: "That window had no audio Chrome could share. Try another window, or use all system audio.",
   lost: "The audio you were sharing stopped, probably because that window closed. Pick where it should come from now.",
-  change: "Pick where the audio comes from. The video keeps going while you choose.",
 } as const;
 
 function showAudioPrompt(reason: keyof typeof AUDIO_PROMPT_TEXT): void {
@@ -886,65 +1097,59 @@ function showAudioPrompt(reason: keyof typeof AUDIO_PROMPT_TEXT): void {
 /** Send `track` to every peer, replacing whatever audio was going before. */
 async function useAudioTrack(track: MediaStreamTrack | null): Promise<void> {
   if (!capture) return;
-  // Stop the audio being replaced so nothing keeps capturing it in the background.
-  // The screen's own track goes too: once replaced there is no way back to it
-  // without a new pick anyway.
   const previous = capture.audio;
   if (previous && previous !== track) previous.stop();
-  if (track) track.enabled = !audioMuted;
   capture.audio = track;
-  audioLost = false;
   if (mesh) await mesh.setAudioTrack(track);
   if (track) watchAudioEnded(track);
-  renderAudioControls();
+  syncAudioModeSelect();
 }
 
 function watchAudioEnded(track: MediaStreamTrack): void {
-  // "ended" fires only when the source goes away (the window closes, or the user
-  // hits Chrome's own stop button for that capture), never for our own stop().
   track.addEventListener("ended", () => {
     if (capture?.audio !== track) return;
-    audioLost = true;
     capture.audio = null;
     void mesh?.setAudioTrack(null);
     if (audioSource?.track === track) {
       stopAudioSource(audioSource);
       audioSource = null;
     }
-    renderAudioControls();
+    syncAudioModeSelect();
     showAudioPrompt("lost");
   });
 }
 
 let audioPickPending = false;
 
-/** Picker #2. Must run straight from a click: Chrome needs a fresh gesture for it. */
-async function pickAudio(kind: "window" | "system"): Promise<void> {
-  if (!capture || audioPickPending) return;
+/** Picker #2. Must run straight from a click/change gesture. Returns true if audio was switched. */
+async function pickAudio(kind: "window" | "system"): Promise<boolean> {
+  if (!capture || audioPickPending) return false;
   audioPickPending = true;
   try {
     let source: AudioSource | null;
     try {
       source = await captureController.captureAudioOnly(kind);
     } catch (err) {
-      // Usually the user cancelling the picker. Leave everything as it was.
       console.warn("[main] audio pick cancelled or failed", err);
-      return;
+      syncAudioModeSelect();
+      return false;
     }
     if (!capture) {
-      // Sharing stopped while the picker was open.
       if (source) stopAudioSource(source);
-      return;
+      return false;
     }
     if (!source) {
       showAudioPrompt("empty");
-      return;
+      syncAudioModeSelect();
+      return false;
     }
     const old = audioSource;
     audioSource = source;
+    localStorage.setItem("audio_mode", kind === "window" ? "app" : "system");
     await useAudioTrack(source.track);
     if (old) stopAudioSource(old);
     ui.audioPrompt.hidden = true;
+    return true;
   } finally {
     audioPickPending = false;
   }
@@ -953,14 +1158,12 @@ async function pickAudio(kind: "window" | "system"): Promise<void> {
 async function chooseNoAudio(): Promise<void> {
   const old = audioSource;
   audioSource = null;
+  localStorage.setItem("audio_mode", "none");
   await useAudioTrack(null);
   if (old) stopAudioSource(old);
   ui.audioPrompt.hidden = true;
 }
 
-/**
- * Web or desktop capture, picked once at load. See src/platform for the boundary.
- */
 const captureController = createCaptureController({
   onEnded: (reason: EndReason) => {
     void stopSharing().then(() => {
@@ -975,29 +1178,23 @@ const captureController = createCaptureController({
   onFollowState: (state) => renderFollowChip(state),
 });
 
-/** The chip shown while the desktop app follows a game between its windows. */
 function renderFollowChip(state: FollowState | null): void {
   if (!state) {
     ui.followChip.hidden = true;
     return;
   }
   ui.followChip.hidden = false;
-  ui.followChip.dataset["kind"] = state.role === "waiting" ? "warn" : "ok";
+  ui.followDot.dataset["state"] = state.role === "waiting" ? "warn" : "live";
   ui.followChipText.textContent =
     state.role === "waiting"
-      ? `Following ${state.profile}: waiting for its next window…`
+      ? `Following ${state.profile}: waiting…`
       : `Following ${state.profile}: ${state.role === "game" ? "in game" : "lobby"}`;
   ui.followChip.title = state.title ?? "";
 }
 
-/** Set for the whole of startSharing, including the await on the OS picker. */
 let sharingPending = false;
 
 async function startSharing(): Promise<void> {
-  // `capture` is only assigned after getDisplayMedia resolves, which can take
-  // seconds while the picker is open. Guarding on it alone lets a second click
-  // open a second picker and orphan the first MediaStream, leaving Chrome's
-  // "sharing your screen" bar attached to a stream nothing references.
   if (!mesh || capture || sharingPending) return;
   sharingPending = true;
 
@@ -1018,7 +1215,6 @@ async function startSharingInner(): Promise<void> {
   }
 
   const mode = currentAudioMode();
-  // These checks are about the browser's picker; the desktop app has its own.
   if (mode !== "none" && captureController.kind === "web") {
     const audio = mode === "app" ? windowAudioSupport() : systemAudioSupport();
     if (!audio.supported && audio.reason) setStatus(audio.reason, "warn");
@@ -1027,46 +1223,33 @@ async function startSharingInner(): Promise<void> {
   try {
     capture = await captureController.start(QUALITY_PRESETS[currentPreset()], mode);
   } catch (err) {
-    // Includes the user simply cancelling the picker, which isn't an error.
     console.warn("[main] capture cancelled or failed", err);
     return;
   }
 
+  selfPreviewHidden = false;
   if (capture.audio) watchAudioEnded(capture.audio);
   renderSelfPreview(capture.stream);
 
-  // Announced before any offer goes out: viewers connect only to sharers, and the
-  // server refuses an offer when neither side is sharing.
   client?.setSharing(true);
   try {
     await mesh.setCapture(capture);
   } catch (err) {
-    // Never leave the screen captured but no peer told: tear the whole thing down
-    // so the UI and the browser's sharing indicator agree with reality.
     console.error("[main] failed to attach capture to peers", err);
     setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
     await stopSharing();
     return;
   }
 
-  ui.shareBtn.textContent = "Stop sharing";
-  // A whole-screen share shows notifications, chat pop-ups and every other window.
-  ui.surfaceWarning.hidden = capture.surface !== "monitor";
+  syncAudioModeSelect();
+  syncViewState();
   renderRoster();
-  audioMuted = false;
-  audioLost = false;
-  renderAudioControls();
 
-  // A whole-screen pick in "Game only" mode comes back silent on purpose; any other
-  // pick that should have had audio but didn't (unticked, or the window has none)
-  // gets the same offer, including the fallback to all system audio.
-  // The second pick is a browser-only workaround; the desktop app has system audio.
   if (mode !== "none" && !capture.audio && captureController.kind === "web") {
     showAudioPrompt(capture.surface === "monitor" && mode === "app" ? "screen" : "missing");
   }
 }
 
-/** Set while stopSharing awaits the mesh, so a second stop (e.g. the source ending) is a no-op. */
 let stoppingShare = false;
 
 async function stopSharing(): Promise<void> {
@@ -1081,18 +1264,20 @@ async function stopSharing(): Promise<void> {
   }
   if (audioSource) stopAudioSource(audioSource);
   audioSource = null;
-  audioLost = false;
+  outboundMonitors.clear();
+  peerOutboundText.clear();
+  totalOutboundMbps = 0;
+  activeViewerCount = 0;
+  ui.audioPrompt.hidden = true;
   renderSelfPreview(null);
   client?.setSharing(false);
-  ui.shareBtn.textContent = "Share screen";
-  ui.surfaceWarning.hidden = true;
+  syncAudioModeSelect();
+  syncViewState();
   renderRoster();
-  renderAudioControls();
 }
 
 // ---- room ----------------------------------------------------------------
 
-/** The display name to join with: what the user typed, else a remembered or random one. */
 function currentName(): string {
   const typed = ui.nameInput.value.trim().slice(0, 32);
   if (typed) return typed;
@@ -1104,7 +1289,16 @@ function currentName(): string {
   return stored;
 }
 
-/** Incremented per join so a superseded in-flight join can detect it lost the race. */
+function syncNameInputs(value: string): void {
+  const clean = value.trim().slice(0, 32);
+  ui.nameInput.value = clean;
+  ui.roomNameInput.value = clean;
+  if (clean) localStorage.setItem("name", clean);
+  if (selfId !== null) {
+    renderRoster();
+  }
+}
+
 let joinGeneration = 0;
 
 const RECONNECT_GRACE_MS = 8_000;
@@ -1120,24 +1314,26 @@ function teardownPeer(peerId: PeerId): void {
   names.delete(peerId);
   members.delete(peerId);
   listening.delete(peerId);
+  outboundMonitors.delete(peerId);
+  peerOutboundText.delete(peerId);
   removeTile(peerId);
   renderRoster();
 }
 
-async function joinRoom(code: string, password?: string): Promise<void> {
+async function joinRoom(code: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setStatus("That doesn't look like a valid room code.", "error");
     return;
   }
 
   const codeToJoin = code;
-  // A share carries over a reconnect to the same room, never into a different one.
   if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
   const generation = ++joinGeneration;
   leaveRoom();
   if (generation !== joinGeneration) return;
   const displayName = currentName();
-  lastJoin = { code, password };
+  lastJoin = { code };
+  syncCopyLinkButton();
 
   client = new SignalingClient(
     code,
@@ -1154,7 +1350,6 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         for (const timer of peerLeftTimers.values()) clearTimeout(timer);
         peerLeftTimers.clear();
 
-        // When reconnecting in-place, reconcile without tearing down healthy links/tiles
         if (
           mesh !== null &&
           selfId !== null &&
@@ -1190,24 +1385,24 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           }
 
-          setStatus(
-            `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
-          );
+          setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
+          syncCopyLinkButton();
+          syncViewState();
           startHealthPolling();
           renderRoster();
           return;
         }
 
-        // Full reset path (first connect, page reload, or selfId changed)
         mesh?.close();
-        monitors.clear();
+        inboundMonitors.clear();
+        outboundMonitors.clear();
+        peerOutboundText.clear();
         members.clear();
         listening.clear();
         selfId = null;
         if (room.hostToken) saveHostToken(code, room.hostToken);
         saveRejoinToken(code, room.rejoinToken);
 
-        // Preserve streamer's local preview tile across all reconnects
         for (const id of [...tiles.keys()]) {
           if (id !== SELF_TILE) removeTile(id);
         }
@@ -1234,6 +1429,7 @@ async function joinRoom(code: string, password?: string): Promise<void> {
               }
               applyAudio(peerId);
               startPlayback(video, peerId);
+              syncViewState();
             },
             onRemoteStreamGone: (peerId) => removeTile(peerId),
             onConnectionState: (peerId, state) => {
@@ -1246,25 +1442,21 @@ async function joinRoom(code: string, password?: string): Promise<void> {
             },
           },
         );
-        // Connect only to the people who are sharing (and to everyone once we share);
-        // see Mesh.members for why viewers never connect to each other.
+
         selfId = selfIdFromServer;
         for (const p of peers) {
           names.set(p.id, p.name);
           members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
           mesh.addMember(p.id, p.sharing);
         }
-        setStatus(
-          `In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`,
-        );
+        setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
         if (capture) {
-          // Still sharing across a reconnect. The server has
-          // this socket down as not sharing, so say so first: others connect only to
-          // sharers, and the server relays an offer only when one side shares.
           client?.setSharing(true);
           if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           void mesh.setCapture(capture);
         }
+        syncCopyLinkButton();
+        syncViewState();
         startHealthPolling();
         renderRoster();
       },
@@ -1309,12 +1501,8 @@ async function joinRoom(code: string, password?: string): Promise<void> {
         roomLocked = locked;
         renderRoster();
       },
-      onError: (code, message) => {
-        // Both close the socket for good. Tear the room down too: a kicked peer's
-        // connections to others would otherwise linger until they time out.
-        if (code === "kicked") {
-          // Stop the capture too. Left running, the browser kept sharing the screen
-          // and the next room joined would have been sent it without asking.
+      onError: (codeErr, message) => {
+        if (codeErr === "kicked") {
           void stopSharing();
           saveRejoinToken(codeToJoin, undefined);
           lastJoin = null;
@@ -1322,45 +1510,23 @@ async function joinRoom(code: string, password?: string): Promise<void> {
           setStatus("You were removed from this room by its host.", "error");
           return;
         }
-        if (code === "room-locked") {
+        if (codeErr === "room-locked") {
           void stopSharing();
           lastJoin = null;
           leaveRoom();
           setStatus(`Room ${codeToJoin} is locked. Ask its host to unlock it.`, "error");
           return;
         }
-        if (code === "not-host") {
+        if (codeErr === "not-host") {
           setStatus(message, "warn");
           return;
         }
-        // A wrong password is the one error the user can actually fix from here, so
-        // say so in plain language and put the cursor where the fix goes. The socket
-        // is closed with 1008 and will not retry by itself, but joinRoom() builds a
-        // fresh SignalingClient, so pressing Join (or Enter) genuinely retries.
-        if (code === "password-ignored") {
-          setStatus(message, "warn");
+        if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
           return;
         }
-        if (code === "weak-password") {
-          setStatus(message, "warn");
-          ui.passInput.focus();
-          return;
-        }
-        if (code === "bad-password") {
-          setStatus(`Room ${codeToJoin} needs a password. Enter it and press Join.`, "warn");
-          // Do NOT clear the field. The rejection can arrive while the user is already
-          // typing — the server deliberately delays a wrong guess — and wiping it then
-          // destroys what they were halfway through entering.
-          ui.passInput.focus();
-          return;
-        }
-        if (code === "unknown-peer" || code === "not-sharing") {
-          return;
-        }
-        setStatus(`${code}: ${message}`, "error");
+        setStatus(`${codeErr}: ${message}`, "error");
       },
     },
-    password,
     () => ({ hostToken: hostTokenFor(code), rejoinToken: rejoinTokenFor(code) }),
   );
 
@@ -1377,7 +1543,11 @@ function leaveRoom(): void {
   client = null;
   mesh?.close();
   mesh = null;
-  monitors.clear();
+  inboundMonitors.clear();
+  outboundMonitors.clear();
+  peerOutboundText.clear();
+  totalOutboundMbps = 0;
+  activeViewerCount = 0;
   for (const id of [...tiles.keys()]) removeTile(id);
   for (const id of [...boostPipes.keys()]) teardownBoostPipe(id);
   names.clear();
@@ -1388,10 +1558,10 @@ function leaveRoom(): void {
   roomLocked = false;
   setFocusedTile(null);
   renderRoster();
-  ui.muteAudioBtn.style.display = "none";
+  syncViewState();
 }
 
-// ---- quality controls ----------------------------------------------------
+// ---- quality & audio controls --------------------------------------------
 
 const CODEC_LABELS: Record<CodecName, string> = {
   h264: "H.264 (hardware, best for gaming)",
@@ -1417,8 +1587,6 @@ function initQualityControls(): void {
   }
   ui.codec.value = currentCodec();
 
-  // Bitrate and framerate are encoder parameters, so they can be re-applied on a
-  // live sender with no renegotiation.
   ui.preset.addEventListener("change", () => {
     const name = ui.preset.value as QualityPresetName;
     if (!(name in QUALITY_PRESETS)) return;
@@ -1427,50 +1595,108 @@ function initQualityControls(): void {
     void mesh?.setPreset(QUALITY_PRESETS[name]);
   });
 
-  // Codec choice only takes effect through setCodecPreferences on the next offer,
-  // so it cannot be changed mid-stream without renegotiating.
   ui.codec.addEventListener("change", () => {
-    localStorage.setItem("codec", ui.codec.value);
-    if (capture) setStatus("Codec applies the next time you start sharing.", "warn");
-  });
-
-  // Mute audio button for active sharer
-  ui.muteAudioBtn.addEventListener("click", () => {
-    if (capture?.audio) {
-      audioMuted = !audioMuted;
-      capture.audio.enabled = !audioMuted;
-      renderAudioControls();
-      setStatus(audioMuted ? "Game audio muted" : "Game audio live", "info");
-    }
+    const chosen = ui.codec.value;
+    if (!isCodecName(chosen)) return;
+    localStorage.setItem("codec", chosen);
+    mesh?.setCodec(chosen);
   });
 
   ui.audioMode.value = currentAudioMode();
   ui.audioMode.addEventListener("change", () => {
-    if (isAudioMode(ui.audioMode.value)) localStorage.setItem("audio_mode", ui.audioMode.value);
+    const chosen = ui.audioMode.value;
+    if (!isAudioMode(chosen)) return;
+    if (!capture) {
+      localStorage.setItem("audio_mode", chosen);
+      return;
+    }
+    if (chosen === "none") {
+      void chooseNoAudio();
+    } else {
+      void pickAudio(chosen === "app" ? "window" : "system");
+    }
   });
-  ui.audioChangeBtn.addEventListener("click", () => showAudioPrompt(audioLost ? "lost" : "change"));
+
   ui.audioPickAppBtn.addEventListener("click", () => void pickAudio("window"));
   ui.audioPickSystemBtn.addEventListener("click", () => void pickAudio("system"));
   ui.audioPickNoneBtn.addEventListener("click", () => void chooseNoAudio());
+
+  ui.togglePreviewBtn.addEventListener("click", () => {
+    selfPreviewHidden = false;
+    const v = tiles.get(SELF_TILE);
+    const wrap = v?.closest<HTMLElement>(".tile");
+    if (wrap) wrap.hidden = false;
+    syncViewState();
+  });
 }
 
 initQualityControls();
 
+// ---- roster & header controls --------------------------------------------
+
+ui.rosterBtn.addEventListener("click", () => {
+  rosterOpen = !rosterOpen;
+  ui.roster.hidden = !rosterOpen;
+  ui.rosterBtn.setAttribute("aria-expanded", String(rosterOpen));
+});
+
+document.addEventListener("click", (ev) => {
+  if (!rosterOpen) return;
+  const target = ev.target as HTMLElement | null;
+  if (target?.closest(".roster-anchor")) return;
+  rosterOpen = false;
+  ui.roster.hidden = true;
+  ui.rosterBtn.setAttribute("aria-expanded", "false");
+});
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && rosterOpen) {
+    rosterOpen = false;
+    ui.roster.hidden = true;
+    ui.rosterBtn.setAttribute("aria-expanded", "false");
+  }
+});
+
 ui.lockBtn.addEventListener("click", () => {
-  // The button flips when the server confirms with room-state, not before.
   client?.setLocked(!roomLocked);
 });
 
-ui.nameInput.value = localStorage.getItem("name") ?? "";
-ui.nameInput.addEventListener("change", () => {
-  const name = ui.nameInput.value.trim().slice(0, 32);
-  if (name) localStorage.setItem("name", name);
-  // Takes effect on the next join: the server learns a name only from `join`.
-  if (client) setStatus("Your new name shows the next time you join.", "info");
+ui.leaveBtn.addEventListener("click", () => {
+  void stopSharing();
+  lastJoin = null;
+  leaveRoom();
+  history.replaceState(null, "", location.pathname + location.search);
+  setStatus("", "info");
 });
 
-// Warn on load rather than only on click — a disabled-looking Share button with no
-// explanation is the worst version of this.
+const initialStoredName = localStorage.getItem("name") ?? "";
+ui.nameInput.value = initialStoredName;
+ui.roomNameInput.value = initialStoredName;
+
+ui.nameInput.addEventListener("change", () => {
+  syncNameInputs(ui.nameInput.value);
+});
+
+ui.roomNameInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    ev.preventDefault();
+    ui.roomNameInput.blur();
+  }
+});
+
+ui.roomNameInput.addEventListener("change", () => {
+  syncNameInputs(ui.roomNameInput.value);
+  if (client && lastJoin) {
+    const wasOpen = rosterOpen;
+    // Reconnect in place so peers learn the updated displayName immediately.
+    void joinRoom(lastJoin.code);
+    if (wasOpen) {
+      rosterOpen = true;
+      ui.rosterBtn.setAttribute("aria-expanded", "true");
+    }
+  }
+});
+
 {
   const blocked = captureBlockedReason();
   if (blocked) {
@@ -1479,70 +1705,28 @@ ui.nameInput.addEventListener("change", () => {
   }
 }
 
-// ---- wiring --------------------------------------------------------------
+// ---- lobby & deep-link wiring --------------------------------------------
 
 ui.joinBtn.addEventListener("click", () =>
-  void joinRoom(ui.roomInput.value.trim().toUpperCase(), ui.passInput.value.trim() || undefined),
+  void joinRoom(ui.roomInput.value.trim().toUpperCase()),
 );
 
-// Typing a password and pressing Enter is the natural retry after a bad-password
-// rejection; without this the user has to notice the Join button to get back in.
-for (const input of [ui.roomInput, ui.passInput]) {
-  input.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Enter") return;
-    ev.preventDefault();
-    // Always the input, never a remembered code: the user may have typed a different
-    // room while the "needs a password" prompt was still showing, and Enter must go
-    // where the Join button next to it would go.
-    const code = ui.roomInput.value.trim().toUpperCase();
-    void joinRoom(code, ui.passInput.value.trim() || undefined);
-  });
-}
-
-/**
- * A random password friends can read out: 12 characters from the room-code alphabet,
- * which has no look-alikes, in groups of four. About 59 bits.
- */
-function generatePassword(): string {
-  const out: string[] = [];
-  const limit = Math.floor(256 / ROOM_CODE_ALPHABET.length) * ROOM_CODE_ALPHABET.length;
-  const buf = new Uint8Array(32);
-  while (out.length < 12) {
-    crypto.getRandomValues(buf);
-    for (const b of buf) {
-      if (b < limit && out.length < 12) out.push(ROOM_CODE_ALPHABET.charAt(b % ROOM_CODE_ALPHABET.length));
-    }
-  }
-  return [out.slice(0, 4), out.slice(4, 8), out.slice(8)].map((g) => g.join("")).join("-");
-}
-
-ui.genPassBtn.addEventListener("click", () => {
-  ui.passInput.value = generatePassword();
-  // Shown, not masked: the point is to copy it to friends.
-  ui.passInput.type = "text";
-  ui.passInput.select();
-});
-ui.passInput.addEventListener("input", () => {
-  if (ui.passInput.value === "") ui.passInput.type = "password";
+ui.roomInput.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Enter") return;
+  ev.preventDefault();
+  const code = ui.roomInput.value.trim().toUpperCase();
+  void joinRoom(code);
 });
 
 ui.createBtn.addEventListener("click", () => {
-  const pass = ui.passInput.value.trim();
-  if (pass && pass.length < MIN_PASSWORD_LENGTH) {
-    setStatus(`Room passwords need at least ${MIN_PASSWORD_LENGTH} characters. Or press Generate.`, "warn");
-    ui.passInput.focus();
-    return;
-  }
   void (async () => {
-    // Without the ok check a 500 or an HTML error page throws inside this voided
-    // IIFE, so the button looks completely inert with the stale status still shown.
     try {
       const res = await fetch("/api/room");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { code } = (await res.json()) as { code: string };
       if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
       ui.roomInput.value = code;
-      await joinRoom(code, ui.passInput.value.trim() || undefined);
+      await joinRoom(code);
     } catch (err) {
       console.error("[main] could not create a room", err);
       setStatus("Could not create a room. Check your connection and try again.", "error");
@@ -1586,13 +1770,13 @@ async function copyRoomLink(): Promise<void> {
   }
   if (copied) {
     if (copyFeedbackTimeout !== null) clearTimeout(copyFeedbackTimeout);
-    ui.copyLinkBtn.textContent = "Copied!";
+    ui.copyLinkBtn.textContent = `${code} · Copied!`;
     ui.copyLinkBtn.classList.add("copied");
     setStatus(`Copied room link: ${url}`, "info");
     copyFeedbackTimeout = setTimeout(() => {
-      ui.copyLinkBtn.textContent = "Copy link";
       ui.copyLinkBtn.classList.remove("copied");
       copyFeedbackTimeout = null;
+      syncCopyLinkButton();
     }, 2000);
   } else {
     setStatus(`Could not copy link automatically. Room link: ${url}`, "warn");
@@ -1608,26 +1792,14 @@ ui.shareBtn.addEventListener("click", () => {
 window.addEventListener("beforeunload", () => leaveRoom());
 window.addEventListener("pagehide", () => leaveRoom());
 
-// Deep link: /#ROOMCODE joins the room straight away.
-//
-// A password-protected room cannot be entered from the link alone: the server answers
-// with bad-password, the status line asks for it, and Enter or Join retries.
 function joinFromHash(): void {
   const fromHash = location.hash.replace(/^#/, "").toUpperCase();
   if (!isValidRoomCode(fromHash)) return;
-  // joinRoom itself writes the hash, which fires hashchange; don't rejoin for that.
   if (lastJoin?.code === fromHash && client) return;
-  // Any password in the field was typed for some other room. Sending it here would
-  // claim an empty room with it, or count as a wrong guess against a protected one.
-  if (ui.roomInput.value.trim().toUpperCase() !== fromHash) {
-    ui.passInput.value = "";
-    ui.passInput.type = "password";
-  }
   ui.roomInput.value = fromHash;
-  void joinRoom(fromHash, ui.passInput.value.trim() || undefined);
+  void joinRoom(fromHash);
 }
 
+syncViewState();
 joinFromHash();
-// Pasting a different room link into an open tab changes only the hash, which does
-// not reload the page, so it would otherwise do nothing.
 window.addEventListener("hashchange", joinFromHash);

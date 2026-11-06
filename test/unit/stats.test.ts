@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { LinkMonitor, isDirect, summarize } from "@src/stats";
+import { LinkMonitor, summarize } from "@src/stats";
 import type { LinkHealth } from "@src/quality";
 
 /** Build a fake RTCPeerConnection whose getStats() returns scripted reports. */
@@ -13,146 +13,103 @@ function fakePc(reports: Array<Record<string, Record<string, unknown>>>): RTCPee
   } as unknown as RTCPeerConnection;
 }
 
-const DIRECT_REPORT = {
+const OUTBOUND_REPORT = {
   T: { type: "transport", selectedCandidatePairId: "CP" },
   CP: {
     type: "candidate-pair",
-    localCandidateId: "L",
-    remoteCandidateId: "R",
     currentRoundTripTime: 0.024,
   },
-  L: { type: "local-candidate", candidateType: "srflx" },
-  R: { type: "remote-candidate", candidateType: "srflx" },
   O: {
-    type: "outbound-rtp", kind: "video", bytesSent: 1_000_000, packetsSent: 1000,
-    framesPerSecond: 60, frameWidth: 1920, frameHeight: 1080,
+    type: "outbound-rtp",
+    kind: "video",
+    bytesSent: 1_000_000,
+    packetsSent: 1000,
+    framesPerSecond: 60,
+    frameWidth: 1920,
+    frameHeight: 1080,
   },
   RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 10 },
 };
 
+const INBOUND_REPORT = {
+  CP: {
+    type: "candidate-pair",
+    state: "succeeded",
+    nominated: true,
+    currentRoundTripTime: 0.018,
+  },
+  I: {
+    type: "inbound-rtp",
+    kind: "video",
+    bytesReceived: 2_000_000,
+    packetsReceived: 2000,
+    packetsLost: 5,
+    framesPerSecond: 60,
+    frameWidth: 2560,
+    frameHeight: 1440,
+  },
+};
+
 describe("LinkMonitor", () => {
-  it("extracts the selected candidate pair via the transport entry", async () => {
-    const h = await new LinkMonitor(fakePc([DIRECT_REPORT])).read();
-    expect(h?.candidateType).toBe("srflx");
-    expect(h?.remoteCandidateType).toBe("srflx");
+  it("converts RTT from seconds to milliseconds via transport or nominated pair", async () => {
+    const hOut = await new LinkMonitor(fakePc([OUTBOUND_REPORT]), "outbound").read();
+    expect(hOut?.rttMs).toBeCloseTo(24);
+
+    const hIn = await new LinkMonitor(fakePc([INBOUND_REPORT]), "inbound").read();
+    expect(hIn?.rttMs).toBeCloseTo(18);
   });
 
-  it("converts RTT from seconds to milliseconds", async () => {
-    const h = await new LinkMonitor(fakePc([DIRECT_REPORT])).read();
-    expect(h?.rttMs).toBeCloseTo(24);
-  });
-
-  it("falls back to a nominated succeeded pair when no transport entry exists", async () => {
-    const h = await new LinkMonitor(fakePc([{
-      CP: {
-        type: "candidate-pair", state: "succeeded", nominated: true,
-        localCandidateId: "L", remoteCandidateId: "R",
-      },
-      L: { type: "local-candidate", candidateType: "relay" },
-      R: { type: "remote-candidate", candidateType: "host" },
-    }])).read();
-    expect(h?.candidateType).toBe("relay");
-  });
-
-  it("reports no bitrate on the first sample, since a rate needs two", async () => {
-    const h = await new LinkMonitor(fakePc([DIRECT_REPORT])).read();
-    expect(h?.outboundBitrate).toBeNull();
+  it("reports no bitrate or loss on the first sample, since rates require two samples", async () => {
+    const h = await new LinkMonitor(fakePc([OUTBOUND_REPORT])).read();
+    expect(h?.bitrate).toBeNull();
     expect(h?.packetLossRatio).toBeNull();
   });
 
-  it("computes bitrate and loss from counter deltas across samples", async () => {
-    const second = structuredClone(DIRECT_REPORT);
-    second.O["bytesSent"] = 1_750_000;   // +750 kB
-    second.O["packetsSent"] = 1600;      // +600
-    second.RI["packetsLost"] = 40;       // +30 -> 5%
-    const monitor = new LinkMonitor(fakePc([DIRECT_REPORT, second]));
+  it("computes outbound bitrate and loss from counter deltas across samples", async () => {
+    const second = structuredClone(OUTBOUND_REPORT);
+    second.O["bytesSent"] = 1_750_000; // +750 kB
+    second.O["packetsSent"] = 1600; // +600
+    second.RI["packetsLost"] = 40; // +30 -> 5%
+    const monitor = new LinkMonitor(fakePc([OUTBOUND_REPORT, second]), "outbound");
 
     await monitor.read();
     await new Promise((r) => setTimeout(r, 25));
     const h = await monitor.read();
 
-    // 750 kB over the elapsed interval, as bits/sec. Timing is real, so assert a range.
-    expect(h?.outboundBitrate).toBeGreaterThan(1_000_000);
+    expect(h?.bitrate).toBeGreaterThan(1_000_000);
     expect(h?.packetLossRatio).toBeCloseTo(30 / 600, 5);
   });
 
+  it("computes inbound bitrate and loss from inbound-rtp deltas across samples", async () => {
+    const second = structuredClone(INBOUND_REPORT);
+    second.I["bytesReceived"] = 2_500_000; // +500 kB
+    second.I["packetsReceived"] = 2475; // +475 received
+    second.I["packetsLost"] = 30; // +25 lost -> 25 / (475 + 25) = 5%
+    const monitor = new LinkMonitor(fakePc([INBOUND_REPORT, second]), "inbound");
+
+    await monitor.read();
+    await new Promise((r) => setTimeout(r, 25));
+    const h = await monitor.read();
+
+    expect(h?.bitrate).toBeGreaterThan(1_000_000);
+    expect(h?.packetLossRatio).toBeCloseTo(25 / 500, 5);
+    expect(h?.frameWidth).toBe(2560);
+    expect(h?.frameHeight).toBe(1440);
+  });
+
   it("returns null instead of throwing when getStats rejects", async () => {
-    const pc = { getStats: async () => { throw new Error("closed"); } } as unknown as RTCPeerConnection;
+    const pc = {
+      getStats: async () => {
+        throw new Error("closed");
+      },
+    } as unknown as RTCPeerConnection;
     expect(await new LinkMonitor(pc).read()).toBeNull();
   });
 
   it("degrades gracefully on an empty report", async () => {
     const h = await new LinkMonitor(fakePc([{}])).read();
-    expect(h?.candidateType).toBe("unknown");
     expect(h?.rttMs).toBeNull();
-  });
-});
-
-describe("isDirect", () => {
-  const base: LinkHealth = {
-    candidateType: "srflx", remoteCandidateType: "srflx", rttMs: 20,
-    packetLossRatio: null, outboundBitrate: null,
-    framesPerSecond: null, frameWidth: null, frameHeight: null,
-  };
-
-  it("treats host and srflx pairs as direct", () => {
-    expect(isDirect(base)).toBe(true);
-    expect(isDirect({ ...base, candidateType: "host", remoteCandidateType: "host" })).toBe(true);
-  });
-
-  it("treats a relay on either end as not direct", () => {
-    expect(isDirect({ ...base, candidateType: "relay" })).toBe(false);
-    expect(isDirect({ ...base, remoteCandidateType: "relay" })).toBe(false);
-  });
-
-  it("labels a relayed link clearly in the summary", () => {
-    expect(summarize({ ...base, candidateType: "relay" })).toContain("relayed");
-    expect(summarize(base)).toContain("direct");
-  });
-
-  it("does not claim an unknown route is direct", () => {
-    expect(isDirect({ ...base, candidateType: "unknown", remoteCandidateType: "unknown" })).toBe(false);
-    expect(isDirect({ ...base, candidateType: "unknown" })).toBe(false);
-    expect(isDirect({ ...base, remoteCandidateType: "unknown" })).toBe(false);
-  });
-
-  it("distinguishes 'not yet known' from 'known and relayed' in the summary", () => {
-    const unknown = summarize({ ...base, candidateType: "unknown", remoteCandidateType: "unknown" });
-    expect(unknown).toContain("connecting");
-    expect(unknown).not.toContain("direct");
-    expect(unknown).not.toContain("relayed");
-  });
-
-  it("accepts prflx, which is a legitimate direct path", () => {
-    expect(isDirect({ ...base, candidateType: "prflx", remoteCandidateType: "host" })).toBe(true);
-  });
-
-  it("reports unknown routes for an empty stats report rather than claiming direct", async () => {
-    const pc = { getStats: async () => new Map() as unknown as RTCStatsReport } as unknown as RTCPeerConnection;
-    const h = await new LinkMonitor(pc).read();
-    expect(h).not.toBeNull();
-    expect(isDirect(h!)).toBe(false);
-  });
-
-  it("includes packet loss percentage when loss is significant", () => {
-    const s = summarize({
-      candidateType: "srflx",
-      remoteCandidateType: "srflx",
-      rttMs: 15,
-      packetLossRatio: 0.045, // 4.5%
-      outboundBitrate: 6_000_000,
-      framesPerSecond: 60,
-      frameWidth: 1920,
-      frameHeight: 1080,
-    });
-    expect(s).toContain("4.5% loss");
-  });
-
-  it("identifies unknown routes with isRouteUnknown", async () => {
-    const { isRouteUnknown } = await import("@src/stats");
-    expect(isRouteUnknown({ candidateType: "unknown", remoteCandidateType: "srflx" } as LinkHealth)).toBe(true);
-    expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "unknown" } as LinkHealth)).toBe(true);
-    expect(isRouteUnknown({ candidateType: "srflx", remoteCandidateType: "srflx" } as LinkHealth)).toBe(false);
+    expect(h?.bitrate).toBeNull();
   });
 
   it("sanitizes non-finite numbers (NaN, Infinity) to null", async () => {
@@ -163,6 +120,8 @@ describe("isDirect", () => {
             "CP",
             {
               type: "candidate-pair",
+              state: "succeeded",
+              nominated: true,
               currentRoundTripTime: Infinity,
             },
           ],
@@ -180,5 +139,40 @@ describe("isDirect", () => {
     const h = await new LinkMonitor(pc).read();
     expect(h?.rttMs).toBeNull();
     expect(h?.framesPerSecond).toBeNull();
+  });
+});
+
+describe("summarize", () => {
+  const base: LinkHealth = {
+    rttMs: 19.2,
+    packetLossRatio: 0,
+    bitrate: 8_000_000,
+    framesPerSecond: 60,
+    frameWidth: 1920,
+    frameHeight: 1080,
+  };
+
+  it("formats compact 1-line telemetry with and without resolution", () => {
+    expect(summarize(base, true)).toBe("19ms · 8.0 Mbps · 60fps · 1920x1080");
+    expect(summarize(base, false)).toBe("19ms · 8.0 Mbps · 60fps");
+  });
+
+  it("includes packet loss percentage when loss is significant (> 0.1%)", () => {
+    expect(summarize({ ...base, packetLossRatio: 0.045 }, false)).toBe(
+      "19ms · 8.0 Mbps · 60fps · 4.5% loss",
+    );
+  });
+
+  it("returns connecting… when no metrics are available yet", () => {
+    expect(
+      summarize({
+        rttMs: null,
+        packetLossRatio: null,
+        bitrate: null,
+        framesPerSecond: null,
+        frameWidth: null,
+        frameHeight: null,
+      }),
+    ).toBe("connecting…");
   });
 });

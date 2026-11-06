@@ -19,8 +19,15 @@ export function createWebCaptureController(cb: CaptureCallbacks): CaptureControl
     captureAudioOnly(kind) {
       return captureAudioOnly(kind);
     },
-    setPreset() {
-      // Nothing to do: the browser never re-captures mid-share.
+    setPreset(preset) {
+      if (!capture) return;
+      void capture.video
+        .applyConstraints({
+          width: { ideal: preset.width },
+          height: { ideal: preset.height },
+          frameRate: { ideal: preset.frameRate, max: preset.frameRate },
+        })
+        .catch(() => {});
     },
     stop() {
       unlisten?.();

@@ -60,7 +60,6 @@ export type ClientMessage =
       t: "join";
       room: string;
       displayName: string;
-      password?: string;
       /** Proof of being the room's creator, from an earlier welcome. */
       hostToken?: string;
       /** Proof of having been in this room, from the last welcome: rejoin past a lock. */
@@ -102,12 +101,9 @@ export type ErrorCode =
   | "bad-message"
   | "unknown-peer"
   | "bad-room-code"
-  | "bad-password"
-  | "password-ignored"
   | "forbidden-origin"
   | "rate-limited"
   | "join-timeout"
-  | "weak-password"
   | "kicked"
   | "room-locked"
   | "not-host"
@@ -115,9 +111,6 @@ export type ErrorCode =
 
 /** Longest host token accepted. Real ones are UUIDs, 36 characters. */
 const MAX_HOST_TOKEN_LENGTH = 64;
-
-/** Shortest password a new room accepts. Enforced by the server on the claiming join. */
-export const MIN_PASSWORD_LENGTH = 8;
 
 /**
  * Generate an 8-character room code using rejection sampling to eliminate modulo bias.
@@ -182,10 +175,6 @@ export function parseClientMessage(raw: string): ClientMessage | null {
             room,
             displayName,
           };
-          const password = record["password"];
-          if (typeof password === "string") {
-            joinMsg.password = password;
-          }
           const hostToken = record["hostToken"];
           if (typeof hostToken === "string" && hostToken.length <= MAX_HOST_TOKEN_LENGTH) {
             joinMsg.hostToken = hostToken;

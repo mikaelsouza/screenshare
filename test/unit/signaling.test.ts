@@ -162,7 +162,7 @@ describe("SignalingClient reconnection", () => {
   });
 
   it("sends signals and state updates", () => {
-    const c = new SignalingClient("ABCDEFGH", "alice", handlers(), "my-password");
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
     c.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
@@ -171,7 +171,6 @@ describe("SignalingClient reconnection", () => {
       t: "join",
       room: "ABCDEFGH",
       displayName: "alice",
-      password: "my-password",
     });
 
     c.signal("p1", { k: "answer", sdp: "v=0" });
@@ -386,7 +385,7 @@ describe("SignalingClient capacity refusals", () => {
   it("sends the host token on every connect and passes the room state on", () => {
     const h = { ...handlers(), onRoomState: vi.fn() };
     let token: string | undefined;
-    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ hostToken: token }));
+    const c = new SignalingClient("ABCDEFGH", "alice", h, () => ({ hostToken: token }));
     c.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
@@ -415,9 +414,9 @@ describe("SignalingClient capacity refusals", () => {
     c.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();
-    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "bad-password", message: "This room needs a password" }) });
+    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "room-locked", message: "This room is locked" }) });
     ws.serverClose(1008);
-    expect(h.onError).toHaveBeenCalledWith("bad-password", "This room needs a password");
+    expect(h.onError).toHaveBeenCalledWith("room-locked", "This room is locked");
     // Reporting "closed" after the error replaced the explanation with "Connection closed…".
     expect(h.onStatus).not.toHaveBeenCalledWith("closed");
   });
@@ -425,7 +424,7 @@ describe("SignalingClient capacity refusals", () => {
   it("sends the rejoin ticket from the last welcome on the next join", () => {
     const h = handlers();
     let rejoin: string | undefined;
-    const c = new SignalingClient("ABCDEFGH", "alice", h, undefined, () => ({ rejoinToken: rejoin }));
+    const c = new SignalingClient("ABCDEFGH", "alice", h, () => ({ rejoinToken: rejoin }));
     c.connect();
     const ws = FakeWebSocket.instances[0]!;
     ws.open();

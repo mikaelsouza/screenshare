@@ -94,7 +94,6 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         if (result.t === "join") {
           expect(typeof result.room).toBe("string");
           expect(typeof result.displayName).toBe("string");
-          if (result.password !== undefined) expect(typeof result.password).toBe("string");
           if (result.hostToken !== undefined) {
             expect(typeof result.hostToken).toBe("string");
             expect(result.hostToken.length).toBeLessThanOrEqual(64);

@@ -69,17 +69,20 @@ async function newPage(name: string): Promise<Page> {
   return page;
 }
 
-async function joinWith(page: Page, code: string, password?: string): Promise<void> {
+async function joinWith(page: Page, code: string): Promise<void> {
   await page.fill("#room-code", code);
-  await page.fill("#room-pass", password ?? "");
   await page.click("#join");
+}
+
+async function openRoster(page: Page): Promise<void> {
+  const hidden = await page.evaluate(() => document.getElementById("roster")?.hidden ?? true);
+  if (hidden) await page.click("#roster-btn");
 }
 
 const inRoom = (): boolean => Boolean(document.getElementById("status")?.textContent?.includes("In room"));
 
 await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   let code = "";
-  let password = "";
 
   before(async () => {
     server = await startServer(PORT);
@@ -110,26 +113,32 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await stopServer(server);
   });
 
-  await it("creates a password-protected room with Generate and Create", async () => {
-    await host.click("#gen-pass");
-    password = await host.inputValue("#room-pass");
-    assert.ok(password.length >= 8, `generated password too short: ${password}`);
+  await it("creates a room with Create and displays the merged copy-link button", async () => {
     await host.click("#create");
     await waitFor(host, inRoom, { label: "host in the new room" });
     code = await host.inputValue("#room-code");
     assert.match(code, /^[A-Z2-9]{8}$/);
+    const copyText = await host.textContent("#copy-link");
+    assert.equal(copyText, `${code} · Copy link`);
+    await openRoster(host);
     assert.equal(await host.isVisible("#lock-btn"), true, "the creator should be host");
   });
 
-  await it("turns away a wrong password and lets the right one in", async () => {
-    await joinWith(other, code, "wrong-password");
-    await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
-      label: "wrong password to be reported",
-    });
+  await it("turns away an invalid room code and lets a valid room code in", async () => {
+    await joinWith(other, "BAD");
+    await waitFor(
+      other,
+      () => {
+        const el = document.getElementById("status");
+        return Boolean(el && !el.hidden && /valid room code/i.test(el.textContent ?? ""));
+      },
+      { label: "invalid room code error to be shown" },
+    );
     assert.equal(await other.evaluate(() => window.__pcs.length), 0);
-    // A retry with the right one, from the same page, must work.
-    await joinWith(other, code, password);
-    await waitFor(other, inRoom, { label: "other in the room with the right password" });
+    // Joining with the valid room code from the same page must succeed and hide #status again.
+    await joinWith(other, code);
+    await waitFor(other, inRoom, { label: "other in the room with the valid code" });
+    assert.equal(await other.evaluate(() => Boolean(document.getElementById("status")?.hidden)), true);
   });
 
   await it("delivers video to someone who joins after sharing started", async () => {
@@ -142,7 +151,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     const videoOpts = opts?.video as MediaTrackConstraints | undefined;
     assert.equal(videoOpts?.displaySurface, "window");
     await framesGrow(other, "other viewer");
-    await joinWith(late, code, password);
+    await joinWith(late, code);
     await waitFor(late, inRoom, { label: "late joiner in the room" });
     await framesGrow(late, "late joiner");
   });
@@ -157,7 +166,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await framesGrow(other, "other viewer after re-share", 0);
   });
 
-  await it("carries video both ways when two people share at once", async () => {
+  await it("carries video both ways when two people share at once, and pauses when scrolled out of stage", async () => {
     await late.click("#share");
     // The host now receives from late while still sending to everyone.
     await framesGrow(host, "host receiving from the second sharer");
@@ -171,19 +180,47 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         ).length >= 2,
       { label: "viewer to show two shared screens", timeout: 45_000 },
     );
+
+    // Push the first remote tile on `other` outside `#stage`'s viewport so IntersectionObserver
+    // marks it non-intersecting and pauses the sharer's outbound encoding for `other`:
+    await other.evaluate(() => {
+      const tile = document.querySelector<HTMLElement>(".tile:has(.tile-controls)");
+      if (tile) tile.style.transform = "translateY(3000px)";
+    });
+    await waitFor(
+      host,
+      () =>
+        window.__pcs
+          .filter((pc) => pc.connectionState !== "closed")
+          .flatMap((pc) => pc.getSenders())
+          .filter((s) => s.track?.kind === "video")
+          .some((s) => s.getParameters().encodings[0]?.active === false),
+      { label: "sharer to pause outbound encoding when viewer tile is outside stage viewport", timeout: 15_000 },
+    );
+    // Restore the tile into `#stage` viewport and verify outbound encoding resumes:
+    await other.evaluate(() => {
+      const tile = document.querySelector<HTMLElement>(".tile:has(.tile-controls)");
+      if (tile) tile.style.transform = "";
+    });
+    await waitFor(
+      host,
+      () =>
+        window.__pcs
+          .filter((pc) => pc.connectionState !== "closed")
+          .flatMap((pc) => pc.getSenders())
+          .filter((s) => s.track?.kind === "video")
+          .every((s) => s.getParameters().encodings[0]?.active !== false),
+      { label: "sharer to resume outbound encoding when viewer tile re-enters stage viewport", timeout: 15_000 },
+    );
+
     await late.click("#share"); // stop again for the rest of the suite
   });
 
   await it("keeps the host a host across a page refresh", async () => {
     await host.reload();
-    // A refresh lands on /#CODE and joins at once, but without the password, so it is
-    // asked for; entering it and pressing Join gets back in.
-    await waitFor(host, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
-      label: "refresh to ask for the password",
-    });
-    await host.fill("#room-pass", password);
-    await host.click("#join");
+    // A refresh lands on /#CODE and automatically rejoins with the stored hostToken.
     await waitFor(host, inRoom, { label: "host back in the room" });
+    await openRoster(host);
     await waitFor(host, () => !document.getElementById("lock-btn")?.hidden, { label: "host controls after refresh" });
     // The others see exactly one host, not a ghost of the old socket.
     await waitFor(
@@ -198,6 +235,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   await it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
     // The refresh above ended the host's share; nobody is sharing now.
     assert.equal(await host.textContent("#share"), "Share screen");
+    await openRoster(host);
     await waitFor(host, () => document.querySelectorAll("#roster-list button").length === 2, {
       label: "Remove buttons for both others",
     });
@@ -210,7 +248,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       label: "the removed person's connections to close",
     });
     // Pressing Join again must not get back in.
-    await joinWith(late, code, password);
+    await joinWith(late, code);
     await waitFor(late, () => (document.getElementById("status")?.textContent ?? "").includes("removed"), {
       label: "rejoin to be refused",
     });
@@ -224,7 +262,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     // the removal ban would also refuse it; the lock message is what must win,
     // or at least a refusal of some kind.
     const newcomer = await newPage("newcomer");
-    await joinWith(newcomer, code, password);
+    await joinWith(newcomer, code);
     await waitFor(newcomer, () => /locked|removed/.test(document.getElementById("status")?.textContent ?? ""), {
       label: "newcomer to be refused",
     });
@@ -238,20 +276,19 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
 
   await it("lets a member back into the locked room after a refresh", async () => {
     // A refresh is a reconnect. The locked room must recognise a member who was
-    // already in, even though every page here shares the removed person's address.
+    // already in via its rejoinToken, even though every page here shares the removed person's address.
     await other.reload();
-    await waitFor(other, () => /password/i.test(document.getElementById("status")?.textContent ?? ""), {
-      label: "refresh to ask for the password",
-    });
-    await other.fill("#room-pass", password);
-    await other.click("#join");
     await waitFor(other, inRoom, { label: "member back in the locked room" });
     await waitFor(other, () => (document.getElementById("roster-title")?.textContent ?? "").includes("locked"), {
       label: "member to see the room is locked",
     });
+    await waitFor(other, () => (document.getElementById("roster-btn")?.textContent ?? "").includes("Locked"), {
+      label: "member top-bar button to show Locked indicator",
+    });
   });
 
   await it("stops sharing when the sharer is removed", async () => {
+    await openRoster(host);
     await host.click("#lock-btn"); // unlock, so a fresh page can come in to be removed
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Lock room", { label: "unlocked" });
     // The removal ban is by address and every page here is 127.0.0.1, so the second
@@ -273,6 +310,33 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((t) => t.readyState === "ended")),
       { label: "every captured track to be stopped" },
     );
+  });
+
+  await it("maintains 52px bars and zero horizontal overflow across viewport resizes", async () => {
+    const viewports: Array<[number, number]> = [
+      [1440, 900],
+      [1024, 768],
+      [800, 600],
+    ];
+    for (const [width, height] of viewports) {
+      await host.setViewportSize({ width, height });
+      const metrics = await host.evaluate(() => {
+        const h = document.querySelector("header.app-bar")?.getBoundingClientRect();
+        const c = document.getElementById("controls")?.getBoundingClientRect();
+        return {
+          headerHeight: Math.round(h?.height ?? 0),
+          controlsHeight: Math.round(c?.height ?? 0),
+          scrollWidth: document.documentElement.scrollWidth,
+          innerWidth: window.innerWidth,
+        };
+      });
+      assert.equal(metrics.headerHeight, 52, `header height at ${String(width)}x${String(height)}`);
+      assert.equal(metrics.controlsHeight, 52, `controls height at ${String(width)}x${String(height)}`);
+      assert.ok(
+        metrics.scrollWidth <= metrics.innerWidth,
+        `horizontal overflow at ${String(width)}x${String(height)}: ${String(metrics.scrollWidth)} > ${String(metrics.innerWidth)}`,
+      );
+    }
   });
 
   await it("raised no CSP or Trusted Types violation on any page", async () => {

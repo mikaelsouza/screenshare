@@ -810,5 +810,29 @@ describe("negotiation recovery", () => {
     pc.connectionState = "disconnected";
     expect(mesh.hasConnectedLink("bob")).toBe(false);
   });
+
+  it("supports live setCodec renegotiation and isPeerViewing inspection", async () => {
+    const signals: Array<{ to: string; data: unknown }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", false);
+    expect(mesh.isPeerViewing("bob")).toBe(false);
+
+    await mesh.setCapture(capture());
+    expect(mesh.isPeerViewing("bob")).toBe(true);
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const ch = pc.dataChannels[0]!;
+    ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    expect(mesh.isPeerViewing("bob")).toBe(false);
+
+    // Answer initial offer so signalingState is stable before live codec change
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+
+    // Live codec change updates preference and triggers renegotiation offer
+    signals.length = 0;
+    mesh.setCodec("vp9");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(signals.some((s) => (s.data as { k?: string }).k === "offer")).toBe(true);
+  });
 });
 

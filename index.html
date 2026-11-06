@@ -7,22 +7,27 @@
     <title>Screenshare</title>
     <style>
       :root {
-        --bg-color: #121214;
-        --surface-color: #1a1a1e;
-        --surface-hover: #26262b;
-        --border-color: #2e2e36;
-        --text-primary: #ededed;
+        --bg-color: #09090b;
+        --surface-color: #121215;
+        --surface-hover: #1c1c21;
+        --border-color: #27272a;
+        --text-primary: #f4f4f5;
         --text-secondary: #8e8e99;
         --accent-color: #3b82f6;
         --accent-hover: #2563eb;
+        --danger-color: #dc2626;
+        --radius: 6px;
       }
       * {
         box-sizing: border-box;
         margin: 0;
         padding: 0;
       }
+      [hidden] {
+        display: none !important;
+      }
       body {
-        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         background-color: var(--bg-color);
         color: var(--text-primary);
         height: 100vh;
@@ -31,129 +36,370 @@
         flex-direction: column;
         overflow: hidden;
       }
-      header {
+
+      /* Primitive 1: App Bar (strict 52px height for 0px shift across states) */
+      .app-bar {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 0.75rem 1.5rem;
+        gap: 12px;
+        height: 52px;
+        padding: 0 16px;
         background-color: var(--surface-color);
+        flex-shrink: 0;
+      }
+      header.app-bar {
         border-bottom: 1px solid var(--border-color);
       }
-      .brand {
-        display: flex;
-        align-items: center;
-        gap: 0.75rem;
+      footer.app-bar {
+        border-top: 1px solid var(--border-color);
       }
-      .brand h1 {
-        font-size: 1.125rem;
-        font-weight: 600;
-        letter-spacing: -0.01em;
-      }
-      .toolbar {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        gap: 0.5rem;
-        padding: 1rem 1.5rem;
+
+      /* Primitive 2: Card / Popover */
+      .app-card {
         background-color: var(--surface-color);
-        border-bottom: 1px solid var(--border-color);
-        flex-wrap: wrap;
-      }
-      input[type="text"] {
-        background-color: var(--bg-color);
         border: 1px solid var(--border-color);
-        color: var(--text-primary);
-        padding: 0.5rem 0.75rem;
-        border-radius: 6px;
-        font-size: 0.875rem;
-        font-family: inherit;
-        letter-spacing: 0.05em;
-        text-transform: uppercase;
-        width: 140px;
-        text-align: center;
+        border-radius: 8px;
+        padding: 16px;
+        box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
       }
-      input[type="text"]:focus,
-      input[type="password"]:focus {
-        outline: none;
-        border-color: var(--accent-color);
-      }
-      input[type="password"] {
-        background-color: var(--bg-color);
+
+      /* Primitive 3: Controls (.ui-btn / .ui-input / .ui-select) */
+      .ui-btn,
+      .ui-input,
+      .ui-select {
+        height: 32px;
+        padding: 0 12px;
+        border-radius: var(--radius);
         border: 1px solid var(--border-color);
-        color: var(--text-primary);
-        padding: 0.5rem 0.75rem;
-        border-radius: 6px;
-        font-size: 0.875rem;
-        font-family: inherit;
-        width: 140px;
-        text-align: center;
-      }
-      button {
         background-color: var(--surface-hover);
         color: var(--text-primary);
-        border: 1px solid var(--border-color);
-        padding: 0.5rem 1rem;
-        border-radius: 6px;
-        font-size: 0.875rem;
+        font: inherit;
+        font-size: 13px;
         font-weight: 500;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .ui-btn {
         cursor: pointer;
-        transition: background-color 0.15s, border-color 0.15s;
+        transition: background-color 0.12s, border-color 0.12s, color 0.12s;
       }
-      button:hover {
-        background-color: #323238;
+      .ui-btn:hover:not(:disabled) {
+        background-color: #27272e;
       }
-      button.primary {
+      .ui-btn:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .ui-btn.primary {
         background-color: var(--accent-color);
         border-color: var(--accent-color);
         color: #ffffff;
       }
-      button.primary:hover {
+      .ui-btn.primary:hover:not(:disabled) {
         background-color: var(--accent-hover);
+        border-color: var(--accent-hover);
       }
-      button.copied {
+      .ui-btn.danger {
+        background-color: rgba(220, 38, 38, 0.16);
+        border-color: rgba(220, 38, 38, 0.45);
+        color: #fca5a5;
+      }
+      .ui-btn.danger:hover:not(:disabled) {
+        background-color: rgba(220, 38, 38, 0.26);
+      }
+      .ui-btn.ghost {
+        background-color: transparent;
+        border-color: transparent;
+        color: var(--text-secondary);
+      }
+      .ui-btn.ghost:hover:not(:disabled) {
+        background-color: var(--surface-hover);
+        color: var(--text-primary);
+      }
+      .ui-btn.copied {
         background-color: #047857;
         border-color: #047857;
         color: #ffffff;
       }
+      .ui-input {
+        background-color: var(--bg-color);
+        cursor: text;
+      }
+      .ui-input:focus,
+      .ui-select:focus {
+        outline: none;
+        border-color: var(--accent-color);
+      }
+      .ui-select {
+        cursor: pointer;
+        padding-right: 8px;
+      }
+
+      /* Primitive 4: Status Dot */
+      .ui-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background-color: var(--text-secondary);
+        flex-shrink: 0;
+      }
+      .ui-dot[data-state="live"] {
+        background-color: #22c55e;
+      }
+      .ui-dot[data-state="warn"] {
+        background-color: #f59e0b;
+      }
+
+      /* Header */
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+      }
+      .brand h1 {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 20px;
+        white-space: nowrap;
+      }
+      #copy-link {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        letter-spacing: 0.02em;
+      }
+      #follow-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 28px;
+        padding: 0 10px;
+        border: 1px solid var(--border-color);
+        border-radius: 999px;
+        background-color: var(--bg-color);
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+      #status {
+        font-size: 12px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 480px;
+      }
+      #status[data-kind="warn"] {
+        color: #fbbf24;
+      }
+      #status[data-kind="error"] {
+        color: #f87171;
+      }
+      #room-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-left: auto;
+      }
+
+      /* Roster Popover */
+      .roster-anchor {
+        position: relative;
+      }
+      #roster-btn {
+        font-variant-numeric: tabular-nums;
+      }
+      #roster {
+        position: absolute;
+        top: calc(100% + 8px);
+        right: 0;
+        width: 380px;
+        max-width: calc(100vw - 32px);
+        z-index: 30;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 12px;
+      }
+      .roster-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      #roster-title {
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-secondary);
+        font-variant-numeric: tabular-nums;
+      }
+      #lock-btn {
+        height: 26px;
+        padding: 0 8px;
+        font-size: 12px;
+      }
+      #roster-list {
+        list-style: none;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        max-height: 280px;
+        overflow-y: auto;
+        font-variant-numeric: tabular-nums;
+      }
+      #roster-list li {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-height: 30px;
+        padding: 4px 8px;
+        border-radius: var(--radius);
+        background-color: var(--bg-color);
+        border: 1px solid var(--border-color);
+        font-size: 12px;
+      }
+      .roster-peer {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-width: 0;
+        overflow: hidden;
+      }
+      .roster-peer .peer-name {
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .roster-peer .peer-id {
+        color: var(--text-secondary);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11px;
+        flex-shrink: 0;
+      }
+      .roster-peer .badge {
+        color: var(--text-secondary);
+        font-size: 11px;
+        flex-shrink: 0;
+      }
+      .roster-meta {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .roster-meta .peer-stats {
+        color: var(--text-secondary);
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .roster-meta .kick-btn {
+        height: 22px;
+        padding: 0 6px;
+        font-size: 11px;
+      }
+      .roster-self-edit {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding-top: 6px;
+        border-top: 1px solid var(--border-color);
+      }
+      .roster-self-edit label {
+        font-size: 12px;
+        color: var(--text-secondary);
+        white-space: nowrap;
+      }
+      .roster-self-edit input {
+        flex: 1;
+        min-width: 0;
+        height: 28px;
+        font-size: 12px;
+      }
+
+      /* Lobby View */
+      #lobby {
+        flex: 1;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        overflow-y: auto;
+      }
+      .lobby-card {
+        width: 100%;
+        max-width: 360px;
+        display: flex;
+        flex-direction: column;
+        gap: 14px;
+      }
+      .lobby-card h2 {
+        font-size: 15px;
+        font-weight: 600;
+      }
+      .lobby-field {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .lobby-field label {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
+      .lobby-field .ui-input {
+        width: 100%;
+      }
+      #room-code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+      .lobby-join-row {
+        display: flex;
+        gap: 8px;
+      }
+      .lobby-join-row .ui-input {
+        flex: 1;
+        min-width: 0;
+      }
+      .lobby-divider {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--text-secondary);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .lobby-divider::before,
+      .lobby-divider::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background-color: var(--border-color);
+      }
+
+      /* Stage & Video Tiles */
       #stage {
         flex: 1;
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
         grid-auto-rows: minmax(0, 1fr);
-        gap: 1rem;
-        padding: 1rem;
+        gap: 12px;
+        padding: 12px;
         align-content: center;
         justify-items: center;
         align-items: center;
         min-height: 0;
         overflow-y: auto;
       }
-      #stage:empty::before {
-        content: "No active screen shares. Open a room link, or create a room to get started.";
-        color: var(--text-secondary);
-        font-size: 0.95rem;
-        grid-column: 1 / -1;
-        align-self: center;
-        text-align: center;
-        padding: 2rem;
-      }
-      #controls {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        flex-wrap: wrap;
-        gap: 0.75rem;
-        padding: 0.75rem 1.5rem;
-        background-color: var(--surface-color);
-        border-top: 1px solid var(--border-color);
-      }
-      #status {
-        font-size: 0.875rem;
-        color: var(--text-secondary);
-      }
-      #status[data-kind="warn"] { color: #fbbf24; }
-      #status[data-kind="error"] { color: #f87171; }
-
       .tile {
         position: relative;
         width: auto;
@@ -181,7 +427,7 @@
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(214px, 1fr));
         grid-template-rows: 1fr auto;
-        gap: 0.75rem;
+        gap: 12px;
       }
       #stage.has-focused .tile.tile-focused {
         grid-column: 1 / -1;
@@ -251,32 +497,26 @@
       }
       .tile-label {
         position: absolute;
-        /* Above the paused overlay, so the name and state stay readable. */
         z-index: 3;
-        left: 0.5rem;
-        bottom: 0.5rem;
-        padding: 0.15rem 0.5rem;
+        left: 8px;
+        bottom: 8px;
+        padding: 3px 8px;
         border-radius: 4px;
-        background: rgba(0, 0, 0, 0.65);
-        font-size: 0.75rem;
+        background: rgba(9, 9, 11, 0.75);
+        font-size: 12px;
         color: var(--text-primary);
       }
       .tile-health {
         position: absolute;
-        /* Above the paused overlay, so the name and state stay readable. */
         z-index: 3;
-        right: 0.5rem;
-        bottom: 0.5rem;
-        padding: 0.15rem 0.5rem;
+        right: 8px;
+        bottom: 8px;
+        padding: 3px 8px;
         border-radius: 4px;
-        background: rgba(0, 0, 0, 0.65);
-        font-size: 0.7rem;
+        background: rgba(9, 9, 11, 0.75);
+        font-size: 11px;
         font-variant-numeric: tabular-nums;
         color: var(--text-secondary);
-      }
-      /* Non-direct link indicator (e.g. while route is still being established or fallback candidate). */
-      .tile-health[data-direct="false"] {
-        color: #fbbf24;
       }
       .tile-unmute {
         position: absolute;
@@ -285,32 +525,27 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 0.5rem;
+        gap: 8px;
         background: rgba(0, 0, 0, 0.45);
         color: #fff;
-        font-size: 0.9rem;
+        font-size: 14px;
         font-weight: 500;
         cursor: pointer;
         border: 0;
         width: 100%;
       }
-      .tile-unmute::before {
-        content: "🔇";
-        font-size: 1.4rem;
-      }
-      /* Per-stream pause / mute / volume. Out of the way until the tile is hovered
-         or focused; always shown on touch screens, which have no hover. */
       .tile-controls {
         position: absolute;
-        top: 0.5rem;
-        right: 0.5rem;
+        top: 8px;
+        right: 8px;
         z-index: 3;
         display: flex;
         align-items: center;
-        gap: 0.35rem;
-        padding: 0.25rem 0.5rem;
-        border-radius: 6px;
-        background: rgba(0, 0, 0, 0.65);
+        gap: 4px;
+        padding: 4px 6px;
+        border-radius: var(--radius);
+        background: rgba(9, 9, 11, 0.78);
+        border: 1px solid rgba(255, 255, 255, 0.08);
         opacity: 0;
         transition: opacity 0.15s;
       }
@@ -322,31 +557,47 @@
       @media (hover: none) {
         .tile-controls {
           opacity: 1;
-          gap: 0.5rem;
-          padding: 0.35rem 0.6rem;
-        }
-        .tile-controls button {
-          min-width: 28px;
-          min-height: 28px;
         }
       }
       .tile-controls button {
         background: transparent;
         border: 0;
-        padding: 0.15rem 0.35rem;
-        font-size: 0.95rem;
-        line-height: 1;
-        color: #fff;
+        border-radius: 4px;
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        color: var(--text-primary);
+        cursor: pointer;
+      }
+      .tile-controls button.tile-hide-self {
+        width: auto;
+        padding: 0 8px;
+        font-size: 12px;
       }
       .tile-controls button:hover:not(:disabled) {
-        background-color: rgba(255, 255, 255, 0.15);
+        background-color: rgba(255, 255, 255, 0.14);
+      }
+      .tile-controls button[aria-pressed="true"] {
+        color: var(--accent-color);
       }
       .tile-controls button:disabled {
         opacity: 0.4;
         cursor: default;
       }
+      .tile-controls svg {
+        width: 15px;
+        height: 15px;
+        stroke: currentColor;
+        stroke-width: 2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+      }
       .tile-volume {
-        width: 90px;
+        width: 72px;
         accent-color: var(--accent-color);
         cursor: pointer;
       }
@@ -369,216 +620,145 @@
         border-radius: 0;
         background: rgba(0, 0, 0, 0.7);
         color: #fff;
-        font-size: 0.95rem;
+        font-size: 14px;
+        cursor: pointer;
       }
-      .tile-paused:hover {
-        background: rgba(0, 0, 0, 0.6);
+      .tile[data-paused="true"] .tile-paused {
+        display: flex;
       }
-      .tile[data-paused="true"] .tile-paused { display: flex; }
-      /* Paused already silences the stream; the unmute offer would only confuse. */
-      .tile[data-paused="true"] .tile-unmute { display: none; }
-      #controls .field {
-        font-size: 0.8rem;
-        color: var(--text-secondary);
-        margin-left: 0.5rem;
+      .tile[data-paused="true"] .tile-unmute {
+        display: none;
       }
-      #controls select {
-        background: var(--surface-color);
-        color: var(--text-primary);
-        border: 1px solid var(--border-color);
-        border-radius: 6px;
-        padding: 0.35rem 0.5rem;
-        font-size: 0.8rem;
-      }
-      /* Author display rules below would otherwise override the hidden attribute. */
-      [hidden] { display: none !important; }
-      /* Audio source: the prompt after a whole-screen pick, and the live chip. */
+
+      /* Audio Fallback Prompt */
       #audio-prompt {
         align-self: center;
-        width: min(460px, calc(100% - 2rem));
-        margin: 0 auto 0.75rem;
-        padding: 1rem;
+        width: min(460px, calc(100% - 32px));
+        margin: 0 auto 12px;
         display: grid;
-        gap: 0.75rem;
-        background: var(--surface-color);
-        border: 1px solid var(--border-color);
-        border-radius: 10px;
-        box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+        gap: 10px;
       }
       #audio-prompt h2 {
-        margin: 0;
-        font-size: 1rem;
+        font-size: 14px;
         font-weight: 600;
       }
       #audio-prompt p {
-        margin: 0;
-        font-size: 0.85rem;
+        font-size: 12px;
         color: var(--text-secondary);
       }
       #audio-prompt .row {
         display: flex;
         flex-wrap: wrap;
-        gap: 0.5rem;
+        gap: 8px;
       }
-      #audio-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.2rem 0.3rem 0.2rem 0.75rem;
-        border: 1px solid var(--border-color);
-        border-radius: 999px;
-        background: var(--bg-color);
-        font-size: 0.8rem;
-      }
-      #audio-chip::before {
-        content: "";
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: #34d399;
-        flex: none;
-      }
-      #audio-chip[data-kind="warn"]::before { background: #fbbf24; }
-      #audio-chip[data-kind="off"]::before { background: var(--text-secondary); }
-      /* Shown while the desktop app follows a game between its lobby and game windows. */
-      #follow-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.5rem;
-        padding: 0.2rem 0.75rem;
-        border: 1px solid var(--border-color);
-        border-radius: 999px;
-        background: var(--bg-color);
-        font-size: 0.8rem;
-      }
-      #follow-chip::before {
-        content: "";
-        width: 8px;
-        height: 8px;
-        border-radius: 50%;
-        background: var(--accent-color);
-        flex: none;
-      }
-      #follow-chip[data-kind="warn"]::before { background: #fbbf24; }
-      #audio-chip button {
-        padding: 0.2rem 0.6rem;
-        font-size: 0.75rem;
-      }
-      input.name-input {
-        text-transform: none;
-        letter-spacing: normal;
-      }
-      #roster {
+
+      /* Bottom Stream Controls Bar */
+      #live-controls {
         display: flex;
-        flex-wrap: wrap;
         align-items: center;
-        justify-content: center;
-        gap: 0.4rem;
-        padding: 0.5rem 1.5rem;
-        font-size: 0.8rem;
-        border-bottom: 1px solid var(--border-color);
+        gap: 8px;
+        min-width: 0;
+        overflow-x: auto;
       }
-      #roster-title {
-        font-size: 0.8rem;
-        font-weight: 600;
+      #controls .field {
+        font-size: 12px;
         color: var(--text-secondary);
-        margin-right: 0.25rem;
+        margin-left: 4px;
       }
-      #roster-list {
-        display: contents;
-        list-style: none;
+      #controls .field:first-child {
+        margin-left: 0;
       }
-      #roster-list li {
-        display: inline-flex;
-        align-items: center;
-        gap: 0.35rem;
-        padding: 0.2rem 0.6rem;
-        border: 1px solid var(--border-color);
-        border-radius: 999px;
-        background-color: var(--surface-color);
-      }
-      #roster-list .peer-id {
-        color: var(--text-secondary);
-        font-family: ui-monospace, monospace;
-        font-size: 0.7rem;
-      }
-      #roster-list .badge {
-        color: #4ade80;
-        font-size: 0.7rem;
-        font-weight: 600;
-      }
-      #roster-list button,
-      #lock-btn {
-        padding: 0.05rem 0.45rem;
-        font-size: 0.7rem;
-      }
-      #surface-warning {
-        font-size: 0.8rem;
-        color: #fbbf24;
+      #share {
+        margin-left: auto;
       }
     </style>
   </head>
   <body>
-    <header>
+    <header class="app-bar">
       <div class="brand">
         <h1>Screenshare</h1>
+        <button type="button" id="copy-link" class="ui-btn" hidden title="Copy room invite link to clipboard"></button>
+        <span id="follow-chip" hidden>
+          <span class="ui-dot" id="follow-dot" data-state="live"></span>
+          <span id="follow-chip-text"></span>
+        </span>
+      </div>
+
+      <span id="status" data-kind="info" aria-live="polite" hidden>Not connected</span>
+
+      <div id="room-bar" hidden>
+        <div class="roster-anchor">
+          <button type="button" id="roster-btn" class="ui-btn" aria-expanded="false" aria-controls="roster">
+            1 in room · 0 sharing &#9662;
+          </button>
+          <section id="roster" class="app-card" hidden aria-labelledby="roster-title">
+            <div class="roster-head">
+              <h2 id="roster-title">In this room</h2>
+              <button type="button" id="lock-btn" class="ui-btn" hidden title="A locked room refuses anyone new. People already in it stay.">
+                Lock room
+              </button>
+            </div>
+            <ul id="roster-list"></ul>
+            <div class="roster-self-edit">
+              <label for="room-name">Your name</label>
+              <input type="text" id="room-name" class="ui-input name-input" maxlength="32" placeholder="Your name" spellcheck="false" />
+            </div>
+          </section>
+        </div>
+        <button type="button" id="leave" class="ui-btn ghost">Leave</button>
       </div>
     </header>
 
-    <div class="toolbar">
-      <input type="text" id="display-name" class="name-input" placeholder="Your name" maxlength="32" autocomplete="nickname" spellcheck="false" />
-      <input type="text" id="room-code" placeholder="Room code" maxlength="8" autocomplete="off" spellcheck="false" />
-      <input type="password" id="room-pass" placeholder="Password (opt)" autocomplete="off" />
-      <button type="button" id="gen-pass" title="Fill in a strong random password (share it with your friends)">Generate</button>
-      <button type="button" id="join" class="primary">Join</button>
-      <button type="button" id="create">Create</button>
-      <button type="button" id="copy-link" title="Copy room invite link to clipboard">Copy link</button>
+    <div id="lobby">
+      <div class="lobby-card app-card">
+        <h2>Start or join a room</h2>
+        <div class="lobby-field">
+          <label for="display-name">Display name</label>
+          <input type="text" id="display-name" class="ui-input name-input" placeholder="Your name" maxlength="32" autocomplete="nickname" spellcheck="false" />
+        </div>
+        <button type="button" id="create" class="ui-btn primary">Create new room</button>
+        <div class="lobby-divider">or join with code</div>
+        <div class="lobby-field">
+          <label for="room-code">Room code</label>
+          <div class="lobby-join-row">
+            <input type="text" id="room-code" class="ui-input" placeholder="8-CHAR CODE" maxlength="8" autocomplete="off" spellcheck="false" />
+            <button type="button" id="join" class="ui-btn">Join room</button>
+          </div>
+        </div>
+      </div>
     </div>
 
-    <section id="roster" hidden aria-labelledby="roster-title">
-      <h2 id="roster-title">In this room</h2>
-      <ul id="roster-list"></ul>
-      <button type="button" id="lock-btn" hidden title="A locked room refuses anyone new. People already in it stay.">Lock room</button>
-    </section>
+    <main id="stage" hidden></main>
 
-    <main id="stage"></main>
-
-    <section id="audio-prompt" hidden aria-labelledby="audio-prompt-title">
+    <section id="audio-prompt" class="app-card" hidden aria-labelledby="audio-prompt-title">
       <h2 id="audio-prompt-title">Which app should viewers hear?</h2>
       <p id="audio-prompt-text">
         You're sharing your whole screen. Pick the game's window and only its sound is sent.
         Discord and music stay private.
       </p>
       <div class="row">
-        <button type="button" id="audio-pick-app" class="primary">Pick game window</button>
-        <button type="button" id="audio-pick-system">Use all system audio</button>
-        <button type="button" id="audio-pick-none">No audio</button>
+        <button type="button" id="audio-pick-app" class="ui-btn primary">Pick game window</button>
+        <button type="button" id="audio-pick-system" class="ui-btn">Use all system audio</button>
+        <button type="button" id="audio-pick-none" class="ui-btn">No audio</button>
       </div>
     </section>
 
-    <div id="controls">
-      <button type="button" id="share" class="primary">Share screen</button>
-      <label class="field" for="audio-mode">Audio</label>
-      <select id="audio-mode" title="Applies the next time you start sharing">
-        <option value="app">Game only</option>
-        <option value="system">All system audio</option>
-        <option value="none">No audio</option>
-      </select>
-      <span id="audio-chip" hidden>
-        <span id="audio-chip-text"></span>
-        <button type="button" id="audio-change">Change</button>
-      </span>
-      <span id="follow-chip" hidden>
-        <span id="follow-chip-text"></span>
-      </span>
-      <button type="button" id="mute-audio" style="display: none;">Mute audio</button>
-      <span id="surface-warning" hidden>Sharing your whole screen: notifications and other windows are visible.</span>
-      <label class="field" for="preset">Quality</label>
-      <select id="preset" title="Applies immediately while sharing"></select>
-      <label class="field" for="codec">Codec</label>
-      <select id="codec" title="Applies the next time you start sharing"></select>
-      <span id="status" data-kind="info" aria-live="polite">Not connected</span>
-    </div>
+    <footer id="controls" class="app-bar" hidden>
+      <div id="live-controls" hidden>
+        <label class="field" for="audio-mode">Audio</label>
+        <select id="audio-mode" class="ui-select" title="Audio source sent with your stream">
+          <option value="app">Game only</option>
+          <option value="system">All system audio</option>
+          <option value="none">No audio</option>
+        </select>
+        <label class="field" for="preset">Quality</label>
+        <select id="preset" class="ui-select" title="Video resolution, frame rate, and bitrate"></select>
+        <label class="field" for="codec">Codec</label>
+        <select id="codec" class="ui-select" title="Video encoder preference"></select>
+        <button type="button" id="toggle-preview" class="ui-btn" hidden>Show preview</button>
+      </div>
+      <button type="button" id="share" class="ui-btn primary">Share screen</button>
+    </footer>
 
     <script type="module" src="/src/main.ts"></script>
   </body>
