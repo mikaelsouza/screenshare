@@ -16,7 +16,7 @@ function track(kind: "video" | "audio", label: string = kind): FakeTrack {
     stopped: false,
     contentHint: "",
     getSettings: () => ({}),
-    applyConstraints: vi.fn(async () => {}),
+    applyConstraints: vi.fn().mockResolvedValue(undefined),
     addEventListener: (ev: string, fn: () => void) => { if (ev === "ended") listeners.push(fn); },
     removeEventListener: (ev: string, fn: () => void) => {
       const i = listeners.indexOf(fn);
@@ -110,12 +110,12 @@ describe("web capture", () => {
 
   it("stops every track and stops listening on stop, and applies constraints on live setPreset", async () => {
     const cb = callbacks();
-    const c = createWebCaptureController(cb);
-    c.setPreset(QUALITY_PRESETS["720p30"]); // before start is a no-op
+    const controller = createWebCaptureController(cb);
+    controller.setPreset(QUALITY_PRESETS["720p30"]); // before start is a no-op
     expect(video.applyConstraints).not.toHaveBeenCalled();
 
-    await c.start(preset, "app");
-    c.setPreset(QUALITY_PRESETS["720p30"]);
+    await controller.start(preset, "app");
+    controller.setPreset(QUALITY_PRESETS["720p30"]);
     expect(video.applyConstraints).toHaveBeenCalledWith({
       width: { ideal: 1280 },
       height: { ideal: 720 },
@@ -124,14 +124,14 @@ describe("web capture", () => {
 
     // Rejecting applyConstraints is caught safely
     video.applyConstraints.mockRejectedValueOnce(new Error("OverconstrainedError"));
-    expect(() => c.setPreset(QUALITY_PRESETS["1080p30"])).not.toThrow();
+    expect(() => controller.setPreset(QUALITY_PRESETS["1080p30"])).not.toThrow();
 
-    c.stop();
+    controller.stop();
     expect(video.stopped).toBe(true);
     expect(audio.stopped).toBe(true);
     video.end();
     expect(cb.onEnded).not.toHaveBeenCalled();
-    c.stop(); // twice is harmless
+    controller.stop(); // twice is harmless
   });
 
   it("passes on a cancelled picker", async () => {

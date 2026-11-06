@@ -50,7 +50,7 @@ function startStaticDistServer(): Promise<StaticServer> {
       const urlPath = (req.url ?? "/").split("?")[0] ?? "/";
       const relPath = urlPath === "/" ? "index.html" : urlPath.replace(/^\/+/, "");
       const filePath = path.join(distDir, relPath);
-      if (!filePath.startsWith(distDir) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+      if (!filePath.startsWith(distDir + path.sep) || !fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
         res.writeHead(404);
         res.end("Not found");
         return;

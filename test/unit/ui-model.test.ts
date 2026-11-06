@@ -8,8 +8,8 @@ import {
 
 describe("deriveViewState", () => {
   it("shows only the lobby when disconnected", () => {
-    const s = deriveViewState(false, false, false, 0);
-    expect(s).toEqual({
+    const state = deriveViewState(false, false, false, 0);
+    expect(state).toEqual({
       lobbyHidden: false,
       roomBarHidden: true,
       controlsHidden: true,
@@ -22,18 +22,18 @@ describe("deriveViewState", () => {
   });
 
   it("ignores sharing or preview flags when disconnected", () => {
-    const s = deriveViewState(false, true, true, 5);
-    expect(s.lobbyHidden).toBe(false);
-    expect(s.roomBarHidden).toBe(true);
-    expect(s.controlsHidden).toBe(true);
-    expect(s.liveControlsHidden).toBe(true);
-    expect(s.togglePreviewHidden).toBe(true);
-    expect(s.showFocusButtons).toBe(false);
+    const state = deriveViewState(false, true, true, 5);
+    expect(state.lobbyHidden).toBe(false);
+    expect(state.roomBarHidden).toBe(true);
+    expect(state.controlsHidden).toBe(true);
+    expect(state.liveControlsHidden).toBe(true);
+    expect(state.togglePreviewHidden).toBe(true);
+    expect(state.showFocusButtons).toBe(false);
   });
 
   it("shows roomBar and controls but hides liveControls when connected and watching", () => {
-    const s = deriveViewState(true, false, false, 1);
-    expect(s).toEqual({
+    const state = deriveViewState(true, false, false, 1);
+    expect(state).toEqual({
       lobbyHidden: true,
       roomBarHidden: false,
       controlsHidden: false,
@@ -46,8 +46,8 @@ describe("deriveViewState", () => {
   });
 
   it("shows liveControls and Stop sharing when connected and sharing", () => {
-    const s = deriveViewState(true, true, false, 2);
-    expect(s).toEqual({
+    const state = deriveViewState(true, true, false, 2);
+    expect(state).toEqual({
       lobbyHidden: true,
       roomBarHidden: false,
       controlsHidden: false,
@@ -158,7 +158,7 @@ describe("sortAndFormatRoster", () => {
     expect(res.totalCount).toBe(4);
     expect(res.sharingCount).toBe(2);
     expect(res.buttonLabel).toBe("4 in room · 2 sharing \u25BE");
-    expect(res.entries.map((e) => e.id)).toEqual([
+    expect(res.entries.map((entry) => entry.id)).toEqual([
       "self0000-0000-4000-8000-000000000000",
       "aaaa3333-0000-4000-8000-000000000000",
       "cccc2222-0000-4000-8000-000000000000",

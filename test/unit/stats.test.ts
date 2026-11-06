@@ -60,9 +60,9 @@ describe("LinkMonitor", () => {
   });
 
   it("reports no bitrate or loss on the first sample, since rates require two samples", async () => {
-    const h = await new LinkMonitor(fakePc([OUTBOUND_REPORT])).read();
-    expect(h?.bitrate).toBeNull();
-    expect(h?.packetLossRatio).toBeNull();
+    const health = await new LinkMonitor(fakePc([OUTBOUND_REPORT])).read();
+    expect(health?.bitrate).toBeNull();
+    expect(health?.packetLossRatio).toBeNull();
   });
 
   it("computes outbound bitrate and loss from counter deltas across samples", async () => {
@@ -73,11 +73,11 @@ describe("LinkMonitor", () => {
     const monitor = new LinkMonitor(fakePc([OUTBOUND_REPORT, second]), "outbound");
 
     await monitor.read();
-    await new Promise((r) => setTimeout(r, 25));
-    const h = await monitor.read();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const health = await monitor.read();
 
-    expect(h?.bitrate).toBeGreaterThan(1_000_000);
-    expect(h?.packetLossRatio).toBeCloseTo(30 / 600, 5);
+    expect(health?.bitrate).toBeGreaterThan(1_000_000);
+    expect(health?.packetLossRatio).toBeCloseTo(30 / 600, 5);
   });
 
   it("computes inbound bitrate and loss from inbound-rtp deltas across samples", async () => {
@@ -88,57 +88,57 @@ describe("LinkMonitor", () => {
     const monitor = new LinkMonitor(fakePc([INBOUND_REPORT, second]), "inbound");
 
     await monitor.read();
-    await new Promise((r) => setTimeout(r, 25));
-    const h = await monitor.read();
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const health = await monitor.read();
 
-    expect(h?.bitrate).toBeGreaterThan(1_000_000);
-    expect(h?.packetLossRatio).toBeCloseTo(25 / 500, 5);
-    expect(h?.frameWidth).toBe(2560);
-    expect(h?.frameHeight).toBe(1440);
+    expect(health?.bitrate).toBeGreaterThan(1_000_000);
+    expect(health?.packetLossRatio).toBeCloseTo(25 / 500, 5);
+    expect(health?.frameWidth).toBe(2560);
+    expect(health?.frameHeight).toBe(1440);
   });
 
   it("returns null instead of throwing when getStats rejects", async () => {
     const pc = {
-      getStats: async () => {
-        throw new Error("closed");
-      },
+      getStats: () => Promise.reject(new Error("closed")),
     } as unknown as RTCPeerConnection;
     expect(await new LinkMonitor(pc).read()).toBeNull();
   });
 
   it("degrades gracefully on an empty report", async () => {
-    const h = await new LinkMonitor(fakePc([{}])).read();
-    expect(h?.rttMs).toBeNull();
-    expect(h?.bitrate).toBeNull();
+    const health = await new LinkMonitor(fakePc([{}])).read();
+    expect(health?.rttMs).toBeNull();
+    expect(health?.bitrate).toBeNull();
   });
 
   it("sanitizes non-finite numbers (NaN, Infinity) to null", async () => {
     const pc = {
-      getStats: async () =>
-        new Map([
-          [
-            "CP",
-            {
-              type: "candidate-pair",
-              state: "succeeded",
-              nominated: true,
-              currentRoundTripTime: Infinity,
-            },
-          ],
-          [
-            "O",
-            {
-              type: "outbound-rtp",
-              kind: "video",
-              framesPerSecond: NaN,
-            },
-          ],
-        ]) as unknown as RTCStatsReport,
+      getStats: () =>
+        Promise.resolve(
+          new Map([
+            [
+              "CP",
+              {
+                type: "candidate-pair",
+                state: "succeeded",
+                nominated: true,
+                currentRoundTripTime: Infinity,
+              },
+            ],
+            [
+              "O",
+              {
+                type: "outbound-rtp",
+                kind: "video",
+                framesPerSecond: NaN,
+              },
+            ],
+          ]) as unknown as RTCStatsReport,
+        ),
     } as unknown as RTCPeerConnection;
 
-    const h = await new LinkMonitor(pc).read();
-    expect(h?.rttMs).toBeNull();
-    expect(h?.framesPerSecond).toBeNull();
+    const health = await new LinkMonitor(pc).read();
+    expect(health?.rttMs).toBeNull();
+    expect(health?.framesPerSecond).toBeNull();
   });
 });
 

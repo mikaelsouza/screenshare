@@ -96,6 +96,42 @@ type IconName =
   | "fullscreen"
   | "exitFullscreen";
 
+const pendingTasks = new Set<Promise<unknown>>();
+
+function runBackground(task: Promise<unknown>): void {
+  const tracked = task
+    .catch(() => {
+      /* errors handled by caller or intentionally ignored */
+    })
+    .finally(() => {
+      pendingTasks.delete(tracked);
+    });
+  pendingTasks.add(tracked);
+}
+
+const ICON_PATHS: Record<IconName, readonly string[]> = {
+  play: ["M6 4l14 8-14 8V4z"],
+  pause: ["M6 4h4v16H6zM14 4h4v16h-4z"],
+  volumeOn: [
+    "M11 5L6 9H2v6h4l5 4V5z",
+    "M15.54 8.46a5 5 0 0 1 0 7.07",
+    "M19.07 4.93a10 10 0 0 1 0 14.14",
+  ],
+  volumeOff: ["M11 5L6 9H2v6h4l5 4V5z", "M22 9l-6 6", "M16 9l6 6"],
+  fitContain: ["M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"],
+  fitCover: ["M8 4v4H4M16 4v4h4M8 20v-4H4M16 20v-4h4"],
+  focus: ["M12 2v8M8 6h8M6 14h12l-2 6H8l-2-6z"],
+  unfocus: ["M4 12h16"],
+  pip: ["M3 5h18v14H3z", "M12 11h7v6h-7z"],
+  stats: ["M18 20V10M12 20V4M6 20v-6"],
+  fullscreen: [
+    "M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3",
+  ],
+  exitFullscreen: [
+    "M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3",
+  ],
+};
+
 /**
  * Trusted-Types-safe SVG icon factory using createElementNS (never innerHTML).
  */
@@ -104,49 +140,10 @@ function createIcon(name: IconName): SVGSVGElement {
   svg.setAttribute("viewBox", "0 0 24 24");
   svg.setAttribute("aria-hidden", "true");
 
-  const path = (d: string): SVGPathElement => {
-    const p = document.createElementNS(SVG_NS, "path");
-    p.setAttribute("d", d);
-    return p;
-  };
-
-  switch (name) {
-    case "play":
-      svg.append(path("M6 4l14 8-14 8V4z"));
-      break;
-    case "pause":
-      svg.append(path("M6 4h4v16H6zM14 4h4v16h-4z"));
-      break;
-    case "volumeOn":
-      svg.append(path("M11 5L6 9H2v6h4l5 4V5z"), path("M15.54 8.46a5 5 0 0 1 0 7.07"), path("M19.07 4.93a10 10 0 0 1 0 14.14"));
-      break;
-    case "volumeOff":
-      svg.append(path("M11 5L6 9H2v6h4l5 4V5z"), path("M22 9l-6 6"), path("M16 9l6 6"));
-      break;
-    case "fitContain":
-      svg.append(path("M4 8V4h4M20 8V4h-4M4 16v4h4M20 16v4h-4"));
-      break;
-    case "fitCover":
-      svg.append(path("M8 4v4H4M16 4v4h4M8 20v-4H4M16 20v-4h4"));
-      break;
-    case "focus":
-      svg.append(path("M12 2v8M8 6h8M6 14h12l-2 6H8l-2-6z"));
-      break;
-    case "unfocus":
-      svg.append(path("M4 12h16"));
-      break;
-    case "pip":
-      svg.append(path("M3 5h18v14H3z"), path("M12 11h7v6h-7z"));
-      break;
-    case "stats":
-      svg.append(path("M18 20V10M12 20V4M6 20v-6"));
-      break;
-    case "fullscreen":
-      svg.append(path("M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"));
-      break;
-    case "exitFullscreen":
-      svg.append(path("M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"));
-      break;
+  for (const pathData of ICON_PATHS[name]) {
+    const pathEl = document.createElementNS(SVG_NS, "path");
+    pathEl.setAttribute("d", pathData);
+    svg.append(pathEl);
   }
   return svg;
 }
@@ -253,8 +250,8 @@ function syncViewState(): ViewState {
     ui.rosterBtn.setAttribute("aria-expanded", "false");
   }
 
-  for (const c of tileControls.values()) {
-    c.focusBtn.hidden = !state.showFocusButtons;
+  for (const ctrl of tileControls.values()) {
+    ctrl.focusBtn.hidden = !state.showFocusButtons;
   }
   if (!state.showFocusButtons && focusedPeerId !== null) {
     setFocusedTile(null);
@@ -267,8 +264,8 @@ function setFocusedTile(peerId: PeerId | null): void {
   if (focusedPeerId === peerId) focusedPeerId = null;
   else focusedPeerId = peerId;
 
-  for (const [id, t] of tiles.entries()) {
-    const wrap = t.closest(".tile");
+  for (const [id, tileVideo] of tiles.entries()) {
+    const wrap = tileVideo.closest(".tile");
     if (!wrap) continue;
     if (focusedPeerId === id) wrap.classList.add("tile-focused");
     else wrap.classList.remove("tile-focused");
@@ -286,6 +283,8 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
   ui.status.dataset["kind"] = kind;
   ui.status.hidden = kind === "info" || text.length === 0;
 }
+
+let copyFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 
 function defaultCopyLinkLabel(): string {
   const code = lastJoin?.code ?? ui.roomInput.value.trim().toUpperCase();
@@ -736,16 +735,18 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.pause();
     return;
   }
-  void video.play().catch(() => {
-    video.muted = true;
-    void video.play().then(
-      () => showUnmutePrompt(video, peerId),
-      () => {
-        if (tiles.get(peerId) !== video) return;
-        setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
-      },
-    );
-  });
+  runBackground(
+    video.play().catch(() => {
+      video.muted = true;
+      return video.play().then(
+        () => showUnmutePrompt(video, peerId),
+        () => {
+          if (tiles.get(peerId) !== video) return;
+          setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
+        },
+      );
+    }),
+  );
 }
 
 function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
@@ -762,11 +763,11 @@ function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
   btn.append(txt);
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
-    const s = listeningFor(peerId);
-    s.muted = false;
+    const audioState = listeningFor(peerId);
+    audioState.muted = false;
     applyAudio(peerId);
     renderTileControls(peerId);
-    void video.play().catch(() => {});
+    runBackground(video.play());
   });
   wrap.append(btn);
   unmutePrompts.set(peerId, btn);
@@ -784,7 +785,7 @@ function removeTile(peerId: PeerId): void {
   observers.delete(peerId);
   dismissUnmutePrompt(peerId);
   if (document.pictureInPictureElement === video) {
-    void document.exitPictureInPicture().catch(() => {});
+    runBackground(document.exitPictureInPicture());
   }
   teardownBoostPipe(peerId);
   video.srcObject = null;
@@ -827,10 +828,12 @@ function startHealthPolling(): void {
             monitor = new LinkMonitor(pc, "inbound");
             inboundMonitors.set(peerId, monitor);
           }
-          void monitor.read().then((health) => {
-            if (!health || paused.has(peerId)) return;
-            target.textContent = summarize(health, true);
-          });
+          runBackground(
+            monitor.read().then((health) => {
+              if (!health || paused.has(peerId)) return;
+              target.textContent = summarize(health, true);
+            }),
+          );
         }
       }
     }
@@ -838,38 +841,40 @@ function startHealthPolling(): void {
     // 2. Outbound stats per viewer for the roster while streaming
     if (capture) {
       const peerIds = [...members.keys()];
-      void Promise.all(
-        peerIds.map(async (peerId) => {
-          const pc = activeMesh.getConnection(peerId);
-          if (!pc) {
-            peerOutboundText.delete(peerId);
-            return { viewing: false, bps: 0 };
-          }
-          const viewing = activeMesh.isPeerViewing(peerId);
-          if (!viewing) {
-            peerOutboundText.set(peerId, "↑ paused");
-            return { viewing: false, bps: 0 };
-          }
-          let outMon = outboundMonitors.get(peerId);
-          if (!outMon) {
-            outMon = new LinkMonitor(pc, "outbound");
-            outboundMonitors.set(peerId, outMon);
-          }
-          const h = await outMon.read();
-          if (!h) {
-            peerOutboundText.set(peerId, "↑ connecting…");
-            return { viewing: true, bps: 0 };
-          }
-          peerOutboundText.set(peerId, `↑ ${summarize(h, false)}`);
-          return { viewing: true, bps: h.bitrate ?? 0 };
+      runBackground(
+        Promise.all(
+          peerIds.map(async (peerId) => {
+            const pc = activeMesh.getConnection(peerId);
+            if (!pc) {
+              peerOutboundText.delete(peerId);
+              return { viewing: false, bps: 0 };
+            }
+            const viewing = activeMesh.isPeerViewing(peerId);
+            if (!viewing) {
+              peerOutboundText.set(peerId, "↑ paused");
+              return { viewing: false, bps: 0 };
+            }
+            let outMon = outboundMonitors.get(peerId);
+            if (!outMon) {
+              outMon = new LinkMonitor(pc, "outbound");
+              outboundMonitors.set(peerId, outMon);
+            }
+            const health = await outMon.read();
+            if (!health) {
+              peerOutboundText.set(peerId, "↑ connecting…");
+              return { viewing: true, bps: 0 };
+            }
+            peerOutboundText.set(peerId, `↑ ${summarize(health, false)}`);
+            return { viewing: true, bps: health.bitrate ?? 0 };
+          }),
+        ).then((results) => {
+          if (!capture) return;
+          activeViewerCount = results.filter((res) => res.viewing).length;
+          const sumBps = results.reduce((acc, res) => acc + res.bps, 0);
+          totalOutboundMbps = sumBps / 1e6;
+          updateRosterStatsInPlace();
         }),
-      ).then((results) => {
-        if (!capture) return;
-        activeViewerCount = results.filter((r) => r.viewing).length;
-        const sumBps = results.reduce((acc, r) => acc + r.bps, 0);
-        totalOutboundMbps = sumBps / 1e6;
-        updateRosterStatsInPlace();
-      });
+      );
     } else {
       peerOutboundText.clear();
       totalOutboundMbps = 0;
@@ -891,12 +896,12 @@ function renderSelfPreview(stream: MediaStream | null): void {
     return;
   }
   names.set(id, "You");
-  const v = tileFor(id);
-  v.muted = true;
-  v.srcObject = stream;
-  const wrap = v.closest<HTMLElement>(".tile");
+  const videoEl = tileFor(id);
+  videoEl.muted = true;
+  videoEl.srcObject = stream;
+  const wrap = videoEl.closest<HTMLElement>(".tile");
   if (wrap) wrap.hidden = selfPreviewHidden;
-  void v.play().catch(() => {});
+  runBackground(videoEl.play());
   syncViewState();
 }
 
@@ -922,13 +927,17 @@ function saveRejoinToken(code: string, token: string | undefined): void {
   try {
     if (token) sessionStorage.setItem(`rejoin:${code}`, token);
     else sessionStorage.removeItem(`rejoin:${code}`);
-  } catch {}
+  } catch {
+    /* sessionStorage unavailable */
+  }
 }
 
 function saveHostToken(code: string, token: string): void {
   try {
     sessionStorage.setItem(`host:${code}`, token);
-  } catch {}
+  } catch {
+    /* sessionStorage unavailable */
+  }
 }
 
 function formatRosterHeaderTitle(totalCount: number): string {
@@ -1036,8 +1045,8 @@ function currentPreset(): QualityPresetName {
 
 const CODEC_NAMES = ["h264", "vp9", "av1", "vp8"] as const;
 
-function isCodecName(v: string | null): v is CodecName {
-  return v !== null && (CODEC_NAMES as readonly string[]).includes(v);
+function isCodecName(val: string | null): val is CodecName {
+  return val !== null && (CODEC_NAMES as readonly string[]).includes(val);
 }
 
 function currentCodec(): CodecName {
@@ -1109,7 +1118,7 @@ function watchAudioEnded(track: MediaStreamTrack): void {
   track.addEventListener("ended", () => {
     if (capture?.audio !== track) return;
     capture.audio = null;
-    void mesh?.setAudioTrack(null);
+    if (mesh) runBackground(mesh.setAudioTrack(null));
     if (audioSource?.track === track) {
       stopAudioSource(audioSource);
       audioSource = null;
@@ -1166,9 +1175,11 @@ async function chooseNoAudio(): Promise<void> {
 
 const captureController = createCaptureController({
   onEnded: (reason: EndReason) => {
-    void stopSharing().then(() => {
-      if (reason === "follow-ended") setStatus("The game closed, so sharing stopped.", "info");
-    });
+    runBackground(
+      stopSharing().then(() => {
+        if (reason === "follow-ended") setStatus("The game closed, so sharing stopped.", "warn");
+      }),
+    );
   },
   onVideoTrackSwapped: async (track, stream) => {
     if (!capture) return;
@@ -1339,12 +1350,13 @@ async function joinRoom(code: string): Promise<void> {
     code,
     displayName,
     {
-      onStatus: (s) =>
-        setStatus(
-          s === "open"
-            ? `In room ${code}`
-            : `Connection ${s}…`,
-        ),
+      onStatus: (status) => {
+        if (status === "open") {
+          setStatus(`In room ${code}`, "info");
+        } else {
+          setStatus(`Connection ${status}…`, "warn");
+        }
+      },
 
       onWelcome: (selfIdFromServer, peers, room) => {
         for (const timer of peerLeftTimers.values()) clearTimeout(timer);
@@ -1592,7 +1604,7 @@ function initQualityControls(): void {
     if (!(name in QUALITY_PRESETS)) return;
     localStorage.setItem("preset", name);
     captureController.setPreset(QUALITY_PRESETS[name]);
-    void mesh?.setPreset(QUALITY_PRESETS[name]);
+    if (mesh) runBackground(mesh.setPreset(QUALITY_PRESETS[name]));
   });
 
   ui.codec.addEventListener("change", () => {
@@ -1611,20 +1623,26 @@ function initQualityControls(): void {
       return;
     }
     if (chosen === "none") {
-      void chooseNoAudio();
+      runBackground(chooseNoAudio());
     } else {
-      void pickAudio(chosen === "app" ? "window" : "system");
+      runBackground(pickAudio(chosen === "app" ? "window" : "system"));
     }
   });
 
-  ui.audioPickAppBtn.addEventListener("click", () => void pickAudio("window"));
-  ui.audioPickSystemBtn.addEventListener("click", () => void pickAudio("system"));
-  ui.audioPickNoneBtn.addEventListener("click", () => void chooseNoAudio());
+  ui.audioPickAppBtn.addEventListener("click", () => {
+    runBackground(pickAudio("window"));
+  });
+  ui.audioPickSystemBtn.addEventListener("click", () => {
+    runBackground(pickAudio("system"));
+  });
+  ui.audioPickNoneBtn.addEventListener("click", () => {
+    runBackground(chooseNoAudio());
+  });
 
   ui.togglePreviewBtn.addEventListener("click", () => {
     selfPreviewHidden = false;
-    const v = tiles.get(SELF_TILE);
-    const wrap = v?.closest<HTMLElement>(".tile");
+    const videoEl = tiles.get(SELF_TILE);
+    const wrap = videoEl?.closest<HTMLElement>(".tile");
     if (wrap) wrap.hidden = false;
     syncViewState();
   });
@@ -1662,7 +1680,7 @@ ui.lockBtn.addEventListener("click", () => {
 });
 
 ui.leaveBtn.addEventListener("click", () => {
-  void stopSharing();
+  runBackground(stopSharing());
   lastJoin = null;
   leaveRoom();
   history.replaceState(null, "", location.pathname + location.search);
@@ -1686,10 +1704,10 @@ ui.roomNameInput.addEventListener("keydown", (ev) => {
 
 ui.roomNameInput.addEventListener("change", () => {
   syncNameInputs(ui.roomNameInput.value);
-  if (client && lastJoin) {
+  // Only reconnect in place when not actively sharing so renaming never interrupts an active stream.
+  if (client && lastJoin && !capture) {
     const wasOpen = rosterOpen;
-    // Reconnect in place so peers learn the updated displayName immediately.
-    void joinRoom(lastJoin.code);
+    runBackground(joinRoom(lastJoin.code));
     if (wasOpen) {
       rosterOpen = true;
       ui.rosterBtn.setAttribute("aria-expanded", "true");
@@ -1707,34 +1725,34 @@ ui.roomNameInput.addEventListener("change", () => {
 
 // ---- lobby & deep-link wiring --------------------------------------------
 
-ui.joinBtn.addEventListener("click", () =>
-  void joinRoom(ui.roomInput.value.trim().toUpperCase()),
-);
+ui.joinBtn.addEventListener("click", () => {
+  runBackground(joinRoom(ui.roomInput.value.trim().toUpperCase()));
+});
 
 ui.roomInput.addEventListener("keydown", (ev) => {
   if (ev.key !== "Enter") return;
   ev.preventDefault();
   const code = ui.roomInput.value.trim().toUpperCase();
-  void joinRoom(code);
+  runBackground(joinRoom(code));
 });
 
 ui.createBtn.addEventListener("click", () => {
-  void (async () => {
-    try {
-      const res = await fetch("/api/room");
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const { code } = (await res.json()) as { code: string };
-      if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
-      ui.roomInput.value = code;
-      await joinRoom(code);
-    } catch (err) {
-      console.error("[main] could not create a room", err);
-      setStatus("Could not create a room. Check your connection and try again.", "error");
-    }
-  })();
+  runBackground(
+    (async () => {
+      try {
+        const res = await fetch("/api/room");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const { code } = (await res.json()) as { code: string };
+        if (!isValidRoomCode(code)) throw new Error(`server returned an invalid code: ${code}`);
+        ui.roomInput.value = code;
+        await joinRoom(code);
+      } catch (err) {
+        console.error("[main] could not create a room", err);
+        setStatus("Could not create a room. Check your connection and try again.", "error");
+      }
+    })(),
+  );
 });
-
-let copyFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
 
 async function copyRoomLink(): Promise<void> {
   const code = (lastJoin?.code ?? ui.roomInput.value.trim()).toUpperCase();
@@ -1766,7 +1784,9 @@ async function copyRoomLink(): Promise<void> {
       ta.select();
       copied = document.execCommand("copy");
       ta.remove();
-    } catch {}
+    } catch {
+      /* execCommand fallback failed */
+    }
   }
   if (copied) {
     if (copyFeedbackTimeout !== null) clearTimeout(copyFeedbackTimeout);
@@ -1783,10 +1803,12 @@ async function copyRoomLink(): Promise<void> {
   }
 }
 
-ui.copyLinkBtn.addEventListener("click", () => void copyRoomLink());
+ui.copyLinkBtn.addEventListener("click", () => {
+  runBackground(copyRoomLink());
+});
 
 ui.shareBtn.addEventListener("click", () => {
-  void (capture ? stopSharing() : startSharing());
+  runBackground(capture ? stopSharing() : startSharing());
 });
 
 window.addEventListener("beforeunload", () => leaveRoom());
@@ -1797,7 +1819,7 @@ function joinFromHash(): void {
   if (!isValidRoomCode(fromHash)) return;
   if (lastJoin?.code === fromHash && client) return;
   ui.roomInput.value = fromHash;
-  void joinRoom(fromHash);
+  runBackground(joinRoom(fromHash));
 }
 
 syncViewState();

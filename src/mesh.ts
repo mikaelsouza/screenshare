@@ -239,6 +239,8 @@ class PeerLink {
         await this.pc.setLocalDescription(answer);
         const out = this.pc.localDescription?.sdp;
         if (out) this.send({ k: "answer", sdp: out });
+      } else {
+        this.flushPendingOffer();
       }
     } catch (err) {
       this.isSettingRemoteAnswerPending = false;
@@ -310,7 +312,7 @@ class PeerLink {
    */
   reapplyCodec(codec: CodecName): void {
     if (!this.videoSender) return;
-    const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
+    const tx = this.pc.getTransceivers().find((transceiver) => transceiver.sender === this.videoSender);
     if (tx) preferCodec(tx, codec);
     this.retryOffer();
   }
@@ -613,7 +615,7 @@ export class Mesh {
    */
   setCodec(codec: CodecName): void {
     this.opts.codec = codec;
-    for (const l of this.links.values()) l.reapplyCodec(codec);
+    for (const link of this.links.values()) link.reapplyCodec(codec);
   }
 
   /**

@@ -7,12 +7,12 @@ import type { LinkHealth } from "./quality";
 /** Narrow a raw stats entry to a plain record so index access is checkable. */
 type Stat = Record<string, unknown>;
 
-function num(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? v : null;
+function num(val: unknown): number | null {
+  return typeof val === "number" && Number.isFinite(val) ? val : null;
 }
 
-function str(v: unknown): string | null {
-  return typeof v === "string" ? v : null;
+function str(val: unknown): string | null {
+  return typeof val === "string" ? val : null;
 }
 
 interface Sample {
@@ -20,6 +20,62 @@ interface Sample {
   packets: number | null;
   packetsLost: number | null;
   timestampMs: number;
+}
+
+function findSelectedPair(byId: Map<string, Stat>): Stat | null {
+  for (const stat of byId.values()) {
+    if (stat["type"] !== "transport") continue;
+    const sel = str(stat["selectedCandidatePairId"]);
+    const found = sel ? byId.get(sel) : undefined;
+    if (found) return found;
+  }
+  for (const stat of byId.values()) {
+    if (stat["type"] === "candidate-pair" && stat["state"] === "succeeded" && stat["nominated"] === true) {
+      return stat;
+    }
+  }
+  return null;
+}
+
+function findVideoStats(
+  byId: Map<string, Stat>,
+  direction: "inbound" | "outbound",
+): { rtp: Stat | null; lostSource: Stat | null } {
+  let rtp: Stat | null = null;
+  let remoteInbound: Stat | null = null;
+  for (const stat of byId.values()) {
+    if (stat["kind"] !== "video") continue;
+    if (direction === "outbound") {
+      if (stat["type"] === "outbound-rtp") rtp = stat;
+      else if (stat["type"] === "remote-inbound-rtp") remoteInbound = stat;
+    } else if (stat["type"] === "inbound-rtp") {
+      rtp = stat;
+    }
+  }
+  return { rtp, lostSource: direction === "outbound" ? remoteInbound : rtp };
+}
+
+function computeBitrate(curr: Sample, prev: Sample): number | null {
+  const dt = (curr.timestampMs - prev.timestampMs) / 1000;
+  if (dt <= 0 || curr.bytes === null || prev.bytes === null) return null;
+  return Math.max(0, ((curr.bytes - prev.bytes) * 8) / dt);
+}
+
+function computeLossRatio(
+  curr: Sample,
+  prev: Sample,
+  direction: "inbound" | "outbound",
+): number | null {
+  if (
+    curr.packets === null || prev.packets === null ||
+    curr.packetsLost === null || prev.packetsLost === null
+  ) {
+    return null;
+  }
+  const dPackets = curr.packets - prev.packets;
+  const dLost = curr.packetsLost - prev.packetsLost;
+  const denom = direction === "inbound" ? dPackets + Math.max(0, dLost) : dPackets;
+  return denom > 0 ? Math.max(0, dLost) / denom : null;
 }
 
 /**
@@ -53,70 +109,21 @@ export class LinkMonitor {
     const byId = new Map<string, Stat>();
     report.forEach((entry, id) => byId.set(id, entry as unknown as Stat));
 
-    // Prefer the transport's nominated pair; fall back to scanning for a succeeded
-    // one, because the transport entry isn't present in every browser version.
-    let pair: Stat | null = null;
-    for (const s of byId.values()) {
-      if (s["type"] === "transport") {
-        const sel = str(s["selectedCandidatePairId"]);
-        const found = sel ? byId.get(sel) : undefined;
-        if (found) {
-          pair = found;
-          break;
-        }
-      }
-    }
-    if (!pair) {
-      for (const s of byId.values()) {
-        if (s["type"] === "candidate-pair" && s["state"] === "succeeded" && s["nominated"] === true) {
-          pair = s;
-          break;
-        }
-      }
-    }
-
-    let rtp: Stat | null = null;
-    let remoteInbound: Stat | null = null;
-    for (const s of byId.values()) {
-      if (s["kind"] !== "video") continue;
-      if (this.direction === "outbound") {
-        if (s["type"] === "outbound-rtp") rtp = s;
-        else if (s["type"] === "remote-inbound-rtp") remoteInbound = s;
-      } else {
-        if (s["type"] === "inbound-rtp") rtp = s;
-      }
-    }
-
-    const now = performance.now();
+    const pair = findSelectedPair(byId);
+    const { rtp, lostSource } = findVideoStats(byId, this.direction);
     const bytesKey = this.direction === "outbound" ? "bytesSent" : "bytesReceived";
     const packetsKey = this.direction === "outbound" ? "packetsSent" : "packetsReceived";
-    const lostSource = this.direction === "outbound" ? remoteInbound : rtp;
 
     const sample: Sample = {
       bytes: rtp ? num(rtp[bytesKey]) : null,
       packets: rtp ? num(rtp[packetsKey]) : null,
       packetsLost: lostSource ? num(lostSource["packetsLost"]) : null,
-      timestampMs: now,
+      timestampMs: performance.now(),
     };
 
-    let bitrate: number | null = null;
-    let packetLossRatio: number | null = null;
     const prev = this.prev;
-    if (prev) {
-      const dt = (sample.timestampMs - prev.timestampMs) / 1000;
-      if (dt > 0 && sample.bytes !== null && prev.bytes !== null) {
-        bitrate = Math.max(0, ((sample.bytes - prev.bytes) * 8) / dt);
-      }
-      if (
-        sample.packets !== null && prev.packets !== null &&
-        sample.packetsLost !== null && prev.packetsLost !== null
-      ) {
-        const dPackets = sample.packets - prev.packets;
-        const dLost = sample.packetsLost - prev.packetsLost;
-        const denom = this.direction === "inbound" ? dPackets + Math.max(0, dLost) : dPackets;
-        if (denom > 0) packetLossRatio = Math.max(0, dLost) / denom;
-      }
-    }
+    const bitrate = prev ? computeBitrate(sample, prev) : null;
+    const packetLossRatio = prev ? computeLossRatio(sample, prev, this.direction) : null;
     this.prev = sample;
 
     const rttSec = pair ? num(pair["currentRoundTripTime"]) : null;
@@ -133,16 +140,16 @@ export class LinkMonitor {
 }
 
 /** Compact one-line summary for a tile overlay or roster row. */
-export function summarize(h: LinkHealth, includeResolution = true): string {
+export function summarize(health: LinkHealth, includeResolution = true): string {
   const bits: string[] = [];
-  if (h.rttMs !== null) bits.push(`${Math.round(h.rttMs)}ms`);
-  if (h.bitrate !== null) bits.push(`${(h.bitrate / 1e6).toFixed(1)} Mbps`);
-  if (h.framesPerSecond !== null) bits.push(`${Math.round(h.framesPerSecond)}fps`);
-  if (includeResolution && h.frameWidth !== null && h.frameHeight !== null) {
-    bits.push(`${h.frameWidth}x${h.frameHeight}`);
+  if (health.rttMs !== null) bits.push(`${Math.round(health.rttMs)}ms`);
+  if (health.bitrate !== null) bits.push(`${(health.bitrate / 1e6).toFixed(1)} Mbps`);
+  if (health.framesPerSecond !== null) bits.push(`${Math.round(health.framesPerSecond)}fps`);
+  if (includeResolution && health.frameWidth !== null && health.frameHeight !== null) {
+    bits.push(`${health.frameWidth}x${health.frameHeight}`);
   }
-  if (h.packetLossRatio !== null && h.packetLossRatio > 0.001) {
-    bits.push(`${(h.packetLossRatio * 100).toFixed(1)}% loss`);
+  if (health.packetLossRatio !== null && health.packetLossRatio > 0.001) {
+    bits.push(`${(health.packetLossRatio * 100).toFixed(1)}% loss`);
   }
   if (bits.length === 0) return "connecting…";
   return bits.join(" · ");

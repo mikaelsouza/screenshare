@@ -42,9 +42,9 @@ describe("Fuzzing Suite: UI Model Volume & Roster Formatting", () => {
         fc.array(peerArb, { maxLength: 25 }),
         (selfId, selfName, selfSharing, isHost, roomLocked, peerList) => {
           const map = new Map<string, { name: string; sharing: boolean; host: boolean }>();
-          for (const p of peerList) {
-            if (p.id !== selfId) {
-              map.set(p.id, { name: p.name, sharing: p.sharing, host: p.host });
+          for (const peer of peerList) {
+            if (peer.id !== selfId) {
+              map.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host });
             }
           }
 
@@ -55,11 +55,10 @@ describe("Fuzzing Suite: UI Model Volume & Roster Formatting", () => {
           expect(res.entries[0]?.id).toBe(selfId);
           expect(res.entries[0]?.canKick).toBe(false);
 
-          for (let i = 1; i < res.entries.length; i++) {
-            const e = res.entries[i]!;
-            expect(e.self).toBe(false);
-            expect(e.canKick).toBe(isHost);
-            expect(e.name.length).toBeGreaterThan(0);
+          for (const entry of res.entries.slice(1)) {
+            expect(entry.self).toBe(false);
+            expect(entry.canKick).toBe(isHost);
+            expect(entry.name.length).toBeGreaterThan(0);
           }
 
           expect(res.buttonLabel).toContain(`${res.totalCount} in room · ${res.sharingCount} sharing`);

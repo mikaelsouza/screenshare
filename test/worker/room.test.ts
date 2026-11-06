@@ -520,10 +520,10 @@ describe("RoomDO membership", () => {
   });
 
   it("erases an abandoned room when the alarm fires", async () => {
-    const a = await Client.connect();
-    await a.join("alice");
-    a.close();
-    await new Promise((r) => setTimeout(r, 100));
+    const aliceClient = await Client.connect();
+    await aliceClient.join("alice");
+    aliceClient.close();
+    await new Promise((resolve) => setTimeout(resolve, 100));
 
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -533,12 +533,12 @@ describe("RoomDO membership", () => {
     );
     expect(stored).toBeUndefined();
 
-    const c = await Client.connect();
-    c.send({ t: "join", room: CODE, displayName: "charlie" });
-    const wc = await c.nextOf("welcome");
+    const charlieClient = await Client.connect();
+    charlieClient.send({ t: "join", room: CODE, displayName: "charlie" });
+    const wc = await charlieClient.nextOf("welcome");
     expect(wc.selfId).toBeDefined();
     expect(wc.host).toBe(true);
-    c.close();
+    charlieClient.close();
   });
 });
 

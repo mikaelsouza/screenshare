@@ -800,7 +800,8 @@ describe("negotiation recovery", () => {
     const mesh = new Mesh("me", opts, () => {}, cb());
     mesh.addMember("bob", false);
     await mesh.setCapture(capture());
-    const pc = FakeRTCPeerConnection.instances[0]!;
+    const [pc] = FakeRTCPeerConnection.instances;
+    if (!pc) throw new Error("Expected peer connection");
 
     expect(mesh.hasConnectedLink("bob")).toBe(false);
     pc.connectionState = "connecting";
@@ -820,19 +821,48 @@ describe("negotiation recovery", () => {
     await mesh.setCapture(capture());
     expect(mesh.isPeerViewing("bob")).toBe(true);
 
-    const pc = FakeRTCPeerConnection.instances[0]!;
-    const ch = pc.dataChannels[0]!;
+    const [pc] = FakeRTCPeerConnection.instances;
+    const ch = pc?.dataChannels[0];
+    if (!pc || !ch) throw new Error("Expected peer connection and data channel");
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
     expect(mesh.isPeerViewing("bob")).toBe(false);
 
-    // Answer initial offer so signalingState is stable before live codec change
+    // Trigger and answer initial offer so signalingState is stable before live codec change
+    pc.onnegotiationneeded?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(pc.signalingState).toBe("have-local-offer");
     await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
 
     // Live codec change updates preference and triggers renegotiation offer
     signals.length = 0;
     mesh.setCodec("vp9");
-    await new Promise((r) => setTimeout(r, 10));
-    expect(signals.some((s) => (s.data as { k?: string }).k === "offer")).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(signals.some((sig) => (sig.data as { k?: string }).k === "offer")).toBe(true);
+  });
+
+  it("flushes a queued setCodec renegotiation offer after an in-flight offer receives its answer", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(capture());
+
+    const [pc] = FakeRTCPeerConnection.instances;
+    if (!pc) throw new Error("Expected peer connection");
+    // Trigger initial offer so signalingState becomes "have-local-offer"
+    pc.onnegotiationneeded?.();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(pc.signalingState).toBe("have-local-offer");
+    signals.length = 0;
+
+    // Change codec while the local offer is still awaiting an answer
+    mesh.setCodec("av1");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(signals.length).toBe(0);
+
+    // Once the remote answer arrives and signaling returns to "stable", the queued offer is flushed
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(signals.some((sig) => sig.data.k === "offer")).toBe(true);
   });
 });
 

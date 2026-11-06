@@ -34,8 +34,8 @@ const decodedFrames = async (): Promise<number> => {
   for (const pc of window.__pcs) {
     if (pc.connectionState === "closed") continue;
     const report = await pc.getStats();
-    report.forEach((s: unknown) => {
-      const rec = s as { type?: string; kind?: string; framesDecoded?: number };
+    report.forEach((statEntry: unknown) => {
+      const rec = statEntry as { type?: string; kind?: string; framesDecoded?: number };
       if (rec.type === "inbound-rtp" && rec.kind === "video") total += rec.framesDecoded ?? 0;
     });
   }
@@ -50,7 +50,7 @@ async function framesGrow(page: Page, label: string, from: number | null = null)
   while (Date.now() < deadline) {
     const now = await page.evaluate(decodedFrames);
     if (now > start + 10) return now;
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error(`${label}: decoded frames stuck at ${start}`);
 }
@@ -61,8 +61,8 @@ async function newPage(name: string): Promise<Page> {
   await ctx.addInitScript(INSTRUMENT);
   contexts.push(ctx);
   const page = await ctx.newPage();
-  page.on("console", (m) => {
-    if (m.type() === "error") console.error(`[${name}]`, m.text());
+  page.on("console", (msg) => {
+    if (msg.type() === "error") console.error(`[${name}]`, msg.text());
   });
   await page.goto(BASE_URL);
   await page.fill("#display-name", name);
@@ -92,7 +92,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     other = await newPage("other");
   });
 
-  afterEach(async (t) => {
+  afterEach(async (testCtx) => {
     // On failure, show what each page was saying: the status line is the app's own account.
     if (process.env["E2E_DEBUG"]) {
       const pages: Array<[string, Page]> = [
@@ -100,10 +100,10 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         ["late", late],
         ["other", other],
       ];
-      for (const [n, p] of pages) {
-        const st = await p.textContent("#status").catch(() => "?");
-        const roster = await p.textContent("#roster").catch(() => "?");
-        console.log(`# ${t.name} :: ${n}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
+      for (const [peerName, peerPage] of pages) {
+        const st = await peerPage.textContent("#status").catch(() => "?");
+        const roster = await peerPage.textContent("#roster").catch(() => "?");
+        console.log(`# ${testCtx.name} :: ${peerName}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
       }
     }
   });
@@ -176,7 +176,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       other,
       () =>
         [...document.querySelectorAll<HTMLVideoElement>(".tile video")].filter(
-          (v) => v.srcObject instanceof MediaStream && v.srcObject.getVideoTracks().length > 0,
+          (videoEl) => videoEl.srcObject instanceof MediaStream && videoEl.srcObject.getVideoTracks().length > 0,
         ).length >= 2,
       { label: "viewer to show two shared screens", timeout: 45_000 },
     );
@@ -193,8 +193,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         window.__pcs
           .filter((pc) => pc.connectionState !== "closed")
           .flatMap((pc) => pc.getSenders())
-          .filter((s) => s.track?.kind === "video")
-          .some((s) => s.getParameters().encodings[0]?.active === false),
+          .filter((sender) => sender.track?.kind === "video")
+          .some((sender) => sender.getParameters().encodings[0]?.active === false),
       { label: "sharer to pause outbound encoding when viewer tile is outside stage viewport", timeout: 15_000 },
     );
     // Restore the tile into `#stage` viewport and verify outbound encoding resumes:
@@ -208,8 +208,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         window.__pcs
           .filter((pc) => pc.connectionState !== "closed")
           .flatMap((pc) => pc.getSenders())
-          .filter((s) => s.track?.kind === "video")
-          .every((s) => s.getParameters().encodings[0]?.active !== false),
+          .filter((sender) => sender.track?.kind === "video")
+          .every((sender) => sender.getParameters().encodings[0]?.active !== false),
       { label: "sharer to resume outbound encoding when viewer tile re-enters stage viewport", timeout: 15_000 },
     );
 
@@ -307,7 +307,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     });
     await waitFor(
       other,
-      () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((t) => t.readyState === "ended")),
+      () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((track) => track.readyState === "ended")),
       { label: "every captured track to be stopped" },
     );
   });
@@ -321,11 +321,11 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     for (const [width, height] of viewports) {
       await host.setViewportSize({ width, height });
       const metrics = await host.evaluate(() => {
-        const h = document.querySelector("header.app-bar")?.getBoundingClientRect();
-        const c = document.getElementById("controls")?.getBoundingClientRect();
+        const headerRect = document.querySelector("header.app-bar")?.getBoundingClientRect();
+        const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
         return {
-          headerHeight: Math.round(h?.height ?? 0),
-          controlsHeight: Math.round(c?.height ?? 0),
+          headerHeight: Math.round(headerRect?.height ?? 0),
+          controlsHeight: Math.round(controlsRect?.height ?? 0),
           scrollWidth: document.documentElement.scrollWidth,
           innerWidth: window.innerWidth,
         };

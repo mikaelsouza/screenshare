@@ -3,6 +3,19 @@
 import { captureAudioOnly, captureScreen, onCaptureEnded, stopCapture, type CaptureResult } from "../capture";
 import type { CaptureCallbacks, CaptureController } from "./types";
 
+const pendingTasks = new Set<Promise<unknown>>();
+
+function runBackground(task: Promise<unknown>): void {
+  const tracked = task
+    .catch(() => {
+      /* ignore unsupported constraint errors */
+    })
+    .finally(() => {
+      pendingTasks.delete(tracked);
+    });
+  pendingTasks.add(tracked);
+}
+
 export function createWebCaptureController(cb: CaptureCallbacks): CaptureController {
   let capture: CaptureResult | null = null;
   let unlisten: (() => void) | null = null;
@@ -21,13 +34,13 @@ export function createWebCaptureController(cb: CaptureCallbacks): CaptureControl
     },
     setPreset(preset) {
       if (!capture) return;
-      void capture.video
-        .applyConstraints({
+      runBackground(
+        capture.video.applyConstraints({
           width: { ideal: preset.width },
           height: { ideal: preset.height },
           frameRate: { ideal: preset.frameRate, max: preset.frameRate },
-        })
-        .catch(() => {});
+        }),
+      );
     },
     stop() {
       unlisten?.();
