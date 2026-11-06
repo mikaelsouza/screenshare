@@ -15,6 +15,9 @@ describe("deriveViewState", () => {
       controlsHidden: true,
       liveControlsHidden: true,
       togglePreviewHidden: true,
+      stageEmptyHidden: true,
+      stageEmptyTitle: "No one is sharing right now",
+      stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
       shareButtonText: "Share screen",
       shareButtonVariant: "primary",
       showFocusButtons: false,
@@ -28,6 +31,7 @@ describe("deriveViewState", () => {
     expect(state.controlsHidden).toBe(true);
     expect(state.liveControlsHidden).toBe(true);
     expect(state.togglePreviewHidden).toBe(true);
+    expect(state.stageEmptyHidden).toBe(true);
     expect(state.showFocusButtons).toBe(false);
   });
 
@@ -39,10 +43,29 @@ describe("deriveViewState", () => {
       controlsHidden: false,
       liveControlsHidden: true,
       togglePreviewHidden: true,
+      stageEmptyHidden: true,
+      stageEmptyTitle: "No one is sharing right now",
+      stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
       shareButtonText: "Share screen",
       shareButtonVariant: "primary",
       showFocusButtons: false,
     });
+  });
+
+  it("shows stageEmpty message when connected with 0 visible tiles", () => {
+    const idleState = deriveViewState(true, false, false, 0);
+    expect(idleState.stageEmptyHidden).toBe(false);
+    expect(idleState.stageEmptyTitle).toBe("No one is sharing right now");
+    expect(idleState.stageEmptySubtitle).toBe(
+      'Click "Share screen" below to start, or wait for someone to share.',
+    );
+
+    const hiddenPreviewState = deriveViewState(true, true, true, 0);
+    expect(hiddenPreviewState.stageEmptyHidden).toBe(false);
+    expect(hiddenPreviewState.stageEmptyTitle).toBe("Your stream preview is hidden");
+    expect(hiddenPreviewState.stageEmptySubtitle).toBe(
+      'Click "Show preview" below to bring it back on stage.',
+    );
   });
 
   it("shows liveControls and Stop sharing when connected and sharing", () => {
@@ -53,6 +76,9 @@ describe("deriveViewState", () => {
       controlsHidden: false,
       liveControlsHidden: false,
       togglePreviewHidden: true,
+      stageEmptyHidden: true,
+      stageEmptyTitle: "No one is sharing right now",
+      stageEmptySubtitle: 'Click "Share screen" below to start, or wait for someone to share.',
       shareButtonText: "Stop sharing",
       shareButtonVariant: "danger",
       showFocusButtons: true,

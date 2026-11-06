@@ -400,6 +400,37 @@
         min-height: 0;
         overflow-y: auto;
       }
+      .stage-empty {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        text-align: center;
+        color: var(--text-secondary);
+        user-select: none;
+        padding: 24px;
+      }
+      .stage-empty svg {
+        width: 24px;
+        height: 24px;
+        stroke: var(--text-secondary);
+        stroke-width: 1.75;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        fill: none;
+        opacity: 0.65;
+        margin-bottom: 2px;
+      }
+      .stage-empty-title {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--text-primary);
+      }
+      .stage-empty-sub {
+        font-size: 12px;
+        color: var(--text-secondary);
+      }
       .tile {
         position: relative;
         width: auto;
@@ -525,14 +556,27 @@
         display: flex;
         align-items: center;
         justify-content: center;
-        gap: 8px;
-        background: rgba(0, 0, 0, 0.45);
-        color: #fff;
-        font-size: 14px;
+        background: rgba(0, 0, 0, 0.35);
+        color: var(--text-primary);
+        font-size: 13px;
         font-weight: 500;
         cursor: pointer;
         border: 0;
         width: 100%;
+        transition: background-color 0.15s;
+      }
+      .tile-unmute:hover {
+        background: rgba(0, 0, 0, 0.48);
+      }
+      .tile-unmute-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(18, 18, 21, 0.9);
+        border: 1px solid var(--border-color);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
       }
       .tile-controls {
         position: absolute;
@@ -587,7 +631,8 @@
         opacity: 0.4;
         cursor: default;
       }
-      .tile-controls svg {
+      .tile-controls svg,
+      .tile-unmute svg {
         width: 15px;
         height: 15px;
         stroke: currentColor;
@@ -595,6 +640,7 @@
         stroke-linecap: round;
         stroke-linejoin: round;
         fill: none;
+        flex-shrink: 0;
       }
       .tile-volume {
         width: 72px;
@@ -728,7 +774,19 @@
       </div>
     </div>
 
-    <main id="stage" hidden></main>
+    <main id="stage" hidden>
+      <div id="stage-empty" class="stage-empty" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="2" y="3" width="20" height="14" rx="2" />
+          <line x1="8" y1="21" x2="16" y2="21" />
+          <line x1="12" y1="17" x2="12" y2="21" />
+        </svg>
+        <p id="stage-empty-title" class="stage-empty-title">No one is sharing right now</p>
+        <p id="stage-empty-sub" class="stage-empty-sub">
+          Click "Share screen" below to start, or wait for someone to share.
+        </p>
+      </div>
+    </main>
 
     <section id="audio-prompt" class="app-card" hidden aria-labelledby="audio-prompt-title">
       <h2 id="audio-prompt-title">Which app should viewers hear?</h2>

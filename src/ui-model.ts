@@ -6,10 +6,18 @@ export interface ViewState {
   controlsHidden: boolean;
   liveControlsHidden: boolean;
   togglePreviewHidden: boolean;
+  stageEmptyHidden: boolean;
+  stageEmptyTitle: string;
+  stageEmptySubtitle: string;
   shareButtonText: "Share screen" | "Stop sharing";
   shareButtonVariant: "primary" | "danger";
   showFocusButtons: boolean;
 }
+
+const DEFAULT_EMPTY_TITLE = "No one is sharing right now";
+const DEFAULT_EMPTY_SUBTITLE = 'Click "Share screen" below to start, or wait for someone to share.';
+const HIDDEN_PREVIEW_TITLE = "Your stream preview is hidden";
+const HIDDEN_PREVIEW_SUBTITLE = 'Click "Show preview" below to bring it back on stage.';
 
 /**
  * Pure derivation of top-level UI visibility and button states across
@@ -28,17 +36,24 @@ export function deriveViewState(
       controlsHidden: true,
       liveControlsHidden: true,
       togglePreviewHidden: true,
+      stageEmptyHidden: true,
+      stageEmptyTitle: DEFAULT_EMPTY_TITLE,
+      stageEmptySubtitle: DEFAULT_EMPTY_SUBTITLE,
       shareButtonText: "Share screen",
       shareButtonVariant: "primary",
       showFocusButtons: false,
     };
   }
+  const hiddenPreview = sharing && selfPreviewHidden;
   return {
     lobbyHidden: true,
     roomBarHidden: false,
     controlsHidden: false,
     liveControlsHidden: !sharing,
-    togglePreviewHidden: !(sharing && selfPreviewHidden),
+    togglePreviewHidden: !hiddenPreview,
+    stageEmptyHidden: visibleTileCount > 0,
+    stageEmptyTitle: hiddenPreview ? HIDDEN_PREVIEW_TITLE : DEFAULT_EMPTY_TITLE,
+    stageEmptySubtitle: hiddenPreview ? HIDDEN_PREVIEW_SUBTITLE : DEFAULT_EMPTY_SUBTITLE,
     shareButtonText: sharing ? "Stop sharing" : "Share screen",
     shareButtonVariant: sharing ? "danger" : "primary",
     showFocusButtons: visibleTileCount >= 2,

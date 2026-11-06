@@ -258,6 +258,15 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     assert.equal(watchingGeometry.controlsHidden, false);
     assert.equal(watchingGeometry.liveControlsHidden, true, "#live-controls must be hidden when not streaming");
     assert.equal(watchingGeometry.statusHidden, true, "#status must be hidden during normal info state");
+    assert.equal(
+      await sharer.evaluate(() => Boolean(document.getElementById("stage-empty")?.hidden)),
+      false,
+      "#stage-empty must be visible when no stream is running",
+    );
+    assert.equal(
+      await sharer.textContent("#stage-empty-title"),
+      "No one is sharing right now",
+    );
 
     // Viewers get no tile, so the participant list is the only place they show up.
     for (const page of [sharer, viewer, viewer2]) {
@@ -305,6 +314,11 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     assert.equal(streamingGeometry.liveControlsHidden, false, "#live-controls must be visible while streaming");
     assert.equal(streamingGeometry.shareText, "Stop sharing");
     assert.equal(streamingGeometry.shareDanger, true);
+    assert.equal(
+      await sharer.evaluate(() => Boolean(document.getElementById("stage-empty")?.hidden)),
+      true,
+      "#stage-empty must be hidden while streaming tile is visible",
+    );
 
     const check = (): boolean => window.__pcs.some((pc) => pc.connectionState === "connected");
     await waitFor(sharer, check, { label: "sharer peer connection" });
@@ -366,12 +380,15 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       true,
     );
     assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("toggle-preview")?.hidden)), false);
+    assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("stage-empty")?.hidden)), false);
+    assert.equal(await sharer.textContent("#stage-empty-title"), "Your stream preview is hidden");
     await sharer.click("#toggle-preview");
     assert.equal(
       await sharer.evaluate(() => Boolean(document.querySelector<HTMLElement>('.tile[data-peer="__self"]')?.hidden)),
       false,
     );
     assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("toggle-preview")?.hidden)), true);
+    assert.equal(await sharer.evaluate(() => Boolean(document.getElementById("stage-empty")?.hidden)), true);
 
     // Verify live Quality (#preset) and Codec (#codec) changes while streaming keep the stream alive:
     await sharer.selectOption("#preset", "720p30");

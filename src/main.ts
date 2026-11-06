@@ -66,6 +66,9 @@ const ui = {
   followChipText: el<HTMLElement>("follow-chip-text"),
   status: el<HTMLElement>("status"),
   stage: el<HTMLDivElement>("stage"),
+  stageEmpty: el<HTMLElement>("stage-empty"),
+  stageEmptyTitle: el<HTMLElement>("stage-empty-title"),
+  stageEmptySub: el<HTMLElement>("stage-empty-sub"),
   audioPrompt: el<HTMLElement>("audio-prompt"),
   audioPromptText: el<HTMLElement>("audio-prompt-text"),
   audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
@@ -236,6 +239,9 @@ function syncViewState(): ViewState {
 
   ui.lobby.hidden = state.lobbyHidden;
   ui.stage.hidden = !state.lobbyHidden;
+  ui.stageEmpty.hidden = state.stageEmptyHidden;
+  ui.stageEmptyTitle.textContent = state.stageEmptyTitle;
+  ui.stageEmptySub.textContent = state.stageEmptySubtitle;
   ui.roomBar.hidden = state.roomBarHidden;
   ui.copyLinkBtn.hidden = state.roomBarHidden;
   ui.controls.hidden = state.controlsHidden;
@@ -525,7 +531,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
   muteBtn.addEventListener("click", () => {
     const s = listeningFor(peerId);
     s.muted = !s.muted;
-    dismissUnmutePrompt(peerId);
+    dismissUnmutePrompt(peerId, false);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -545,7 +551,7 @@ function buildTileControls(peerId: PeerId, wrap: HTMLElement): void {
       s.volume = volState.volume;
       s.muted = false;
     }
-    dismissUnmutePrompt(peerId);
+    dismissUnmutePrompt(peerId, false);
     applyAudio(peerId);
     renderTileControls(peerId);
   });
@@ -750,7 +756,7 @@ function setPaused(peerId: PeerId, value: boolean): void {
     if (value) {
       video.pause();
     } else {
-      void video.play().catch(() => {});
+      startPlayback(video, peerId);
     }
   }
   applyViewing(peerId);
@@ -766,42 +772,52 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
     video.play().catch(() => {
       video.muted = true;
       return video.play().then(
-        () => showUnmutePrompt(video, peerId),
         () => {
-          if (tiles.get(peerId) !== video) return;
-          setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
+          if (tiles.get(peerId) === video) showUnmutePrompt(video, peerId, false);
+        },
+        () => {
+          if (tiles.get(peerId) === video) showUnmutePrompt(video, peerId, true);
         },
       );
     }),
   );
 }
 
-function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
+function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId, playbackBlocked = false): void {
   const wrap = video.closest(".tile");
   if (!wrap || wrap.querySelector(".tile-unmute")) return;
-  if (listeningFor(peerId).muted) return;
+  if (!playbackBlocked && listeningFor(peerId).muted) return;
 
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
-  btn.append(createIcon("volumeOff"));
+  btn.dataset["blocked"] = String(playbackBlocked);
+  const pill = document.createElement("span");
+  pill.className = "tile-unmute-pill";
+  pill.append(createIcon(playbackBlocked ? "play" : "volumeOff"));
   const txt = document.createElement("span");
-  txt.textContent = "Click to unmute";
-  btn.append(txt);
+  txt.textContent = playbackBlocked ? "Click to play" : "Click to unmute";
+  pill.append(txt);
+  btn.append(pill);
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
-    const audioState = listeningFor(peerId);
-    audioState.muted = false;
+    if (!playbackBlocked) {
+      const audioState = listeningFor(peerId);
+      audioState.muted = false;
+    }
     applyAudio(peerId);
     renderTileControls(peerId);
-    runBackground(video.play());
+    startPlayback(video, peerId);
   });
   wrap.append(btn);
   unmutePrompts.set(peerId, btn);
 }
 
-function dismissUnmutePrompt(peerId: PeerId): void {
-  unmutePrompts.get(peerId)?.remove();
+function dismissUnmutePrompt(peerId: PeerId, includeBlocked = true): void {
+  const btn = unmutePrompts.get(peerId);
+  if (!btn) return;
+  if (!includeBlocked && btn.dataset["blocked"] === "true") return;
+  btn.remove();
   unmutePrompts.delete(peerId);
 }
 
