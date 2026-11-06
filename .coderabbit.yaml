@@ -30,7 +30,7 @@ reviews:
       instructions: |
         Focus on Cloudflare Workers and Durable Object correctness:
         - Verify WebSocket Hibernation state consistency (`serializeAttachment` / `deserializeAttachment` and `ctx.getWebSockets()`).
-        - Check room capacity enforcement, password verification, and rate-limiting invariants.
+        - Check room capacity enforcement, host/rejoin token verification, room locking, kick bans, and rate-limiting invariants.
         - Ignore formatting, style, and unused-variable issues (handled by tsc, oxlint, and knip).
     - path: "electron/**/*.{ts,cts}"
       instructions: |
