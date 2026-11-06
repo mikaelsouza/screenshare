@@ -28,14 +28,19 @@ quiet; media flows directly peer-to-peer via WebRTC.
 ```bash
 nix develop             # Node 22, patchelf, Chromium, gh (optional)
 npm install             # installs dependencies; patches workerd on NixOS
-npm run dev             # frontend dev server (Vite)
-npm run preview         # built assets + Worker/RoomDO via wrangler dev
+npm run dev             # frontend-only Vite server (no /api/room or /ws Worker proxy)
+npm run preview         # built assets + Worker/RoomDO via wrangler dev (full room creation/joining)
 
 # Desktop app (Electron)
-npm run electron:dev    # Vite dev server + Electron app
-npm run electron:start  # built assets + Electron app
+npm run electron:dev    # Vite dev server + Electron app (frontend UI only without a Worker proxy)
+npm run electron:start  # build assets; Electron loads the hosted site by default
 npm run electron:build  # Windows NSIS installer + portable exe in release/
 ```
+
+Room creation (`/api/room`) and signalling (`/ws/:code`) require the Worker. Use
+`npm run preview` for local browser testing with built assets, or set
+`SCREENSHARE_URL=http://localhost:8787` when running Electron against `npm run preview`
+(or proxy `/api/room` HTTP and `/ws` WebSocket requests from Vite to `wrangler dev`).
 
 ## How it works
 
@@ -75,12 +80,16 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   (`stun:stun.cloudflare.com:3478`) for NAT traversal. Connections are opened only when at
   least one side is sharing; people in the room you connect with can see your IP address.
 - **Host controls:** The join that creates a room becomes its host (`hostToken`). The host
-  can remove people (revoking their rejoin ticket and banning their IPv4 address or IPv6
-  `/64` for 15 minutes) or lock the room to new joins. Members receive a `rejoinToken` on
-  welcome to resume in place on reconnect or rejoin past a lock; if the host leaves a
-  locked room for 5 minutes, it unlocks automatically.
+  can remove people (revoking that session's `rejoinToken` and banning their IPv4 address
+  or IPv6 `/64` for 15 minutes) or lock the room to new joins. Members receive a
+  `rejoinToken` on welcome to resume in place on reconnect or rejoin past a lock; a valid
+  `rejoinToken` also bypasses the IP ban (so other members sharing the address, or a member
+  holding another valid session token, can still rejoin from that address). If the host
+  leaves a locked room for 5 minutes, it unlocks automatically.
 - **The server sees** your IP, the room code and your display name while you are connected.
-  Room state and tokens are erased 12 hours after the room empties.
+  Room state and tokens are erased 12 hours after the room empties. A kicked member's IPv4
+  address or IPv6 `/64` can remain stored after the 15-minute ban expires, until a later
+  kick removes expired entries or room-state cleanup erases them.
 
 Known limitations and open defects are tracked in
 [Issues](https://github.com/mikaelsouza/screenshare/issues).
