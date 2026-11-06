@@ -1,0 +1,35 @@
+version = 1
+
+exclude_patterns = [
+  "test/**",
+  "dist/**",
+  "dist-electron/**",
+  "release/**",
+  "reports/**",
+  "coverage/**",
+  "node_modules/**",
+  ".wrangler/**",
+  ".stryker-tmp/**"
+]
+
+[[analyzers]]
+name = "javascript"
+enabled = true
+
+  [analyzers.meta]
+  dialect = "typescript"
+  module_system = "es-modules"
+  environment = ["nodejs", "browser"]
+  cyclomatic_complexity_threshold = "very-high"
+
+[[analyzers]]
+name = "shell"
+enabled = true
+
+[[analyzers]]
+name = "test-coverage"
+enabled = true
+
+[[analyzers]]
+name = "secrets"
+enabled = true
