@@ -66,6 +66,9 @@ const ui = {
   followChipText: el<HTMLElement>("follow-chip-text"),
   status: el<HTMLElement>("status"),
   stage: el<HTMLDivElement>("stage"),
+  stageEmpty: el<HTMLElement>("stage-empty"),
+  stageEmptyTitle: el<HTMLElement>("stage-empty-title"),
+  stageEmptySub: el<HTMLElement>("stage-empty-sub"),
   audioPrompt: el<HTMLElement>("audio-prompt"),
   audioPromptText: el<HTMLElement>("audio-prompt-text"),
   audioPickAppBtn: el<HTMLButtonElement>("audio-pick-app"),
@@ -236,6 +239,9 @@ function syncViewState(): ViewState {
 
   ui.lobby.hidden = state.lobbyHidden;
   ui.stage.hidden = !state.lobbyHidden;
+  ui.stageEmpty.hidden = state.stageEmptyHidden;
+  ui.stageEmptyTitle.textContent = state.stageEmptyTitle;
+  ui.stageEmptySub.textContent = state.stageEmptySubtitle;
   ui.roomBar.hidden = state.roomBarHidden;
   ui.copyLinkBtn.hidden = state.roomBarHidden;
   ui.controls.hidden = state.controlsHidden;
@@ -765,13 +771,14 @@ function startPlayback(video: HTMLVideoElement, peerId: PeerId): void {
   runBackground(
     video.play().catch(() => {
       video.muted = true;
-      return video.play().then(
-        () => showUnmutePrompt(video, peerId),
-        () => {
-          if (tiles.get(peerId) !== video) return;
-          setStatus("The browser blocked video playback. Click the tile to start it.", "warn");
-        },
-      );
+      return video
+        .play()
+        .catch(() => {})
+        .then(() => {
+          if (tiles.get(peerId) === video) {
+            showUnmutePrompt(video, peerId);
+          }
+        });
     }),
   );
 }
@@ -784,10 +791,13 @@ function showUnmutePrompt(video: HTMLVideoElement, peerId: PeerId): void {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "tile-unmute";
-  btn.append(createIcon("volumeOff"));
+  const pill = document.createElement("span");
+  pill.className = "tile-unmute-pill";
+  pill.append(createIcon("volumeOff"));
   const txt = document.createElement("span");
   txt.textContent = "Click to unmute";
-  btn.append(txt);
+  pill.append(txt);
+  btn.append(pill);
   btn.addEventListener("click", () => {
     dismissUnmutePrompt(peerId);
     const audioState = listeningFor(peerId);

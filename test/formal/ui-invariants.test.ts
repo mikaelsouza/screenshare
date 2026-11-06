@@ -36,6 +36,9 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
 
             // Invariant 5: Focus buttons are shown iff connected and at least 2 tiles are visible.
             expect(state.showFocusButtons).toBe(connected && visibleTileCount >= 2);
+
+            // Invariant 6: Empty-stage placeholder is shown iff connected and 0 tiles are visible.
+            expect(state.stageEmptyHidden).toBe(!(connected && visibleTileCount === 0));
           }
         }
       }
