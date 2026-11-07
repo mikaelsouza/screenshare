@@ -144,7 +144,7 @@ Set `CHROMIUM_BIN` if you are not inside `nix develop`.
 This project was made using autonomous AI agents that wrote, tested and reviewed the code.
 
 <a href="https://0rwx.com/">
-  <img src="https://github.com/NamtaoProductions/0rwx.com/blob/main/static/AI-X.png" alt="Learn More About the 0rwx framework" width="100" height="100">
+  <img src="https://raw.githubusercontent.com/NamtaoProductions/0rwx.com/main/static/AI-X.png" alt="Learn More About the 0rwx framework" width="100" height="100">
 </a>
 
 ## License
