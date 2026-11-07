@@ -1,20 +1,23 @@
 import { describe, it, expect } from "vitest";
 import fc from "fast-check";
-import { mungeOpusSdp } from "@src/quality";
+import { DEFAULT_START_BITRATE_KBPS, mungeOpusSdp, mungeVideoSdp } from "@src/quality";
 
-describe("Fuzzing Suite: Opus SDP Munging (Feature 42)", () => {
+describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
   /**
-   * Feature 42: Fuzz: Opus SDP Munging
-   * Invariant: mungeOpusSdp never throws, never hangs, and maintains idempotence.
+   * Feature 42: Fuzz: Opus & Video SDP Munging
+   * Invariant: mungeOpusSdp and mungeVideoSdp never throw, never hang, and maintain idempotence.
    */
   it("never crashes on arbitrary strings, unicode, or binary fragments", () => {
     fc.assert(
       fc.property(fc.string(), (raw) => {
-        let result: string | undefined;
+        let opusResult: string | undefined;
+        let videoResult: string | undefined;
         expect(() => {
-          result = mungeOpusSdp(raw);
+          opusResult = mungeOpusSdp(raw);
+          videoResult = mungeVideoSdp(raw);
         }).not.toThrow();
-        expect(typeof result).toBe("string");
+        expect(typeof opusResult).toBe("string");
+        expect(typeof videoResult).toBe("string");
         return true;
       }),
       { numRuns: 1000 }
@@ -29,7 +32,9 @@ describe("Fuzzing Suite: Opus SDP Munging (Feature 42)", () => {
       "a=fmtp:111 minptime=10;useinbandfec=1\r\n",
       "a=fmtp:111 stereo=0;sprop-stereo=0\r\n",
       "a=rtpmap:96 VP8/90000\r\n",
-      "m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+      "a=rtpmap:45 AV1/90000\r\n",
+      "a=fmtp:45 level-idx=5;profile=0;tier=0\r\n",
+      "m=video 9 UDP/TLS/RTP/SAVPF 96 45\r\n"
     );
 
     const syntheticSdpArb = fc
@@ -41,7 +46,7 @@ describe("Fuzzing Suite: Opus SDP Munging (Feature 42)", () => {
         const mungedOnce = mungeOpusSdp(sdp);
         const mungedTwice = mungeOpusSdp(mungedOnce);
 
-        // Idempotence Invariant
+        // Idempotence Invariant (Opus)
         expect(mungedTwice).toBe(mungedOnce);
 
         // If opus was present, verify stereo & bitrate guarantees
@@ -50,6 +55,16 @@ describe("Fuzzing Suite: Opus SDP Munging (Feature 42)", () => {
           expect(mungedOnce).toContain("sprop-stereo=1");
           expect(mungedOnce).toContain("maxaveragebitrate=256000");
           expect(mungedOnce).toContain("usedtx=0");
+        }
+
+        const videoOnce = mungeVideoSdp(sdp);
+        const videoTwice = mungeVideoSdp(videoOnce);
+
+        // Idempotence Invariant (Video)
+        expect(videoTwice).toBe(videoOnce);
+
+        if (/^a=rtpmap:(\d+) (?:VP8|VP9|H264|AV1)\/90000/im.test(sdp)) {
+          expect(videoOnce).toContain(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
         }
         return true;
       }),
@@ -77,6 +92,32 @@ describe("Fuzzing Suite: Opus SDP Munging (Feature 42)", () => {
           // Must force stereo=1
           expect(result).toContain("stereo=1");
           expect(result).not.toMatch(/stereo=0/);
+          return true;
+        }
+      ),
+      { numRuns: 200 }
+    );
+  });
+
+  it("preserves existing video fmtp attributes when injecting x-google-start-bitrate", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 35, max: 127 }),
+        fc.constantFrom("VP8", "VP9", "H264", "AV1"),
+        fc.stringMatching(/^[a-z]{3,8}=[a-z0-9]{1,8}$/),
+        (pt, codec, customAttr) => {
+          const sdp = [
+            "v=0",
+            `m=video 9 UDP/TLS/RTP/SAVPF ${pt}`,
+            `a=rtpmap:${pt} ${codec}/90000`,
+            `a=fmtp:${pt} ${customAttr};x-google-start-bitrate=300`,
+          ].join("\r\n");
+
+          const result = mungeVideoSdp(sdp);
+
+          expect(result).toContain(customAttr);
+          expect(result).toContain(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+          expect(result).not.toMatch(/x-google-start-bitrate=300\b/);
           return true;
         }
       ),

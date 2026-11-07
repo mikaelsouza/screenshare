@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { applyVideoEncoding, mungeOpusSdp } from "@src/quality";
+import {
+  applyVideoEncoding,
+  DEFAULT_START_BITRATE_KBPS,
+  mungeOpusSdp,
+  mungeVideoSdp,
+} from "@src/quality";
 
 /** Minimal but realistic audio m-line, matching what Chrome actually emits. */
 function sdpWith(fmtp: string | null, pt = "111"): string {
@@ -72,6 +77,88 @@ describe("mungeOpusSdp", () => {
   it("is idempotent", () => {
     const once = mungeOpusSdp(sdpWith("minptime=10"));
     expect(mungeOpusSdp(once)).toBe(once);
+  });
+});
+
+describe("mungeVideoSdp", () => {
+  const multiCodecVideoSdp = [
+    "v=0",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 102 45 46",
+    "a=rtpmap:96 VP8/90000",
+    "a=rtpmap:97 rtx/90000",
+    "a=fmtp:97 apt=96",
+    "a=rtpmap:98 VP9/90000",
+    "a=fmtp:98 profile-id=0",
+    "a=rtpmap:102 H264/90000",
+    "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+    "a=rtpmap:45 AV1/90000",
+    "a=fmtp:45 level-idx=5;profile=0;tier=0",
+    "a=rtpmap:46 red/90000",
+    "",
+  ].join("\r\n");
+
+  it("inserts x-google-start-bitrate on video codecs without an existing fmtp line", () => {
+    const out = mungeVideoSdp(multiCodecVideoSdp);
+    expect(fmtpOf(out, "96")).toBe(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(out).toMatch(
+      new RegExp(`a=rtpmap:96 VP8\\/90000\\r\\na=fmtp:96 x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`),
+    );
+  });
+
+  it("appends x-google-start-bitrate to existing VP9, H264, and AV1 fmtp lines while preserving parameters", () => {
+    const out = mungeVideoSdp(multiCodecVideoSdp);
+    expect(fmtpOf(out, "98")).toBe(`profile-id=0;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(fmtpOf(out, "102")).toBe(
+      `level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`,
+    );
+    expect(fmtpOf(out, "45")).toBe(
+      `level-idx=5;profile=0;tier=0;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`,
+    );
+  });
+
+  it("does not munge auxiliary payload types (rtx, red, ulpfec) or audio tracks", () => {
+    const out = mungeVideoSdp(multiCodecVideoSdp);
+    expect(fmtpOf(out, "97")).toBe("apt=96");
+    expect(fmtpOf(out, "46")).toBeNull();
+    const audioOnly = sdpWith("minptime=10");
+    expect(mungeVideoSdp(audioOnly)).toBe(audioOnly);
+  });
+
+  it("does not inject x-google-min-bitrate so congestion control can still adapt downward", () => {
+    const out = mungeVideoSdp(multiCodecVideoSdp);
+    expect(out).not.toContain("x-google-min-bitrate");
+  });
+
+  it("overrides an existing x-google-start-bitrate value and is idempotent", () => {
+    const withOldStart = [
+      "v=0",
+      "m=video 9 UDP/TLS/RTP/SAVPF 45",
+      "a=rtpmap:45 AV1/90000",
+      "a=fmtp:45 level-idx=5;x-google-start-bitrate=300;profile=0",
+      "",
+    ].join("\r\n");
+    const once = mungeVideoSdp(withOldStart, 5000);
+    expect(fmtpOf(once, "45")).toBe("level-idx=5;profile=0;x-google-start-bitrate=5000");
+    expect(mungeVideoSdp(once, 5000)).toBe(once);
+  });
+
+  it("bounds processed payload types to 0-127 and deduplicates leading-zero payload numbers", () => {
+    const sdp = [
+      "v=0",
+      "m=video 9 UDP/TLS/RTP/SAVPF 0 127 128 999",
+      "a=rtpmap:0 VP8/90000",
+      "a=rtpmap:0127 AV1/90000",
+      "a=rtpmap:127 AV1/90000",
+      "a=fmtp:127 profile=0",
+      "a=rtpmap:128 H264/90000",
+      "a=rtpmap:999 VP9/90000",
+      "",
+    ].join("\r\n");
+    const out = mungeVideoSdp(sdp);
+    expect(fmtpOf(out, "0")).toBe(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(fmtpOf(out, "127")).toBe(`profile=0;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(fmtpOf(out, "128")).toBeNull();
+    expect(fmtpOf(out, "999")).toBeNull();
   });
 });
 
