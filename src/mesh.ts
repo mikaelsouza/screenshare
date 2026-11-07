@@ -349,11 +349,16 @@ class PeerLink {
 
     this.attachingCount++;
     try {
-      await Promise.all([
+      const results = await Promise.allSettled([
         applyAudioEncoding(this.audioSender),
         applyVideoEncoding(this.videoSender, this.opts.preset),
       ]);
+      const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+      if (rejected) throw rejected.reason;
       await this.setSenderActive(this.remoteWantsVideo);
+    } catch (err) {
+      // A link closed during setup can reject the pending setParameters calls.
+      if (this.pc.signalingState !== "closed") throw err;
     } finally {
       this.attachingCount--;
       if (this.attachingCount === 0 && !this.applyingOffer && this.pc.signalingState === "stable") {
@@ -361,7 +366,7 @@ class PeerLink {
       }
     }
 
-    if (this.videoSender !== videoTx.sender) return;
+    if (this.pc.signalingState === "closed" || this.videoSender !== videoTx.sender) return;
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
   }

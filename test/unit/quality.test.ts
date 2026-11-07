@@ -141,6 +141,25 @@ describe("mungeVideoSdp", () => {
     expect(fmtpOf(once, "45")).toBe("level-idx=5;profile=0;x-google-start-bitrate=5000");
     expect(mungeVideoSdp(once, 5000)).toBe(once);
   });
+
+  it("bounds processed payload types to 0-127 and deduplicates leading-zero payload numbers", () => {
+    const sdp = [
+      "v=0",
+      "m=video 9 UDP/TLS/RTP/SAVPF 0 127 128 999",
+      "a=rtpmap:0 VP8/90000",
+      "a=rtpmap:0127 AV1/90000",
+      "a=rtpmap:127 AV1/90000",
+      "a=fmtp:127 profile=0",
+      "a=rtpmap:128 H264/90000",
+      "a=rtpmap:999 VP9/90000",
+      "",
+    ].join("\r\n");
+    const out = mungeVideoSdp(sdp);
+    expect(fmtpOf(out, "0")).toBe(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(fmtpOf(out, "127")).toBe(`profile=0;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(fmtpOf(out, "128")).toBeNull();
+    expect(fmtpOf(out, "999")).toBeNull();
+  });
 });
 
 /** Minimal RTCRtpSender double that records what setParameters received. */

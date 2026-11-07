@@ -175,8 +175,10 @@ export function mungeVideoSdp(
   let out = sdp;
 
   for (const match of matches) {
-    const pt = match[1];
-    if (!pt || seenPts.has(pt)) continue;
+    const raw = match[1];
+    if (!raw) continue;
+    const pt = String(Number(raw));
+    if (Number(pt) > 127 || seenPts.has(pt)) continue;
     seenPts.add(pt);
 
     const fmtpRe = new RegExp(`^a=fmtp:${pt} (.*)$`, "gm");

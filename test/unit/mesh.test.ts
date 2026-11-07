@@ -985,6 +985,55 @@ describe("negotiation recovery", () => {
       createAnswerSpy.mockRestore();
     }
   });
+
+  it("suppresses setParameters rejections and skips starting BitrateAdapter when link closes during attachCapture, while rethrowing errors on open links", async () => {
+    let shouldCloseDuringSetParams = true;
+    let getStatsCalls = 0;
+
+    const addTransceiverSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "addTransceiver")
+      .mockImplementation(function (
+        this: FakeRTCPeerConnection,
+        trackOrKind: MediaStreamTrack | string,
+      ): RTCRtpTransceiver {
+        const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
+        const tx = this.transceivers.find((t) => t.sender === sender)!;
+        tx.sender.getStats = async () => {
+          getStatsCalls++;
+          return new Map() as unknown as RTCStatsReport;
+        };
+        tx.sender.setParameters = async () => {
+          await Promise.resolve();
+          if (shouldCloseDuringSetParams) {
+            this.signalingState = "closed";
+          }
+          throw new Error("InvalidStateError: PeerConnection is closed");
+        };
+        return tx;
+      });
+
+    try {
+      vi.useFakeTimers();
+      const mesh = new Mesh("me", opts, () => {}, cb());
+      mesh.addMember("bob", false);
+
+      // Case 1: link closes while setParameters is pending -> rejection is suppressed and BitrateAdapter is not started
+      await expect(mesh.setCapture(capture())).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(getStatsCalls).toBe(0);
+
+      // Case 2: link stays open and setParameters rejects -> rejection is propagated
+      await mesh.setCapture(null);
+      shouldCloseDuringSetParams = false;
+      mesh.removeMember("bob");
+      mesh.addMember("bob", false);
+      await expect(mesh.setCapture(capture())).rejects.toThrow("InvalidStateError");
+    } finally {
+      vi.useRealTimers();
+      addTransceiverSpy.mockRestore();
+    }
+  });
 });
+
 
 
