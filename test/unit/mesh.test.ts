@@ -864,5 +864,127 @@ describe("negotiation recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(signals.some((sig) => sig.data.k === "offer")).toBe(true);
   });
+
+  it("defers onnegotiationneeded during attachCapture until codec preference and sender parameters are applied", async () => {
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({
+        codecs: [{ mimeType: "video/VP8" }, { mimeType: "video/AV1" }],
+      }),
+    };
+
+    const events: string[] = [];
+    const signals: Array<{ to: string; data: SignalData }> = [];
+
+    const addTransceiverSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "addTransceiver")
+      .mockImplementation(function (
+        this: FakeRTCPeerConnection,
+        trackOrKind: MediaStreamTrack | string,
+      ): RTCRtpTransceiver {
+        const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
+        const tx = this.transceivers.find((t) => t.sender === sender)!;
+        const isVideo = typeof trackOrKind !== "string";
+        tx.setCodecPreferences = vi.fn((codecs: readonly RTCRtpCodec[]) => {
+          events.push(`setCodecPreferences:${codecs[0]?.mimeType ?? "none"}`);
+        });
+        const origSetParams = tx.sender.setParameters.bind(tx.sender);
+        tx.sender.setParameters = async (p: RTCRtpSendParameters) => {
+          await new Promise((r) => setTimeout(r, 5));
+          events.push(`setParameters:${isVideo ? "video" : "audio"}`);
+          return origSetParams(p);
+        };
+        // Simulate Chrome firing onnegotiationneeded on the microtask queue right after addTransceiver
+        queueMicrotask(() => this.onnegotiationneeded?.());
+        return tx;
+      });
+
+    const createOfferSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "createOffer")
+      .mockImplementation(async () => {
+        events.push("createOffer");
+        return {
+          type: "offer",
+          sdp: "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n",
+        };
+      });
+
+    try {
+      const mesh = new Mesh(
+        "me",
+        { ...opts, codec: "av1" },
+        (to, data) => signals.push({ to, data }),
+        cb(),
+      );
+      mesh.addMember("bob", false);
+      await mesh.setCapture(capture());
+      await new Promise((r) => setTimeout(r, 10));
+
+      expect(events[0]).toBe("setCodecPreferences:video/AV1");
+      const offerIdx = events.indexOf("createOffer");
+      expect(offerIdx).toBeGreaterThan(events.indexOf("setCodecPreferences:video/AV1"));
+      expect(offerIdx).toBeGreaterThan(events.indexOf("setParameters:video"));
+      expect(offerIdx).toBeGreaterThan(events.indexOf("setParameters:audio"));
+      expect(signals.some((s) => s.data.k === "offer")).toBe(true);
+    } finally {
+      addTransceiverSpy.mockRestore();
+      createOfferSpy.mockRestore();
+    }
+  });
+
+  it("munges x-google-start-bitrate into outgoing offers, outgoing answers, and incoming remote descriptions", async () => {
+    const videoSdp = [
+      "v=0",
+      "m=audio 9 UDP/TLS/RTP/SAVPF 111",
+      "a=rtpmap:111 opus/48000/2",
+      "m=video 9 UDP/TLS/RTP/SAVPF 45",
+      "a=rtpmap:45 AV1/90000",
+      "a=fmtp:45 level-idx=5;profile=0;tier=0",
+      "",
+    ].join("\r\n");
+
+    const createOfferSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "createOffer")
+      .mockResolvedValue({ type: "offer", sdp: videoSdp });
+    const createAnswerSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "createAnswer")
+      .mockResolvedValue({ type: "answer", sdp: videoSdp });
+
+    try {
+      const signals: Array<{ to: string; data: SignalData }> = [];
+      const mesh = new Mesh("me", { ...opts, codec: "av1" }, (to, data) => signals.push({ to, data }), cb());
+      mesh.addMember("bob", true);
+      await mesh.setCapture(capture());
+
+      const [pc] = FakeRTCPeerConnection.instances;
+      if (!pc) throw new Error("Expected peer connection");
+
+      // Outgoing offer
+      pc.onnegotiationneeded?.();
+      await new Promise((r) => setTimeout(r, 10));
+      const offerSig = signals.find((s) => s.data.k === "offer");
+      expect(offerSig?.data.k).toBe("offer");
+      if (offerSig?.data.k === "offer") {
+        expect(offerSig.data.sdp).toContain("x-google-start-bitrate=4000");
+      }
+
+      // Incoming remote answer
+      await mesh.handleSignal("bob", { k: "answer", sdp: videoSdp });
+      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=4000");
+
+      // Incoming remote offer + outgoing answer
+      signals.length = 0;
+      await mesh.handleSignal("bob", { k: "offer", sdp: videoSdp });
+      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=4000");
+      const answerSig = signals.find((s) => s.data.k === "answer");
+      expect(answerSig?.data.k).toBe("answer");
+      if (answerSig?.data.k === "answer") {
+        expect(answerSig.data.sdp).toContain("x-google-start-bitrate=4000");
+      }
+    } finally {
+      createOfferSpy.mockRestore();
+      createAnswerSpy.mockRestore();
+    }
+  });
 });
+
 

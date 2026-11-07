@@ -17,9 +17,14 @@ import {
   BitrateAdapter,
   type CodecName,
   mungeOpusSdp,
+  mungeVideoSdp,
   preferCodec,
   tuneReceiverLatency,
 } from "./quality";
+
+function mungeSdp(sdp: string): string {
+  return mungeVideoSdp(mungeOpusSdp(sdp));
+}
 
 export interface MeshOptions {
   iceServers: RTCIceServer[];
@@ -80,6 +85,8 @@ class PeerLink {
   private remoteOffers = 0;
   /** A remote offer is being applied and answered. */
   private applyingOffer = false;
+  /** Non-zero while attachCapture is awaiting initial sender setParameters calls. */
+  private attachingCount = 0;
 
   private control: RTCDataChannel | null = null;
   private remoteWantsVideo = true;
@@ -158,6 +165,10 @@ class PeerLink {
 
   private async negotiate(): Promise<void> {
     if (this.pc.signalingState === "closed") return;
+    if (this.attachingCount > 0) {
+      this.offerPending = true;
+      return;
+    }
     // Counted when their offer arrives, not once it is applied: RTCPeerConnection
     // queues its operations, so our createOffer can resolve, and our
     // setLocalDescription be queued, while their offer is still being applied.
@@ -177,7 +188,7 @@ class PeerLink {
         this.retryOffer();
         return;
       }
-      offer.sdp = mungeOpusSdp(offer.sdp ?? "");
+      offer.sdp = mungeSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
       if (sdp) this.send({ k: "offer", sdp });
@@ -200,7 +211,7 @@ class PeerLink {
   }
 
   private flushPendingOffer(): void {
-    if (!this.offerPending || this.pc.signalingState === "closed") return;
+    if (!this.offerPending || this.attachingCount > 0 || this.pc.signalingState === "closed") return;
     this.offerPending = false;
     void this.negotiate();
   }
@@ -231,12 +242,12 @@ class PeerLink {
     }
     try {
       this.isSettingRemoteAnswerPending = kind === "answer";
-      await this.pc.setRemoteDescription({ type: kind, sdp });
+      await this.pc.setRemoteDescription({ type: kind, sdp: mungeSdp(sdp) });
       this.isSettingRemoteAnswerPending = false;
 
       if (kind === "offer") {
         const answer = await this.pc.createAnswer();
-        answer.sdp = mungeOpusSdp(answer.sdp ?? "");
+        answer.sdp = mungeSdp(answer.sdp ?? "");
         await this.pc.setLocalDescription(answer);
         const out = this.pc.localDescription?.sdp;
         if (out) this.send({ k: "answer", sdp: out });
@@ -319,27 +330,38 @@ class PeerLink {
   }
 
   async attachCapture(capture: CaptureResult): Promise<void> {
-    await this.detachCapture();
+    this.detachCapture();
 
     // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
     // addTrack reuses the receive-only transceiver its offer created, and that
     // sender has no send encodings yet: setting ours is "Read-only field modified",
     // which stopped the whole share. So a viewer could not share back to a sharer.
     const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
-    this.videoSender = this.pc.addTransceiver(capture.video, send).sender;
+    const videoTx = this.pc.addTransceiver(capture.video, send);
+    this.videoSender = videoTx.sender;
+    preferCodec(videoTx, this.opts.codec);
+
     // Always open an audio sender, even when capture.audio is null, so attaching or
     // replacing an audio track later never requires SDP renegotiation. Tagging it
     // with the video's stream keeps the two in one MediaStream on the far end, so
     // they play in sync.
     this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
-    await applyAudioEncoding(this.audioSender);
 
-    const tx = this.pc.getTransceivers().find((t) => t.sender === this.videoSender);
-    if (tx) preferCodec(tx, this.opts.codec);
+    this.attachingCount++;
+    try {
+      await Promise.all([
+        applyAudioEncoding(this.audioSender),
+        applyVideoEncoding(this.videoSender, this.opts.preset),
+      ]);
+      await this.setSenderActive(this.remoteWantsVideo);
+    } finally {
+      this.attachingCount--;
+      if (this.attachingCount === 0 && !this.applyingOffer && this.pc.signalingState === "stable") {
+        this.flushPendingOffer();
+      }
+    }
 
-    await applyVideoEncoding(this.videoSender, this.opts.preset);
-    await this.setSenderActive(this.remoteWantsVideo);
-
+    if (this.videoSender !== videoTx.sender) return;
     this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
     this.adapter.start();
   }
@@ -357,7 +379,7 @@ class PeerLink {
     await this.videoSender?.replaceTrack(track);
   }
 
-  async detachCapture(): Promise<void> {
+  detachCapture(): void {
     this.adapter?.stop();
     this.adapter = null;
     for (const s of [this.videoSender, this.audioSender]) {
@@ -560,21 +582,18 @@ export class Mesh {
    * not sharing themselves, since those existed only to carry our stream.
    */
   async setCapture(capture: CaptureResult | null): Promise<void> {
-    // Links that already exist get the capture attached (or detached) here; links
-    // created below attach it themselves in addPeer, and attaching twice would leave
-    // an extra pair of transceivers behind.
-    const existing = [...this.links.values()];
-    this.capture = capture;
     if (capture) {
+      // Create missing links before storing this.capture so addPeer does not fire
+      // an un-awaited attachCapture; then attach (and await) every link once.
+      this.capture = null;
       for (const id of this.members.keys()) this.addPeer(id);
+      this.capture = capture;
+      await Promise.all([...this.links.values()].map((l) => l.attachCapture(capture)));
     } else {
+      this.capture = null;
       for (const [id, m] of this.members) if (!m.sharing) this.removePeer(id);
+      for (const l of this.links.values()) l.detachCapture();
     }
-    await Promise.all(
-      existing
-        .filter((l) => this.links.get(l.peerId) === l)
-        .map((l) => (capture ? l.attachCapture(capture) : l.detachCapture())),
-    );
   }
 
   /**

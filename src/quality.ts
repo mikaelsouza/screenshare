@@ -147,6 +147,56 @@ export function mungeOpusSdp(sdp: string): string {
   return sdp.replace(rtpmap[0], `${rtpmap[0]}\r\na=fmtp:${pt} ${wanted}`);
 }
 
+/**
+ * Initial video bandwidth estimate (kbps) injected into SDP via x-google-start-bitrate.
+ *
+ * Without this hint, Chromium's libwebrtc initializes a new peer connection's
+ * send-side bandwidth estimator at kDefaultStartBitrateBps (300 kbps). For a
+ * 1080p/1440p screen share with contentHint="motion" and maintain-framerate,
+ * 300 kbps triggers InitialFrameDropper and 4 consecutive resolution downscales
+ * down to 480x270 (QP ~208 on AV1) on the first 5 frames — and if the shared
+ * window is static, no further frames arrive to drive QualityScaler back up.
+ *
+ * Only x-google-start-bitrate is set (never x-google-min-bitrate), so GCC and
+ * BitrateAdapter remain free to adapt downward on genuinely constrained links.
+ */
+export const DEFAULT_START_BITRATE_KBPS = 4000;
+
+export function mungeVideoSdp(
+  sdp: string,
+  startBitrateKbps: number = DEFAULT_START_BITRATE_KBPS,
+): string {
+  const rtpmapRe = /^a=rtpmap:(\d+) (?:VP8|VP9|H264|AV1)\/90000\b.*$/gim;
+  const matches = [...sdp.matchAll(rtpmapRe)];
+  if (matches.length === 0) return sdp;
+
+  const wanted = `x-google-start-bitrate=${startBitrateKbps}`;
+  const seenPts = new Set<string>();
+  let out = sdp;
+
+  for (const match of matches) {
+    const pt = match[1];
+    if (!pt || seenPts.has(pt)) continue;
+    seenPts.add(pt);
+
+    const fmtpRe = new RegExp(`^a=fmtp:${pt} (.*)$`, "gm");
+    if (fmtpRe.test(out)) {
+      out = out.replace(fmtpRe, (_full, existing: string) => {
+        const keep = existing
+          .split(";")
+          .map((s) => s.trim())
+          .filter((s) => s && !/^x-google-start-bitrate=/i.test(s));
+        return `a=fmtp:${pt} ${[...keep, wanted].join(";")}`;
+      });
+    } else {
+      const lineRe = new RegExp(`^a=rtpmap:${pt} (?:VP8|VP9|H264|AV1)\\/90000\\b.*$`, "gim");
+      out = out.replace(lineRe, (line) => `${line}\r\na=fmtp:${pt} ${wanted}`);
+    }
+  }
+
+  return out;
+}
+
 export interface LinkHealth {
   rttMs: number | null;
   packetLossRatio: number | null;
