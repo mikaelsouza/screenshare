@@ -493,7 +493,12 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
         true,
         "peer connection must remain connected when AV1 is unsupported",
       );
-      const fallbackCodec = await viewer.evaluate(inboundVideoCodec);
+      const fallbackDeadline = Date.now() + 30_000;
+      let fallbackCodec = await viewer.evaluate(inboundVideoCodec);
+      while (Date.now() < fallbackDeadline && fallbackCodec === null) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        fallbackCodec = await viewer.evaluate(inboundVideoCodec);
+      }
       assert.ok(
         fallbackCodec !== null && fallbackCodec !== "video/av1",
         `expected non-AV1 fallback codec when AV1 is unsupported: ${String(fallbackCodec)}`,
