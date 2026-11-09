@@ -60,8 +60,9 @@ async function captureDesktopSource(sourceId: string, preset: QualityPreset): Pr
     stream.getTracks().forEach((t) => t.stop());
     throw new Error(`no video track for source ${sourceId}`);
   }
-  // Leave track.contentHint unset ("") to match captureScreen(), keeping the same
-  // default screen-capture maintain-resolution policy on followed windows.
+  // Hint "motion" to match captureScreen() so followed windows also use
+  // realtime video encoding and maintain-framerate policy.
+  track.contentHint = "motion";
   return track;
 }
 

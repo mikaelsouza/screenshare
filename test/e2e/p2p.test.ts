@@ -443,8 +443,8 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       "selecting a preset option must restore focus to #preset-btn",
     );
     await sharer.click("#codec-btn");
-    await sharer.focus('#codec-list button[data-codec="vp8"]');
-    await sharer.click('#codec-list button[data-codec="vp8"]');
+    await sharer.focus('#codec-list button[data-codec="h264"]');
+    await sharer.click('#codec-list button[data-codec="h264"]');
     assert.equal(
       await sharer.evaluate(() => document.activeElement?.id),
       "codec-btn",

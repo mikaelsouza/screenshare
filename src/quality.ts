@@ -6,22 +6,19 @@
 
 import type { QualityPreset } from "./capture";
 
-export type CodecName = "h264" | "vp9" | "av1" | "vp8";
+export type CodecName = "h264" | "av1";
 
 /**
- * H.264 is the default *for gaming specifically*. VP9/AV1 compress better per bit,
- * but on most machines they encode in software and steal CPU from the game being
- * streamed. H.264 hits the hardware encoder (NVENC / AMF / QuickSync) on essentially
- * every gaming GPU, and WebRTC's H.264 has no B-frames, which helps latency.
- * Exposed as a toggle because the right answer is GPU-dependent and empirical.
+ * H.264 is the default *for gaming specifically*: it hits the hardware encoder
+ * (NVENC / AMF / QuickSync) on essentially every gaming GPU, and WebRTC's H.264 has
+ * no B-frames, which helps latency. AV1 is offered for modern GPUs (RTX 40+, RX 7000+,
+ * Arc) with dedicated AV1 hardware encoders.
  */
 export const DEFAULT_CODEC: CodecName = "h264";
 
 const CODEC_MIME: Record<CodecName, string> = {
   h264: "video/H264",
-  vp9: "video/VP9",
   av1: "video/AV1",
-  vp8: "video/VP8",
 };
 
 export async function applyVideoEncoding(
@@ -41,10 +38,7 @@ export async function applyVideoEncoding(
   // through here would silently resume uploading video nobody is watching —
   // defeating the largest bandwidth lever the room-size budget depends on.
   // Resuming is the explicit job of setSenderActive().
-  // Leave params.degradationPreference unset so Chromium/Electron uses its default
-  // screen-capture policy (maintain-resolution when video.contentHint is "") and
-  // built-in per-peer transport-cc congestion control up to preset.maxBitrate,
-  // avoiding mid-stream resolution downscales.
+  params.degradationPreference = "maintain-framerate";
   e.maxBitrate = preset.maxBitrate;
   e.maxFramerate = preset.frameRate;
   e.scaleResolutionDownBy = 1;
@@ -148,7 +142,7 @@ export function mungeOpusSdp(sdp: string): string {
  * Only x-google-start-bitrate is set (never x-google-min-bitrate), so GCC remains
  * free to adapt downward on genuinely constrained links.
  */
-export const DEFAULT_START_BITRATE_KBPS = 4000;
+export const DEFAULT_START_BITRATE_KBPS = 6000;
 
 export function mungeVideoSdp(
   sdp: string,

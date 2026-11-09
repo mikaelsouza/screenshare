@@ -195,13 +195,13 @@ function fakeSender(initial: Record<string, unknown>) {
 const PRESET = { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 };
 
 describe("applyVideoEncoding", () => {
-  it("applies the preset's bitrate and framerate without overriding degradationPreference", async () => {
+  it("applies the preset's bitrate, framerate, and maintain-framerate degradationPreference", async () => {
     const f = fakeSender({ active: true });
     await applyVideoEncoding(f.sender, PRESET);
     expect(f.current()["maxBitrate"]).toBe(6_000_000);
     expect(f.current()["maxFramerate"]).toBe(60);
     expect(f.current()["scaleResolutionDownBy"]).toBe(1);
-    expect(f.sender.getParameters()).not.toHaveProperty("degradationPreference");
+    expect(f.sender.getParameters().degradationPreference).toBe("maintain-framerate");
   });
 
   it("applies every defined QUALITY_PRESETS ceiling accurately", async () => {
@@ -295,7 +295,7 @@ describe("preferCodec", () => {
     (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = orig;
   });
 
-  it("reorders codecs with the preferred codec first across h264, vp9, av1, and vp8", async () => {
+  it("reorders codecs with the preferred codec first across h264 and av1", async () => {
     const { preferCodec } = await import("@src/quality");
     const codecs = [
       { mimeType: "video/VP8" },
@@ -327,14 +327,13 @@ describe("preferCodec", () => {
       "video/AV1",
     ]);
 
-    preferCodec(tx, "vp9");
-    expect(setPreferencesArg[0]?.mimeType).toBe("video/VP9");
-
     preferCodec(tx, "av1");
-    expect(setPreferencesArg[0]?.mimeType).toBe("video/AV1");
-
-    preferCodec(tx, "vp8");
-    expect(setPreferencesArg[0]?.mimeType).toBe("video/VP8");
+    expect(setPreferencesArg.map((c) => c.mimeType)).toEqual([
+      "video/AV1",
+      "video/VP8",
+      "video/VP9",
+      "video/H264",
+    ]);
   });
 
   it("handles when preferred codec is not offered by browser", async () => {

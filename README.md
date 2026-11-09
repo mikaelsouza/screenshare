@@ -104,9 +104,9 @@ the shared window's process tree (following games between lobby and match window
 system audio excluding the app itself. While streaming, the **Mute audio** button next to
 **Stop sharing** mutes or unmutes your outbound audio track in place.
 
-Sharers can switch quality presets (`1080p60` at 8 Mbps default, `1080p30` at 6 Mbps,
-`720p60` at 6 Mbps, `720p30` at 4 Mbps) and video codecs (`H.264` default, `VP9`, `AV1`,
-`VP8`) live without stopping the share, toggle their local preview tile, and view
+Sharers can switch quality presets (`1080p60` at 12 Mbps default, `1080p30` at 8 Mbps,
+`720p60` at 8 Mbps, `720p30` at 6 Mbps) and video codecs (`H.264` default, `AV1`) live
+without stopping the share, toggle their local preview tile, and view
 per-viewer outbound bitrates in the room roster. Viewers get per-tile pause (which stops
 the sharer's outbound video encoder for that link via a P2P data channel, alongside
 automatic off-screen `IntersectionObserver` pausing), mute, volume boost up to 200% via

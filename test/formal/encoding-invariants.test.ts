@@ -103,8 +103,8 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
             const expectedActive = shape === "populated" ? initialActive : undefined;
             expect(enc["active"]).toBe(expectedActive);
 
-            // Invariant 3: Chrome's default degradationPreference is never overridden
-            expect(afterFirst["degradationPreference"]).toBe(existingDegradation);
+            // Invariant 3: degradationPreference is always locked to "maintain-framerate"
+            expect(afterFirst["degradationPreference"]).toBe("maintain-framerate");
 
             // Invariant 4: Idempotence — f(f(x, p), p) === f(x, p)
             await applyVideoEncoding(sender, preset);
@@ -209,8 +209,8 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
 
           const res = await captureScreen(preset);
 
-          // Invariant 1: initial video.contentHint stays "" so Chromium treats the capture as a native screenshare
-          expect(res.video.contentHint).toBe("");
+          // Invariant 1: initial video.contentHint is "motion" so Chromium configures realtime video encoding
+          expect(res.video.contentHint).toBe("motion");
 
           // Invariant 2: audio.contentHint is "music" iff an audio track was captured
           if (hasAudio) {
@@ -219,7 +219,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
             expect(res.audio).toBeNull();
           }
 
-          // Invariant 3: followed desktop tracks swapped via ElectronCaptureController preserve contentHint === ""
+          // Invariant 3: followed desktop tracks swapped via ElectronCaptureController set contentHint === "motion"
           let onFollow: ((u: FollowUpdate) => void) | null = null;
           let swappedTrack: MediaStreamTrack | null = null;
           const controller = createElectronCaptureController(
@@ -239,13 +239,13 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
             },
           );
           const started = await controller.start(preset);
-          expect(started.video.contentHint).toBe("");
+          expect(started.video.contentHint).toBe("motion");
           const emitFollow = onFollow as unknown as (u: FollowUpdate) => void;
           emitFollow({ role: "lobby", sourceId: "window:1:0", title: "Lobby", profile: "LoL" });
           emitFollow({ role: "game", sourceId: "window:2:0", title: "Game", profile: "LoL" });
           await new Promise((r) => setTimeout(r, 0));
           expect(swappedTrack).toBe(followedVideoTrack);
-          expect((swappedTrack as unknown as MediaStreamTrack).contentHint).toBe("");
+          expect((swappedTrack as unknown as MediaStreamTrack).contentHint).toBe("motion");
           controller.stop();
         }
       }

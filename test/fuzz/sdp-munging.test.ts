@@ -183,7 +183,6 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
       fc.asyncProperty(presetArb, paramsArb, async (preset, initialParams) => {
         let state = structuredClone(initialParams) as Record<string, unknown>;
         const initialActive = (initialParams.encodings?.[0] as Record<string, unknown> | undefined)?.["active"];
-        const initialDegradation = initialParams.degradationPreference;
 
         const sender = {
           getParameters: () => structuredClone(state),
@@ -200,7 +199,7 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
         expect(vEnc["maxFramerate"]).toBe(preset.frameRate);
         expect(vEnc["scaleResolutionDownBy"]).toBe(1);
         expect(vEnc["active"]).toBe(initialActive);
-        expect(firstVideo["degradationPreference"]).toBe(initialDegradation);
+        expect(firstVideo["degradationPreference"]).toBe("maintain-framerate");
 
         // Idempotence
         await applyVideoEncoding(sender, preset);
