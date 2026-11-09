@@ -363,7 +363,7 @@ describe("BitrateAdapter", () => {
       const map = new Map<string, unknown>();
       map.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
       map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
-      return map as unknown as RTCStatsReport;
+      return map;
     });
 
     const adapter = new BitrateAdapter(sender, PRESET, 1_000_000);
@@ -412,7 +412,7 @@ describe("BitrateAdapter", () => {
 
   it("handles start and stop timer", async () => {
     const { BitrateAdapter } = await import("@src/quality");
-    const sender = makeSender(() => new Map() as unknown as RTCStatsReport);
+    const sender = makeSender(() => new Map());
     const adapter = new BitrateAdapter(sender, PRESET);
     adapter.start(100);
     adapter.stop();
@@ -427,7 +427,7 @@ describe("BitrateAdapter", () => {
     let map = new Map<string, unknown>();
     map.set("outbound", { type: "outbound-rtp", kind: "video" }); // no packetsSent
     map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video" }); // no packetsLost
-    const sender1 = makeSender(() => map as unknown as RTCStatsReport);
+    const sender1 = makeSender(() => map);
     const adapter1 = new BitrateAdapter(sender1, PRESET);
     await (adapter1 as unknown as { tick: () => Promise<void> }).tick();
     expect(adapter1.bitrate).toBe(PRESET.maxBitrate);
@@ -439,7 +439,7 @@ describe("BitrateAdapter", () => {
       const m = new Map<string, unknown>();
       m.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
       m.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
-      return m as unknown as RTCStatsReport;
+      return m;
     });
     const adapter2 = new BitrateAdapter(sender2, PRESET);
     await (adapter2 as unknown as { tick: () => Promise<void> }).tick(); // baseline

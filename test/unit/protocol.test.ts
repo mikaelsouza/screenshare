@@ -65,9 +65,9 @@ describe("isValidRoomCode", () => {
   });
 
   it("rejects non-string inputs safely", () => {
-    expect(isValidRoomCode(123 as unknown as string)).toBe(false);
-    expect(isValidRoomCode(null as unknown as string)).toBe(false);
-    expect(isValidRoomCode(undefined as unknown as string)).toBe(false);
+    expect(isValidRoomCode(123)).toBe(false);
+    expect(isValidRoomCode(null)).toBe(false);
+    expect(isValidRoomCode(undefined)).toBe(false);
   });
 });
 

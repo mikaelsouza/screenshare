@@ -149,7 +149,7 @@ export async function captureScreen(preset: QualityPreset): Promise<CaptureResul
       // whole-screen share also shows notifications, chat pop-ups and every other
       // app. Only a starting point: the other tabs stay one click away.
       displaySurface: "window",
-    } as MediaTrackConstraints,
+    },
     // Always offer audio in the native picker: per-application audio on the Window tab
     // (`windowAudio: "window"`) and full system audio on the Entire Screen tab
     // (`systemAudio: "include"`).

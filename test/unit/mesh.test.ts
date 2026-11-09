@@ -225,7 +225,7 @@ describe("Mesh and PeerLink", () => {
     expect(callbacks.onRemoteStream).toHaveBeenCalledWith("bob", mockStream);
 
     // Track ended
-    (endedHandler as (() => void) | undefined)?.();
+    endedHandler?.();
     expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("bob");
   });
 
@@ -472,11 +472,11 @@ describe("Mesh and PeerLink", () => {
     const pc = FakeRTCPeerConnection.instances[0]!;
 
     // Non-control channel should be ignored
-    pc.ondatachannel?.({ channel: new FakeDataChannel("unrelated") as unknown as RTCDataChannel });
+    pc.ondatachannel?.({ channel: new FakeDataChannel("unrelated") });
 
     // Control channel should be bound
     const remoteControl = new FakeDataChannel("control");
-    pc.ondatachannel?.({ channel: remoteControl as unknown as RTCDataChannel });
+    pc.ondatachannel?.({ channel: remoteControl });
 
     // Negotiation failure handling
     pc.createOffer = vi.fn().mockRejectedValue(new Error("offer creation failed"));
@@ -509,7 +509,7 @@ describe("channel hardening", () => {
     mesh.addPeer("bob");
     const pc = FakeRTCPeerConnection.instances[0]!;
     const stray = new FakeDataChannel("exfil");
-    pc.ondatachannel?.({ channel: stray as unknown as RTCDataChannel });
+    pc.ondatachannel?.({ channel: stray });
     expect(stray.readyState).toBe("closed");
   });
 });
@@ -1000,7 +1000,7 @@ describe("negotiation recovery", () => {
         const tx = this.transceivers.find((t) => t.sender === sender)!;
         tx.sender.getStats = async () => {
           getStatsCalls++;
-          return new Map() as unknown as RTCStatsReport;
+          return new Map();
         };
         tx.sender.setParameters = async () => {
           await Promise.resolve();
