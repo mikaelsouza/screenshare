@@ -14,7 +14,6 @@ import type { CaptureResult, QualityPreset } from "./capture";
 import {
   applyAudioEncoding,
   applyVideoEncoding,
-  BitrateAdapter,
   type CodecName,
   mungeOpusSdp,
   mungeVideoSdp,
@@ -95,7 +94,6 @@ class PeerLink {
 
   private videoSender: RTCRtpSender | null = null;
   private audioSender: RTCRtpSender | null = null;
-  private adapter: BitrateAdapter | null = null;
   private remoteStream: MediaStream | null = null;
   readonly selfId: PeerId;
   readonly peerId: PeerId;
@@ -303,19 +301,14 @@ class PeerLink {
   }
 
   /**
-   * Re-apply encoder settings after a live quality change. The BitrateAdapter is
-   * rebuilt because it captures the preset's ceiling as its recovery target — reusing
-   * the old one would let it climb back to the previous preset's bitrate.
+   * Re-apply encoder settings after a live quality change.
    */
   async reapplyEncoding(): Promise<void> {
     if (!this.videoSender) return;
-    this.adapter?.stop();
     await applyVideoEncoding(this.videoSender, this.opts.preset);
     // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
     // in both directions rather than only pausing.
     await this.setSenderActive(this.remoteWantsVideo);
-    this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
-    this.adapter.start();
   }
 
   /**
@@ -365,10 +358,6 @@ class PeerLink {
         this.flushPendingOffer();
       }
     }
-
-    if (this.pc.signalingState === "closed" || this.videoSender !== videoTx.sender) return;
-    this.adapter = new BitrateAdapter(this.videoSender, this.opts.preset);
-    this.adapter.start();
   }
 
   /** Swap the audio being sent without renegotiating. Null sends silence. */
@@ -377,16 +366,14 @@ class PeerLink {
   }
 
   /**
-   * Swap the video being sent without renegotiating. The encoder settings and the
-   * bitrate adapter stay attached to the sender, so they carry over to the new track.
+   * Swap the video being sent without renegotiating. The encoder settings stay
+   * attached to the sender, so they carry over to the new track.
    */
   async replaceVideo(track: MediaStreamTrack): Promise<void> {
     await this.videoSender?.replaceTrack(track);
   }
 
   detachCapture(): void {
-    this.adapter?.stop();
-    this.adapter = null;
     for (const s of [this.videoSender, this.audioSender]) {
       if (s) {
         try {
@@ -457,7 +444,6 @@ class PeerLink {
   }
 
   close(): void {
-    this.adapter?.stop();
     if (this.control) {
       this.control.onopen = null;
       this.control.onmessage = null;

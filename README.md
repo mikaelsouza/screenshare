@@ -14,8 +14,7 @@ quiet; media flows directly peer-to-peer via WebRTC.
 ## Requirements
 
 - **Web:** Chrome or Edge on desktop. Only Chromium captures system/game audio and exposes
-  the encoder controls (`degradationPreference: "maintain-framerate"`, `jitterBufferTarget`,
-  codec preferences) the app depends on.
+  the encoder controls (`jitterBufferTarget`, codec preferences) the app depends on.
 - **Per-window audio on the web** needs Chrome or Edge 141+ (`windowAudio: "window"`).
 - **macOS & Linux:** macOS Chrome captures tab audio only; Linux/Wayland has similar
   limits. Screen sharing works, system audio does not.
@@ -63,11 +62,11 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
 - **Shared protocol** (`shared/protocol.ts`) validates room codes and all client/server
   WebSocket and P2P control messages at runtime with Zod (in `jitless` mode for Trusted
   Types CSP compatibility).
-- **Frontend** (`src/`) handles capture (`src/capture.ts`), encoder/decoder tuning and
-  per-peer bitrate adaptation (`src/quality.ts`), the partial WebRTC mesh with perfect
-  negotiation and send-side pausing (`src/mesh.ts`), WebSocket reconnection
-  (`src/signaling.ts`), `getStats()` link health (`src/stats.ts`), and pure UI state
-  (`src/ui-model.ts`). Viewers connect only to sharers, never to each other.
+- **Frontend** (`src/`) handles capture (`src/capture.ts`), encoder/decoder tuning
+  (`src/quality.ts`), the partial WebRTC mesh with perfect negotiation and send-side pausing
+  (`src/mesh.ts`), WebSocket reconnection (`src/signaling.ts`), `getStats()` link health
+  (`src/stats.ts`), and pure UI state (`src/ui-model.ts`). Viewers connect only to sharers,
+  never to each other.
 - **Desktop app** (`electron/`, `src/platform/`) loads the hosted web app so desktop and
   browser users share rooms, adding a native window/screen picker (`electron/picker.ts`),
   WASAPI process-tree and system audio capture (`electron/audio/`,

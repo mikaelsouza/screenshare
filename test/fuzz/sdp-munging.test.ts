@@ -124,4 +124,96 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
       { numRuns: 200 }
     );
   });
+
+  it("satisfies idempotence and payload-type bounds [0, 127] for arbitrary startBitrateKbps values", () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: 200 }),
+        fc.constantFrom("VP8", "VP9", "H264", "AV1", "vp8", "h264"),
+        fc.integer({ min: 300, max: 50_000 }),
+        (pt, codec, startKbps) => {
+          const sdp = `v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF ${pt}\r\na=rtpmap:${pt} ${codec}/90000\r\n`;
+          const once = mungeVideoSdp(sdp, startKbps);
+          const twice = mungeVideoSdp(once, startKbps);
+
+          expect(twice).toBe(once);
+          if (pt <= 127) {
+            expect(once).toContain(`a=fmtp:${pt} x-google-start-bitrate=${startKbps}`);
+          } else {
+            expect(once).toBe(sdp);
+          }
+          return true;
+        }
+      ),
+      { numRuns: 300 }
+    );
+  });
+
+  it("fuzzes applyVideoEncoding and applyAudioEncoding across arbitrary presets and sender parameter structures", async () => {
+    const { applyAudioEncoding, applyVideoEncoding } = await import("@src/quality");
+
+    const presetArb = fc.record({
+      label: fc.string({ minLength: 1, maxLength: 20 }),
+      width: fc.integer({ min: 320, max: 7680 }),
+      height: fc.integer({ min: 240, max: 4320 }),
+      frameRate: fc.integer({ min: 1, max: 240 }),
+      maxBitrate: fc.integer({ min: 100_000, max: 100_000_000 }),
+    });
+
+    const encodingArb = fc.record(
+      {
+        active: fc.boolean(),
+        maxBitrate: fc.integer({ min: 1000, max: 50_000_000 }),
+        maxFramerate: fc.integer({ min: 1, max: 120 }),
+        scaleResolutionDownBy: fc.double({ min: 1, max: 4, noNaN: true }),
+        rid: fc.string({ minLength: 1, maxLength: 4 }),
+      },
+      { requiredKeys: [] }
+    );
+
+    const paramsArb = fc.record(
+      {
+        encodings: fc.array(encodingArb, { minLength: 0, maxLength: 3 }),
+        degradationPreference: fc.constantFrom("balanced", "maintain-framerate", "maintain-resolution"),
+      },
+      { requiredKeys: [] }
+    );
+
+    await fc.assert(
+      fc.asyncProperty(presetArb, paramsArb, async (preset, initialParams) => {
+        let state = structuredClone(initialParams) as Record<string, unknown>;
+        const initialActive = (initialParams.encodings?.[0] as Record<string, unknown> | undefined)?.["active"];
+        const initialDegradation = initialParams.degradationPreference;
+
+        const sender = {
+          getParameters: () => structuredClone(state),
+          setParameters: async (next: Record<string, unknown>) => {
+            state = structuredClone(next);
+          },
+        } as unknown as RTCRtpSender;
+
+        await applyVideoEncoding(sender, preset);
+        const firstVideo = structuredClone(state);
+        const vEnc = (firstVideo["encodings"] as Array<Record<string, unknown>>)[0]!;
+
+        expect(vEnc["maxBitrate"]).toBe(preset.maxBitrate);
+        expect(vEnc["maxFramerate"]).toBe(preset.frameRate);
+        expect(vEnc["scaleResolutionDownBy"]).toBe(1);
+        expect(vEnc["active"]).toBe(initialActive);
+        expect(firstVideo["degradationPreference"]).toBe(initialDegradation);
+
+        // Idempotence
+        await applyVideoEncoding(sender, preset);
+        expect(state).toEqual(firstVideo);
+
+        // Audio encoding ceiling & activation
+        await applyAudioEncoding(sender);
+        const aEnc = (state["encodings"] as Array<Record<string, unknown>>)[0]!;
+        expect(aEnc["active"]).toBe(true);
+        expect(aEnc["maxBitrate"]).toBe(256_000);
+        return true;
+      }),
+      { numRuns: 200 }
+    );
+  });
 });
