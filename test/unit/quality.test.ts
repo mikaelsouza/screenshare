@@ -69,9 +69,17 @@ describe("mungeOpusSdp", () => {
     expect(fmtpOf(out, "96")).toContain("stereo=1");
   });
 
-  it("leaves SDP without an opus track untouched", () => {
-    const videoOnly = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\n";
+  it("leaves SDP without an opus track untouched, including non-line-start rtpmap tokens", () => {
+    const videoOnly = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP8/90000\r\na=note: a=rtpmap:111 opus/48000/2\r\n";
     expect(mungeOpusSdp(videoOnly)).toBe(videoOnly);
+  });
+
+  it("trims whitespace around fmtp tokens and only strips exact key prefixes", () => {
+    const out = mungeOpusSdp(sdpWith("minptime=10 ; stereo=0 ; custom_stereo=1"));
+    const fmtp = fmtpOf(out) ?? "";
+    expect(fmtp).toBe(
+      "minptime=10;custom_stereo=1;stereo=1;sprop-stereo=1;maxaveragebitrate=256000;maxplaybackrate=48000;usedtx=0",
+    );
   });
 
   it("is idempotent", () => {
@@ -116,11 +124,11 @@ describe("mungeVideoSdp", () => {
     );
   });
 
-  it("does not munge auxiliary payload types (rtx, red, ulpfec) or audio tracks", () => {
+  it("does not munge auxiliary payload types (rtx, red, ulpfec), audio tracks, or mid-line rtpmap text", () => {
     const out = mungeVideoSdp(multiCodecVideoSdp);
     expect(fmtpOf(out, "97")).toBe("apt=96");
     expect(fmtpOf(out, "46")).toBeNull();
-    const audioOnly = sdpWith("minptime=10");
+    const audioOnly = sdpWith("minptime=10") + "a=note: a=rtpmap:96 VP8/90000\r\n";
     expect(mungeVideoSdp(audioOnly)).toBe(audioOnly);
   });
 
@@ -129,24 +137,28 @@ describe("mungeVideoSdp", () => {
     expect(out).not.toContain("x-google-min-bitrate");
   });
 
-  it("overrides an existing x-google-start-bitrate value and is idempotent", () => {
+  it("overrides an existing x-google-start-bitrate value, trims whitespace, preserves prefixed keys, and is idempotent", () => {
     const withOldStart = [
       "v=0",
       "m=video 9 UDP/TLS/RTP/SAVPF 45",
       "a=rtpmap:45 AV1/90000",
-      "a=fmtp:45 level-idx=5;x-google-start-bitrate=300;profile=0",
+      "a=fmtp:45 level-idx=5 ; x-google-start-bitrate=300 ; my-x-google-start-bitrate=999 ; profile=0",
       "",
     ].join("\r\n");
     const once = mungeVideoSdp(withOldStart, 5000);
-    expect(fmtpOf(once, "45")).toBe("level-idx=5;profile=0;x-google-start-bitrate=5000");
+    expect(fmtpOf(once, "45")).toBe(
+      "level-idx=5;my-x-google-start-bitrate=999;profile=0;x-google-start-bitrate=5000",
+    );
     expect(mungeVideoSdp(once, 5000)).toBe(once);
   });
 
-  it("bounds processed payload types to 0-127 and deduplicates leading-zero payload numbers", () => {
+  it("bounds processed payload types to 0-127 and deduplicates repeated or leading-zero payload numbers", () => {
     const sdp = [
       "v=0",
-      "m=video 9 UDP/TLS/RTP/SAVPF 0 127 128 999",
+      "m=video 9 UDP/TLS/RTP/SAVPF 0 96 127 128 999",
       "a=rtpmap:0 VP8/90000",
+      "a=rtpmap:96 VP8/90000",
+      "a=rtpmap:96 VP8/90000",
       "a=rtpmap:0127 AV1/90000",
       "a=rtpmap:127 AV1/90000",
       "a=fmtp:127 profile=0",
@@ -156,6 +168,7 @@ describe("mungeVideoSdp", () => {
     ].join("\r\n");
     const out = mungeVideoSdp(sdp);
     expect(fmtpOf(out, "0")).toBe(`x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
+    expect(out.match(/^a=fmtp:96 /gm)).toHaveLength(2);
     expect(fmtpOf(out, "127")).toBe(`profile=0;x-google-start-bitrate=${DEFAULT_START_BITRATE_KBPS}`);
     expect(fmtpOf(out, "128")).toBeNull();
     expect(fmtpOf(out, "999")).toBeNull();
@@ -182,27 +195,34 @@ function fakeSender(initial: Record<string, unknown>) {
 const PRESET = { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 };
 
 describe("applyVideoEncoding", () => {
-  it("applies the preset's bitrate and framerate", async () => {
+  it("applies the preset's bitrate and framerate without overriding degradationPreference", async () => {
     const f = fakeSender({ active: true });
     await applyVideoEncoding(f.sender, PRESET);
     expect(f.current()["maxBitrate"]).toBe(6_000_000);
     expect(f.current()["maxFramerate"]).toBe(60);
+    expect(f.current()["scaleResolutionDownBy"]).toBe(1);
+    expect(f.sender.getParameters()).not.toHaveProperty("degradationPreference");
   });
 
-  it("honours a bitrate override from the adapter", async () => {
-    const f = fakeSender({ active: true });
-    await applyVideoEncoding(f.sender, PRESET, 2_000_000);
-    expect(f.current()["maxBitrate"]).toBe(2_000_000);
+  it("applies every defined QUALITY_PRESETS ceiling accurately", async () => {
+    const { QUALITY_PRESETS } = await import("@src/capture");
+    for (const preset of Object.values(QUALITY_PRESETS)) {
+      const f = fakeSender({ active: true });
+      await applyVideoEncoding(f.sender, preset);
+      expect(f.current()["maxBitrate"]).toBe(preset.maxBitrate);
+      expect(f.current()["maxFramerate"]).toBe(preset.frameRate);
+      expect(f.current()["scaleResolutionDownBy"]).toBe(1);
+    }
   });
 
-  // Regression: this used to set `active = true` unconditionally, so a BitrateAdapter
-  // tick silently resumed a sender that send-side pausing had switched off — quietly
+  // Regression: this used to set `active = true` unconditionally, so a live preset
+  // change silently resumed a sender that send-side pausing had switched off — quietly
   // uploading video nobody was watching and defeating the main bandwidth lever.
   it("does not resurrect a sender that send-side pausing disabled", async () => {
     const f = fakeSender({ active: false });
-    await applyVideoEncoding(f.sender, PRESET, 3_000_000);
+    await applyVideoEncoding(f.sender, PRESET);
     expect(f.current()["active"]).toBe(false);
-    expect(f.current()["maxBitrate"]).toBe(3_000_000);
+    expect(f.current()["maxBitrate"]).toBe(6_000_000);
   });
 
   it("leaves an active sender active", async () => {
@@ -211,39 +231,54 @@ describe("applyVideoEncoding", () => {
     expect(f.current()["active"]).toBe(true);
   });
 
-  it("handles an empty encodings array gracefully", async () => {
-    let params: Record<string, unknown> = { encodings: [] };
-    const sender = {
-      getParameters: () => structuredClone(params),
-      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
-    } as unknown as RTCRtpSender;
+  it("handles missing or empty encodings array gracefully", async () => {
+    for (const initial of [{ encodings: [] }, {}]) {
+      let params: Record<string, unknown> = structuredClone(initial);
+      const sender = {
+        getParameters: () => structuredClone(params),
+        setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+      } as unknown as RTCRtpSender;
 
-    await applyVideoEncoding(sender, PRESET);
-    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(6_000_000);
+      await applyVideoEncoding(sender, PRESET);
+      const enc = (params["encodings"] as Array<Record<string, unknown>>)[0];
+      expect(enc?.["maxBitrate"]).toBe(6_000_000);
+      expect(enc?.["maxFramerate"]).toBe(60);
+      expect(enc?.["scaleResolutionDownBy"]).toBe(1);
+    }
   });
 });
 
 describe("applyAudioEncoding", () => {
-  it("enables audio and sets high-fidelity bitrate ceiling", async () => {
-    const f = fakeSender({ active: false });
+  it("enables audio, sets high-fidelity bitrate ceiling, and preserves existing encoding fields", async () => {
+    const f = fakeSender({ active: false, rid: "audio-0" });
     await (await import("@src/quality")).applyAudioEncoding(f.sender);
     expect(f.current()["active"]).toBe(true);
     expect(f.current()["maxBitrate"]).toBe(256_000);
+    expect(f.current()["rid"]).toBe("audio-0");
   });
 
-  it("handles empty encodings array on audio sender", async () => {
-    let params: Record<string, unknown> = { encodings: [] };
-    const sender = {
-      getParameters: () => structuredClone(params),
-      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
-    } as unknown as RTCRtpSender;
+  it("handles missing or empty encodings array on audio sender", async () => {
+    for (const initial of [{ encodings: [] }, {}]) {
+      let params: Record<string, unknown> = structuredClone(initial);
+      const sender = {
+        getParameters: () => structuredClone(params),
+        setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
+      } as unknown as RTCRtpSender;
 
-    await (await import("@src/quality")).applyAudioEncoding(sender);
-    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["active"]).toBe(true);
+      await (await import("@src/quality")).applyAudioEncoding(sender);
+      const enc = (params["encodings"] as Array<Record<string, unknown>>)[0];
+      expect(enc?.["active"]).toBe(true);
+      expect(enc?.["maxBitrate"]).toBe(256_000);
+    }
   });
 });
 
 describe("preferCodec", () => {
+  it("exports h264 as DEFAULT_CODEC", async () => {
+    const { DEFAULT_CODEC } = await import("@src/quality");
+    expect(DEFAULT_CODEC).toBe("h264");
+  });
+
   it("does nothing if setCodecPreferences is not supported", async () => {
     const { preferCodec } = await import("@src/quality");
     expect(() => preferCodec({} as unknown as RTCRtpTransceiver, "h264")).not.toThrow();
@@ -260,15 +295,20 @@ describe("preferCodec", () => {
     (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = orig;
   });
 
-  it("reorders codecs with the preferred codec first", async () => {
+  it("reorders codecs with the preferred codec first across h264, vp9, av1, and vp8", async () => {
     const { preferCodec } = await import("@src/quality");
     const codecs = [
       { mimeType: "video/VP8" },
+      { mimeType: "video/VP9" },
       { mimeType: "video/H264" },
       { mimeType: "video/AV1" },
     ];
+    let requestedKind = "";
     (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
-      getCapabilities: () => ({ codecs }),
+      getCapabilities: (kind: string) => {
+        requestedKind = kind;
+        return { codecs };
+      },
     };
 
     let setPreferencesArg: Array<{ mimeType: string }> = [];
@@ -279,12 +319,22 @@ describe("preferCodec", () => {
     } as unknown as RTCRtpTransceiver;
 
     preferCodec(tx, "h264");
-    expect(setPreferencesArg[0]?.mimeType).toBe("video/H264");
+    expect(requestedKind).toBe("video");
     expect(setPreferencesArg.map((c) => c.mimeType)).toEqual([
       "video/H264",
       "video/VP8",
+      "video/VP9",
       "video/AV1",
     ]);
+
+    preferCodec(tx, "vp9");
+    expect(setPreferencesArg[0]?.mimeType).toBe("video/VP9");
+
+    preferCodec(tx, "av1");
+    expect(setPreferencesArg[0]?.mimeType).toBe("video/AV1");
+
+    preferCodec(tx, "vp8");
+    expect(setPreferencesArg[0]?.mimeType).toBe("video/VP8");
   });
 
   it("handles when preferred codec is not offered by browser", async () => {
@@ -319,18 +369,20 @@ describe("preferCodec", () => {
 });
 
 describe("tuneReceiverLatency", () => {
-  it("sets jitterBufferTarget in milliseconds", async () => {
+  it("sets jitterBufferTarget in milliseconds only when property is present", async () => {
     const { tuneReceiverLatency } = await import("@src/quality");
     const receiver = { jitterBufferTarget: 100 } as unknown as RTCRtpReceiver;
     tuneReceiverLatency(receiver, 20);
     expect((receiver as unknown as { jitterBufferTarget: number }).jitterBufferTarget).toBe(20);
+    expect("playoutDelayHint" in receiver).toBe(false);
   });
 
-  it("sets playoutDelayHint in seconds", async () => {
+  it("sets playoutDelayHint in seconds only when property is present", async () => {
     const { tuneReceiverLatency } = await import("@src/quality");
     const receiver = { playoutDelayHint: 1 } as unknown as RTCRtpReceiver;
     tuneReceiverLatency(receiver, 50);
     expect((receiver as unknown as { playoutDelayHint: number }).playoutDelayHint).toBe(0.05);
+    expect("jitterBufferTarget" in receiver).toBe(false);
   });
 
   it("swallows errors if properties throw", async () => {
@@ -341,110 +393,5 @@ describe("tuneReceiverLatency", () => {
       set: () => { throw new Error("read only"); },
     });
     expect(() => tuneReceiverLatency(receiver, 10)).not.toThrow();
-  });
-});
-
-describe("BitrateAdapter", () => {
-  function makeSender(getStatsReport: () => RTCStatsReport) {
-    let params: Record<string, unknown> = { encodings: [{ active: true, maxBitrate: PRESET.maxBitrate }] };
-    return {
-      getParameters: () => structuredClone(params),
-      setParameters: async (p: Record<string, unknown>) => { params = structuredClone(p); },
-      getStats: async () => getStatsReport(),
-    } as unknown as RTCRtpSender;
-  }
-
-  it("backs off on sustained packet loss and climbs back on sustained good reception", async () => {
-    const { BitrateAdapter } = await import("@src/quality");
-
-    let packetsSent = 1000;
-    let packetsLost = 0;
-    const sender = makeSender(() => {
-      const map = new Map<string, unknown>();
-      map.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
-      map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
-      return map;
-    });
-
-    const adapter = new BitrateAdapter(sender, PRESET, 1_000_000);
-    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
-
-    // First sample establishes baseline
-    await (adapter as unknown as { tick: () => Promise<void> }).tick();
-    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
-
-    // One bad sample (10% loss > 3% threshold): consecutiveBad = 1, should not drop yet
-    packetsSent += 100;
-    packetsLost += 10;
-    await (adapter as unknown as { tick: () => Promise<void> }).tick();
-    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
-
-    // Second bad sample (10% loss): consecutiveBad = 2 -> drops by 25% (0.75x)
-    packetsSent += 100;
-    packetsLost += 10;
-    await (adapter as unknown as { tick: () => Promise<void> }).tick();
-    const droppedBitrate = Math.round(PRESET.maxBitrate * 0.75);
-    expect(adapter.bitrate).toBe(droppedBitrate);
-
-    // Now 5 good samples with 0 loss: climbs back by 1.15x
-    for (let i = 0; i < 4; i++) {
-      packetsSent += 100;
-      await (adapter as unknown as { tick: () => Promise<void> }).tick();
-      expect(adapter.bitrate).toBe(droppedBitrate);
-    }
-    // 5th good sample:
-    packetsSent += 100;
-    await (adapter as unknown as { tick: () => Promise<void> }).tick();
-    expect(adapter.bitrate).toBe(Math.round(droppedBitrate * 1.15));
-  });
-
-  it("handles missing or throwing getStats gracefully", async () => {
-    const { BitrateAdapter } = await import("@src/quality");
-    const brokenSender = {
-      getParameters: () => ({ encodings: [{}] }),
-      setParameters: async () => {},
-      getStats: async () => { throw new Error("network error"); },
-    } as unknown as RTCRtpSender;
-
-    const adapter = new BitrateAdapter(brokenSender, PRESET);
-    await expect((adapter as unknown as { tick: () => Promise<void> }).tick()).resolves.not.toThrow();
-  });
-
-  it("handles start and stop timer", async () => {
-    const { BitrateAdapter } = await import("@src/quality");
-    const sender = makeSender(() => new Map());
-    const adapter = new BitrateAdapter(sender, PRESET);
-    adapter.start(100);
-    adapter.stop();
-    adapter.stop(); // idempotent
-    expect(adapter.bitrate).toBe(PRESET.maxBitrate);
-  });
-
-  it("handles incomplete or non-advancing stats in sampleLossRatio", async () => {
-    const { BitrateAdapter } = await import("@src/quality");
-
-    // Case 1: missing packetsSent or packetsLost
-    let map = new Map<string, unknown>();
-    map.set("outbound", { type: "outbound-rtp", kind: "video" }); // no packetsSent
-    map.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video" }); // no packetsLost
-    const sender1 = makeSender(() => map);
-    const adapter1 = new BitrateAdapter(sender1, PRESET);
-    await (adapter1 as unknown as { tick: () => Promise<void> }).tick();
-    expect(adapter1.bitrate).toBe(PRESET.maxBitrate);
-
-    // Case 2: packetsSent doesn't advance (dSent <= 0)
-    let packetsSent = 500;
-    let packetsLost = 10;
-    const sender2 = makeSender(() => {
-      const m = new Map<string, unknown>();
-      m.set("outbound", { type: "outbound-rtp", kind: "video", packetsSent });
-      m.set("remote-inbound", { type: "remote-inbound-rtp", kind: "video", packetsLost });
-      return m;
-    });
-    const adapter2 = new BitrateAdapter(sender2, PRESET);
-    await (adapter2 as unknown as { tick: () => Promise<void> }).tick(); // baseline
-    // Tick again without incrementing packetsSent -> dSent == 0 -> returns null
-    await (adapter2 as unknown as { tick: () => Promise<void> }).tick();
-    expect(adapter2.bitrate).toBe(PRESET.maxBitrate);
   });
 });

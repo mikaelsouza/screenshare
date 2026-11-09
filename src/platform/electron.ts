@@ -60,8 +60,8 @@ async function captureDesktopSource(sourceId: string, preset: QualityPreset): Pr
     stream.getTracks().forEach((t) => t.stop());
     throw new Error(`no video track for source ${sourceId}`);
   }
-  // Same reason as captureScreen: games want framerate over per-frame sharpness.
-  track.contentHint = "motion";
+  // Leave track.contentHint unset ("") to match captureScreen(), keeping the same
+  // default screen-capture maintain-resolution policy on followed windows.
   return track;
 }
 

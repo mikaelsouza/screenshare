@@ -305,7 +305,7 @@ describe("Mesh and PeerLink", () => {
       expect(pc.senders).toHaveLength(2);
       expect(pc.senders[0]!.track).toBe(game);
     }
-    // The same sender, so encoder settings and the bitrate adapter carry over.
+    // The same sender, so encoder settings carry over.
     expect(bob!.senders[0]).toBe(bobVideo);
 
     mesh.addPeer("dave");
@@ -346,9 +346,15 @@ describe("Mesh and PeerLink", () => {
     expect(mesh.getConnection("aaron")).toBeDefined();
   });
 
-  it("re-applies quality presets to all peers", async () => {
+  it("re-applies quality presets to all peers and preserves send-side pause state", async () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
     mesh.addPeer("bob");
+    mesh.addPeer("aaron"); // impolite: has control data channel
+
+    // setPreset before sharing (when videoSender is null) is a safe no-op
+    const preset30 = { label: "720p30", width: 1280, height: 720, frameRate: 30, maxBitrate: 4_000_000 };
+    await mesh.setPreset(preset30);
+    expect(FakeRTCPeerConnection.instances[0]!.senders).toHaveLength(0);
 
     const videoTrack = { kind: "video" } as unknown as MediaStreamTrack;
     const capture: CaptureResult = {
@@ -358,9 +364,25 @@ describe("Mesh and PeerLink", () => {
     };
     await mesh.setCapture(capture);
 
+    const bobSender = FakeRTCPeerConnection.instances[0]!.senders[0]!;
+    const aaronPc = FakeRTCPeerConnection.instances[1]!;
+    const aaronSender = aaronPc.senders[0]!;
+    expect(bobSender.getParameters().encodings?.[0]?.maxBitrate).toBe(4_000_000);
+    expect(bobSender.getParameters().encodings?.[0]?.maxFramerate).toBe(30);
+
+    // Pause aaron via control channel, keep bob active
+    aaronPc.dataChannels[0]!.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    expect(aaronSender.getParameters().encodings?.[0]?.active).toBe(false);
+
     const newPreset = { label: "1080p60", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 };
     await mesh.setPreset(newPreset);
-    expect(mesh.peers()).toEqual(["bob"]);
+    expect(mesh.peers()).toEqual(["bob", "aaron"]);
+    expect(bobSender.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
+    expect(bobSender.getParameters().encodings?.[0]?.maxFramerate).toBe(60);
+    expect(bobSender.getParameters().encodings?.[0]?.active).toBe(true);
+    expect(aaronSender.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
+    expect(aaronSender.getParameters().encodings?.[0]?.maxFramerate).toBe(60);
+    expect(aaronSender.getParameters().encodings?.[0]?.active).toBe(false);
   });
 
   it("handles offer collisions on impolite peer by ignoring colliding offer", async () => {
@@ -986,9 +1008,8 @@ describe("negotiation recovery", () => {
     }
   });
 
-  it("suppresses setParameters rejections and skips starting BitrateAdapter when link closes during attachCapture, while rethrowing errors on open links", async () => {
+  it("suppresses setParameters rejections when link closes during attachCapture, while rethrowing errors on open links", async () => {
     let shouldCloseDuringSetParams = true;
-    let getStatsCalls = 0;
 
     const addTransceiverSpy = vi
       .spyOn(FakeRTCPeerConnection.prototype, "addTransceiver")
@@ -998,10 +1019,6 @@ describe("negotiation recovery", () => {
       ): RTCRtpTransceiver {
         const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
         const tx = this.transceivers.find((t) => t.sender === sender)!;
-        tx.sender.getStats = async () => {
-          getStatsCalls++;
-          return new Map();
-        };
         tx.sender.setParameters = async () => {
           await Promise.resolve();
           if (shouldCloseDuringSetParams) {
@@ -1013,14 +1030,11 @@ describe("negotiation recovery", () => {
       });
 
     try {
-      vi.useFakeTimers();
       const mesh = new Mesh("me", opts, () => {}, cb());
       mesh.addMember("bob", false);
 
-      // Case 1: link closes while setParameters is pending -> rejection is suppressed and BitrateAdapter is not started
+      // Case 1: link closes while setParameters is pending -> rejection is suppressed
       await expect(mesh.setCapture(capture())).resolves.toBeUndefined();
-      await vi.advanceTimersByTimeAsync(10_000);
-      expect(getStatsCalls).toBe(0);
 
       // Case 2: link stays open and setParameters rejects -> rejection is propagated
       await mesh.setCapture(null);
@@ -1029,7 +1043,6 @@ describe("negotiation recovery", () => {
       mesh.addMember("bob", false);
       await expect(mesh.setCapture(capture())).rejects.toThrow("InvalidStateError");
     } finally {
-      vi.useRealTimers();
       addTransceiverSpy.mockRestore();
     }
   });

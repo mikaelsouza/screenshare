@@ -11,6 +11,7 @@
     "src/capture.ts",
     "src/platform/**/*.ts",
     "src/mesh.ts",
+    "src/quality.ts",
     "src/ui-model.ts"
   ],
   "ignorePatterns": ["release/**", "dist/**", "dist-electron/**", "reports/**", ".wrangler/**", ".stryker-tmp/**"],

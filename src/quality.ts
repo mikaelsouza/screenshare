@@ -4,7 +4,6 @@
  * smoothness rather than latency. Everything here overrides that.
  */
 
-import { z } from "@shared/protocol";
 import type { QualityPreset } from "./capture";
 
 export type CodecName = "h264" | "vp9" | "av1" | "vp8";
@@ -25,17 +24,11 @@ const CODEC_MIME: Record<CodecName, string> = {
   vp8: "video/VP8",
 };
 
-/** `degradationPreference` isn't in every TS DOM lib version. */
-type SendParams = RTCRtpSendParameters & {
-  degradationPreference?: "maintain-framerate" | "maintain-resolution" | "balanced";
-};
-
 export async function applyVideoEncoding(
   sender: RTCRtpSender,
   preset: QualityPreset,
-  bitrateOverride?: number,
 ): Promise<void> {
-  const params = sender.getParameters() as SendParams;
+  const params = sender.getParameters();
   // getParameters() can return an empty encodings array before negotiation settles.
   if (!params.encodings || params.encodings.length === 0) {
     params.encodings = [{}];
@@ -44,19 +37,17 @@ export async function applyVideoEncoding(
   if (!e) return;
 
   // Deliberately do NOT force active = true. Send-side pausing sets active = false
-  // for peers who are not looking at this tile, and a BitrateAdapter tick calling
+  // for peers who are not looking at this tile, and a live preset change calling
   // through here would silently resume uploading video nobody is watching —
   // defeating the largest bandwidth lever the room-size budget depends on.
   // Resuming is the explicit job of setSenderActive().
-  e.maxBitrate = bitrateOverride ?? preset.maxBitrate;
+  // Leave params.degradationPreference unset so Chromium/Electron uses its default
+  // screen-capture policy (maintain-resolution when video.contentHint is "") and
+  // built-in per-peer transport-cc congestion control up to preset.maxBitrate,
+  // avoiding mid-stream resolution downscales.
+  e.maxBitrate = preset.maxBitrate;
   e.maxFramerate = preset.frameRate;
   e.scaleResolutionDownBy = 1;
-
-  // The single most important line for this use case: under constraint, drop
-  // RESOLUTION before FRAMERATE. A soft 900p at 60fps is far more playable to watch
-  // than a crisp 1080p at 20fps, and it encodes the latency-over-quality preference
-  // directly into the encoder's own degradation policy.
-  params.degradationPreference = "maintain-framerate";
 
   await sender.setParameters(params);
 }
@@ -151,14 +142,11 @@ export function mungeOpusSdp(sdp: string): string {
  * Initial video bandwidth estimate (kbps) injected into SDP via x-google-start-bitrate.
  *
  * Without this hint, Chromium's libwebrtc initializes a new peer connection's
- * send-side bandwidth estimator at kDefaultStartBitrateBps (300 kbps). For a
- * 1080p/1440p screen share with contentHint="motion" and maintain-framerate,
- * 300 kbps triggers InitialFrameDropper and 4 consecutive resolution downscales
- * down to 480x270 (QP ~208 on AV1) on the first 5 frames — and if the shared
- * window is static, no further frames arrive to drive QualityScaler back up.
+ * send-side bandwidth estimator at kDefaultStartBitrateBps (300 kbps), which triggers
+ * InitialFrameDropper on the first frames of a 1080p/1440p screen share.
  *
- * Only x-google-start-bitrate is set (never x-google-min-bitrate), so GCC and
- * BitrateAdapter remain free to adapt downward on genuinely constrained links.
+ * Only x-google-start-bitrate is set (never x-google-min-bitrate), so GCC remains
+ * free to adapt downward on genuinely constrained links.
  */
 export const DEFAULT_START_BITRATE_KBPS = 4000;
 
@@ -206,121 +194,4 @@ export interface LinkHealth {
   framesPerSecond: number | null;
   frameWidth: number | null;
   frameHeight: number | null;
-}
-
-const VideoLossStatSchema = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("outbound-rtp"),
-    kind: z.literal("video"),
-    packetsSent: z.number().nullable().optional().catch(null),
-  }),
-  z.object({
-    type: z.literal("remote-inbound-rtp"),
-    kind: z.literal("video"),
-    packetsLost: z.number().nullable().optional().catch(null),
-  }),
-]);
-
-/**
- * Per-peer adaptive bitrate. Because mesh connections are independent, one friend
- * on bad wifi degrades only their own stream — everyone else is untouched.
- * Backs off fast on sustained loss, recovers slowly.
- */
-export class BitrateAdapter {
-  private current: number;
-  private consecutiveBad = 0;
-  private consecutiveGood = 0;
-  private timer: ReturnType<typeof setInterval> | null = null;
-  private lastPacketsSent = 0;
-  private lastPacketsLost = 0;
-  private readonly sender: RTCRtpSender;
-  private readonly preset: QualityPreset;
-  private readonly floor: number;
-
-  constructor(
-    sender: RTCRtpSender,
-    preset: QualityPreset,
-    floor = 1_500_000,
-  ) {
-    this.sender = sender;
-    this.preset = preset;
-    this.floor = floor;
-    this.current = preset.maxBitrate;
-  }
-
-  start(intervalMs = 3000): void {
-    this.stop();
-    this.timer = setInterval(() => void this.tick(), intervalMs);
-  }
-
-  stop(): void {
-    if (this.timer !== null) clearInterval(this.timer);
-    this.timer = null;
-  }
-
-  get bitrate(): number {
-    return this.current;
-  }
-
-  private async tick(): Promise<void> {
-    const loss = await this.sampleLoss();
-    if (loss === null) return;
-
-    if (loss > 0.03) {
-      this.consecutiveBad++;
-      this.consecutiveGood = 0;
-    } else {
-      this.consecutiveGood++;
-      this.consecutiveBad = 0;
-    }
-
-    let next = this.current;
-    // Two bad samples in a row (~6s) before reacting, so a single blip doesn't
-    // drop quality for everyone.
-    if (this.consecutiveBad >= 2) {
-      next = Math.max(this.floor, Math.round(this.current * 0.75));
-      this.consecutiveBad = 0;
-    } else if (this.consecutiveGood >= 5) {
-      // Climb back much more slowly than we fell.
-      next = Math.min(this.preset.maxBitrate, Math.round(this.current * 1.15));
-      this.consecutiveGood = 0;
-    }
-
-    if (next !== this.current) {
-      this.current = next;
-      await applyVideoEncoding(this.sender, this.preset, next);
-    }
-  }
-
-  private async sampleLoss(): Promise<number | null> {
-    let stats: RTCStatsReport;
-    try {
-      stats = await this.sender.getStats();
-    } catch {
-      return null;
-    }
-
-    let packetsSent: number | null = null;
-    let packetsLost: number | null = null;
-
-    stats.forEach((r) => {
-      const parsed = VideoLossStatSchema.safeParse(r);
-      if (!parsed.success) return;
-      if (parsed.data.type === "outbound-rtp") {
-        packetsSent = parsed.data.packetsSent ?? null;
-      } else {
-        packetsLost = parsed.data.packetsLost ?? null;
-      }
-    });
-
-    if (packetsSent === null || packetsLost === null) return null;
-
-    const dSent = packetsSent - this.lastPacketsSent;
-    const dLost = packetsLost - this.lastPacketsLost;
-    this.lastPacketsSent = packetsSent;
-    this.lastPacketsLost = packetsLost;
-
-    if (dSent <= 0) return null;
-    return Math.max(0, dLost) / dSent;
-  }
 }
