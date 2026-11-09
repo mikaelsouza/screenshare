@@ -1091,7 +1091,7 @@ function currentPreset(): QualityPresetName {
   return isQualityPresetName(stored) ? stored : DEFAULT_PRESET;
 }
 
-const CODEC_NAMES = ["h264", "vp9", "av1", "vp8"] as const;
+const CODEC_NAMES = ["h264", "av1"] as const;
 
 function isCodecName(val: string | null): val is CodecName {
   return val !== null && (CODEC_NAMES as readonly string[]).includes(val);
@@ -1546,9 +1546,7 @@ function leaveRoom(): void {
 
 const CODEC_META: Record<CodecName, { title: string; hint: string }> = {
   h264: { title: "H.264", hint: "Hardware · Best for gaming" },
-  vp9: { title: "VP9", hint: "Higher quality · More CPU" },
   av1: { title: "AV1", hint: "Best quality · Modern GPU" },
-  vp8: { title: "VP8", hint: "Compatibility fallback" },
 };
 
 function applyPopoverState(target: PopoverKind | null): void {

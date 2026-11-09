@@ -16,11 +16,10 @@ export interface QualityPreset {
 }
 
 export const QUALITY_PRESETS: Record<QualityPresetName, QualityPreset> = {
-  "1080p60": { label: "1080p 60fps", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 },
-  "1080p30": { label: "1080p 30fps", width: 1920, height: 1080, frameRate: 30, maxBitrate: 6_000_000 },
-  // The floor the project promises: 720p @ 6 Mbps.
-  "720p60": { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
-  "720p30": { label: "720p 30fps", width: 1280, height: 720, frameRate: 30, maxBitrate: 4_000_000 },
+  "1080p60": { label: "1080p 60fps", width: 1920, height: 1080, frameRate: 60, maxBitrate: 12_000_000 },
+  "1080p30": { label: "1080p 30fps", width: 1920, height: 1080, frameRate: 30, maxBitrate: 8_000_000 },
+  "720p60": { label: "720p 60fps", width: 1280, height: 720, frameRate: 60, maxBitrate: 8_000_000 },
+  "720p30": { label: "720p 30fps", width: 1280, height: 720, frameRate: 30, maxBitrate: 6_000_000 },
 };
 
 export const DEFAULT_PRESET: QualityPresetName = "1080p60";
@@ -170,10 +169,11 @@ export async function captureScreen(preset: QualityPreset): Promise<CaptureResul
   }
   const audio = stream.getAudioTracks()[0] ?? null;
 
-  // Leave video.contentHint unset ("") so Chromium/Electron treats the track as
-  // screen capture (using its default maintain-resolution policy to keep the
-  // preset resolution locked instead of downscaling mid-stream). Stop Opus
-  // applying speech-optimised coding to game audio.
+  // Hint "motion" so Chromium configures the hardware encoder for realtime
+  // video (kRealtimeVideo / ContentType::kCamera) rather than static slide
+  // sharing (kScreensharing / ZeroHertzMode). Stop Opus applying speech-optimised
+  // coding to game audio.
+  video.contentHint = "motion";
   if (audio) audio.contentHint = "music";
 
   return { stream, video, audio, surface: surfaceOf(video) };

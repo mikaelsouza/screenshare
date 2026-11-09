@@ -47,6 +47,8 @@ interface RawStatRecord {
   framesDecoded?: number;
   framesEncoded?: number;
   bytesReceived?: number;
+  codecId?: string;
+  mimeType?: string;
 }
 
 /** Read link stats out of the page's recorded RTCPeerConnections. */
@@ -105,6 +107,26 @@ const decodedFrames = async (): Promise<number> => {
     });
   }
   return total;
+};
+
+/** Negotiated inbound video codec mimeType (lowercase) on the first active peer connection, if any. */
+const inboundVideoCodec = async (): Promise<string | null> => {
+  for (const pc of window.__pcs) {
+    if (pc.connectionState === "closed") continue;
+    const report = await pc.getStats();
+    const codecs = new Map<string, string>();
+    let codecId: string | null = null;
+    report.forEach((statEntry: unknown, id: string) => {
+      const rec = statEntry as RawStatRecord;
+      if (rec.type === "codec" && typeof rec.mimeType === "string") {
+        codecs.set(id, rec.mimeType.toLowerCase());
+      } else if (rec.type === "inbound-rtp" && rec.kind === "video" && typeof rec.codecId === "string") {
+        codecId = rec.codecId;
+      }
+    });
+    if (codecId && codecs.has(codecId)) return codecs.get(codecId) ?? null;
+  }
+  return null;
 };
 
 await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
@@ -442,14 +464,46 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       "preset-btn",
       "selecting a preset option must restore focus to #preset-btn",
     );
+    const av1Supported =
+      (await sharer.evaluate(() =>
+        Boolean(RTCRtpSender.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/av1")),
+      )) &&
+      (await viewer.evaluate(() =>
+        Boolean(RTCRtpReceiver.getCapabilities("video")?.codecs.some((c) => c.mimeType.toLowerCase() === "video/av1")),
+      ));
     await sharer.click("#codec-btn");
-    await sharer.focus('#codec-list button[data-codec="vp8"]');
-    await sharer.click('#codec-list button[data-codec="vp8"]');
+    await sharer.focus('#codec-list button[data-codec="av1"]');
+    await sharer.click('#codec-list button[data-codec="av1"]');
     assert.equal(
       await sharer.evaluate(() => document.activeElement?.id),
       "codec-btn",
       "selecting a codec option must restore focus to #codec-btn",
     );
+    if (av1Supported) {
+      const codecDeadline = Date.now() + 30_000;
+      let negotiatedCodec = await viewer.evaluate(inboundVideoCodec);
+      while (Date.now() < codecDeadline && negotiatedCodec !== "video/av1") {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        negotiatedCodec = await viewer.evaluate(inboundVideoCodec);
+      }
+      assert.equal(negotiatedCodec, "video/av1", "expected viewer inbound video codec to switch to video/av1");
+    } else {
+      assert.equal(
+        await sharer.evaluate(() => window.__pcs.every((pc) => pc.connectionState === "connected")),
+        true,
+        "peer connection must remain connected when AV1 is unsupported",
+      );
+      const fallbackDeadline = Date.now() + 30_000;
+      let fallbackCodec = await viewer.evaluate(inboundVideoCodec);
+      while (Date.now() < fallbackDeadline && fallbackCodec === null) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        fallbackCodec = await viewer.evaluate(inboundVideoCodec);
+      }
+      assert.ok(
+        fallbackCodec !== null && fallbackCodec !== "video/av1",
+        `expected non-AV1 fallback codec when AV1 is unsupported: ${String(fallbackCodec)}`,
+      );
+    }
     const beforeSwitch = await viewer.evaluate(decodedFrames);
     const switchDeadline = Date.now() + 30_000;
     let afterSwitch = beforeSwitch;

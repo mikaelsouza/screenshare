@@ -857,7 +857,7 @@ describe("negotiation recovery", () => {
 
     // Live codec change updates preference and triggers renegotiation offer
     signals.length = 0;
-    mesh.setCodec("vp9");
+    mesh.setCodec("av1");
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(signals.some((sig) => (sig.data as { k?: string }).k === "offer")).toBe(true);
   });
@@ -986,21 +986,21 @@ describe("negotiation recovery", () => {
       const offerSig = signals.find((s) => s.data.k === "offer");
       expect(offerSig?.data.k).toBe("offer");
       if (offerSig?.data.k === "offer") {
-        expect(offerSig.data.sdp).toContain("x-google-start-bitrate=4000");
+        expect(offerSig.data.sdp).toContain("x-google-start-bitrate=6000");
       }
 
       // Incoming remote answer
       await mesh.handleSignal("bob", { k: "answer", sdp: videoSdp });
-      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=4000");
+      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=6000");
 
       // Incoming remote offer + outgoing answer
       signals.length = 0;
       await mesh.handleSignal("bob", { k: "offer", sdp: videoSdp });
-      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=4000");
+      expect(pc.remoteDescription?.sdp).toContain("x-google-start-bitrate=6000");
       const answerSig = signals.find((s) => s.data.k === "answer");
       expect(answerSig?.data.k).toBe("answer");
       if (answerSig?.data.k === "answer") {
-        expect(answerSig.data.sdp).toContain("x-google-start-bitrate=4000");
+        expect(answerSig.data.sdp).toContain("x-google-start-bitrate=6000");
       }
     } finally {
       createOfferSpy.mockRestore();

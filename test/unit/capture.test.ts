@@ -17,28 +17,28 @@ describe("QUALITY_PRESETS", () => {
       width: 1920,
       height: 1080,
       frameRate: 60,
-      maxBitrate: 8_000_000,
+      maxBitrate: 12_000_000,
     });
     expect(QUALITY_PRESETS["1080p30"]).toEqual({
       label: "1080p 30fps",
       width: 1920,
       height: 1080,
       frameRate: 30,
-      maxBitrate: 6_000_000,
+      maxBitrate: 8_000_000,
     });
     expect(QUALITY_PRESETS["720p60"]).toEqual({
       label: "720p 60fps",
       width: 1280,
       height: 720,
       frameRate: 60,
-      maxBitrate: 6_000_000,
+      maxBitrate: 8_000_000,
     });
     expect(QUALITY_PRESETS["720p30"]).toEqual({
       label: "720p 30fps",
       width: 1280,
       height: 720,
       frameRate: 30,
-      maxBitrate: 4_000_000,
+      maxBitrate: 6_000_000,
     });
   });
 });
@@ -258,7 +258,7 @@ describe("captureScreen and track helpers", () => {
     expect(result.stream).toBe(stream);
     expect(result.video).toBe(vTrack);
     expect(result.audio).toBe(aTrack);
-    expect(vTrack.contentHint).toBe("");
+    expect(vTrack.contentHint).toBe("motion");
     expect(aTrack.contentHint).toBe("music");
 
     const callArgs = getDisplayMediaMock.mock.calls[0]?.[0] as DisplayMediaStreamOptions;

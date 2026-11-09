@@ -489,9 +489,9 @@ describe("desktop capture defaults", () => {
     );
     const result = await c.start(preset);
     // By default the audio is whatever came with the capture, and both initial
-    // and followed video tracks preserve Chrome's default "" contentHint.
+    // and followed video tracks set contentHint to "motion".
     expect(result.audio).toBe(audio);
-    expect(result.video.contentHint).toBe("");
+    expect(result.video.contentHint).toBe("motion");
     const send = listener as unknown as (u: FollowUpdate) => void;
     send({ role: "lobby", sourceId: "window:1:0", title: "a", profile: "P" });
     send({ role: "game", sourceId: "window:2:0", title: "b", profile: "P" });
@@ -509,7 +509,7 @@ describe("desktop capture defaults", () => {
         },
       },
     });
-    expect(swapped.contentHint).toBe("");
+    expect(swapped.contentHint).toBe("motion");
     expect(cb.onVideoTrackSwapped).toHaveBeenCalledWith(swapped, expect.anything());
   });
 
