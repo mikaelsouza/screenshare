@@ -5,6 +5,8 @@ import {
   captureScreen,
   type QualityPresetName,
 } from "@src/capture";
+import { createElectronCaptureController } from "@src/platform/electron";
+import type { FollowUpdate } from "@src/platform/types";
 import {
   DEFAULT_START_BITRATE_KBPS,
   applyAudioEncoding,
@@ -146,7 +148,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves captureScreen preserves Chrome default video contentHint ('') and sets audio contentHint ('music') across all presets and surfaces", async () => {
+  it("exhaustively proves initial and followed capture tracks preserve Chrome default video contentHint ('') and set audio contentHint ('music') across all presets and surfaces", async () => {
     const presets = Object.values(QUALITY_PRESETS);
     const hasAudioStates = [false, true];
     const surfaces = ["monitor", "window", "browser", "other", undefined] as const;
@@ -156,8 +158,20 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
         for (const displaySurface of surfaces) {
           const videoTrack = {
             kind: "video",
+            readyState: "live",
             contentHint: "",
             getSettings: () => (displaySurface ? { displaySurface } : {}),
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
+            stop: vi.fn(),
+          } as unknown as MediaStreamTrack;
+          const followedVideoTrack = {
+            kind: "video",
+            readyState: "live",
+            contentHint: "",
+            getSettings: () => ({}),
+            addEventListener: vi.fn(),
+            removeEventListener: vi.fn(),
             stop: vi.fn(),
           } as unknown as MediaStreamTrack;
           const audioTrack = hasAudio
@@ -168,16 +182,34 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
             getAudioTracks: () => (audioTrack ? [audioTrack] : []),
             getTracks: () => (audioTrack ? [videoTrack, audioTrack] : [videoTrack]),
           } as unknown as MediaStream;
+          const followedStream = {
+            getVideoTracks: () => [followedVideoTrack],
+            getAudioTracks: () => [],
+            getTracks: () => [followedVideoTrack],
+          } as unknown as MediaStream;
 
           vi.stubGlobal("navigator", {
             mediaDevices: {
               getDisplayMedia: vi.fn().mockResolvedValue(stream),
+              getUserMedia: vi.fn().mockResolvedValue(followedStream),
             },
           });
+          vi.stubGlobal(
+            "MediaStream",
+            class {
+              readonly tracks: MediaStreamTrack[];
+              constructor(tracks: MediaStreamTrack[]) {
+                this.tracks = tracks;
+              }
+              getTracks() {
+                return this.tracks;
+              }
+            },
+          );
 
           const res = await captureScreen(preset);
 
-          // Invariant 1: video.contentHint stays "" so Chromium treats the capture as a native screenshare
+          // Invariant 1: initial video.contentHint stays "" so Chromium treats the capture as a native screenshare
           expect(res.video.contentHint).toBe("");
 
           // Invariant 2: audio.contentHint is "music" iff an audio track was captured
@@ -186,6 +218,35 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
           } else {
             expect(res.audio).toBeNull();
           }
+
+          // Invariant 3: followed desktop tracks swapped via ElectronCaptureController preserve contentHint === ""
+          let onFollow: ((u: FollowUpdate) => void) | null = null;
+          let swappedTrack: MediaStreamTrack | null = null;
+          const controller = createElectronCaptureController(
+            {
+              onFollowUpdate: (fn) => {
+                onFollow = fn;
+                return () => {};
+              },
+              stopFollow: () => {},
+            },
+            {
+              onEnded: () => {},
+              onFollowState: () => {},
+              onVideoTrackSwapped: async (track) => {
+                swappedTrack = track;
+              },
+            },
+          );
+          const started = await controller.start(preset);
+          expect(started.video.contentHint).toBe("");
+          const emitFollow = onFollow as unknown as (u: FollowUpdate) => void;
+          emitFollow({ role: "lobby", sourceId: "window:1:0", title: "Lobby", profile: "LoL" });
+          emitFollow({ role: "game", sourceId: "window:2:0", title: "Game", profile: "LoL" });
+          await new Promise((r) => setTimeout(r, 0));
+          expect(swappedTrack).toBe(followedVideoTrack);
+          expect((swappedTrack as unknown as MediaStreamTrack).contentHint).toBe("");
+          controller.stop();
         }
       }
     }

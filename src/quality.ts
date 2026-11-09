@@ -41,6 +41,10 @@ export async function applyVideoEncoding(
   // through here would silently resume uploading video nobody is watching —
   // defeating the largest bandwidth lever the room-size budget depends on.
   // Resuming is the explicit job of setSenderActive().
+  // Leave params.degradationPreference unset so Chromium/Electron uses its default
+  // screen-capture policy (maintain-resolution when video.contentHint is "") and
+  // built-in per-peer transport-cc congestion control up to preset.maxBitrate,
+  // avoiding mid-stream resolution downscales.
   e.maxBitrate = preset.maxBitrate;
   e.maxFramerate = preset.frameRate;
   e.scaleResolutionDownBy = 1;

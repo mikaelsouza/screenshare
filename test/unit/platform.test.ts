@@ -488,8 +488,10 @@ describe("desktop capture defaults", () => {
       cb,
     );
     const result = await c.start(preset);
-    // By default the audio is whatever came with the capture.
+    // By default the audio is whatever came with the capture, and both initial
+    // and followed video tracks preserve Chrome's default "" contentHint.
     expect(result.audio).toBe(audio);
+    expect(result.video.contentHint).toBe("");
     const send = listener as unknown as (u: FollowUpdate) => void;
     send({ role: "lobby", sourceId: "window:1:0", title: "a", profile: "P" });
     send({ role: "game", sourceId: "window:2:0", title: "b", profile: "P" });

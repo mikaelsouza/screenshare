@@ -170,7 +170,10 @@ export async function captureScreen(preset: QualityPreset): Promise<CaptureResul
   }
   const audio = stream.getAudioTracks()[0] ?? null;
 
-  // Stop Opus applying speech-optimised coding to game audio.
+  // Leave video.contentHint unset ("") so Chromium/Electron treats the track as
+  // screen capture (using its default maintain-resolution policy to keep the
+  // preset resolution locked instead of downscaling mid-stream). Stop Opus
+  // applying speech-optimised coding to game audio.
   if (audio) audio.contentHint = "music";
 
   return { stream, video, audio, surface: surfaceOf(video) };
