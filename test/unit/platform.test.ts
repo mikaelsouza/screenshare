@@ -507,7 +507,7 @@ describe("desktop capture defaults", () => {
         },
       },
     });
-    expect(swapped.contentHint).toBe("motion");
+    expect(swapped.contentHint).toBe("");
     expect(cb.onVideoTrackSwapped).toHaveBeenCalledWith(swapped, expect.anything());
   });
 

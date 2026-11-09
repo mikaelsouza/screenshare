@@ -258,7 +258,7 @@ describe("captureScreen and track helpers", () => {
     expect(result.stream).toBe(stream);
     expect(result.video).toBe(vTrack);
     expect(result.audio).toBe(aTrack);
-    expect(vTrack.contentHint).toBe("motion");
+    expect(vTrack.contentHint).toBe("");
     expect(aTrack.contentHint).toBe("music");
 
     const callArgs = getDisplayMediaMock.mock.calls[0]?.[0] as DisplayMediaStreamOptions;

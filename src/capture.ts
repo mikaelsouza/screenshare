@@ -170,11 +170,7 @@ export async function captureScreen(preset: QualityPreset): Promise<CaptureResul
   }
   const audio = stream.getAudioTracks()[0] ?? null;
 
-  // Content hints materially change encoder behaviour.
-  //  - "motion": trade per-frame sharpness for framerate. Correct for games.
-  //    ("detail" is for text/slides and makes game footage stutter.)
-  //  - "music": stop Opus applying speech-optimised coding to game audio.
-  video.contentHint = "motion";
+  // Stop Opus applying speech-optimised coding to game audio.
   if (audio) audio.contentHint = "music";
 
   return { stream, video, audio, surface: surfaceOf(video) };
