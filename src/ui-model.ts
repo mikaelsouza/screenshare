@@ -111,17 +111,18 @@ export function deriveOutboundAudioState(
   };
 }
 
-export type PopoverKind = "roster" | "preset" | "codec";
+export type PopoverKind = "roster" | "preset" | "codec" | "degradation";
 
 export interface PopoverVisibility {
   active: PopoverKind | null;
   rosterOpen: boolean;
   presetOpen: boolean;
   codecOpen: boolean;
+  degradationOpen: boolean;
 }
 
 /**
- * Pure state-machine transition for header & footer popovers (`roster`, `preset`, `codec`).
+ * Pure state-machine transition for header & footer popovers (`roster`, `preset`, `codec`, `degradation`).
  * Guarantees at most one popover is open at any time and only when its parent bar is visible.
  */
 export function nextPopoverState(
@@ -134,14 +135,17 @@ export function nextPopoverState(
   const rosterOpen = connected && requested === "roster";
   const presetOpen = connected && sharing && requested === "preset";
   const codecOpen = connected && sharing && requested === "codec";
+  const degradationOpen = connected && sharing && requested === "degradation";
   const active: PopoverKind | null = rosterOpen
     ? "roster"
     : presetOpen
       ? "preset"
       : codecOpen
         ? "codec"
-        : null;
-  return { active, rosterOpen, presetOpen, codecOpen };
+        : degradationOpen
+          ? "degradation"
+          : null;
+  return { active, rosterOpen, presetOpen, codecOpen, degradationOpen };
 }
 
 /**

@@ -81,8 +81,8 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
     }
   });
 
-  it("exhaustively verifies popover mutual exclusion across all 64 state transitions", () => {
-    const popovers: Array<PopoverKind | null> = [null, "roster", "preset", "codec"];
+  it("exhaustively verifies popover mutual exclusion across all 100 state transitions", () => {
+    const popovers: Array<PopoverKind | null> = [null, "roster", "preset", "codec", "degradation"];
     const bools = [false, true];
 
     for (const current of popovers) {
@@ -92,13 +92,18 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
             const next = nextPopoverState(current, target, connected, sharing);
 
             // Invariant 1: At most one popover is open at any time.
-            const openCount = Number(next.rosterOpen) + Number(next.presetOpen) + Number(next.codecOpen);
+            const openCount =
+              Number(next.rosterOpen) +
+              Number(next.presetOpen) +
+              Number(next.codecOpen) +
+              Number(next.degradationOpen);
             expect(openCount).toBeLessThanOrEqual(1);
 
             // Invariant 2: `active` matches the unique open popover, or null if none.
             if (next.rosterOpen) expect(next.active).toBe("roster");
             else if (next.presetOpen) expect(next.active).toBe("preset");
             else if (next.codecOpen) expect(next.active).toBe("codec");
+            else if (next.degradationOpen) expect(next.active).toBe("degradation");
             else expect(next.active).toBeNull();
 
             // Invariant 3: Toggling the already-open popover or passing null always closes all popovers.
@@ -107,13 +112,14 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
               expect(openCount).toBe(0);
             }
 
-            // Invariant 4: No popover can open when disconnected; preset/codec cannot open when not sharing.
+            // Invariant 4: No popover can open when disconnected; preset/codec/degradation cannot open when not sharing.
             if (!connected) {
               expect(next.active).toBeNull();
             }
             if (!sharing) {
               expect(next.presetOpen).toBe(false);
               expect(next.codecOpen).toBe(false);
+              expect(next.degradationOpen).toBe(false);
             }
           }
         }

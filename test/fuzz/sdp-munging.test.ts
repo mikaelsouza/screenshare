@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import fc from "fast-check";
 import { DEFAULT_START_BITRATE_KBPS, mungeOpusSdp, mungeVideoSdp } from "@src/quality";
 
@@ -174,44 +174,85 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
     const paramsArb = fc.record(
       {
         encodings: fc.array(encodingArb, { minLength: 0, maxLength: 3 }),
-        degradationPreference: fc.constantFrom("balanced", "maintain-framerate", "maintain-resolution"),
+        degradationPreference: fc.constantFrom(
+          "balanced",
+          "maintain-framerate",
+          "maintain-resolution",
+          "maintain-framerate-and-resolution",
+        ),
       },
       { requiredKeys: [] }
     );
+    const modeArb = fc.constantFrom(undefined, "framerate" as const, "clarity" as const);
 
     await fc.assert(
-      fc.asyncProperty(presetArb, paramsArb, async (preset, initialParams) => {
-        let state = structuredClone(initialParams) as Record<string, unknown>;
-        const initialActive = (initialParams.encodings?.[0] as Record<string, unknown> | undefined)?.["active"];
+      fc.asyncProperty(
+        presetArb,
+        paramsArb,
+        modeArb,
+        fc.boolean(),
+        async (preset, initialParams, mode, supportsClarity) => {
+          let state = structuredClone(initialParams) as Record<string, unknown>;
+          const initialActive = (initialParams.encodings?.[0] as Record<string, unknown> | undefined)?.["active"];
+          let nextTx = 1;
+          let activeTx: number | null = null;
 
-        const sender = {
-          getParameters: () => structuredClone(state),
-          setParameters: async (next: Record<string, unknown>) => {
-            state = structuredClone(next);
-          },
-        } as unknown as RTCRtpSender;
+          const sender = {
+            getParameters: () => {
+              activeTx = nextTx++;
+              return { ...structuredClone(state), transactionId: String(activeTx) };
+            },
+            setParameters: async (next: Record<string, unknown>) => {
+              const expected = activeTx !== null ? String(activeTx) : null;
+              activeTx = null;
+              if (expected === null || next["transactionId"] !== expected) {
+                throw new Error("stale WebRTC transactionId");
+              }
+              if (
+                !supportsClarity &&
+                next["degradationPreference"] === "maintain-framerate-and-resolution"
+              ) {
+                throw new TypeError("unsupported enum value");
+              }
+              const copy = structuredClone(next);
+              delete copy["transactionId"];
+              state = copy;
+            },
+          } as unknown as RTCRtpSender;
 
-        await applyVideoEncoding(sender, preset);
-        const firstVideo = structuredClone(state);
-        const vEnc = (firstVideo["encodings"] as Array<Record<string, unknown>>)[0]!;
+          const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+          try {
+            await applyVideoEncoding(sender, preset, mode);
+            const fellBack = mode === "clarity" && !supportsClarity;
+            expect(errorSpy).toHaveBeenCalledTimes(fellBack ? 1 : 0);
+            const firstVideo = structuredClone(state);
+            const vEnc = (firstVideo["encodings"] as Array<Record<string, unknown>>)[0]!;
 
-        expect(vEnc["maxBitrate"]).toBe(preset.maxBitrate);
-        expect(vEnc["maxFramerate"]).toBe(preset.frameRate);
-        expect(vEnc["scaleResolutionDownBy"]).toBe(1);
-        expect(vEnc["active"]).toBe(initialActive);
-        expect(firstVideo["degradationPreference"]).toBe("maintain-framerate");
+            expect(vEnc["maxBitrate"]).toBe(preset.maxBitrate);
+            expect(vEnc["maxFramerate"]).toBe(preset.frameRate);
+            expect(vEnc["scaleResolutionDownBy"]).toBe(1);
+            expect(vEnc["active"]).toBe(initialActive);
+            const expectedPref =
+              mode === "clarity" && supportsClarity
+                ? "maintain-framerate-and-resolution"
+                : "maintain-framerate";
+            expect(firstVideo["degradationPreference"]).toBe(expectedPref);
 
-        // Idempotence
-        await applyVideoEncoding(sender, preset);
-        expect(state).toEqual(firstVideo);
+            // Idempotence
+            await applyVideoEncoding(sender, preset, mode);
+            expect(state).toEqual(firstVideo);
+          } finally {
+            errorSpy.mockRestore();
+          }
 
-        // Audio encoding ceiling & activation
-        await applyAudioEncoding(sender);
-        const aEnc = (state["encodings"] as Array<Record<string, unknown>>)[0]!;
-        expect(aEnc["active"]).toBe(true);
-        expect(aEnc["maxBitrate"]).toBe(256_000);
-        return true;
-      }),
+          // Audio encoding ceiling & activation
+          await applyAudioEncoding(sender);
+          const aEnc = (state["encodings"] as Array<Record<string, unknown>>)[0]!;
+          expect(aEnc["active"]).toBe(true);
+          expect(aEnc["maxBitrate"]).toBe(256_000);
+          return true;
+        },
+      ),
       { numRuns: 200 }
     );
   });

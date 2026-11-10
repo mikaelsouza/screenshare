@@ -380,9 +380,44 @@ describe("Mesh and PeerLink", () => {
     expect(bobSender.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
     expect(bobSender.getParameters().encodings?.[0]?.maxFramerate).toBe(60);
     expect(bobSender.getParameters().encodings?.[0]?.active).toBe(true);
+    expect(bobSender.getParameters().degradationPreference).toBe("maintain-framerate");
     expect(aaronSender.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
     expect(aaronSender.getParameters().encodings?.[0]?.maxFramerate).toBe(60);
     expect(aaronSender.getParameters().encodings?.[0]?.active).toBe(false);
+    expect(aaronSender.getParameters().degradationPreference).toBe("maintain-framerate");
+
+    await mesh.setDegradation("clarity");
+    expect(bobSender.getParameters().degradationPreference).toBe("maintain-framerate-and-resolution");
+    expect(bobSender.getParameters().encodings?.[0]?.active).toBe(true);
+    expect(aaronSender.getParameters().degradationPreference).toBe("maintain-framerate-and-resolution");
+    expect(aaronSender.getParameters().encodings?.[0]?.active).toBe(false);
+
+    // Late-joining viewer while clarity mode is active receives maintain-framerate-and-resolution on attachCapture
+    mesh.addMember("charlie", false);
+    await new Promise((r) => setTimeout(r, 0));
+    const charlieSender = FakeRTCPeerConnection.instances[2]!.senders[0]!;
+    expect(charlieSender.getParameters().degradationPreference).toBe(
+      "maintain-framerate-and-resolution",
+    );
+
+    await mesh.setDegradation("framerate");
+    expect(bobSender.getParameters().degradationPreference).toBe("maintain-framerate");
+    expect(aaronSender.getParameters().degradationPreference).toBe("maintain-framerate");
+    expect(charlieSender.getParameters().degradationPreference).toBe("maintain-framerate");
+
+    // Starting capture when MeshOptions already specifies degradation: "clarity"
+    const clarityMesh = new Mesh(
+      "alice",
+      { ...defaultOptions, degradation: "clarity" },
+      (to, data) => sentSignals.push({ to, data }),
+      callbacks,
+    );
+    clarityMesh.addMember("dave", false);
+    await clarityMesh.setCapture(capture);
+    const daveSender = FakeRTCPeerConnection.instances[3]!.senders[0]!;
+    expect(daveSender.getParameters().degradationPreference).toBe(
+      "maintain-framerate-and-resolution",
+    );
   });
 
   it("handles offer collisions on impolite peer by ignoring colliding offer", async () => {
