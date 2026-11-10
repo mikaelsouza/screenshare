@@ -56,59 +56,67 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves applyVideoEncoding ceiling projection, send-side pause invariance, Chrome default delegation, and idempotence", async () => {
+  it("exhaustively proves applyVideoEncoding ceiling projection, send-side pause invariance, degradation mode mapping, and idempotence", async () => {
     const presets = Object.values(QUALITY_PRESETS);
     const activeStates: Array<boolean | undefined> = [undefined, false, true];
-    const degradationStates: Array<"balanced" | "maintain-resolution" | "maintain-framerate" | undefined> = [
+    const degradationStates: Array<
+      "balanced" | "maintain-resolution" | "maintain-framerate" | "maintain-framerate-and-resolution" | undefined
+    > = [
       undefined,
       "balanced",
       "maintain-resolution",
       "maintain-framerate",
+      "maintain-framerate-and-resolution",
     ];
+    const modes = ["framerate", "clarity"] as const;
     const shapes = ["populated", "empty", "missing"] as const;
 
     for (const preset of presets) {
-      for (const initialActive of activeStates) {
-        for (const existingDegradation of degradationStates) {
-          for (const shape of shapes) {
-            let state: Record<string, unknown> = {};
-            if (existingDegradation !== undefined) {
-              state["degradationPreference"] = existingDegradation;
+      for (const mode of modes) {
+        for (const initialActive of activeStates) {
+          for (const existingDegradation of degradationStates) {
+            for (const shape of shapes) {
+              let state: Record<string, unknown> = {};
+              if (existingDegradation !== undefined) {
+                state["degradationPreference"] = existingDegradation;
+              }
+              if (shape === "populated") {
+                state["encodings"] = [
+                  initialActive === undefined ? { rid: "f" } : { active: initialActive, rid: "f" },
+                ];
+              } else if (shape === "empty") {
+                state["encodings"] = [];
+              }
+
+              const sender = {
+                getParameters: () => structuredClone(state),
+                setParameters: async (next: Record<string, unknown>) => {
+                  state = structuredClone(next);
+                },
+              } as unknown as RTCRtpSender;
+
+              await applyVideoEncoding(sender, preset, mode);
+              const afterFirst = structuredClone(state);
+              const enc = (afterFirst["encodings"] as Array<Record<string, unknown>>)[0]!;
+
+              // Invariant 1: Exact preset ceiling projection
+              expect(enc["maxBitrate"]).toBe(preset.maxBitrate);
+              expect(enc["maxFramerate"]).toBe(preset.frameRate);
+              expect(enc["scaleResolutionDownBy"]).toBe(1);
+
+              // Invariant 2: Send-side pause state (`active`) is never mutated by applyVideoEncoding
+              const expectedActive = shape === "populated" ? initialActive : undefined;
+              expect(enc["active"]).toBe(expectedActive);
+
+              // Invariant 3: degradationPreference matches mode ("maintain-framerate" vs "maintain-framerate-and-resolution")
+              const expectedPref =
+                mode === "clarity" ? "maintain-framerate-and-resolution" : "maintain-framerate";
+              expect(afterFirst["degradationPreference"]).toBe(expectedPref);
+
+              // Invariant 4: Idempotence — f(f(x, p, m), p, m) === f(x, p, m)
+              await applyVideoEncoding(sender, preset, mode);
+              expect(state).toEqual(afterFirst);
             }
-            if (shape === "populated") {
-              state["encodings"] = [
-                initialActive === undefined ? { rid: "f" } : { active: initialActive, rid: "f" },
-              ];
-            } else if (shape === "empty") {
-              state["encodings"] = [];
-            }
-
-            const sender = {
-              getParameters: () => structuredClone(state),
-              setParameters: async (next: Record<string, unknown>) => {
-                state = structuredClone(next);
-              },
-            } as unknown as RTCRtpSender;
-
-            await applyVideoEncoding(sender, preset);
-            const afterFirst = structuredClone(state);
-            const enc = (afterFirst["encodings"] as Array<Record<string, unknown>>)[0]!;
-
-            // Invariant 1: Exact preset ceiling projection
-            expect(enc["maxBitrate"]).toBe(preset.maxBitrate);
-            expect(enc["maxFramerate"]).toBe(preset.frameRate);
-            expect(enc["scaleResolutionDownBy"]).toBe(1);
-
-            // Invariant 2: Send-side pause state (`active`) is never mutated by applyVideoEncoding
-            const expectedActive = shape === "populated" ? initialActive : undefined;
-            expect(enc["active"]).toBe(expectedActive);
-
-            // Invariant 3: degradationPreference is always locked to "maintain-framerate"
-            expect(afterFirst["degradationPreference"]).toBe("maintain-framerate");
-
-            // Invariant 4: Idempotence — f(f(x, p), p) === f(x, p)
-            await applyVideoEncoding(sender, preset);
-            expect(state).toEqual(afterFirst);
           }
         }
       }
@@ -148,7 +156,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves initial and followed capture tracks preserve Chrome default video contentHint ('') and set audio contentHint ('music') across all presets and surfaces", async () => {
+  it("exhaustively proves initial and followed capture tracks set video contentHint ('motion') and audio contentHint ('music') across all presets and surfaces", async () => {
     const presets = Object.values(QUALITY_PRESETS);
     const hasAudioStates = [false, true];
     const surfaces = ["monitor", "window", "browser", "other", undefined] as const;

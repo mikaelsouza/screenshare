@@ -29,7 +29,7 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
 
   it("nextPopoverState and deriveOutboundAudioState preserve invariants across random action traces", () => {
     const stepArb = fc.record({
-      target: fc.constantFrom<PopoverKind | null>(null, "roster", "preset", "codec"),
+      target: fc.constantFrom<PopoverKind | null>(null, "roster", "preset", "codec", "degradation"),
       connected: fc.boolean(),
       sharing: fc.boolean(),
       hasAudio: fc.boolean(),
@@ -41,12 +41,17 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
         let current: PopoverKind | null = null;
         for (const step of steps) {
           const pop = nextPopoverState(current, step.target, step.connected, step.sharing);
-          const openCount = Number(pop.rosterOpen) + Number(pop.presetOpen) + Number(pop.codecOpen);
+          const openCount =
+            Number(pop.rosterOpen) +
+            Number(pop.presetOpen) +
+            Number(pop.codecOpen) +
+            Number(pop.degradationOpen);
           expect(openCount).toBeLessThanOrEqual(1);
           if (!step.connected) expect(pop.active).toBeNull();
           if (!step.sharing) {
             expect(pop.presetOpen).toBe(false);
             expect(pop.codecOpen).toBe(false);
+            expect(pop.degradationOpen).toBe(false);
           }
           current = pop.active;
 

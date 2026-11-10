@@ -21,7 +21,12 @@ import {
 import { Mesh } from "./mesh";
 import { createCaptureController } from "./platform";
 import type { EndReason, FollowState } from "./platform/types";
-import { DEFAULT_CODEC, type CodecName } from "./quality";
+import {
+  DEFAULT_CODEC,
+  DEFAULT_DEGRADATION_MODE,
+  type CodecName,
+  type DegradationMode,
+} from "./quality";
 import { SignalingClient } from "./signaling";
 import { LinkMonitor, summarize } from "./stats";
 import {
@@ -78,6 +83,10 @@ const ui = {
   codecBtnLabel: el<HTMLElement>("codec-btn-label"),
   codecMenu: el<HTMLElement>("codec-menu"),
   codecList: el<HTMLElement>("codec-list"),
+  degradationBtn: el<HTMLButtonElement>("degradation-btn"),
+  degradationBtnLabel: el<HTMLElement>("degradation-btn-label"),
+  degradationMenu: el<HTMLElement>("degradation-menu"),
+  degradationList: el<HTMLElement>("degradation-list"),
   togglePreviewBtn: el<HTMLButtonElement>("toggle-preview"),
   muteAudioBtn: el<HTMLButtonElement>("mute-audio"),
   shareBtn: el<HTMLButtonElement>("share"),
@@ -253,7 +262,10 @@ function syncViewState(): ViewState {
 
   if (client === null) {
     applyPopoverState(null);
-  } else if (!sharing && (activePopover === "preset" || activePopover === "codec")) {
+  } else if (
+    !sharing &&
+    (activePopover === "preset" || activePopover === "codec" || activePopover === "degradation")
+  ) {
     applyPopoverState(null);
   }
 
@@ -1102,6 +1114,17 @@ function currentCodec(): CodecName {
   return isCodecName(stored) ? stored : DEFAULT_CODEC;
 }
 
+const DEGRADATION_MODES = ["framerate", "clarity"] as const;
+
+function isDegradationMode(val: string | null): val is DegradationMode {
+  return val !== null && (DEGRADATION_MODES as readonly string[]).includes(val);
+}
+
+function currentDegradation(): DegradationMode {
+  const stored = localStorage.getItem("stream-degradation");
+  return isDegradationMode(stored) ? stored : DEFAULT_DEGRADATION_MODE;
+}
+
 function captureBlockedReason(): string | null {
   if (typeof navigator.mediaDevices?.getDisplayMedia === "function") return null;
   if (!window.isSecureContext) {
@@ -1391,6 +1414,7 @@ async function joinRoom(code: string): Promise<void> {
             iceServers: ICE_SERVERS,
             preset: QUALITY_PRESETS[currentPreset()],
             codec: currentCodec(),
+            degradation: currentDegradation(),
             jitterBufferTargetMs: 150,
           },
           (to, data) => client?.signal(to, data),
@@ -1549,6 +1573,11 @@ const CODEC_META: Record<CodecName, { title: string; hint: string }> = {
   av1: { title: "AV1", hint: "Best quality · Modern GPU" },
 };
 
+const DEGRADATION_META: Record<DegradationMode, { title: string; hint: string }> = {
+  framerate: { title: "Focus Framerate", hint: "Smooth FPS" },
+  clarity: { title: "Focus Clarity", hint: "Sharp Resolution" },
+};
+
 function applyPopoverState(target: PopoverKind | null): void {
   const previous = activePopover;
   const state = nextPopoverState(
@@ -1561,12 +1590,28 @@ function applyPopoverState(target: PopoverKind | null): void {
   ui.roster.hidden = !state.rosterOpen;
   ui.presetMenu.hidden = !state.presetOpen;
   ui.codecMenu.hidden = !state.codecOpen;
+  ui.degradationMenu.hidden = !state.degradationOpen;
   ui.rosterBtn.setAttribute("aria-expanded", String(state.rosterOpen));
   ui.presetBtn.setAttribute("aria-expanded", String(state.presetOpen));
   ui.codecBtn.setAttribute("aria-expanded", String(state.codecOpen));
+  ui.degradationBtn.setAttribute("aria-expanded", String(state.degradationOpen));
   if (previous !== null && previous !== state.active) {
-    const menu = previous === "roster" ? ui.roster : previous === "preset" ? ui.presetMenu : ui.codecMenu;
-    const trigger = previous === "roster" ? ui.rosterBtn : previous === "preset" ? ui.presetBtn : ui.codecBtn;
+    const menu =
+      previous === "roster"
+        ? ui.roster
+        : previous === "preset"
+          ? ui.presetMenu
+          : previous === "codec"
+            ? ui.codecMenu
+            : ui.degradationMenu;
+    const trigger =
+      previous === "roster"
+        ? ui.rosterBtn
+        : previous === "preset"
+          ? ui.presetBtn
+          : previous === "codec"
+            ? ui.codecBtn
+            : ui.degradationBtn;
     if (menu.contains(document.activeElement)) trigger.focus();
   }
 }
@@ -1596,6 +1641,19 @@ function syncCodecMenuSelection(selected: CodecName): void {
   ui.codecBtnLabel.textContent = CODEC_META[selected].title;
   for (const btn of ui.codecList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
     const active = btn.dataset["codec"] === selected;
+    btn.setAttribute("aria-pressed", String(active));
+    const dot = btn.querySelector<HTMLElement>(".ui-dot");
+    if (dot) {
+      if (active) dot.dataset["state"] = "active";
+      else delete dot.dataset["state"];
+    }
+  }
+}
+
+function syncDegradationMenuSelection(selected: DegradationMode): void {
+  ui.degradationBtnLabel.textContent = DEGRADATION_META[selected].title;
+  for (const btn of ui.degradationList.querySelectorAll<HTMLButtonElement>(".popover-item")) {
+    const active = btn.dataset["degradation"] === selected;
     btn.setAttribute("aria-pressed", String(active));
     const dot = btn.querySelector<HTMLElement>(".ui-dot");
     if (dot) {
@@ -1664,12 +1722,44 @@ function initQualityControls(): void {
   }
   syncCodecMenuSelection(currentCodec());
 
+  for (const [name, meta] of Object.entries(DEGRADATION_META)) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "popover-item";
+    btn.dataset["degradation"] = name;
+
+    const left = document.createElement("span");
+    left.className = "popover-item-left";
+    const dot = document.createElement("span");
+    dot.className = "ui-dot";
+    left.append(dot, document.createTextNode(meta.title));
+
+    const right = document.createElement("span");
+    right.className = "popover-item-right";
+    right.textContent = meta.hint;
+
+    btn.append(left, right);
+    btn.addEventListener("click", () => {
+      if (!isDegradationMode(name)) return;
+      localStorage.setItem("stream-degradation", name);
+      syncDegradationMenuSelection(name);
+      closeAllPopovers();
+      if (mesh) runBackground(mesh.setDegradation(name));
+    });
+    ui.degradationList.append(btn);
+  }
+  syncDegradationMenuSelection(currentDegradation());
+
   ui.presetBtn.addEventListener("click", () => {
     togglePopover("preset");
   });
 
   ui.codecBtn.addEventListener("click", () => {
     togglePopover("codec");
+  });
+
+  ui.degradationBtn.addEventListener("click", () => {
+    togglePopover("degradation");
   });
 
   ui.muteAudioBtn.addEventListener("click", () => {

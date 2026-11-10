@@ -105,8 +105,9 @@ system audio excluding the app itself. While streaming, the **Mute audio** butto
 **Stop sharing** mutes or unmutes your outbound audio track in place.
 
 Sharers can switch quality presets (`1080p60` default, 12 Mbps max; `1080p30`, 8 Mbps max;
-`720p60`, 8 Mbps max; `720p30`, 6 Mbps max) and video codecs (`H.264` default, `AV1`) live
-without stopping the share, toggle their local preview tile, and view
+`720p60`, 8 Mbps max; `720p30`, 6 Mbps max), video codecs (`H.264` default, `AV1`), and
+stream priority (`Focus Framerate` default for smooth FPS, or `Focus Clarity` for sharp
+resolution) live without stopping the share, toggle their local preview tile, and view
 per-viewer outbound bitrates in the room roster. Viewers get per-tile pause (which stops
 the sharer's outbound video encoder for that link via a P2P data channel, alongside
 automatic off-screen `IntersectionObserver` pausing), mute, volume boost up to 200% via

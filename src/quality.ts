@@ -8,6 +8,10 @@ import type { QualityPreset } from "./capture";
 
 export type CodecName = "h264" | "av1";
 
+export type DegradationMode = "framerate" | "clarity";
+
+export const DEFAULT_DEGRADATION_MODE: DegradationMode = "framerate";
+
 /**
  * H.264 is the default *for gaming specifically*: it hits the hardware encoder
  * (NVENC / AMF / QuickSync) on essentially every gaming GPU, and WebRTC's H.264 has
@@ -21,29 +25,63 @@ const CODEC_MIME: Record<CodecName, string> = {
   av1: "video/AV1",
 };
 
-export async function applyVideoEncoding(
+type ExtendedDegradationPreference =
+  | RTCDegradationPreference
+  | "maintain-framerate-and-resolution";
+
+function buildVideoParameters(
   sender: RTCRtpSender,
   preset: QualityPreset,
-): Promise<void> {
+  degradationPreference: ExtendedDegradationPreference,
+): RTCRtpSendParameters {
   const params = sender.getParameters();
   // getParameters() can return an empty encodings array before negotiation settles.
-  if (!params.encodings || params.encodings.length === 0) {
-    params.encodings = [{}];
+  let first = params.encodings?.[0];
+  if (!first) {
+    first = {};
+    params.encodings = [first];
   }
-  const e = params.encodings[0];
-  if (!e) return;
 
   // Deliberately do NOT force active = true. Send-side pausing sets active = false
   // for peers who are not looking at this tile, and a live preset change calling
   // through here would silently resume uploading video nobody is watching —
   // defeating the largest bandwidth lever the room-size budget depends on.
   // Resuming is the explicit job of setSenderActive().
-  params.degradationPreference = "maintain-framerate";
-  e.maxBitrate = preset.maxBitrate;
-  e.maxFramerate = preset.frameRate;
-  e.scaleResolutionDownBy = 1;
+  first.maxBitrate = preset.maxBitrate;
+  first.maxFramerate = preset.frameRate;
+  first.scaleResolutionDownBy = 1;
 
-  await sender.setParameters(params);
+  const widened: Omit<RTCRtpSendParameters, "degradationPreference"> & {
+    degradationPreference?: ExtendedDegradationPreference;
+  } = params;
+  widened.degradationPreference = degradationPreference;
+  return params;
+}
+
+export async function applyVideoEncoding(
+  sender: RTCRtpSender,
+  preset: QualityPreset,
+  degradation: DegradationMode = DEFAULT_DEGRADATION_MODE,
+): Promise<void> {
+  if (degradation === "clarity") {
+    try {
+      await sender.setParameters(
+        buildVideoParameters(sender, preset, "maintain-framerate-and-resolution"),
+      );
+      return;
+    } catch (err) {
+      // Fallback for older browsers whose WebIDL enum or engine rejects
+      // "maintain-framerate-and-resolution". Re-read getParameters() so the retry
+      // carries a fresh WebRTC transaction ID and current active state.
+      console.error(
+        "[quality] Focus Clarity (maintain-framerate-and-resolution) was rejected; " +
+          "falling back to Focus Framerate (maintain-framerate).",
+        err,
+      );
+    }
+  }
+
+  await sender.setParameters(buildVideoParameters(sender, preset, "maintain-framerate"));
 }
 
 export async function applyAudioEncoding(sender: RTCRtpSender): Promise<void> {

@@ -10,12 +10,12 @@ export { z };
  * Hard room cap.
  *
  * Upload cost is linear in room size and paid by the sharer's uplink: each viewer
- * receives one stream at the selected preset's maxBitrate (8 Mbps at the default
- * 1080p60, 6 Mbps for 1080p30/720p60). An 8-person room therefore needs ~56 Mbps up at
- * the default, and the 20-person cap ~152 Mbps — past ordinary home uplinks. Per-peer
- * WebRTC congestion control and send-side pausing for unwatched tiles are what
- * keep the mesh viable at these sizes. The cap is where the mesh shape still holds;
- * beyond it an SFU is needed.
+ * receives one stream at the selected preset's maxBitrate (12 Mbps at the default
+ * 1080p60, 8 Mbps for 1080p30/720p60, 6 Mbps for 720p30). An 8-person room therefore
+ * needs ~84 Mbps up at the default, and the 20-person cap ~228 Mbps — past ordinary home
+ * uplinks. Per-peer WebRTC congestion control and send-side pausing for unwatched tiles
+ * are what keep the mesh viable at these sizes. The cap is where the mesh shape still
+ * holds; beyond it an SFU is needed.
  */
 export const MAX_ROOM_SIZE = 20;
 export const ROOM_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; // no O/0/I/1/L

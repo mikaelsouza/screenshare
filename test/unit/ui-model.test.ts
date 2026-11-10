@@ -153,6 +153,7 @@ describe("nextPopoverState", () => {
       rosterOpen: true,
       presetOpen: false,
       codecOpen: false,
+      degradationOpen: false,
     });
     const closed = nextPopoverState("roster", "roster", true, false);
     expect(closed).toEqual({
@@ -160,6 +161,7 @@ describe("nextPopoverState", () => {
       rosterOpen: false,
       presetOpen: false,
       codecOpen: false,
+      degradationOpen: false,
     });
   });
 
@@ -170,6 +172,7 @@ describe("nextPopoverState", () => {
       rosterOpen: false,
       presetOpen: true,
       codecOpen: false,
+      degradationOpen: false,
     });
     const codec = nextPopoverState("preset", "codec", true, true);
     expect(codec).toEqual({
@@ -177,20 +180,31 @@ describe("nextPopoverState", () => {
       rosterOpen: false,
       presetOpen: false,
       codecOpen: true,
+      degradationOpen: false,
     });
-    const closedAll = nextPopoverState("codec", null, true, true);
+    const degradation = nextPopoverState("codec", "degradation", true, true);
+    expect(degradation).toEqual({
+      active: "degradation",
+      rosterOpen: false,
+      presetOpen: false,
+      codecOpen: false,
+      degradationOpen: true,
+    });
+    const closedAll = nextPopoverState("degradation", null, true, true);
     expect(closedAll).toEqual({
       active: null,
       rosterOpen: false,
       presetOpen: false,
       codecOpen: false,
+      degradationOpen: false,
     });
   });
 
-  it("refuses to open roster when disconnected or preset/codec when not sharing", () => {
+  it("refuses to open roster when disconnected or preset/codec/degradation when not sharing", () => {
     expect(nextPopoverState(null, "roster", false, true).active).toBeNull();
     expect(nextPopoverState(null, "preset", true, false).active).toBeNull();
     expect(nextPopoverState(null, "codec", true, false).active).toBeNull();
+    expect(nextPopoverState(null, "degradation", true, false).active).toBeNull();
   });
 });
 

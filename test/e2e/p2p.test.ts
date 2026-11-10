@@ -327,8 +327,26 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       const muteEl = document.getElementById("mute-audio");
       const muteRect = muteEl?.getBoundingClientRect();
       const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
-      if (!headerRect || !h1Rect || !controlsRect || !shareEl || !shareRect || !muteEl || !muteRect || !rosterBtnRect) {
+      const presetBtnRect = document.getElementById("preset-btn")?.getBoundingClientRect();
+      const codecBtnRect = document.getElementById("codec-btn")?.getBoundingClientRect();
+      const degradationBtnRect = document.getElementById("degradation-btn")?.getBoundingClientRect();
+      if (
+        !headerRect ||
+        !h1Rect ||
+        !controlsRect ||
+        !shareEl ||
+        !shareRect ||
+        !muteEl ||
+        !muteRect ||
+        !rosterBtnRect ||
+        !presetBtnRect ||
+        !codecBtnRect ||
+        !degradationBtnRect
+      ) {
         throw new Error("Missing streaming elements");
+      }
+      if (presetBtnRect.right > codecBtnRect.left || codecBtnRect.right > degradationBtnRect.left) {
+        throw new Error("#preset-btn, #codec-btn, and #degradation-btn must be ordered left-to-right");
       }
       if (muteEl.hidden || muteRect.right > shareRect.left) {
         throw new Error("#mute-audio must be visible and positioned to the left of #share");
@@ -454,8 +472,104 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       "clicking #mute-audio again must re-enable the outbound audio track",
     );
 
-    // Verify live Quality (#preset-btn) and Codec (#codec-btn) popover changes while streaming keep the stream alive
-    // and restore keyboard focus to the trigger button when closed:
+    // Verify live Quality (#preset-btn), Codec (#codec-btn), and Stream Priority (#degradation-btn)
+    // popover changes while streaming keep the stream alive and restore keyboard focus to the trigger button:
+    assert.equal(await sharer.textContent("#degradation-btn-label"), "Focus Framerate");
+    assert.equal(
+      await sharer.evaluate(() => {
+        const senders = window.__pcs
+          .filter((pc) => pc.connectionState !== "closed")
+          .flatMap((pc) => pc.getSenders())
+          .filter((sender) => sender.track?.kind === "video");
+        return (
+          senders.length > 0 &&
+          senders.every((sender) => sender.getParameters().degradationPreference === "maintain-framerate")
+        );
+      }),
+      true,
+      "sharer video senders must start with maintain-framerate",
+    );
+    await sharer.evaluate(() => {
+      window.__setParamsCalls = [];
+    });
+    await sharer.click("#degradation-btn");
+    await sharer.focus('#degradation-list button[data-degradation="clarity"]');
+    await sharer.click('#degradation-list button[data-degradation="clarity"]');
+    assert.equal(
+      await sharer.evaluate(() => document.activeElement?.id),
+      "degradation-btn",
+      "selecting a degradation option must restore focus to #degradation-btn",
+    );
+    assert.equal(await sharer.textContent("#degradation-btn-label"), "Focus Clarity");
+    assert.equal(
+      await sharer.evaluate(() => localStorage.getItem("stream-degradation")),
+      "clarity",
+    );
+    await waitFor(
+      sharer,
+      () => {
+        const senders = window.__pcs
+          .filter((pc) => pc.connectionState !== "closed")
+          .flatMap((pc) => pc.getSenders())
+          .filter((sender) => sender.track?.kind === "video");
+        if (senders.length === 0) return false;
+        const calls = window.__setParamsCalls ?? [];
+        const clarityCalls = calls.filter(
+          (call) => call.degradationPreference === "maintain-framerate-and-resolution",
+        );
+        if (clarityCalls.length < senders.length) return false;
+        if (clarityCalls.every((call) => call.ok)) {
+          return senders.every((sender) => {
+            const pref: string | undefined = sender.getParameters().degradationPreference;
+            return pref === "maintain-framerate-and-resolution";
+          });
+        }
+        const fallbackCalls = calls.filter(
+          (call) => call.degradationPreference === "maintain-framerate" && call.ok,
+        );
+        return (
+          fallbackCalls.length >= senders.length &&
+          senders.every((sender) => sender.getParameters().degradationPreference === "maintain-framerate")
+        );
+      },
+      { label: "sharer video sender clarity degradationPreference update" },
+    );
+
+    await sharer.evaluate(() => {
+      window.__setParamsCalls = [];
+    });
+    await sharer.click("#degradation-btn");
+    await sharer.focus('#degradation-list button[data-degradation="framerate"]');
+    await sharer.click('#degradation-list button[data-degradation="framerate"]');
+    assert.equal(
+      await sharer.evaluate(() => document.activeElement?.id),
+      "degradation-btn",
+      "selecting Focus Framerate must restore focus to #degradation-btn",
+    );
+    assert.equal(await sharer.textContent("#degradation-btn-label"), "Focus Framerate");
+    assert.equal(
+      await sharer.evaluate(() => localStorage.getItem("stream-degradation")),
+      "framerate",
+    );
+    await waitFor(
+      sharer,
+      () => {
+        const senders = window.__pcs
+          .filter((pc) => pc.connectionState !== "closed")
+          .flatMap((pc) => pc.getSenders())
+          .filter((sender) => sender.track?.kind === "video");
+        const framerateCalls = (window.__setParamsCalls ?? []).filter(
+          (call) => call.degradationPreference === "maintain-framerate" && call.ok,
+        );
+        return (
+          senders.length > 0 &&
+          framerateCalls.length >= senders.length &&
+          senders.every((sender) => sender.getParameters().degradationPreference === "maintain-framerate")
+        );
+      },
+      { label: "sharer video sender framerate degradationPreference restore" },
+    );
+
     await sharer.click("#preset-btn");
     await sharer.focus('#preset-list button[data-preset="720p30"]');
     await sharer.click('#preset-list button[data-preset="720p30"]');

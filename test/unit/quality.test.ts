@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   applyVideoEncoding,
   DEFAULT_START_BITRATE_KBPS,
@@ -245,6 +245,70 @@ describe("applyVideoEncoding", () => {
       expect(enc?.["maxFramerate"]).toBe(60);
       expect(enc?.["scaleResolutionDownBy"]).toBe(1);
     }
+  });
+
+  it("sets maintain-framerate-and-resolution in clarity mode and mints a fresh getParameters() transaction ID on fallback", async () => {
+    const { DEFAULT_DEGRADATION_MODE } = await import("@src/quality");
+    expect(DEFAULT_DEGRADATION_MODE).toBe("framerate");
+
+    const fClarity = fakeSender({ active: true });
+    await applyVideoEncoding(fClarity.sender, PRESET, "clarity");
+    expect(fClarity.sender.getParameters().degradationPreference).toBe(
+      "maintain-framerate-and-resolution",
+    );
+
+    let params: Record<string, unknown> = { encodings: [{ active: true }] };
+    let nextTxId = 1;
+    let activeTxId: number | null = null;
+    const seenPreferences: unknown[] = [];
+    const fallbackSender = {
+      getParameters: () => {
+        activeTxId = nextTxId++;
+        return { ...structuredClone(params), transactionId: String(activeTxId) };
+      },
+      setParameters: async (p: Record<string, unknown>) => {
+        // Per W3C WebRTC 1.0 § 5.2, setParameters validates and consumes [[LastReturnedParameters]].
+        const expectedTx = activeTxId !== null ? String(activeTxId) : null;
+        activeTxId = null;
+        if (expectedTx === null || p["transactionId"] !== expectedTx) {
+          throw new DOMException(
+            "getParameters() needs to be called before setParameters().",
+            "InvalidStateError",
+          );
+        }
+        seenPreferences.push(p["degradationPreference"]);
+        if (p["degradationPreference"] === "maintain-framerate-and-resolution") {
+          throw new TypeError("Failed to execute 'setParameters': invalid enum value");
+        }
+        params = structuredClone(p);
+      },
+    } as unknown as RTCRtpSender;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await applyVideoEncoding(fallbackSender, PRESET, "clarity");
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        "[quality] Focus Clarity (maintain-framerate-and-resolution) was rejected; " +
+          "falling back to Focus Framerate (maintain-framerate).",
+        expect.any(TypeError),
+      );
+
+      // A browser that accepts Focus Clarity logs nothing.
+      errorSpy.mockClear();
+      await applyVideoEncoding(fakeSender({ active: true }).sender, PRESET, "clarity");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+    expect(seenPreferences).toEqual([
+      "maintain-framerate-and-resolution",
+      "maintain-framerate",
+    ]);
+    expect(params["degradationPreference"]).toBe("maintain-framerate");
+    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(
+      PRESET.maxBitrate,
+    );
   });
 });
 

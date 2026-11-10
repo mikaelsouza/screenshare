@@ -231,7 +231,7 @@
         margin-left: auto;
       }
 
-      /* Shared Popover Anchors & Menus (Roster, Stream Quality, Video Codec) */
+      /* Shared Popover Anchors & Menus (Roster, Stream Quality, Video Codec, Stream Priority) */
       .popover-anchor,
       .roster-anchor {
         position: relative;
@@ -253,6 +253,7 @@
         position: absolute;
         bottom: calc(100% + 8px);
         left: 0;
+        max-width: calc(100vw - 32px);
         z-index: 30;
         display: flex;
         flex-direction: column;
@@ -263,6 +264,9 @@
         width: 224px;
       }
       #codec-menu {
+        width: 268px;
+      }
+      #degradation-menu {
         width: 268px;
       }
       .popover-head,
@@ -332,6 +336,7 @@
         align-items: center;
         gap: 8px;
         font-weight: 500;
+        white-space: nowrap;
       }
       .popover-item-right {
         color: var(--text-secondary);
@@ -852,6 +857,15 @@
           <section id="codec-menu" class="app-card popover-up" hidden aria-labelledby="codec-menu-title">
             <div class="popover-head" id="codec-menu-title">Video codec</div>
             <div id="codec-list" class="popover-list" role="group" aria-labelledby="codec-menu-title"></div>
+          </section>
+        </div>
+        <div class="popover-anchor">
+          <button type="button" id="degradation-btn" class="ui-btn" aria-expanded="false" aria-controls="degradation-menu" title="Stream priority under bandwidth bottlenecks">
+            <span id="degradation-btn-label">Focus Framerate</span> &#9662;
+          </button>
+          <section id="degradation-menu" class="app-card popover-up" hidden aria-labelledby="degradation-menu-title">
+            <div class="popover-head" id="degradation-menu-title">Stream priority</div>
+            <div id="degradation-list" class="popover-list" role="group" aria-labelledby="degradation-menu-title"></div>
           </section>
         </div>
         <button type="button" id="toggle-preview" class="ui-btn" hidden>Show preview</button>

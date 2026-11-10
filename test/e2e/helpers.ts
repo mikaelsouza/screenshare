@@ -18,6 +18,7 @@ declare global {
     __csp: string[];
     __gdmOpts: DisplayMediaStreamOptions[];
     __gdmStreams?: MediaStream[];
+    __setParamsCalls?: Array<{ degradationPreference: string | undefined; ok: boolean }>;
   }
 }
 
@@ -162,6 +163,30 @@ export const INSTRUMENT = (): void => {
   WrappedPC.prototype = Native.prototype;
   Object.setPrototypeOf(WrappedPC, Native);
   window.RTCPeerConnection = WrappedPC;
+
+  window.__setParamsCalls = [];
+  const origSetParameters = Reflect.get(window.RTCRtpSender.prototype, "setParameters");
+  window.RTCRtpSender.prototype.setParameters = function (
+    this: RTCRtpSender,
+    params: RTCRtpSendParameters,
+    ...rest: [RTCSetParameterOptions?]
+  ): Promise<void> {
+    const rawPref: unknown = Reflect.get(params, "degradationPreference");
+    const pref = typeof rawPref === "string" ? rawPref : undefined;
+    return origSetParameters.call(this, params, ...rest).then(
+      () => {
+        if (this.track?.kind === "video") {
+          window.__setParamsCalls?.push({ degradationPreference: pref, ok: true });
+        }
+      },
+      (err: unknown) => {
+        if (this.track?.kind === "video") {
+          window.__setParamsCalls?.push({ degradationPreference: pref, ok: false });
+        }
+        throw err;
+      },
+    );
+  };
 
   navigator.mediaDevices.getDisplayMedia = (
     options?: DisplayMediaStreamOptions,

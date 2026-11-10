@@ -15,6 +15,8 @@ import {
   applyAudioEncoding,
   applyVideoEncoding,
   type CodecName,
+  DEFAULT_DEGRADATION_MODE,
+  type DegradationMode,
   mungeOpusSdp,
   mungeVideoSdp,
   preferCodec,
@@ -29,6 +31,7 @@ export interface MeshOptions {
   iceServers: RTCIceServer[];
   preset: QualityPreset;
   codec: CodecName;
+  degradation?: DegradationMode;
   /** Receive-side jitter buffer target, ms. 0 = lowest latency. */
   jitterBufferTargetMs: number;
 }
@@ -305,7 +308,11 @@ class PeerLink {
    */
   async reapplyEncoding(): Promise<void> {
     if (!this.videoSender) return;
-    await applyVideoEncoding(this.videoSender, this.opts.preset);
+    await applyVideoEncoding(
+      this.videoSender,
+      this.opts.preset,
+      this.opts.degradation ?? DEFAULT_DEGRADATION_MODE,
+    );
     // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
     // in both directions rather than only pausing.
     await this.setSenderActive(this.remoteWantsVideo);
@@ -344,7 +351,11 @@ class PeerLink {
     try {
       const results = await Promise.allSettled([
         applyAudioEncoding(this.audioSender),
-        applyVideoEncoding(this.videoSender, this.opts.preset),
+        applyVideoEncoding(
+          this.videoSender,
+          this.opts.preset,
+          this.opts.degradation ?? DEFAULT_DEGRADATION_MODE,
+        ),
       ]);
       const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
       if (rejected) throw rejected.reason;
@@ -426,7 +437,7 @@ class PeerLink {
 
   /**
    * Send-side pausing. The largest single bandwidth lever available: a lone sharer in
-   * an 8-person room needs ~42 Mbps up at the 6 Mbps presets (~56 Mbps at the default),
+   * an 8-person room needs ~56 Mbps up at the 8 Mbps presets (~84 Mbps at the default),
    * and not sending video that nobody is looking at removes most of that. At these room
    * sizes it is what keeps the mesh viable on an ordinary home uplink.
    */
@@ -617,6 +628,14 @@ export class Mesh {
    */
   async setPreset(preset: QualityPreset): Promise<void> {
     this.opts.preset = preset;
+    await Promise.all([...this.links.values()].map((l) => l.reapplyEncoding()));
+  }
+
+  /**
+   * Change stream degradation priority for every peer without renegotiating.
+   */
+  async setDegradation(degradation: DegradationMode): Promise<void> {
+    this.opts.degradation = degradation;
     await Promise.all([...this.links.values()].map((l) => l.reapplyEncoding()));
   }
 
