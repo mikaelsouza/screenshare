@@ -34,7 +34,7 @@ npm run preview         # built assets + Worker/RoomDO via wrangler dev (full ro
 # Desktop app (Electron)
 npm run electron:dev    # Vite dev server + Electron app (frontend UI only without a Worker proxy)
 npm run electron:start  # build assets; Electron loads the hosted site by default
-npm run electron:pack   # unpacked Windows x64 directory build in release/
+npm run electron:pack   # unpacked directory build for the current host in release/
 npm run electron:build  # Windows x64 NSIS installer + portable exe in release/
 ```
 
@@ -123,9 +123,9 @@ Picture-in-Picture, live stats, and fullscreen controls.
 
 ## Deploy
 
-1. Uncomment `routes` in `wrangler.jsonc`, replace the `<tld>` placeholder with your
-   custom domain, and configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in
-   GitHub Actions repository secrets.
+1. Add a comma after `ratelimits`, uncomment `routes` in `wrangler.jsonc`, replace the
+   `<tld>` placeholder with your custom domain, and configure `CLOUDFLARE_API_TOKEN` and
+   `CLOUDFLARE_ACCOUNT_ID` in GitHub Actions repository secrets.
 2. Push to `main`. `.github/workflows/deploy.yml` verifies that both `CI` and `CodeQL`
    succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`;
    `npm run deploy` builds and deploys locally without running any checks.
