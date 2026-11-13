@@ -18,9 +18,10 @@ quiet; media flows directly peer-to-peer via WebRTC.
 - **Per-window audio on the web** needs Chrome or Edge 141+ (`windowAudio: "window"`).
 - **macOS & Linux:** macOS Chrome captures tab audio only; Linux/Wayland has similar
   limits. Screen sharing works, system audio does not.
-- **Desktop app (Windows):** Captures per-window process-tree audio or system audio via
-  WASAPI loopback (`loopback-capture` + `koffi`), and automatically follows supported
-  multi-window games (such as League of Legends) between lobby and match windows.
+- **Desktop app (Windows):** Targets Windows x64; captures per-window process-tree audio or
+  system audio via WASAPI loopback (`loopback-capture` + `koffi`), and automatically follows
+  supported multi-window games (such as League of Legends) between lobby and match windows.
+- **Development:** Node.js 22.18+ (`engines.node` in `package.json`), or `nix develop`.
 
 ## Quick start
 
@@ -33,7 +34,8 @@ npm run preview         # built assets + Worker/RoomDO via wrangler dev (full ro
 # Desktop app (Electron)
 npm run electron:dev    # Vite dev server + Electron app (frontend UI only without a Worker proxy)
 npm run electron:start  # build assets; Electron loads the hosted site by default
-npm run electron:build  # Windows NSIS installer + portable exe in release/
+npm run electron:pack   # unpacked Windows x64 directory build in release/
+npm run electron:build  # Windows x64 NSIS installer + portable exe in release/
 ```
 
 Room creation (`/api/room`) and signalling (`/ws/:code`) require the Worker. Use
@@ -56,14 +58,19 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   `require-trusted-types-for 'script'` and `trusted-types 'none'`), hands out 8-character
   room codes at `/api/room`, and routes `/ws/:code` to a per-room Durable Object behind
   per-IP rate limits (keyed by IPv4 address or IPv6 `/64`).
-- **RoomDO** (`worker/room.ts`) coordinates WebSocket Hibernation signalling, room
+- **RoomDO** (`worker/room.ts`) coordinates WebSocket Hibernation signalling (answering
+  keepalive pings via `setWebSocketAutoResponse` without waking the object), room
   membership, in-place session resumption, and host moderation. It never parses SDP or sees
   media.
-- **Shared protocol** (`shared/protocol.ts`) validates room codes and all client/server
-  WebSocket and P2P control messages at runtime with Zod (in `jitless` mode for Trusted
-  Types CSP compatibility).
+- **Shared protocol** (`shared/protocol.ts`) validates room codes, `/api/room` responses,
+  and client/server WebSocket messages (capping SDP at 64 KB and ICE candidates at 1 KB)
+  at runtime with Zod in `jitless` mode for Trusted Types CSP compatibility; P2P
+  data-channel `view` control messages are validated with the same Zod instance in
+  `src/mesh.ts`.
 - **Frontend** (`src/`) handles capture (`src/capture.ts`), encoder/decoder tuning
-  (`src/quality.ts`), the partial WebRTC mesh with perfect negotiation and send-side pausing
+  (`src/quality.ts` — `x-google-start-bitrate=6000` kbps, 48 kHz / 256 kbps stereo Opus,
+  150 ms receiver `jitterBufferTarget`, and Chromium's built-in per-peer WebRTC congestion
+  control), the partial WebRTC mesh with perfect negotiation and send-side pausing
   (`src/mesh.ts`), WebSocket reconnection (`src/signaling.ts`), `getStats()` link health
   (`src/stats.ts`), and pure UI state (`src/ui-model.ts`). Viewers connect only to sharers,
   never to each other.
@@ -116,9 +123,11 @@ Picture-in-Picture, live stats, and fullscreen controls.
 
 ## Deploy
 
-1. Set the custom domain in `routes` in `wrangler.jsonc` (replace the `<tld>` placeholder).
+1. Uncomment `routes` in `wrangler.jsonc`, replace the `<tld>` placeholder with your
+   custom domain, and configure `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` in
+   GitHub Actions repository secrets.
 2. Push to `main`. `.github/workflows/deploy.yml` verifies that both `CI` and `CodeQL`
-   succeeded for the commit and deploys with `cloudflare/wrangler-action`;
+   succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`;
    `npm run deploy` builds and deploys locally without running any checks.
 
 ## Development
@@ -137,7 +146,8 @@ npm test                # check + lint:all + test:unit + test:worker
 npm run test:all        # test + test:formal + test:fuzz + test:e2e
 ```
 
-Set `CHROMIUM_BIN` if you are not inside `nix develop`.
+Set `CHROMIUM_BIN` if you are not inside `nix develop` (on Windows, E2E tests fall back
+to `C:\Program Files\Google\Chrome\Application\chrome.exe` when `CHROMIUM_BIN` is unset).
 
 ## AI Usage Alert
 
