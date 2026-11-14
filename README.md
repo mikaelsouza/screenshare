@@ -23,6 +23,22 @@ quiet; media flows directly peer-to-peer via WebRTC.
   supported multi-window games (such as League of Legends) between lobby and match windows.
 - **Development:** Node.js 22.18+ (`engines.node` in `package.json`), or `nix develop`.
 
+## Desktop app (Windows)
+
+Download the latest Windows x64 installer from
+[GitHub Releases](https://github.com/mikaelsouza/screenshare/releases/latest):
+
+- **`Screenshare-Setup-<version>.exe`** — assisted NSIS installer (defaults to a
+  per-user install without admin rights, with an optional all-users mode and Start Menu
+  / Desktop shortcuts). Checks GitHub Releases in the background and installs updates
+  automatically when you close the app.
+
+> **Windows SmartScreen & update verification:** Release binaries and background
+> auto-updates are not Authenticode-signed yet, so Windows may prompt *"Windows protected
+> your PC"* on first launch — click **More info** → **Run anyway**. Auto-updates verify the
+> `SHA-512` digest in `latest.yml` from the GitHub Release; `SHA256SUMS.txt` is provided to
+> verify download integrity against corrupted or truncated transfers.
+
 ## Quick start
 
 ```bash
@@ -35,7 +51,7 @@ npm run preview         # built assets + Worker/RoomDO via wrangler dev (full ro
 npm run electron:dev    # Vite dev server + Electron app (frontend UI only without a Worker proxy)
 npm run electron:start  # build assets; Electron loads the hosted site by default
 npm run electron:pack   # unpacked directory build for the current host in release/
-npm run electron:build  # Windows x64 NSIS installer + portable exe in release/
+npm run electron:build  # Windows x64 NSIS installer in release/
 ```
 
 Room creation (`/api/room`) and signalling (`/ws/:code`) require the Worker. Use
@@ -77,8 +93,8 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
 - **Desktop app** (`electron/`, `src/platform/`) loads the hosted web app so desktop and
   browser users share rooms, adding a native window/screen picker (`electron/picker.ts`),
   WASAPI process-tree and system audio capture (`electron/audio/`,
-  `src/platform/pcm-audio.ts`), and automatic lobby-to-match window following
-  (`electron/follow/`).
+  `src/platform/pcm-audio.ts`), automatic lobby-to-match window following
+  (`electron/follow/`), and background GitHub Releases auto-updates (`electron/updater.ts`).
 
 ## Privacy
 
@@ -126,9 +142,20 @@ Picture-in-Picture, live stats, and fullscreen controls.
 1. Add a comma after `ratelimits`, uncomment `routes` in `wrangler.jsonc`, replace the
    `<tld>` placeholder with your custom domain, and configure `CLOUDFLARE_API_TOKEN` and
    `CLOUDFLARE_ACCOUNT_ID` in GitHub Actions repository secrets.
-2. Push to `main`. `.github/workflows/deploy.yml` verifies that both `CI` and `CodeQL`
-   succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`;
-   `npm run deploy` builds and deploys locally without running any checks.
+2. Push to `main`.
+   - **Frontend & Worker:** `.github/workflows/deploy.yml` verifies that both `CI` and
+     `CodeQL` succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`.
+     Existing desktop app installs pick up web/UI updates immediately because they load
+     the hosted site.
+   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs after `CI`
+     succeeds on `main`, verifies `CodeQL` passed, checks Electron-relevant changes since
+     the latest tag (`electron/`, `electron-builder.json`, `tsconfig.electron.json`,
+     `assets/icon.*`, `.github/workflows/release-electron.yml`, or runtime/Electron entries
+     in `package.json` and `package-lock.json`), builds and smoke-tests the NSIS installer
+     in a read-only job, and publishes the GitHub Release (`latest.yml`, `.blockmap`, and
+     `SHA256SUMS.txt`) in an isolated release job (or via `workflow_dispatch` with an
+     optional `force` flag).
+   - `npm run deploy` builds and deploys the Worker locally without running any checks.
 
 ## Development
 

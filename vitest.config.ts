@@ -19,6 +19,7 @@ const config: ViteUserConfig = defineConfig({
         "electron/follow/**/*.ts",
         "electron/audio/**/*.ts",
         "electron/picker.ts",
+        "electron/updater.ts",
         "worker/ratelimit.ts",
       ],
       exclude: ["src/main.ts", "src/platform/types.ts"],

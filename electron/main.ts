@@ -2,17 +2,20 @@ import {
   app,
   BrowserWindow,
   Menu,
+  Notification,
   session,
   desktopCapturer,
   ipcMain,
   shell,
   type DesktopCapturerSource,
 } from "electron";
+import { NsisUpdater } from "electron-updater";
 import { matchProfile, type FollowProfile } from "./follow/profiles.js";
 import { createFollower, type Follower, type FollowStatus, type WindowSource } from "./follow/follower.js";
 import { buildPickerTemplate } from "./picker.js";
 import { createPidResolver } from "./audio/pid.js";
 import { createAudioSessionController } from "./audio/capture.js";
+import { createAutoUpdateController } from "./updater.js";
 import koffi from "koffi";
 import loopback from "loopback-capture";
 import path from "node:path";
@@ -290,6 +293,7 @@ async function initApplication(): Promise<void> {
     minHeight: 600,
     backgroundColor: "#121214",
     show: false,
+    ...(app.isPackaged ? {} : { icon: path.join(__dirname, "../assets/icon.ico") }),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -357,10 +361,50 @@ async function initApplication(): Promise<void> {
   }
 }
 
+if (process.platform === "win32" && app.isPackaged) {
+  app.setAppUserModelId("com.screenshare.app");
+}
+
+const activeNotifications = new Set<Notification>();
+
+const autoUpdate = createAutoUpdateController(
+  {
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    isDev,
+    isSmokeTest,
+  },
+  {
+    createUpdater: () => new NsisUpdater(),
+    notifyDownloaded: (version: string) => {
+      if (Notification.isSupported()) {
+        const notification = new Notification({
+          title: "Screenshare update ready",
+          body: `Version ${version} has been downloaded and will install when you close Screenshare.`,
+        });
+        activeNotifications.add(notification);
+        notification.once("close", () => {
+          activeNotifications.delete(notification);
+        });
+        notification.show();
+      }
+    },
+    onError: (err: unknown) => {
+      console.warn("[updater] auto-update check failed:", err);
+    },
+  },
+);
+
 // Smoke tests use a throwaway profile so they neither collide with a running copy of the
 // app (single-instance lock) nor touch its data.
 if (isSmokeTest) {
-  app.setPath("userData", path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`));
+  const customSmokeDir = process.env["SMOKE_USER_DATA_DIR"];
+  app.setPath(
+    "userData",
+    customSmokeDir && customSmokeDir.length > 0
+      ? customSmokeDir
+      : path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`),
+  );
 }
 
 // Single instance lock
@@ -384,12 +428,17 @@ if (!gotTheLock) {
 
   runBackground(
     app.whenReady().then(async () => {
+      autoUpdate.start();
       setupMediaHandlers();
       await initApplication();
     }),
     "app startup",
   );
 }
+
+app.on("will-quit", () => {
+  autoUpdate.stop();
+});
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {

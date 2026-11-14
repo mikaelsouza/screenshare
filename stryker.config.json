@@ -8,6 +8,7 @@
     "electron/follow/**/*.ts",
     "electron/audio/**/*.ts",
     "electron/picker.ts",
+    "electron/updater.ts",
     "src/capture.ts",
     "src/platform/**/*.ts",
     "src/mesh.ts",

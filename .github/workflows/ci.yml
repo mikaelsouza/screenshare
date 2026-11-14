@@ -97,3 +97,37 @@ jobs:
         env:
           CHROMIUM_BIN: /usr/bin/google-chrome
         run: npm run test:e2e
+
+  electron-smoke:
+    name: Electron Packaged Smoke Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        shell: bash
+        run: npm ci --legacy-peer-deps
+
+      - name: Build Windows NSIS installer and unpacked app
+        shell: bash
+        run: npm run electron:build
+
+      - name: Verify release metadata and run smoke test on packaged binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          test -f "release/win-unpacked/resources/app-update.yml"
+          test -f "release/Screenshare-Setup-${PKG_VERSION}.exe"
+          test -f "release/Screenshare-Setup-${PKG_VERSION}.exe.blockmap"
+          test -f "release/latest.yml"
+          npm run electron:smoke:packaged
