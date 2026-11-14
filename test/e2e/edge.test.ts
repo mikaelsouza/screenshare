@@ -359,6 +359,37 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     );
   });
 
+  await it("serves /privacy.html with strict CSP headers and zero CSP violations", async () => {
+    const manualRes = await fetch(`${BASE_URL}/privacy.html`, { redirect: "manual" });
+    assert.equal(manualRes.status, 307);
+    assert.equal(manualRes.headers.get("location"), "/privacy");
+    const res = await fetch(`${BASE_URL}/privacy.html`);
+    assert.equal(res.status, 200);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    assert.ok(csp.includes("require-trusted-types-for 'script'"), `expected strict CSP header, got ${JSON.stringify(csp)}`);
+    const html = await res.text();
+    assert.ok(html.includes("Privacy Policy"));
+    assert.ok(html.includes("Webmikas"));
+
+    if (!browser) throw new Error("Browser not initialized");
+    const ctx = await browser.newContext();
+    try {
+      await ctx.addInitScript(INSTRUMENT);
+      const page = await ctx.newPage();
+      const consoleErrors: string[] = [];
+      page.on("console", (msg) => {
+        if (msg.type() === "error") consoleErrors.push(msg.text());
+      });
+      await page.goto(`${BASE_URL}/privacy.html`);
+      const heading = await page.textContent("h1");
+      assert.ok(heading?.includes("Privacy Policy"), `expected Privacy Policy heading, got ${JSON.stringify(heading)}`);
+      assert.deepEqual(await page.evaluate(() => window.__csp), [], "privacy page hit a CSP violation");
+      assert.deepEqual(consoleErrors, [], `privacy page logged console errors: ${consoleErrors.join("; ")}`);
+    } finally {
+      await ctx.close();
+    }
+  });
+
   await it("raised no CSP or Trusted Types violation on any page", async () => {
     const pages: Array<[string, Page]> = [
       ["host", host],

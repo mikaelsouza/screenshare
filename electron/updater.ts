@@ -20,6 +20,7 @@ export interface UpdaterClient {
 export interface AutoUpdateEnv {
   readonly isPackaged: boolean;
   readonly platform: string;
+  readonly isWindowsStore: boolean;
   readonly isDev: boolean;
   readonly isSmokeTest: boolean;
 }
@@ -37,12 +38,14 @@ export interface AutoUpdateController {
 }
 
 /**
- * Only installed packaged Windows builds check GitHub Releases for updates.
+ * Only non-Store packaged Windows builds check GitHub Releases for updates;
+ * Microsoft Store packages are updated automatically by the Store.
  */
 export function shouldEnableAutoUpdate(env: AutoUpdateEnv): boolean {
   return (
     env.isPackaged &&
     env.platform === "win32" &&
+    !env.isWindowsStore &&
     !env.isDev &&
     !env.isSmokeTest
   );

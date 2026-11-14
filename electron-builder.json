@@ -3,7 +3,8 @@
   "appId": "com.screenshare.app",
   "productName": "Screenshare",
   "directories": {
-    "output": "release"
+    "output": "release",
+    "buildResources": "assets"
   },
   "files": [
     "dist/**/*",
@@ -45,5 +46,17 @@
     "createStartMenuShortcut": true,
     "shortcutName": "Screenshare",
     "uninstallDisplayName": "Screenshare"
+  },
+  "appx": {
+    "artifactName": "${productName}-${version}.${ext}",
+    "applicationId": "Screenshare",
+    "identityName": "Webmikas.WebmikasScreenshare",
+    "publisher": "CN=24C7834C-4201-4DB0-A702-B1D72CF9BEA4",
+    "publisherDisplayName": "Webmikas",
+    "displayName": "Webmikas Screenshare",
+    "backgroundColor": "#09090b",
+    "languages": [
+      "en-US"
+    ]
   }
 }
