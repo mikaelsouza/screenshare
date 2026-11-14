@@ -335,6 +335,7 @@ jobs:
           TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
         run: |
           set -euo pipefail
+          shopt -s inherit_errexit
 
           if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Invalid RELEASE_VERSION: '$RELEASE_VERSION'"
@@ -365,16 +366,16 @@ jobs:
           trap 'rm -rf "$TMP_DIR"' EXIT
 
           refresh_repo_metadata() {
-            gh api --paginate "repos/$REPO/releases?per_page=100" \
-              | jq -s 'add // [] | map({tag_name, draft, prerelease, target_commitish, assets: ((.assets // []) | map({name, state, size, digest}))})' \
-              > "$TMP_DIR/releases.json"
-            gh api --paginate "repos/$REPO/git/matching-refs/tags/v" \
-              | jq -s 'add // [] | map(.ref)' \
-              > "$TMP_DIR/tags.json"
+            gh api --paginate "repos/$REPO/releases?per_page=100" > "$TMP_DIR/releases.raw.json" || return 1
+            jq -s 'add // [] | map({tag_name, draft, prerelease, target_commitish, assets: ((.assets // []) | map({name, state, size, digest}))})' \
+              "$TMP_DIR/releases.raw.json" > "$TMP_DIR/releases.json" || return 1
+            gh api --paginate "repos/$REPO/git/matching-refs/tags/v" > "$TMP_DIR/tags.raw.json" || return 1
+            jq -s 'add // [] | map(.ref)' \
+              "$TMP_DIR/tags.raw.json" > "$TMP_DIR/tags.json" || return 1
           }
 
           find_newer_published_tag() {
-            refresh_repo_metadata
+            refresh_repo_metadata || return 1
             RELEASE_VERSION="$RELEASE_VERSION" TMP_DIR="$TMP_DIR" node -e '
               const fs = require("node:fs");
               const path = require("node:path");
@@ -407,7 +408,7 @@ jobs:
                 }
               }
               if (highest) process.stdout.write(highest);
-            '
+            ' || return 1
           }
 
           NEWER_TAG="$(find_newer_published_tag)"
