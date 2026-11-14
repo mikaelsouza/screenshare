@@ -2,17 +2,20 @@ import {
   app,
   BrowserWindow,
   Menu,
+  Notification,
   session,
   desktopCapturer,
   ipcMain,
   shell,
   type DesktopCapturerSource,
 } from "electron";
+import { NsisUpdater } from "electron-updater";
 import { matchProfile, type FollowProfile } from "./follow/profiles.js";
 import { createFollower, type Follower, type FollowStatus, type WindowSource } from "./follow/follower.js";
 import { buildPickerTemplate } from "./picker.js";
 import { createPidResolver } from "./audio/pid.js";
 import { createAudioSessionController } from "./audio/capture.js";
+import { createAutoUpdateController } from "./updater.js";
 import koffi from "koffi";
 import loopback from "loopback-capture";
 import path from "node:path";
@@ -290,6 +293,7 @@ async function initApplication(): Promise<void> {
     minHeight: 600,
     backgroundColor: "#121214",
     show: false,
+    ...(app.isPackaged ? {} : { icon: path.join(__dirname, "../assets/icon.ico") }),
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -357,6 +361,33 @@ async function initApplication(): Promise<void> {
   }
 }
 
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.screenshare.app");
+}
+
+const autoUpdate = createAutoUpdateController(
+  {
+    isPackaged: app.isPackaged,
+    platform: process.platform,
+    isDev,
+    isSmokeTest,
+  },
+  {
+    createUpdater: () => new NsisUpdater(),
+    notifyDownloaded: (version: string) => {
+      if (Notification.isSupported()) {
+        new Notification({
+          title: "Screenshare update ready",
+          body: `Version ${version} has been downloaded and will install when you close Screenshare.`,
+        }).show();
+      }
+    },
+    onError: (err: unknown) => {
+      console.warn("[updater] auto-update check failed:", err);
+    },
+  },
+);
+
 // Smoke tests use a throwaway profile so they neither collide with a running copy of the
 // app (single-instance lock) nor touch its data.
 if (isSmokeTest) {
@@ -386,10 +417,15 @@ if (!gotTheLock) {
     app.whenReady().then(async () => {
       setupMediaHandlers();
       await initApplication();
+      autoUpdate.start();
     }),
     "app startup",
   );
 }
+
+app.on("will-quit", () => {
+  autoUpdate.stop();
+});
 
 app.on("activate", () => {
   if (BrowserWindow.getAllWindows().length === 0) {

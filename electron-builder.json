@@ -8,26 +8,37 @@
   "files": [
     "dist/**/*",
     "dist-electron/**/*",
-    "package.json"
+    "package.json",
+    "!**/node_modules/zod{,/**}",
+    "!**/node_modules/loopback-capture/src{,/**}",
+    "!**/node_modules/loopback-capture/scripts{,/**}",
+    "!**/node_modules/loopback-capture/CMakeLists.txt"
   ],
   "asar": true,
   "asarUnpack": [
     "**/*.node"
   ],
   "npmRebuild": false,
+  "publish": [
+    {
+      "provider": "github",
+      "owner": "mikaelsouza",
+      "repo": "screenshare",
+      "releaseType": "release"
+    }
+  ],
   "win": {
+    "icon": "assets/icon.ico",
+    "verifyUpdateCodeSignature": false,
     "target": [
       {
         "target": "nsis",
-        "arch": ["x64"]
-      },
-      {
-        "target": "portable",
         "arch": ["x64"]
       }
     ]
   },
   "nsis": {
+    "artifactName": "${productName}-Setup-${version}.${ext}",
     "oneClick": false,
     "perMachine": false,
     "allowToChangeInstallationDirectory": true,
@@ -35,8 +46,5 @@
     "createStartMenuShortcut": true,
     "shortcutName": "Screenshare",
     "uninstallDisplayName": "Screenshare"
-  },
-  "portable": {
-    "artifactName": "${productName}-portable-${version}.${ext}"
   }
 }

@@ -70,15 +70,29 @@ function startStaticDistServer(): Promise<StaticServer> {
   });
 }
 
-async function resolveElectronPath(): Promise<string | undefined> {
+interface ResolvedElectron {
+  executablePath: string | undefined;
+  isPackagedBinary: boolean;
+}
+
+async function resolveElectronPath(): Promise<ResolvedElectron> {
   const fromEnv = process.env["ELECTRON_EXEC_PATH"];
-  if (fromEnv) return fromEnv;
+  if (fromEnv) {
+    const resolved = path.resolve(projectRoot, fromEnv);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`ELECTRON_EXEC_PATH does not exist: ${resolved}`);
+    }
+    return { executablePath: resolved, isPackagedBinary: true };
+  }
   try {
     const electronModule = (await import("electron")) as { default?: unknown };
     const candidate = electronModule.default ?? electronModule;
-    return typeof candidate === "string" ? candidate : undefined;
+    return {
+      executablePath: typeof candidate === "string" ? candidate : undefined,
+      isPackagedBinary: false,
+    };
   } catch {
-    return undefined;
+    return { executablePath: undefined, isPackagedBinary: false };
   }
 }
 
@@ -177,7 +191,7 @@ async function executeSmokeChecks(): Promise<void> {
   console.log("[smoke-test] Starting Electron Automated Smoke Check");
   console.log("[smoke-test] ========================================");
 
-  const executablePath = await resolveElectronPath();
+  const { executablePath, isPackagedBinary } = await resolveElectronPath();
   console.log("[smoke-test] Launching Electron app with playwright-core...");
   const consoleErrors: string[] = [];
   const pageErrors: string[] = [];
@@ -188,7 +202,7 @@ async function executeSmokeChecks(): Promise<void> {
 
   const app = await electron.launch({
     cwd: projectRoot,
-    args: ["."],
+    args: isPackagedBinary ? ["--smoke-test"] : [".", "--smoke-test"],
     ...(executablePath !== undefined ? { executablePath } : {}),
     env: buildSmokeEnv(targetUrl),
   });
@@ -228,13 +242,34 @@ async function executeSmokeChecks(): Promise<void> {
     await verifyRequiredSelectors(page);
     await verifyInputInteractions(page);
 
-    const preloadInfo = await page.evaluate(() => ({
-      isElectron: Boolean(window.electronAPI?.isElectron),
-      platform: window.electronAPI?.platform ?? null,
-    }));
+    const preloadInfo = await page.evaluate(() => {
+      const api = window.electronAPI;
+      return {
+        isElectron: api?.isElectron === true,
+        platform: typeof api?.platform === "string" ? api.platform : null,
+        hasOnFollowUpdate: typeof api?.onFollowUpdate === "function",
+        hasStopFollow: typeof api?.stopFollow === "function",
+        hasStartWindowAudio: typeof api?.startWindowAudio === "function",
+        hasStartSystemAudio: typeof api?.startSystemAudio === "function",
+        hasStopAudio: typeof api?.stopAudio === "function",
+        hasOnAudioPcm: typeof api?.onAudioPcm === "function",
+      };
+    });
     console.log(
       `[smoke-test] Preload context check: isElectron=${String(preloadInfo.isElectron)}, platform=${String(preloadInfo.platform)}`,
     );
+    if (
+      !preloadInfo.isElectron ||
+      preloadInfo.platform === null ||
+      !preloadInfo.hasOnFollowUpdate ||
+      !preloadInfo.hasStopFollow ||
+      !preloadInfo.hasStartWindowAudio ||
+      !preloadInfo.hasStartSystemAudio ||
+      !preloadInfo.hasStopAudio ||
+      !preloadInfo.hasOnAudioPcm
+    ) {
+      throw new Error(`Preload electronAPI bridge incomplete: ${JSON.stringify(preloadInfo)}`);
+    }
 
     verifyNoFatalErrors(pageErrors, consoleErrors);
 
