@@ -361,9 +361,11 @@ async function initApplication(): Promise<void> {
   }
 }
 
-if (process.platform === "win32") {
+if (process.platform === "win32" && app.isPackaged) {
   app.setAppUserModelId("com.screenshare.app");
 }
+
+const activeNotifications = new Set<Notification>();
 
 const autoUpdate = createAutoUpdateController(
   {
@@ -376,10 +378,15 @@ const autoUpdate = createAutoUpdateController(
     createUpdater: () => new NsisUpdater(),
     notifyDownloaded: (version: string) => {
       if (Notification.isSupported()) {
-        new Notification({
+        const notification = new Notification({
           title: "Screenshare update ready",
           body: `Version ${version} has been downloaded and will install when you close Screenshare.`,
-        }).show();
+        });
+        activeNotifications.add(notification);
+        notification.once("close", () => {
+          activeNotifications.delete(notification);
+        });
+        notification.show();
       }
     },
     onError: (err: unknown) => {
@@ -391,7 +398,13 @@ const autoUpdate = createAutoUpdateController(
 // Smoke tests use a throwaway profile so they neither collide with a running copy of the
 // app (single-instance lock) nor touch its data.
 if (isSmokeTest) {
-  app.setPath("userData", path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`));
+  const customSmokeDir = process.env["SMOKE_USER_DATA_DIR"];
+  app.setPath(
+    "userData",
+    customSmokeDir && customSmokeDir.length > 0
+      ? customSmokeDir
+      : path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`),
+  );
 }
 
 // Single instance lock
@@ -415,9 +428,9 @@ if (!gotTheLock) {
 
   runBackground(
     app.whenReady().then(async () => {
+      autoUpdate.start();
       setupMediaHandlers();
       await initApplication();
-      autoUpdate.start();
     }),
     "app startup",
   );

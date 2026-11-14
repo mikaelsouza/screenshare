@@ -13,6 +13,7 @@
 import { _electron as electron, type Page } from "playwright-core";
 import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -96,7 +97,7 @@ async function resolveElectronPath(): Promise<ResolvedElectron> {
   }
 }
 
-function buildSmokeEnv(targetUrl: string): Record<string, string> {
+function buildSmokeEnv(targetUrl: string, smokeUserDataDir: string): Record<string, string> {
   const envVars: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (value !== undefined) envVars[key] = value;
@@ -104,6 +105,7 @@ function buildSmokeEnv(targetUrl: string): Record<string, string> {
   envVars["ELECTRON_DEV"] = "0";
   envVars["NODE_ENV"] = "test";
   envVars["SMOKE_TEST"] = "1";
+  envVars["SMOKE_USER_DATA_DIR"] = smokeUserDataDir;
   envVars["SCREENSHARE_URL"] = targetUrl;
   return envVars;
 }
@@ -197,18 +199,22 @@ async function executeSmokeChecks(): Promise<void> {
   const pageErrors: string[] = [];
 
   const envUrl = process.env["SCREENSHARE_URL"];
-  const localServer = envUrl ? null : await startStaticDistServer();
-  const targetUrl = envUrl ?? localServer?.url ?? "http://127.0.0.1:8080";
-
-  const app = await electron.launch({
-    cwd: projectRoot,
-    args: isPackagedBinary ? ["--smoke-test"] : [".", "--smoke-test"],
-    ...(executablePath !== undefined ? { executablePath } : {}),
-    env: buildSmokeEnv(targetUrl),
-  });
-  console.log("[smoke-test] Electron process launched successfully.");
+  const smokeUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "screenshare-smoke-"));
+  let localServer: StaticServer | null = null;
+  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
 
   try {
+    localServer = envUrl ? null : await startStaticDistServer();
+    const targetUrl = envUrl ?? localServer?.url ?? "http://127.0.0.1:8080";
+
+    app = await electron.launch({
+      cwd: projectRoot,
+      args: isPackagedBinary ? ["--smoke-test"] : [".", "--smoke-test"],
+      ...(executablePath !== undefined ? { executablePath } : {}),
+      env: buildSmokeEnv(targetUrl, smokeUserDataDir),
+    });
+    console.log("[smoke-test] Electron process launched successfully.");
+
     console.log("[smoke-test] Waiting for BrowserWindow to open...");
     const page = await app.firstWindow();
     console.log("[smoke-test] BrowserWindow acquired.");
@@ -277,12 +283,19 @@ async function executeSmokeChecks(): Promise<void> {
     console.log("[smoke-test] ALL SMOKE CHECKS PASSED SUCCESSFULLY!");
     console.log("[smoke-test] ========================================");
   } finally {
-    console.log("[smoke-test] Closing Electron application...");
-    await app.close();
-    if (localServer) {
-      await new Promise<void>((r) => localServer.server.close(() => r()));
+    if (app) {
+      console.log("[smoke-test] Closing Electron application...");
+      await app.close();
+      console.log("[smoke-test] Electron application closed cleanly.");
     }
-    console.log("[smoke-test] Electron application closed cleanly.");
+    if (localServer) {
+      await new Promise<void>((r) => localServer?.server.close(() => r()));
+    }
+    try {
+      fs.rmSync(smokeUserDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    } catch {
+      // Best-effort cleanup if Windows holds a transient file handle
+    }
   }
 }
 

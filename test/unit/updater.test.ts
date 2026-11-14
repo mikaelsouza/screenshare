@@ -161,8 +161,8 @@ describe("createAutoUpdateController", () => {
     expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("can be restarted cleanly after stop()", async () => {
-    const { deps, mock } = makeDeps({ checkIntervalMs: 1_000 });
+  it("reuses a single UpdaterClient instance when restarted after stop()", async () => {
+    const { deps, mock, notifyDownloaded } = makeDeps({ checkIntervalMs: 1_000 });
     const controller = createAutoUpdateController(BASE_ENV, deps);
     expect(controller.start()).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
@@ -171,8 +171,45 @@ describe("createAutoUpdateController", () => {
     controller.stop();
     expect(controller.start()).toBe(true);
     await vi.advanceTimersByTimeAsync(0);
-    expect(deps.createUpdater).toHaveBeenCalledTimes(2);
+    expect(deps.createUpdater).toHaveBeenCalledTimes(1);
     expect(mock.checkForUpdates).toHaveBeenCalledTimes(2);
+
+    mock.emitDownloaded("1.0.5");
+    expect(notifyDownloaded).toHaveBeenCalledTimes(1);
+    expect(notifyDownloaded).toHaveBeenCalledWith("1.0.5");
+    controller.stop();
+  });
+
+  it("reports createUpdater errors without crashing and can recover on a later start()", async () => {
+    const initErr = new Error("bad semver");
+    const mock = makeMockUpdater();
+    const notifyDownloaded = vi.fn<(version: string) => void>();
+    const onError = vi.fn<(err: unknown) => void>();
+    const createUpdater = vi
+      .fn<() => UpdaterClient>()
+      .mockImplementationOnce(() => {
+        throw initErr;
+      })
+      .mockImplementationOnce(() => mock.client);
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+
+    const controller = createAutoUpdateController(BASE_ENV, {
+      createUpdater,
+      notifyDownloaded,
+      onError,
+      checkIntervalMs: 1_000,
+    });
+
+    expect(controller.start()).toBe(false);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(onError).toHaveBeenCalledWith(initErr);
+    expect(setIntervalSpy).not.toHaveBeenCalled();
+
+    expect(controller.start()).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(createUpdater).toHaveBeenCalledTimes(2);
+    expect(mock.checkForUpdates).toHaveBeenCalledTimes(1);
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
     controller.stop();
   });
 
@@ -206,34 +243,56 @@ describe("createAutoUpdateController", () => {
     controller.stop();
   });
 
-  it("awaits downloadPromise and forwards both checkForUpdates, downloadPromise, and event errors to onError", async () => {
+  it("deduplicates errors emitted and rethrown by AppUpdater while still forwarding primitives and event-only errors", async () => {
     const { deps, mock, onError } = makeDeps({ checkIntervalMs: 1_000 });
     const checkErr = new Error("network down");
     const downloadErr = new Error("sha512 mismatch");
 
     mock.checkForUpdates
-      .mockRejectedValueOnce(checkErr)
+      // Real AppUpdater.checkForUpdates emits 'error' AND rejects with the same Error object.
+      .mockImplementationOnce(async () => {
+        mock.emitError(checkErr);
+        throw checkErr;
+      })
+      // Real AppUpdater.downloadUpdate emits 'error' AND rejects downloadPromise with the same Error.
       .mockImplementationOnce(async () => ({
         downloadPromise: Promise.resolve().then(() => {
+          mock.emitError(downloadErr);
           throw downloadErr;
         }),
       }))
+      // Non-object rejections must bypass WeakSet tracking cleanly without throwing.
+      .mockRejectedValueOnce("primitive failure")
+      .mockRejectedValueOnce(null)
       .mockImplementationOnce(async () => ({ downloadPromise: Promise.resolve(["installer.exe"]) }));
 
     const controller = createAutoUpdateController(BASE_ENV, deps);
     controller.start();
     await vi.advanceTimersByTimeAsync(0);
+    expect(onError).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenNthCalledWith(1, checkErr);
 
     await vi.advanceTimersByTimeAsync(1_000);
+    expect(onError).toHaveBeenCalledTimes(2);
     expect(onError).toHaveBeenNthCalledWith(2, downloadErr);
 
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(onError).toHaveBeenCalledTimes(2);
+    expect(onError).toHaveBeenCalledTimes(3);
+    expect(onError).toHaveBeenNthCalledWith(3, "primitive failure");
 
-    const emittedErr = new Error("github 502");
-    mock.emitError(emittedErr);
-    expect(onError).toHaveBeenNthCalledWith(3, emittedErr);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onError).toHaveBeenCalledTimes(4);
+    expect(onError).toHaveBeenNthCalledWith(4, null);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(onError).toHaveBeenCalledTimes(4);
+
+    // Quit-time / event-only errors (no active checkForUpdates promise) still report once.
+    const quitErr = new Error("github 502");
+    mock.emitError(quitErr);
+    mock.emitError(quitErr);
+    expect(onError).toHaveBeenCalledTimes(5);
+    expect(onError).toHaveBeenNthCalledWith(5, quitErr);
 
     controller.stop();
   });

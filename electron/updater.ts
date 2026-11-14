@@ -60,19 +60,56 @@ export function createAutoUpdateController(
   let started = false;
   let stopped = false;
   let inFlight = false;
+  let client: UpdaterClient | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   const notifiedVersions = new Set<string>();
+  const reportedErrors = new WeakSet<object>();
 
-  async function checkOnce(client: UpdaterClient): Promise<void> {
+  function reportError(err: unknown): void {
+    if (typeof err === "object" && err !== null) {
+      if (reportedErrors.has(err)) return;
+      reportedErrors.add(err);
+    }
+    deps.onError(err);
+  }
+
+  function ensureClient(): UpdaterClient | null {
+    if (client !== null) return client;
+    let created: UpdaterClient;
+    try {
+      created = deps.createUpdater();
+    } catch (err: unknown) {
+      reportError(err);
+      return null;
+    }
+
+    created.autoDownload = true;
+    created.autoInstallOnAppQuit = true;
+    created.disableWebInstaller = true;
+
+    created.on("error", (err: Error) => {
+      reportError(err);
+    });
+    created.on("update-downloaded", (info: { readonly version: string }) => {
+      if (stopped || notifiedVersions.has(info.version)) return;
+      notifiedVersions.add(info.version);
+      deps.notifyDownloaded(info.version);
+    });
+
+    client = created;
+    return client;
+  }
+
+  async function checkOnce(activeClient: UpdaterClient): Promise<void> {
     if (inFlight || stopped) return;
     inFlight = true;
     try {
-      const res = await client.checkForUpdates();
+      const res = await activeClient.checkForUpdates();
       if (res?.downloadPromise) {
         await res.downloadPromise;
       }
     } catch (err: unknown) {
-      deps.onError(err);
+      reportError(err);
     } finally {
       inFlight = false;
     }
@@ -82,27 +119,16 @@ export function createAutoUpdateController(
     start(): boolean {
       if (!shouldEnableAutoUpdate(env)) return false;
       if (started) return true;
+      const activeClient = ensureClient();
+      if (activeClient === null) return false;
+
       started = true;
       stopped = false;
 
-      const client = deps.createUpdater();
-      client.autoDownload = true;
-      client.autoInstallOnAppQuit = true;
-      client.disableWebInstaller = true;
-
-      client.on("error", (err: Error) => {
-        deps.onError(err);
-      });
-      client.on("update-downloaded", (info: { readonly version: string }) => {
-        if (stopped || notifiedVersions.has(info.version)) return;
-        notifiedVersions.add(info.version);
-        deps.notifyDownloaded(info.version);
-      });
-
-      void checkOnce(client);
+      void checkOnce(activeClient);
       const intervalMs = deps.checkIntervalMs ?? DEFAULT_UPDATE_CHECK_INTERVAL_MS;
       timer = setInterval(() => {
-        void checkOnce(client);
+        void checkOnce(activeClient);
       }, intervalMs);
       timer.unref();
       return true;

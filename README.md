@@ -28,14 +28,16 @@ quiet; media flows directly peer-to-peer via WebRTC.
 Download the latest Windows x64 installer from
 [GitHub Releases](https://github.com/mikaelsouza/screenshare/releases/latest):
 
-- **`Screenshare-Setup-<version>.exe`** — per-user NSIS installer with Start Menu and
-  Desktop shortcuts. Checks GitHub Releases in the background and installs updates
+- **`Screenshare-Setup-<version>.exe`** — assisted NSIS installer (defaults to a
+  per-user install without admin rights, with an optional all-users mode and Start Menu
+  / Desktop shortcuts). Checks GitHub Releases in the background and installs updates
   automatically when you close the app.
 
-> **Windows SmartScreen:** Release binaries are not Authenticode-signed, so Windows may
-> prompt *"Windows protected your PC"* on first launch — click **More info** → **Run
-> anyway**. Each release includes `SHA256SUMS.txt` so you can verify file hashes before
-> running.
+> **Windows SmartScreen & update verification:** Release binaries and background
+> auto-updates are not Authenticode-signed yet, so Windows may prompt *"Windows protected
+> your PC"* on first launch — click **More info** → **Run anyway**. Auto-updates verify the
+> `SHA-512` digest in `latest.yml` from the GitHub Release; `SHA256SUMS.txt` is provided to
+> verify download integrity against corrupted or truncated transfers.
 
 ## Quick start
 
@@ -145,12 +147,14 @@ Picture-in-Picture, live stats, and fullscreen controls.
      `CodeQL` succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`.
      Existing desktop app installs pick up web/UI updates immediately because they load
      the hosted site.
-   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` watches pushes to
-     `main` that touch `electron/`, `electron-builder.json`, `tsconfig.electron.json`,
-     `assets/icon.*`, or Electron dependencies in `package.json`, verifies `CI` and
-     `CodeQL` succeeded, builds and smoke-tests the NSIS installer, and publishes a new
-     GitHub Release with `latest.yml` and `SHA256SUMS.txt` (or can be run manually via
-     `workflow_dispatch`).
+   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs after `CI`
+     succeeds on `main`, verifies `CodeQL` passed, checks Electron-relevant changes since
+     the latest tag (`electron/`, `electron-builder.json`, `tsconfig.electron.json`,
+     `assets/icon.*`, `.github/workflows/release-electron.yml`, or runtime/Electron entries
+     in `package.json` and `package-lock.json`), builds and smoke-tests the NSIS installer
+     in a read-only job, and publishes the GitHub Release (`latest.yml`, `.blockmap`, and
+     `SHA256SUMS.txt`) in an isolated release job (or via `workflow_dispatch` with an
+     optional `force` flag).
    - `npm run deploy` builds and deploys the Worker locally without running any checks.
 
 ## Development

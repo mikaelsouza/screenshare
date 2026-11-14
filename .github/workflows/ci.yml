@@ -117,13 +117,17 @@ jobs:
         shell: bash
         run: npm ci --legacy-peer-deps
 
-      - name: Package Electron app (unpacked Windows dir)
+      - name: Build Windows NSIS installer and unpacked app
         shell: bash
-        run: npm run electron:pack
+        run: npm run electron:build
 
-      - name: Verify update metadata and run smoke test on packaged binary
+      - name: Verify release metadata and run smoke test on packaged binary
         shell: bash
         run: |
           set -euo pipefail
-          test -f release/win-unpacked/resources/app-update.yml
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          test -f "release/win-unpacked/resources/app-update.yml"
+          test -f "release/Screenshare-Setup-${PKG_VERSION}.exe"
+          test -f "release/Screenshare-Setup-${PKG_VERSION}.exe.blockmap"
+          test -f "release/latest.yml"
           npm run electron:smoke:packaged

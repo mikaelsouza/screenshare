@@ -1,19 +1,18 @@
 name: Release Electron Desktop App
 
 on:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches:
       - main
-    paths:
-      - "electron/**"
-      - "electron-builder.json"
-      - "tsconfig.electron.json"
-      - "assets/icon.ico"
-      - "assets/icon.svg"
-      - "package.json"
-      - "package-lock.json"
-      - ".github/workflows/release-electron.yml"
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Publish a new patch release even when no Electron-relevant files changed"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,6 +24,7 @@ concurrency:
 jobs:
   prepare:
     name: Plan Electron Release
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,21 +41,33 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Determine release version and necessity
+      - name: Determine release version, scope, and workflow gates
         id: plan
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
 
           TARGET_SHA="$(git rev-parse HEAD)"
 
+          if [ "$EVENT_NAME" = "workflow_run" ] && [ -n "${WORKFLOW_HEAD_SHA:-}" ] && [ "$WORKFLOW_HEAD_SHA" != "$TARGET_SHA" ]; then
+            echo "Commit ${WORKFLOW_HEAD_SHA} is superseded by current main tip ${TARGET_SHA}; skipping release."
+            {
+              echo "should_release=false"
+              echo "version="
+              echo "target_sha=${TARGET_SHA}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           ALL_TAGS="$({
             git tag -l 'v*'
-            gh api "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true
+            gh api --paginate "repos/$REPO/releases?per_page=100" --jq '.[].tag_name' 2>/dev/null || true
           } | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV || true)"
 
           LATEST_TAG=""
@@ -63,8 +75,13 @@ jobs:
             LATEST_TAG="$(printf '%s\n' "$ALL_TAGS" | tail -n 1)"
           fi
 
+          FORCE_RELEASE="false"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${INPUT_FORCE:-false}" = "true" ]; then
+            FORCE_RELEASE="true"
+          fi
+
           SHOULD_RELEASE="false"
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] || [ -z "$LATEST_TAG" ]; then
+          if [ "$FORCE_RELEASE" = "true" ] || [ -z "$LATEST_TAG" ]; then
             SHOULD_RELEASE="true"
           elif ! git merge-base --is-ancestor "$LATEST_TAG" HEAD 2>/dev/null; then
             SHOULD_RELEASE="true"
@@ -72,21 +89,58 @@ jobs:
             CHANGED_FILES="$(git diff --name-only "${LATEST_TAG}..HEAD")"
             if printf '%s\n' "$CHANGED_FILES" | grep -qE '^(electron/|electron-builder\.json$|tsconfig\.electron\.json$|assets/icon\.(ico|svg)$|\.github/workflows/release-electron\.yml$)'; then
               SHOULD_RELEASE="true"
-            elif printf '%s\n' "$CHANGED_FILES" | grep -qx 'package.json'; then
+            elif printf '%s\n' "$CHANGED_FILES" | grep -Eq '^(package\.json|package-lock\.json)$'; then
               if LATEST_TAG="$LATEST_TAG" node -e '
                 const { execFileSync } = require("node:child_process");
                 const fs = require("node:fs");
-                const prev = JSON.parse(execFileSync("git", ["show", `${process.env.LATEST_TAG}:package.json`], { encoding: "utf8" }));
-                const curr = JSON.parse(fs.readFileSync("package.json", "utf8"));
-                const pick = (pkg) => ({
-                  version: pkg.version ?? null,
-                  main: pkg.main ?? null,
-                  dependencies: pkg.dependencies ?? {},
-                  overrides: pkg.overrides ?? {},
-                  electron: pkg.devDependencies?.electron ?? null,
-                  electronBuilder: pkg.devDependencies?.["electron-builder"] ?? null,
+
+                const readAtTag = (tag, filePath) => {
+                  try {
+                    return JSON.parse(execFileSync("git", ["show", `${tag}:${filePath}`], { encoding: "utf8" }));
+                  } catch {
+                    return null;
+                  }
+                };
+                const readCurrent = (filePath) => {
+                  try {
+                    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+                  } catch {
+                    return null;
+                  }
+                };
+                const pickPkg = (pkg) => ({
+                  version: pkg?.version ?? null,
+                  main: pkg?.main ?? null,
+                  dependencies: pkg?.dependencies ?? {},
+                  overrides: pkg?.overrides ?? {},
+                  electron: pkg?.devDependencies?.electron ?? null,
+                  electronBuilder: pkg?.devDependencies?.["electron-builder"] ?? null,
                 });
-                process.exit(JSON.stringify(pick(prev)) === JSON.stringify(pick(curr)) ? 1 : 0);
+                const pickLock = (lock) => {
+                  if (!lock?.packages) return null;
+                  const entries = [];
+                  for (const [name, info] of Object.entries(lock.packages)) {
+                    if (name === "") continue;
+                    const isPackagedRuntime = info && info.dev !== true;
+                    const isElectronTooling =
+                      name === "node_modules/electron" ||
+                      name === "node_modules/electron-builder";
+                    if (isPackagedRuntime || isElectronTooling) {
+                      entries.push([name, info?.version ?? null, info?.resolved ?? null, info?.integrity ?? null]);
+                    }
+                  }
+                  entries.sort((a, b) => a[0].localeCompare(b[0]));
+                  return entries;
+                };
+
+                const tag = process.env.LATEST_TAG;
+                const pkgChanged =
+                  JSON.stringify(pickPkg(readAtTag(tag, "package.json"))) !==
+                  JSON.stringify(pickPkg(readCurrent("package.json")));
+                const lockChanged =
+                  JSON.stringify(pickLock(readAtTag(tag, "package-lock.json"))) !==
+                  JSON.stringify(pickLock(readCurrent("package-lock.json")));
+                process.exit(pkgChanged || lockChanged ? 0 : 1);
               '; then
                 SHOULD_RELEASE="true"
               fi
@@ -126,24 +180,20 @@ jobs:
             NEXT_VERSION="${BASE_MAJOR}.${BASE_MINOR}.${NEXT_PATCH}"
           fi
 
-          echo "Planning Electron release v${NEXT_VERSION} for commit ${TARGET_SHA} (previous tag: ${LATEST_TAG:-none})."
-          {
-            echo "should_release=true"
-            echo "version=${NEXT_VERSION}"
-            echo "target_sha=${TARGET_SHA}"
-          } >> "$GITHUB_OUTPUT"
+          if [ -n "$LATEST_TAG" ]; then
+            if ! NEXT_VERSION="$NEXT_VERSION" LATEST_TAG="$LATEST_TAG" node -e '
+              const parse = (v) => v.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10));
+              const [na, nb, nc] = parse(process.env.NEXT_VERSION);
+              const [la, lb, lc] = parse(process.env.LATEST_TAG);
+              const gt = na > la || (na === la && (nb > lb || (nb === lb && nc > lc)));
+              process.exit(gt ? 0 : 1);
+            '; then
+              echo "::error::Computed version v${NEXT_VERSION} would regress below latest release ${LATEST_TAG}."
+              exit 1
+            fi
+          fi
 
-      - name: Verify CI and CodeQL passed for target commit
-        if: steps.plan.outputs.should_release == 'true'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          TARGET_SHA: ${{ steps.plan.outputs.target_sha }}
-        run: |
-          set -euo pipefail
           echo "Verifying CI and CodeQL status for target commit: $TARGET_SHA"
-
           for WORKFLOW_FILE in "ci.yml" "codeql.yml"; do
             ATTEMPTS=0
             while true; do
@@ -156,12 +206,21 @@ jobs:
                   echo "$WORKFLOW_FILE succeeded for $TARGET_SHA."
                   break
                 fi
+                if [ "$CONCLUSION" = "cancelled" ] || [ "$CONCLUSION" = "skipped" ]; then
+                  echo "$WORKFLOW_FILE completed with conclusion '$CONCLUSION' for $TARGET_SHA; skipping release."
+                  {
+                    echo "should_release=false"
+                    echo "version="
+                    echo "target_sha=${TARGET_SHA}"
+                  } >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
                 echo "::error::$WORKFLOW_FILE completed with conclusion '$CONCLUSION' for $TARGET_SHA."
                 exit 1
               fi
 
               ATTEMPTS=$((ATTEMPTS + 1))
-              if [ "$ATTEMPTS" -ge 90 ]; then
+              if [ "$ATTEMPTS" -ge 60 ]; then
                 echo "::error::Timed out waiting for $WORKFLOW_FILE on $TARGET_SHA (last status: $STATUS)."
                 exit 1
               fi
@@ -169,13 +228,20 @@ jobs:
             done
           done
 
-  release:
-    name: Build & Publish Windows Release
+          echo "Planning Electron release v${NEXT_VERSION} for commit ${TARGET_SHA} (previous tag: ${LATEST_TAG:-none})."
+          {
+            echo "should_release=true"
+            echo "version=${NEXT_VERSION}"
+            echo "target_sha=${TARGET_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build & Smoke-Test Windows Installer
     needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
     runs-on: windows-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout target commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -216,12 +282,39 @@ jobs:
           npm run electron:smoke:packaged
           (
             cd release
-            sha256sum \
+            sha256sum -b \
               "Screenshare-Setup-${RELEASE_VERSION}.exe" \
+              "Screenshare-Setup-${RELEASE_VERSION}.exe.blockmap" \
               "latest.yml" > SHA256SUMS.txt
           )
 
-      - name: Publish GitHub Release
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-release-assets
+          path: |
+            release/Screenshare-Setup-${{ needs.prepare.outputs.version }}.exe
+            release/Screenshare-Setup-${{ needs.prepare.outputs.version }}.exe.blockmap
+            release/latest.yml
+            release/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    if: ${{ needs.prepare.outputs.should_release == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-release-assets
+          path: dist-release
+
+      - name: Verify checksums and publish GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -230,14 +323,38 @@ jobs:
           TARGET_SHA: ${{ needs.prepare.outputs.target_sha }}
         run: |
           set -euo pipefail
+
+          if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid RELEASE_VERSION: '$RELEASE_VERSION'"
+            exit 1
+          fi
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid TARGET_SHA: '$TARGET_SHA'"
+            exit 1
+          fi
+
+          (
+            cd dist-release
+            sha256sum -c SHA256SUMS.txt
+          )
+
           TAG="v${RELEASE_VERSION}"
-          gh release create "$TAG" \
-            "release/Screenshare-Setup-${RELEASE_VERSION}.exe" \
-            "release/Screenshare-Setup-${RELEASE_VERSION}.exe.blockmap" \
-            "release/latest.yml" \
-            "release/SHA256SUMS.txt" \
-            --repo "$REPO" \
-            --target "$TARGET_SHA" \
-            --title "Screenshare Desktop ${TAG}" \
-            --generate-notes \
-            --latest
+          ASSETS=(
+            "dist-release/Screenshare-Setup-${RELEASE_VERSION}.exe"
+            "dist-release/Screenshare-Setup-${RELEASE_VERSION}.exe.blockmap"
+            "dist-release/latest.yml"
+            "dist-release/SHA256SUMS.txt"
+          )
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading assets with --clobber and publishing as latest."
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$REPO"
+            gh release edit "$TAG" --draft=false --latest --repo "$REPO"
+          else
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --repo "$REPO" \
+              --target "$TARGET_SHA" \
+              --title "Screenshare Desktop ${TAG}" \
+              --generate-notes \
+              --latest
+          fi

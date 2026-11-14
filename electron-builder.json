@@ -29,7 +29,6 @@
   ],
   "win": {
     "icon": "assets/icon.ico",
-    "verifyUpdateCodeSignature": false,
     "target": [
       {
         "target": "nsis",
