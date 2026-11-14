@@ -243,11 +243,23 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Checkout target commit
+      - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.prepare.outputs.target_sha }}
+          ref: main
           persist-credentials: false
+
+      - name: Verify checked-out commit matches planned target SHA
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.target_sha }}
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA="$(git rev-parse HEAD)"
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::main advanced from ${EXPECTED_SHA} to ${ACTUAL_SHA} before build checkout; deferring to newer CI run."
+            exit 1
+          fi
 
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
