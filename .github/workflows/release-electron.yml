@@ -345,11 +345,6 @@ jobs:
             exit 1
           fi
 
-          (
-            cd dist-release
-            sha256sum -c SHA256SUMS.txt
-          )
-
           TAG="v${RELEASE_VERSION}"
           ASSETS=(
             "dist-release/Screenshare-Setup-${RELEASE_VERSION}.exe"
@@ -357,12 +352,210 @@ jobs:
             "dist-release/latest.yml"
             "dist-release/SHA256SUMS.txt"
           )
+          for ASSET in "${ASSETS[@]}"; do
+            test -f "$ASSET"
+          done
 
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; uploading assets with --clobber and publishing as latest."
+          (
+            cd dist-release
+            sha256sum -c SHA256SUMS.txt
+          )
+
+          TMP_DIR="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DIR"' EXIT
+
+          refresh_repo_metadata() {
+            gh api --paginate "repos/$REPO/releases?per_page=100" \
+              | jq -s 'add // [] | map({tag_name, draft, prerelease, target_commitish, assets: ((.assets // []) | map({name, state, size, digest}))})' \
+              > "$TMP_DIR/releases.json"
+            gh api --paginate "repos/$REPO/git/matching-refs/tags/v" \
+              | jq -s 'add // [] | map(.ref)' \
+              > "$TMP_DIR/tags.json"
+          }
+
+          find_newer_published_tag() {
+            refresh_repo_metadata
+            RELEASE_VERSION="$RELEASE_VERSION" TMP_DIR="$TMP_DIR" node -e '
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const parse = (v) => {
+                const m = /^v?([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(v || "");
+                return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+              };
+              const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+              const target = parse(process.env.RELEASE_VERSION);
+              const releases = JSON.parse(fs.readFileSync(path.join(process.env.TMP_DIR, "releases.json"), "utf8"));
+              const tags = JSON.parse(fs.readFileSync(path.join(process.env.TMP_DIR, "tags.json"), "utf8"));
+              const candidates = new Set();
+              for (const r of releases) {
+                if (r && !r.draft && !r.prerelease && typeof r.tag_name === "string") {
+                  candidates.add(r.tag_name);
+                }
+              }
+              for (const ref of tags) {
+                if (typeof ref === "string" && ref.startsWith("refs/tags/")) {
+                  candidates.add(ref.slice("refs/tags/".length));
+                }
+              }
+              let highest = null;
+              let highestParsed = target;
+              for (const tag of candidates) {
+                const parsed = parse(tag);
+                if (parsed && cmp(parsed, highestParsed) > 0) {
+                  highest = tag;
+                  highestParsed = parsed;
+                }
+              }
+              if (highest) process.stdout.write(highest);
+            '
+          }
+
+          NEWER_TAG="$(find_newer_published_tag)"
+          if [ -n "$NEWER_TAG" ]; then
+            echo "::warning::Skipping stale release ${TAG}: newer release ${NEWER_TAG} is already published."
+            exit 0
+          fi
+
+          TAG_EXISTS="$(jq -r --arg ref "refs/tags/${TAG}" 'any(.[]; . == $ref)' "$TMP_DIR/tags.json")"
+          if [ "$TAG_EXISTS" = "true" ]; then
+            EXISTING_TAG_SHA="$(gh api "repos/$REPO/commits/refs/tags/$TAG" --jq '.sha')"
+            if [ "$EXISTING_TAG_SHA" != "$TARGET_SHA" ]; then
+              echo "::error::Tag ${TAG} already points to ${EXISTING_TAG_SHA}, expected ${TARGET_SHA}; refusing to modify release."
+              exit 1
+            fi
+          fi
+
+          INSPECTION="$(
+            TAG="$TAG" \
+            TARGET_SHA="$TARGET_SHA" \
+            RELEASE_VERSION="$RELEASE_VERSION" \
+            TMP_DIR="$TMP_DIR" \
+            node -e '
+              const crypto = require("node:crypto");
+              const fs = require("node:fs");
+              const path = require("node:path");
+
+              const tag = process.env.TAG;
+              const targetSha = process.env.TARGET_SHA;
+              const version = process.env.RELEASE_VERSION;
+              const tmpDir = process.env.TMP_DIR;
+              const expectedFiles = [
+                `dist-release/Screenshare-Setup-${version}.exe`,
+                `dist-release/Screenshare-Setup-${version}.exe.blockmap`,
+                "dist-release/latest.yml",
+                "dist-release/SHA256SUMS.txt",
+              ];
+              const localByName = new Map();
+              for (const filePath of expectedFiles) {
+                const buf = fs.readFileSync(filePath);
+                const sha256 = crypto.createHash("sha256").update(buf).digest("hex");
+                localByName.set(path.basename(filePath), { filePath, size: buf.length, sha256 });
+              }
+
+              const allReleases = JSON.parse(fs.readFileSync(path.join(tmpDir, "releases.json"), "utf8"));
+              const releases = allReleases.filter((r) => r && r.tag_name === tag);
+              if (releases.length === 0) {
+                process.stdout.write(JSON.stringify({ state: "missing", missingFiles: expectedFiles }));
+                process.exit(0);
+              }
+              if (releases.length > 1) {
+                console.error(`::error::Multiple releases found for ${tag}; clean up duplicate drafts before retrying.`);
+                process.exit(1);
+              }
+
+              const rel = releases[0];
+              if (rel.prerelease) {
+                console.error(`::error::Existing release ${tag} is marked as prerelease; refusing to modify.`);
+                process.exit(1);
+              }
+              if (rel.draft) {
+                if (rel.target_commitish !== targetSha) {
+                  console.error(`::error::Draft release ${tag} targets ${rel.target_commitish}, expected ${targetSha}.`);
+                  process.exit(1);
+                }
+                process.stdout.write(JSON.stringify({ state: "draft", missingFiles: expectedFiles }));
+                process.exit(0);
+              }
+
+              const remoteAssets = Array.isArray(rel.assets) ? rel.assets : [];
+              const seenNames = new Set();
+              for (const asset of remoteAssets) {
+                const expected = localByName.get(asset.name);
+                if (!expected) {
+                  console.error(`::error::Published release ${tag} contains unexpected asset ${asset.name}; refusing to modify immutable release.`);
+                  process.exit(1);
+                }
+                if (asset.state !== "uploaded") {
+                  console.error(`::error::Published release ${tag} contains incomplete asset ${asset.name} (state: ${asset.state}).`);
+                  process.exit(1);
+                }
+                if (asset.size !== expected.size) {
+                  console.error(`::error::Published release ${tag} asset ${asset.name} size (${asset.size}) differs from built artifact (${expected.size}).`);
+                  process.exit(1);
+                }
+                if (typeof asset.digest === "string" && asset.digest !== `sha256:${expected.sha256}`) {
+                  console.error(`::error::Published release ${tag} asset ${asset.name} digest (${asset.digest}) differs from built artifact (sha256:${expected.sha256}).`);
+                  process.exit(1);
+                }
+                seenNames.add(asset.name);
+              }
+
+              const missingFiles = [];
+              for (const [name, info] of localByName.entries()) {
+                if (!seenNames.has(name)) {
+                  missingFiles.push(info.filePath);
+                }
+              }
+              process.stdout.write(JSON.stringify({ state: "published", missingFiles }));
+            '
+          )"
+
+          RELEASE_STATE="$(printf '%s' "$INSPECTION" | jq -r '.state')"
+          mapfile -t MISSING_ASSETS < <(printf '%s' "$INSPECTION" | jq -r '.missingFiles[]')
+
+          if [ "$RELEASE_STATE" = "published" ]; then
+            if [ "$TAG_EXISTS" != "true" ]; then
+              echo "::error::Published release ${TAG} is missing git tag refs/tags/${TAG}; refusing to modify."
+              exit 1
+            fi
+            if [ "${#MISSING_ASSETS[@]}" -gt 0 ]; then
+              echo "Release ${TAG} exists with verified partial assets; uploading ${#MISSING_ASSETS[@]} missing asset(s)."
+              gh release upload "$TAG" "${MISSING_ASSETS[@]}" --repo "$REPO"
+            else
+              echo "Release ${TAG} already exists with all verified assets."
+            fi
+
+            NEWER_TAG="$(find_newer_published_tag)"
+            if [ -n "$NEWER_TAG" ]; then
+              echo "::warning::Newer release ${NEWER_TAG} is already published; leaving latest release unchanged."
+              exit 0
+            fi
+
+            CURRENT_LATEST_TAG=""
+            if LATEST_JSON="$(gh api "repos/$REPO/releases/latest" 2>/dev/null)"; then
+              CURRENT_LATEST_TAG="$(printf '%s' "$LATEST_JSON" | jq -r '.tag_name // empty')"
+            fi
+            if [ "$CURRENT_LATEST_TAG" != "$TAG" ]; then
+              gh release edit "$TAG" --latest --repo "$REPO"
+            fi
+          elif [ "$RELEASE_STATE" = "draft" ]; then
+            echo "Draft release ${TAG} exists for ${TARGET_SHA}; uploading verified assets and promoting."
             gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$REPO"
+
+            NEWER_TAG="$(find_newer_published_tag)"
+            if [ -n "$NEWER_TAG" ]; then
+              echo "::warning::Newer release ${NEWER_TAG} was published before ${TAG} promotion; leaving draft ${TAG} unpublished."
+              exit 0
+            fi
+
             gh release edit "$TAG" --draft=false --latest --repo "$REPO"
           else
+            NEWER_TAG="$(find_newer_published_tag)"
+            if [ -n "$NEWER_TAG" ]; then
+              echo "::warning::Skipping stale release ${TAG}: newer release ${NEWER_TAG} is already published."
+              exit 0
+            fi
+
             gh release create "$TAG" "${ASSETS[@]}" \
               --repo "$REPO" \
               --target "$TARGET_SHA" \
