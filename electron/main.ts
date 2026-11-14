@@ -420,6 +420,9 @@ if (!gotTheLock) {
   );
   app.quit();
 } else {
+  // Suppress Electron's default File/Edit/View/Window/Help menu bar.
+  Menu.setApplicationMenu(null);
+
   app.on("second-instance", () => {
     if (mainWindow) {
       if (mainWindow.isMinimized()) mainWindow.restore();

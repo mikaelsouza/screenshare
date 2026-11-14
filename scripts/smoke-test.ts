@@ -10,7 +10,7 @@
  * 6. Gracefully close the application.
  */
 
-import { _electron as electron, type Page } from "playwright-core";
+import { _electron as electron, type ElectronApplication, type Page } from "playwright-core";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -174,6 +174,23 @@ async function verifyInputInteractions(page: Page): Promise<void> {
   }
 }
 
+async function verifyMenuBarRemoved(app: ElectronApplication): Promise<void> {
+  console.log("[smoke-test] Verifying Electron menu bar is removed...");
+  const menuState = await app.evaluate(({ Menu, BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows()[0];
+    return {
+      hasApplicationMenu: Menu.getApplicationMenu() !== null,
+      isMenuBarVisible:
+        process.platform !== "darwin" && win ? win.isMenuBarVisible() : false,
+    };
+  });
+  if (menuState.hasApplicationMenu || menuState.isMenuBarVisible) {
+    throw new Error(
+      `Expected Electron menu bar to be removed, got ${JSON.stringify(menuState)}`,
+    );
+  }
+}
+
 function verifyNoFatalErrors(pageErrors: readonly string[], consoleErrors: readonly string[]): void {
   if (pageErrors.length > 0) {
     throw new Error(
@@ -238,6 +255,8 @@ async function executeSmokeChecks(): Promise<void> {
 
     await page.waitForLoadState("domcontentloaded");
     console.log("[smoke-test] DOMContentLoaded event received.");
+
+    await verifyMenuBarRemoved(app);
 
     const windowTitle = await page.title();
     console.log(`[smoke-test] Window title: "${windowTitle}"`);
