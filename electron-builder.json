@@ -2,18 +2,28 @@
   "$schema": "https://raw.githubusercontent.com/electron-userland/electron-builder/master/packages/app-builder-lib/scheme.json",
   "appId": "com.screenshare.app",
   "productName": "Screenshare",
+  "compression": "maximum",
+  "electronLanguages": ["en-US"],
   "directories": {
     "output": "release",
     "buildResources": "assets"
   },
   "files": [
-    "dist/**/*",
     "dist-electron/**/*",
+    "!dist-electron/**/*.d.{ts,cts}",
     "package.json",
     "!**/node_modules/zod{,/**}",
     "!**/node_modules/loopback-capture/src{,/**}",
     "!**/node_modules/loopback-capture/scripts{,/**}",
-    "!**/node_modules/loopback-capture/CMakeLists.txt"
+    "!**/node_modules/loopback-capture/CMakeLists.txt",
+    "!**/node_modules/loopback-capture/prebuilds/linux-*{,/**}",
+    "!**/node_modules/koffi/doc{,/**}",
+    "!**/node_modules/koffi/lib{,/**}",
+    "!**/node_modules/koffi/vendor{,/**}",
+    "!**/node_modules/koffi/cnoke.cjs",
+    "!**/node_modules/koffi/src/koffi/CMakeLists.txt",
+    "!**/node_modules/koffi/src/koffi/src/abi{,/**}",
+    "!**/node_modules/koffi/src/koffi/src/*.{cc,hh,inc,def}"
   ],
   "asar": true,
   "asarUnpack": [
