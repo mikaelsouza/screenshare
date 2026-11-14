@@ -3,6 +3,9 @@ import fc from "fast-check";
 import {
   parseClientMessage,
   parseServerMessage,
+  parseInviteInput,
+  isValidRoomCode,
+  isValidRoomPassword,
   type ClientMessage,
   MAX_SDP_LENGTH,
   MAX_CANDIDATE_LENGTH,
@@ -27,7 +30,9 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
 
         if (result !== null) {
           expect(typeof result).toBe("object");
-          expect(["join", "signal", "state", "kick", "lock"]).toContain(result.t);
+          expect(["join", "signal", "state", "kick", "lock", "rotate-password", "rename"]).toContain(
+            result.t,
+          );
         }
         return true;
       }),
@@ -76,6 +81,10 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
   function assertJoinInvariants(result: Extract<ReturnType<typeof parseClientMessage>, { t: "join" }>): void {
     expect(typeof result.room).toBe("string");
     expect(typeof result.displayName).toBe("string");
+    if (result.password !== undefined) {
+      expect(typeof result.password).toBe("string");
+      expect(result.password.length).toBeLessThanOrEqual(128);
+    }
     if (result.hostToken !== undefined) {
       expect(typeof result.hostToken).toBe("string");
       expect(result.hostToken.length).toBeLessThanOrEqual(64);
@@ -128,7 +137,12 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         else if (result.t === "signal") assertSignalInvariants(result);
         else if (result.t === "state") expect(typeof result.sharing).toBe("boolean");
         else if (result.t === "kick") expect(PEER_ID_REGEX.test(result.id)).toBe(true);
-        else expect(typeof result.locked).toBe("boolean");
+        else if (result.t === "lock") expect(typeof result.locked).toBe("boolean");
+        else if (result.t === "rotate-password") expect(result.t).toBe("rotate-password");
+        else {
+          expect(typeof result.displayName).toBe("string");
+          expect(result.displayName.length).toBeLessThanOrEqual(128);
+        }
 
         return true;
       }),
@@ -144,6 +158,9 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
       "signal",
       "peer-state",
       "room-state",
+      "room-password",
+      "peer-renamed",
+      "host-promoted",
       "error",
     ];
 
@@ -167,7 +184,13 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         from: fc.string(),
         locked: fc.boolean(),
         sharing: fc.boolean(),
-        code: fc.constantFrom("room-full", "bad-message", "invalid-code"),
+        code: fc.constantFrom(
+          "room-full",
+          "bad-message",
+          "bad-password",
+          "session-replaced",
+          "invalid-code",
+        ),
         message: fc.string(),
       }),
     );
@@ -177,6 +200,23 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         const res = parseServerMessage(JSON.stringify(payload));
         if (res !== null) {
           expect(validTypes).toContain(res.t);
+        }
+        return true;
+      }),
+      { numRuns: 500 },
+    );
+  });
+
+  it("parseInviteInput never throws and always produces valid credentials or a known failure reason", () => {
+    const validReasons = ["empty", "url-missing-invite", "missing-secret", "invalid"];
+    fc.assert(
+      fc.property(fc.string(), (raw) => {
+        const res = parseInviteInput(raw);
+        if (res.ok) {
+          expect(isValidRoomCode(res.code)).toBe(true);
+          expect(isValidRoomPassword(res.password)).toBe(true);
+        } else {
+          expect(validReasons).toContain(res.reason);
         }
         return true;
       }),

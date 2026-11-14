@@ -1,8 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   computeVolumeState,
+  deriveInviteMenuState,
   deriveOutboundAudioState,
   deriveViewState,
+  describeInviteParseFailure,
+  formatJoinChipText,
+  maskInviteSecret,
   nextPopoverState,
   shouldRequestRemoteVideo,
   sortAndFormatRoster,
@@ -146,10 +150,20 @@ describe("deriveOutboundAudioState", () => {
 });
 
 describe("nextPopoverState", () => {
-  it("opens a popover when closed and closes it when toggled again", () => {
-    const opened = nextPopoverState(null, "roster", true, false);
+  it("opens invite and roster when connected and closes when toggled again", () => {
+    const inviteOpened = nextPopoverState(null, "invite", true, false);
+    expect(inviteOpened).toEqual({
+      active: "invite",
+      inviteOpen: true,
+      rosterOpen: false,
+      presetOpen: false,
+      codecOpen: false,
+      degradationOpen: false,
+    });
+    const opened = nextPopoverState("invite", "roster", true, false);
     expect(opened).toEqual({
       active: "roster",
+      inviteOpen: false,
       rosterOpen: true,
       presetOpen: false,
       codecOpen: false,
@@ -158,6 +172,7 @@ describe("nextPopoverState", () => {
     const closed = nextPopoverState("roster", "roster", true, false);
     expect(closed).toEqual({
       active: null,
+      inviteOpen: false,
       rosterOpen: false,
       presetOpen: false,
       codecOpen: false,
@@ -169,6 +184,7 @@ describe("nextPopoverState", () => {
     const preset = nextPopoverState("roster", "preset", true, true);
     expect(preset).toEqual({
       active: "preset",
+      inviteOpen: false,
       rosterOpen: false,
       presetOpen: true,
       codecOpen: false,
@@ -177,6 +193,7 @@ describe("nextPopoverState", () => {
     const codec = nextPopoverState("preset", "codec", true, true);
     expect(codec).toEqual({
       active: "codec",
+      inviteOpen: false,
       rosterOpen: false,
       presetOpen: false,
       codecOpen: true,
@@ -185,6 +202,7 @@ describe("nextPopoverState", () => {
     const degradation = nextPopoverState("codec", "degradation", true, true);
     expect(degradation).toEqual({
       active: "degradation",
+      inviteOpen: false,
       rosterOpen: false,
       presetOpen: false,
       codecOpen: false,
@@ -193,6 +211,7 @@ describe("nextPopoverState", () => {
     const closedAll = nextPopoverState("degradation", null, true, true);
     expect(closedAll).toEqual({
       active: null,
+      inviteOpen: false,
       rosterOpen: false,
       presetOpen: false,
       codecOpen: false,
@@ -200,7 +219,8 @@ describe("nextPopoverState", () => {
     });
   });
 
-  it("refuses to open roster when disconnected or preset/codec/degradation when not sharing", () => {
+  it("refuses to open invite/roster when disconnected or preset/codec/degradation when not sharing", () => {
+    expect(nextPopoverState(null, "invite", false, true).active).toBeNull();
     expect(nextPopoverState(null, "roster", false, true).active).toBeNull();
     expect(nextPopoverState(null, "preset", true, false).active).toBeNull();
     expect(nextPopoverState(null, "codec", true, false).active).toBeNull();
@@ -331,5 +351,154 @@ describe("sortAndFormatRoster", () => {
     expect(res.entries[1]?.name).toBe("Anonymous");
     expect(res.entries[1]?.shortId).toBe("#peer");
     expect(res.entries[1]?.canKick).toBe(false);
+    expect(res.entries[0]?.duplicateName).toBe(true);
+    expect(res.entries[1]?.duplicateName).toBe(true);
+  });
+
+  it("marks newPeerIds, detects case-insensitive duplicate names, and synthesizes extraPeerIds", () => {
+    const members = new Map([
+      ["bbbb1111-0000-4000-8000-000000000000", { name: "  ALICE ", sharing: false, host: false }],
+    ]);
+    const res = sortAndFormatRoster(
+      "self0000-0000-4000-8000-000000000000",
+      "alice",
+      false,
+      false,
+      false,
+      members,
+      {
+        newPeerIds: new Set([
+          "self0000-0000-4000-8000-000000000000",
+          "bbbb1111-0000-4000-8000-000000000000",
+          "cccc2222-0000-4000-8000-000000000000",
+        ]),
+        extraPeerIds: [
+          "self0000-0000-4000-8000-000000000000",
+          "bbbb1111-0000-4000-8000-000000000000",
+          "cccc2222-0000-4000-8000-000000000000",
+        ],
+      },
+    );
+    expect(res.totalCount).toBe(3);
+    expect(res.entries.find((e) => e.self)?.isNew).toBe(false);
+    expect(res.entries.find((e) => e.self)?.duplicateName).toBe(true);
+    const bbbb = res.entries.find((e) => e.id.startsWith("bbbb"));
+    expect(bbbb?.duplicateName).toBe(true);
+    expect(bbbb?.isNew).toBe(true);
+    const cccc = res.entries.find((e) => e.id.startsWith("cccc"));
+    expect(cccc?.name).toBe("Peer");
+    expect(cccc?.isNew).toBe(true);
+    expect(cccc?.duplicateName).toBe(false);
+  });
+});
+
+describe("deriveInviteMenuState & maskInviteSecret", () => {
+  it("masks the secret portion with 16 bullets while preserving the 8-char room code", () => {
+    expect(maskInviteSecret("ABCDEFGH")).toBe(`ABCDEFGH-${"\u2022".repeat(16)}`);
+  });
+
+  it("allows copying, revealing, and rotating for unlocked rooms when host", () => {
+    const masked = deriveInviteMenuState({
+      roomCode: "ABCDEFGH",
+      roomPassword: "SECRET23456789AB",
+      roomLocked: false,
+      isHost: true,
+      revealed: false,
+    });
+    expect(masked).toEqual({
+      canCopy: true,
+      canShow: true,
+      canRotate: true,
+      showLockedBanner: false,
+      displayCode: `ABCDEFGH-${"\u2022".repeat(16)}`,
+    });
+
+    const revealed = deriveInviteMenuState({
+      roomCode: "ABCDEFGH",
+      roomPassword: "SECRET23456789AB",
+      roomLocked: false,
+      isHost: true,
+      revealed: true,
+    });
+    expect(revealed.displayCode).toBe("ABCDEFGH-SECRET23456789AB");
+  });
+
+  it("disables copy/show and masks the code when room is locked, while preserving host rotate", () => {
+    const hostLocked = deriveInviteMenuState({
+      roomCode: "ABCDEFGH",
+      roomPassword: "SECRET23456789AB",
+      roomLocked: true,
+      isHost: true,
+      revealed: true,
+    });
+    expect(hostLocked).toEqual({
+      canCopy: false,
+      canShow: false,
+      canRotate: true,
+      showLockedBanner: true,
+      displayCode: `ABCDEFGH-${"\u2022".repeat(16)}`,
+    });
+
+    const guestLocked = deriveInviteMenuState({
+      roomCode: "ABCDEFGH",
+      roomPassword: null,
+      roomLocked: true,
+      isHost: false,
+      revealed: true,
+    });
+    expect(guestLocked).toEqual({
+      canCopy: false,
+      canShow: false,
+      canRotate: false,
+      showLockedBanner: true,
+      displayCode: `ABCDEFGH-${"\u2022".repeat(16)}`,
+    });
+  });
+
+  it("returns empty displayCode when roomCode is null", () => {
+    expect(
+      deriveInviteMenuState({
+        roomCode: null,
+        roomPassword: null,
+        roomLocked: false,
+        isHost: false,
+        revealed: false,
+      }),
+    ).toEqual({
+      canCopy: false,
+      canShow: false,
+      canRotate: false,
+      showLockedBanner: false,
+      displayCode: "",
+    });
+  });
+});
+
+describe("describeInviteParseFailure", () => {
+  it("maps every invite failure reason to user-facing lobby copy", () => {
+    expect(describeInviteParseFailure("empty")).toContain("Paste an invite link or code");
+    expect(describeInviteParseFailure("url-missing-invite")).toContain("#CODE-SECRET");
+    expect(describeInviteParseFailure("missing-secret")).toContain("CODE-SECRET");
+    expect(describeInviteParseFailure("invalid")).toContain("Invalid invite");
+  });
+});
+
+describe("formatJoinChipText", () => {
+  it("formats empty, single, pair, and 3+ coalesced arrivals cleanly", () => {
+    expect(formatJoinChipText([])).toBe("");
+    expect(formatJoinChipText([{ name: "Alice", shortId: "#1a2b" }])).toBe("Alice #1a2b joined");
+    expect(
+      formatJoinChipText([
+        { name: "Alice", shortId: "1a2b" },
+        { name: "Bob", shortId: "#3c4d" },
+      ]),
+    ).toBe("Alice #1a2b & Bob #3c4d joined");
+    expect(
+      formatJoinChipText([
+        { name: "Alice", shortId: "#1a2b" },
+        { name: "Bob", shortId: "#3c4d" },
+        { name: "Carol", shortId: "#5e6f" },
+      ]),
+    ).toBe("Alice #1a2b + 2 others joined");
   });
 });

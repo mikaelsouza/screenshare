@@ -79,10 +79,26 @@ async function openRoster(page: Page): Promise<void> {
   if (hidden) await page.click("#roster-btn");
 }
 
+async function openInvite(page: Page): Promise<void> {
+  const hidden = await page.evaluate(() => document.getElementById("invite-menu")?.hidden ?? true);
+  if (hidden) await page.click("#invite-btn");
+}
+
+async function readHostInvite(page: Page): Promise<string> {
+  await openInvite(page);
+  if ((await page.textContent("#invite-show-btn")) === "Show") {
+    await page.click("#invite-show-btn");
+  }
+  const value = ((await page.textContent("#invite-code-value")) ?? "").trim();
+  await page.click("#invite-btn");
+  return value;
+}
+
 const inRoom = (): boolean => Boolean(document.getElementById("status")?.textContent?.includes("In room"));
 
 await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   let code = "";
+  let inviteCode = "";
 
   before(async () => {
     server = await startServer(PORT);
@@ -102,8 +118,11 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       ];
       for (const [peerName, peerPage] of pages) {
         const st = await peerPage.textContent("#status").catch(() => "?");
+        const err = await peerPage.textContent("#lobby-error").catch(() => "?");
         const roster = await peerPage.textContent("#roster").catch(() => "?");
-        console.log(`# ${testCtx.name} :: ${peerName}: status=${JSON.stringify(st)} roster=${JSON.stringify(roster)}`);
+        console.log(
+          `# ${testCtx.name} :: ${peerName}: status=${JSON.stringify(st)} err=${JSON.stringify(err)} roster=${JSON.stringify(roster)}`,
+        );
       }
     }
   });
@@ -113,36 +132,88 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await stopServer(server);
   });
 
-  await it("creates a room with Create and displays the merged copy-link button", async () => {
+  await it("creates a room with Create and displays the 1C-2 invite menu", async () => {
     await host.click("#create");
     await waitFor(host, inRoom, { label: "host in the new room" });
-    code = await host.inputValue("#room-code");
-    assert.match(code, /^[A-Z2-9]{8}$/);
-    const copyText = await host.textContent("#copy-link");
-    assert.equal(copyText, `${code} · Copy link`);
+    assert.equal(await host.evaluate(() => window.location.hash), "", "URL hash must stay empty after Create");
+    assert.equal(await host.inputValue("#room-code"), "", "#room-code input should clear on join");
+
+    await openInvite(host);
+    const masked = ((await host.textContent("#invite-code-value")) ?? "").trim();
+    assert.match(masked, /^[A-Z2-9]{8}-\u2022{16}$/, "invite code must be masked by default");
+    assert.equal(await host.isVisible("#invite-rotate-btn"), true, "host should see Rotate button");
+    await host.click("#invite-show-btn");
+    inviteCode = ((await host.textContent("#invite-code-value")) ?? "").trim();
+    assert.match(inviteCode, /^[A-Z2-9]{8}-[A-Z2-9]{16}$/);
+    code = inviteCode.slice(0, 8);
+    await host.click("#invite-btn"); // close popover
+
     await openRoster(host);
     assert.equal(await host.isVisible("#lock-btn"), true, "the creator should be host");
+    await host.click("#roster-btn"); // close so incoming join lights unread dot
   });
 
-  await it("turns away an invalid room code and lets a valid room code in", async () => {
+  await it("shows inline lobby errors for invalid/wrong invites, lets valid invite in, and lights 2AB-2 join awareness", async () => {
     await joinWith(other, "BAD");
     await waitFor(
       other,
       () => {
-        const el = document.getElementById("status");
-        return Boolean(el && !el.hidden && /valid room code/i.test(el.textContent ?? ""));
+        const el = document.getElementById("lobby-error");
+        return Boolean(el && !el.hidden && /invalid/i.test(el.textContent ?? ""));
       },
-      { label: "invalid room code error to be shown" },
+      { label: "invalid invite error in #lobby-error" },
+    );
+    await joinWith(other, code);
+    await waitFor(
+      other,
+      () => {
+        const el = document.getElementById("lobby-error");
+        return Boolean(el && !el.hidden && /CODE-SECRET/i.test(el.textContent ?? ""));
+      },
+      { label: "missing secret error in #lobby-error" },
+    );
+    await joinWith(other, `${code}-23456789ABCDEFGH`);
+    await waitFor(
+      other,
+      () => {
+        const el = document.getElementById("lobby-error");
+        return Boolean(el && !el.hidden && /Invalid or expired room invite/i.test(el.textContent ?? ""));
+      },
+      { label: "wrong secret error in #lobby-error" },
     );
     assert.equal(await other.evaluate(() => window.__pcs.length), 0);
-    // Joining with the valid room code from the same page must succeed and hide #status again.
-    await joinWith(other, code);
-    await waitFor(other, inRoom, { label: "other in the room with the valid code" });
+
+    // Joining with the full CODE-SECRET invite succeeds and clears both #lobby-error and #status.
+    await host.bringToFront();
+    await joinWith(other, inviteCode);
+    await waitFor(other, inRoom, { label: "other in the room with the valid invite" });
     assert.equal(await other.evaluate(() => Boolean(document.getElementById("status")?.hidden)), true);
+    assert.equal(await other.evaluate(() => Boolean(document.getElementById("lobby-error")?.hidden)), true);
+
+    await waitFor(
+      host,
+      () => !document.getElementById("roster-unread-dot")?.hidden && !document.getElementById("join-chip")?.hidden,
+      { label: "host to see 2AB-2 unread dot and join chip" },
+    );
+    await openRoster(host);
+    assert.equal(
+      await host.evaluate(() => Boolean(document.getElementById("roster-unread-dot")?.hidden)),
+      true,
+      "opening roster clears unread dot",
+    );
+    await host.click("#roster-btn");
   });
 
-  await it("delivers video to someone who joins after sharing started", async () => {
+  await it("delivers video to someone who joins after sharing started and auto-remasks invite secret on share", async () => {
+    await openInvite(host);
+    await host.click("#invite-show-btn");
+    assert.equal(await host.textContent("#invite-show-btn"), "Hide");
     await host.click("#share");
+    await waitFor(
+      host,
+      () => (document.getElementById("invite-code-value")?.textContent ?? "").includes("\u2022"),
+      { label: "starting share auto-remasks revealed secret" },
+    );
     // The picker is asked for a window and never this tab, so a share does not
     // default to the whole screen or show the app to itself.
     const [opts] = await host.evaluate(() => window.__gdmOpts);
@@ -153,7 +224,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     const videoOpts = opts?.video as MediaTrackConstraints | undefined;
     assert.equal(videoOpts?.displaySurface, "window");
     await framesGrow(other, "other viewer");
-    await joinWith(late, code);
+    await joinWith(late, inviteCode);
     await waitFor(late, inRoom, { label: "late joiner in the room" });
     await framesGrow(late, "late joiner");
   });
@@ -220,57 +291,95 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
 
   await it("keeps the host a host across a page refresh", async () => {
     await host.reload();
-    // A refresh lands on /#CODE and automatically rejoins with the stored hostToken.
+    // A refresh auto-rejoins via sessionStorage.activeRoom and stored hostToken without URL hash.
     await waitFor(host, inRoom, { label: "host back in the room" });
     await openRoster(host);
     await waitFor(host, () => !document.getElementById("lock-btn")?.hidden, { label: "host controls after refresh" });
-    // The others see exactly one host, not a ghost of the old socket.
+    // The others see exactly one host role-badge, not a ghost of the old socket.
     await waitFor(
       other,
       () =>
-        [...document.querySelectorAll("#roster-list li")].filter((li) => (li.textContent ?? "").includes("(host)"))
+        [...document.querySelectorAll("#roster-list .role-badge")].filter((el) => el.textContent === "host")
           .length === 1,
       { label: "one host in the viewer's list" },
     );
   });
 
-  await it("does not let a removed person back in, and a locked room refuses newcomers", async () => {
+  await it("auto-rotates invite on removal, blocks removed member's old & new invite, and locks newcomers out", async () => {
     // The refresh above ended the host's share; nobody is sharing now.
     assert.equal(await host.textContent("#share"), "Share screen");
     await openRoster(host);
     await waitFor(host, () => document.querySelectorAll("#roster-list button").length === 2, {
       label: "Remove buttons for both others",
     });
+    const oldInvite = inviteCode;
     await host.click("#roster-list li:has-text('late') button");
-    await waitFor(late, () => (document.getElementById("status")?.textContent ?? "").includes("removed"), {
-      label: "late to be told it was removed",
-    });
+    await waitFor(
+      late,
+      () => {
+        const err = document.getElementById("lobby-error");
+        return Boolean(err && !err.hidden && (err.textContent ?? "").includes("removed"));
+      },
+      { label: "late to be told in #lobby-error it was removed" },
+    );
     // Removal cuts the media, not just the list entry.
     await waitFor(late, () => window.__pcs.every((pc) => pc.connectionState === "closed"), {
       label: "the removed person's connections to close",
     });
-    // Pressing Join again must not get back in.
-    await joinWith(late, code);
-    await waitFor(late, () => (document.getElementById("status")?.textContent ?? "").includes("removed"), {
-      label: "rejoin to be refused",
-    });
+    // Old invite link fails immediately due to auto-rotation on kick.
+    await joinWith(late, oldInvite);
+    await waitFor(
+      late,
+      () => {
+        const err = document.getElementById("lobby-error");
+        return Boolean(err && !err.hidden && /Invalid or expired room invite/i.test(err.textContent ?? ""));
+      },
+      { label: "kicked member using old link sees invalid invite" },
+    );
+
+    inviteCode = await readHostInvite(host);
+    assert.notEqual(inviteCode, oldInvite, "removing a peer must rotate the room secret");
+    // Even with the newly rotated invite, the removed IP is refused.
+    await joinWith(late, inviteCode);
+    await waitFor(
+      late,
+      () => {
+        const err = document.getElementById("lobby-error");
+        return Boolean(err && !err.hidden && (err.textContent ?? "").includes("removed"));
+      },
+      { label: "rejoin with new invite to be refused as removed" },
+    );
     assert.equal((await status(late)).includes("In room"), false);
 
+    await openRoster(host);
     await host.click("#lock-btn");
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Unlock room", {
       label: "room locked",
     });
-    // A newcomer from another browser profile. Every page here shares 127.0.0.1, so
-    // the removal ban would also refuse it; the lock message is what must win,
-    // or at least a refusal of some kind.
+    // Locked non-host member cannot view or copy the invite secret while locked.
+    await openInvite(other);
+    await waitFor(
+      other,
+      () =>
+        !document.getElementById("invite-locked-note")?.hidden &&
+        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.disabled === true &&
+        (document.getElementById("invite-show-btn") as HTMLButtonElement | null)?.disabled === true,
+      { label: "other sees invite disabled while room locked" },
+    );
+    await other.click("#invite-btn");
+
+    // A newcomer with the rotated invite must still be refused while locked (or IP-banned).
     const newcomer = await newPage("newcomer");
-    await joinWith(newcomer, code);
-    await waitFor(newcomer, () => /locked|removed/.test(document.getElementById("status")?.textContent ?? ""), {
-      label: "newcomer to be refused",
-    });
+    await joinWith(newcomer, inviteCode);
+    await waitFor(
+      newcomer,
+      () => {
+        const err = document.getElementById("lobby-error");
+        return Boolean(err && !err.hidden && /locked|removed/.test(err.textContent ?? ""));
+      },
+      { label: "newcomer to be refused" },
+    );
     assert.equal(await newcomer.evaluate(() => window.__pcs.length), 0);
-    // People already inside are unaffected.
-    assert.ok((await status(other)).length > 0);
     await waitFor(other, () => document.querySelectorAll("#roster-list li").length === 2, {
       label: "other still in the room with the host",
     });
@@ -289,20 +398,49 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     });
   });
 
-  await it("stops sharing when the sharer is removed", async () => {
+  await it("unlocks, rotates invites on demand, and stops sharing when the sharer is removed", async () => {
     await openRoster(host);
-    await host.click("#lock-btn"); // unlock, so a fresh page can come in to be removed
+    await host.click("#lock-btn"); // unlock
     await waitFor(host, () => document.getElementById("lock-btn")?.textContent === "Lock room", { label: "unlocked" });
+
+    // Other member regains copyable invite secret once unlocked, and host can rotate on demand.
+    await openInvite(other);
+    await waitFor(
+      other,
+      () =>
+        Boolean(document.getElementById("invite-locked-note")?.hidden) &&
+        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.disabled === false,
+      { label: "other regains invite controls after unlock" },
+    );
+    await other.click("#invite-btn");
+
+    const beforeRotate = inviteCode;
+    await openInvite(host);
+    await host.click("#invite-rotate-btn");
+    await waitFor(host, () => document.getElementById("invite-rotate-btn")?.textContent === "Rotated!", {
+      label: "host sees Rotated! feedback",
+    });
+    await host.click("#invite-show-btn");
+    inviteCode = ((await host.textContent("#invite-code-value")) ?? "").trim();
+    assert.notEqual(inviteCode, beforeRotate, "Rotate must mint a new invite secret");
+    await host.click("#invite-btn");
+
     // The removal ban is by address and every page here is 127.0.0.1, so the second
     // person to remove has to be someone already inside: the other member.
     await other.click("#share");
     await waitFor(host, () => document.querySelectorAll("#roster-list .badge").length === 1, {
       label: "host to see other sharing",
     });
+    await openRoster(host);
     await host.click("#roster-list li:has-text('other') button");
-    await waitFor(other, () => (document.getElementById("status")?.textContent ?? "").includes("removed"), {
-      label: "other to be told it was removed",
-    });
+    await waitFor(
+      other,
+      () => {
+        const err = document.getElementById("lobby-error");
+        return Boolean(err && !err.hidden && (err.textContent ?? "").includes("removed"));
+      },
+      { label: "other to be told in #lobby-error it was removed" },
+    );
     // The screen capture itself is stopped, not left running for the next room.
     await waitFor(other, () => document.getElementById("share")?.textContent === "Share screen", {
       label: "the share button to reset",
@@ -314,7 +452,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     );
   });
 
-  await it("maintains 52px bars and zero horizontal overflow across viewport resizes", async () => {
+  await it("maintains 52px bars, header button order, and zero horizontal overflow across viewport resizes", async () => {
     const viewports: Array<[number, number]> = [
       [1440, 900],
       [1024, 768],
@@ -325,15 +463,19 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       const metrics = await host.evaluate(() => {
         const headerRect = document.querySelector("header.app-bar")?.getBoundingClientRect();
         const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
+        const inviteBtnRect = document.getElementById("invite-btn")?.getBoundingClientRect();
+        const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
         return {
           headerHeight: Math.round(headerRect?.height ?? 0),
           controlsHeight: Math.round(controlsRect?.height ?? 0),
+          inviteLeftOfRoster: Boolean(inviteBtnRect && rosterBtnRect && inviteBtnRect.right <= rosterBtnRect.left),
           scrollWidth: document.documentElement.scrollWidth,
           innerWidth: window.innerWidth,
         };
       });
       assert.equal(metrics.headerHeight, 52, `header height at ${String(width)}x${String(height)}`);
       assert.equal(metrics.controlsHeight, 52, `controls height at ${String(width)}x${String(height)}`);
+      assert.equal(metrics.inviteLeftOfRoster, true, `header button order at ${String(width)}x${String(height)}`);
       assert.ok(
         metrics.scrollWidth <= metrics.innerWidth,
         `horizontal overflow at ${String(width)}x${String(height)}: ${String(metrics.scrollWidth)} > ${String(metrics.innerWidth)}`,

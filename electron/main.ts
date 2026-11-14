@@ -339,6 +339,8 @@ async function initApplication(): Promise<void> {
     // -3 = ERR_ABORTED (e.g. superseded navigation); not a real failure.
     if (!isMainFrame || errorCode === -3 || validatedURL.startsWith("data:")) return;
     console.error(`[main] Failed to load ${validatedURL}: ${errorDescription} (${errorCode})`);
+    stopFollow();
+    audioSession.stop();
     runBackground(win.loadURL(offlinePage(targetUrl, errorDescription)), "load offline page");
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = setTimeout(() => {

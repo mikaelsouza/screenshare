@@ -81,8 +81,8 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
     }
   });
 
-  it("exhaustively verifies popover mutual exclusion across all 100 state transitions", () => {
-    const popovers: Array<PopoverKind | null> = [null, "roster", "preset", "codec", "degradation"];
+  it("exhaustively verifies popover mutual exclusion across all 144 state transitions", () => {
+    const popovers: Array<PopoverKind | null> = [null, "invite", "roster", "preset", "codec", "degradation"];
     const bools = [false, true];
 
     for (const current of popovers) {
@@ -93,6 +93,7 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
 
             // Invariant 1: At most one popover is open at any time.
             const openCount =
+              Number(next.inviteOpen) +
               Number(next.rosterOpen) +
               Number(next.presetOpen) +
               Number(next.codecOpen) +
@@ -100,7 +101,8 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
             expect(openCount).toBeLessThanOrEqual(1);
 
             // Invariant 2: `active` matches the unique open popover, or null if none.
-            if (next.rosterOpen) expect(next.active).toBe("roster");
+            if (next.inviteOpen) expect(next.active).toBe("invite");
+            else if (next.rosterOpen) expect(next.active).toBe("roster");
             else if (next.presetOpen) expect(next.active).toBe("preset");
             else if (next.codecOpen) expect(next.active).toBe("codec");
             else if (next.degradationOpen) expect(next.active).toBe("degradation");

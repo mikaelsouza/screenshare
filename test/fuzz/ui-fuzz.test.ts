@@ -29,7 +29,14 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
 
   it("nextPopoverState and deriveOutboundAudioState preserve invariants across random action traces", () => {
     const stepArb = fc.record({
-      target: fc.constantFrom<PopoverKind | null>(null, "roster", "preset", "codec", "degradation"),
+      target: fc.constantFrom<PopoverKind | null>(
+        null,
+        "invite",
+        "roster",
+        "preset",
+        "codec",
+        "degradation",
+      ),
       connected: fc.boolean(),
       sharing: fc.boolean(),
       hasAudio: fc.boolean(),
@@ -42,6 +49,7 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
         for (const step of steps) {
           const pop = nextPopoverState(current, step.target, step.connected, step.sharing);
           const openCount =
+            Number(pop.inviteOpen) +
             Number(pop.rosterOpen) +
             Number(pop.presetOpen) +
             Number(pop.codecOpen) +

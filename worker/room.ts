@@ -4,6 +4,8 @@ import {
   MAX_ROOM_SIZE,
   PING,
   PONG,
+  generateRoomPassword,
+  isValidRoomCode,
   type ErrorCode,
   type ServerMessage,
   type ClientMessage,
@@ -11,6 +13,7 @@ import {
 } from "@shared/protocol";
 import type { Env } from "./index";
 import { ipKey } from "./ipkey";
+import { RateLimiter } from "./ratelimit";
 import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
 /**
@@ -31,29 +34,50 @@ const MAX_SOCKETS = MAX_ROOM_SIZE * 4;
 const MAX_SOCKETS_PER_IP = MAX_ROOM_SIZE * 2;
 
 /**
- * Storage key marking that this room has been joined at least once.
+ * Storage key marking that this room has been initialized by POST /api/room.
  *
- * Only the join that creates the room becomes its host.
+ * Only rooms initialized via /init (never arbitrary GET /ws/:code scans) exist.
  */
 const CLAIMED_KEY = "claimed";
 
+/** Storage key holding the canonical 8-character room code for /ws/:code binding checks. */
+const ROOM_CODE_KEY = "roomCode";
+
+/** Storage key holding the salted SHA-256 hex digest of the active room invite secret. */
+const PASSWORD_KEY = "passwordHash";
+
+/** Storage key holding the current plaintext room invite secret (cleared on alarm expiry or rotated). */
+const ROOM_PASSWORD_KEY = "roomPassword";
+
 /**
- * Storage key holding the salted hash of the host token. The token itself is handed
- * to the creating join only; whoever presents it later is the host again.
+ * Storage key holding the salted hash of the host token. The token itself is minted on
+ * room creation (or promoted after HOST_GRACE_MS); whoever presents it is the host.
  */
 const HOST_KEY = "hostTokenHash";
 
 /**
- * Storage key: rejoin tickets, as salted hash to expiry. Every welcome hands out a
- * fresh one; presenting it gets a returning member past the lock and a kick ban.
+ * Storage key: rejoin tickets, as salted hash to MemberEntry. Every welcome hands out a
+ * fresh one; presenting it gets a returning member past a lock (and valid disconnect TTL).
  */
 const MEMBERS_KEY = "members";
 
-/** Storage key: when the last host socket left, for dropping an orphaned lock. */
+/** Storage key: when the last host socket left, for 5-minute universal host promotion. */
 const HOST_GONE_KEY = "hostGoneAt";
 
-/** How long a locked room waits for its host to come back before it unlocks. */
+/** Storage key: when the last joined peer left, for 12-hour room expiration. */
+const EMPTY_SINCE_KEY = "emptySince";
+
+/** How long an occupied room waits for its host to return before promoting the earliest member. */
 const HOST_GRACE_MS = 5 * 60 * 1000;
+
+/** How long a disconnected peer's rejoin ticket remains valid before expiring. */
+const DISCONNECTED_REJOIN_TTL_MS = 5 * 60 * 1000;
+
+/** Short overlap window so peers with in-flight reconnects survive an invite rotation. */
+const ROTATION_REJOIN_GRACE_MS = 15_000;
+
+/** Hard cap on stored ticket/deny maps so a single DO key stays well below Cloudflare's 128 KiB limit. */
+const MAX_STORED_ENTRIES = 128;
 
 /** Storage key: true while the host has locked the room to new joins. */
 const LOCKED_KEY = "locked";
@@ -64,7 +88,7 @@ const DENY_KEY = "deny";
 /**
  * How long a kicked address is refused. Short on purpose: it is by address, so on a
  * shared connection (a household, CGNAT) it also shuts out whoever sits behind the
- * same one. Locking the room is the lasting answer.
+ * same one. Invite rotation + lock handles stronger enforcement.
  */
 const KICK_BAN_MS = 15 * 60 * 1000;
 
@@ -72,6 +96,9 @@ const KICK_BAN_MS = 15 * 60 * 1000;
  * How long an empty room keeps its state before the object erases itself.
  */
 const EMPTY_ROOM_TTL_MS = 12 * 60 * 60 * 1000;
+
+/** Fixed-length sentinel hex digest so uninitialized rooms still run constant-time comparison. */
+const DUMMY_HASH_HEX = "0".repeat(64);
 
 /**
  * Largest raw frame accepted, checked before JSON.parse. A legitimate frame is at most
@@ -82,11 +109,6 @@ const MAX_FRAME_LENGTH = 80 * 1024;
 /**
  * Per-socket message budget: a token bucket of MESSAGE_BURST, refilled at
  * MESSAGE_REFILL_PER_SEC.
- *
- * The burst has to cover the worst honest case, which is joining a full room:
- * seven links, each an offer or answer plus trickled candidates, all
- * within a second or two. Sustained traffic after that is a handful of messages per
- * renegotiation. A flood well past both is not a browser doing WebRTC.
  */
 const MESSAGE_BURST = 200;
 const MESSAGE_REFILL_PER_SEC = 20;
@@ -94,18 +116,19 @@ const MESSAGE_REFILL_PER_SEC = 20;
 /**
  * How long a socket may stay open without joining. A real client sends `join` the
  * moment the socket opens; one that has not after this long is holding a slot.
- * Keepalive pings are answered without waking the object, so an idle unjoined
- * socket costs its holder nothing and would otherwise count against the room forever.
  */
 const JOIN_DEADLINE_MS = 10_000;
 
 /** Unparseable messages a socket may send before it is closed. */
 const MAX_BAD_MESSAGES = 5;
 
+const TEXT_ENCODER = new TextEncoder();
+
 interface MemberEntry {
   until: number;
   id?: string;
   sharing?: boolean;
+  ip?: string;
 }
 
 const MemberEntrySchema: z.ZodType<MemberEntry> = z
@@ -113,12 +136,14 @@ const MemberEntrySchema: z.ZodType<MemberEntry> = z
     until: z.number(),
     id: z.string().optional(),
     sharing: z.boolean().optional(),
+    ip: z.string().optional(),
   })
   .transform(
-    ({ until, id, sharing }): MemberEntry => ({
+    ({ until, id, sharing, ip }): MemberEntry => ({
       until,
       ...(id !== undefined ? { id } : {}),
       ...(sharing !== undefined ? { sharing } : {}),
+      ...(ip !== undefined ? { ip } : {}),
     }),
   );
 
@@ -129,11 +154,13 @@ interface PeerAttachment {
   joined: boolean;
   /** Rate-limit key for the client address: IPv4 as is, IPv6 as its /64. */
   ip?: string;
-  /** When the socket was accepted, for the join deadline. */
+  /** Room code from the WebSocket upgrade path (`/ws/:code`), for join binding checks. */
+  roomCode?: string;
+  /** When the socket was accepted, for the join deadline and host promotion ordering. */
   openedAt?: number;
-  /** Presented the room's host token. */
+  /** Presented the room's host token or was promoted to host. */
   host?: boolean;
-  /** Hash of the rejoin ticket this socket was issued, deleted if it is kicked. */
+  /** Hash of the rejoin ticket this socket was issued. */
   rejoinHash?: string;
 }
 
@@ -144,22 +171,28 @@ const PeerAttachmentSchema: z.ZodType<PeerAttachment> = z
     sharing: z.boolean(),
     joined: z.boolean(),
     ip: z.string().optional(),
+    roomCode: z.string().optional(),
     openedAt: z.number().optional(),
     host: z.boolean().optional(),
     rejoinHash: z.string().optional(),
   })
   .transform(
-    ({ id, name, sharing, joined, ip, openedAt, host, rejoinHash }): PeerAttachment => ({
+    ({ id, name, sharing, joined, ip, roomCode, openedAt, host, rejoinHash }): PeerAttachment => ({
       id,
       name,
       sharing,
       joined,
       ...(ip !== undefined ? { ip } : {}),
+      ...(roomCode !== undefined ? { roomCode } : {}),
       ...(openedAt !== undefined ? { openedAt } : {}),
       ...(host !== undefined ? { host } : {}),
       ...(rejoinHash !== undefined ? { rejoinHash } : {}),
     }),
   );
+
+const InitBodySchema: z.ZodType<{ code: string }> = z.object({
+  code: z.string().refine(isValidRoomCode),
+});
 
 function getAttachment(ws: WebSocket): PeerAttachment | null {
   try {
@@ -174,12 +207,9 @@ function getAttachment(ws: WebSocket): PeerAttachment | null {
 /**
  * A display name safe to show other people.
  *
- * Rendering already goes through textContent, so this is not about markup. It is
- * about impersonation: control and format characters (bidi overrides such as U+202E,
- * zero-width joiners and spaces) let "alice" and "al\u200Bice" look identical, or
- * make a name render backwards. NFKC folds compatibility look-alikes such as
- * full-width letters into their plain forms. Cut to 32 after cleaning, so invisible
- * characters cannot eat the budget.
+ * NFKC-folds look-alikes, strips control/format characters, and caps both Unicode
+ * code points and UTF-16 code units at <= 32 so PeerInfoSchema never rejects astral
+ * characters on the client.
  */
 function sanitiseName(raw: string): string {
   const cleaned = raw
@@ -187,7 +217,14 @@ function sanitiseName(raw: string): string {
     .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, "")
     .replace(/\s+/gu, " ")
     .trim();
-  return Array.from(cleaned).slice(0, 32).join("").trim() || "Anonymous";
+  let out = "";
+  let codePoints = 0;
+  for (const ch of cleaned) {
+    if (codePoints >= 32 || out.length + ch.length > 32) break;
+    out += ch;
+    codePoints++;
+  }
+  return out.trim() || "Anonymous";
 }
 
 function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
@@ -200,23 +237,26 @@ function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
 }
 
 /**
- * Constant-time string comparison, so the password check does not leak the length or
- * the position of the first mismatching character through response timing. A room
- * code is public-ish (it gets pasted into chats) and the password is the only thing
- * standing behind it, so it is worth not handing out a byte-by-byte oracle.
+ * Native constant-time comparison over UTF-8 encoded buffers. Because all compared
+ * secrets here are 64-char SHA-256 hex digests, byteLength is fixed at 64.
  */
-function timingSafeEqual(a: string, b: string): boolean {
-  const encoder = new TextEncoder();
-  const ab = encoder.encode(a);
-  const bb = encoder.encode(b);
-  // Compare over a fixed length so the loop count does not depend on the input, and
-  // fold the length difference into the result rather than returning early.
-  const len = Math.max(ab.length, bb.length);
-  let diff = ab.length ^ bb.length;
-  for (let i = 0; i < len; i++) {
-    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
-  }
-  return diff === 0;
+function timingSafeEqualStr(a: string, b: string): boolean {
+  const ab = TEXT_ENCODER.encode(a);
+  const bb = TEXT_ENCODER.encode(b);
+  if (ab.byteLength !== bb.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(ab, bb);
+}
+
+/** Evict oldest-expiring entries when a persisted map exceeds MAX_STORED_ENTRIES. */
+function capByExpiry<T>(
+  map: Record<string, T>,
+  getUntil: (value: T) => number,
+  maxEntries: number = MAX_STORED_ENTRIES,
+): Record<string, T> {
+  const entries = Object.entries(map);
+  if (entries.length <= maxEntries) return map;
+  entries.sort((a, b) => getUntil(a[1]) - getUntil(b[1]));
+  return Object.fromEntries(entries.slice(entries.length - maxEntries));
 }
 
 /**
@@ -236,6 +276,7 @@ function broadcastJoinOutcome(
   supersededCount: number,
   supersededSocket: { ws: WebSocket; att: PeerAttachment } | undefined,
   isHost: boolean,
+  replacesId: string | undefined,
   others: Array<{ ws: WebSocket; att: PeerAttachment }>,
 ): void {
   if (isResume && supersededCount > 0) {
@@ -259,6 +300,7 @@ function broadcastJoinOutcome(
       sharing: attachment.sharing,
       ...(isHost ? { host: true } : {}),
     },
+    ...(replacesId !== undefined ? { replaces: replacesId } : {}),
   };
   for (const { ws: peerWs } of others) {
     sendSafe(peerWs, joinedMsg);
@@ -271,8 +313,10 @@ export class RoomDO extends DurableObject<Env> {
   private readonly badMessages = new Map<string, number>();
   /** Sockets with a join in flight, so a second join on the same socket is ignored. */
   private readonly joining = new Set<string>();
-  /** Sockets that closed, so a join still in flight knows not to commit. */
+  /** Sockets that closed while a join is in flight, deleted once that join unwinds. */
   private readonly gone = new Set<string>();
+  /** Per-IP failed room-password attempts inside this DO (15/min/IP). */
+  private readonly passwordFailures = new RateLimiter(15, 60_000, 2_048);
 
   /**
    * Close every socket that has been open longer than the join deadline without
@@ -336,36 +380,171 @@ export class RoomDO extends DurableObject<Env> {
 
   /**
    * Salted SHA-256, hex. The Durable Object id is a stable, room-specific salt, and the
-   * host/rejoin tokens get their own prefix.
+   * host/rejoin/password secrets get their own domain prefix.
    */
-  private async hashSecret(secret: string, kind: "host" | "rejoin"): Promise<string> {
+  private async hashSecret(secret: string, kind: "host" | "rejoin" | "password"): Promise<string> {
     const prefix = `${this.ctx.id.toString()}:${kind}`;
-    const data = new TextEncoder().encode(`${prefix}:${secret}`);
+    const data = TEXT_ENCODER.encode(`${prefix}:${secret}`);
     const digest = await crypto.subtle.digest("SHA-256", data);
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
   /**
-   * Erase an abandoned room. Armed when the last peer leaves and cancelled the moment
-   * anyone joins, so a reconnect never trips it.
+   * Multiplex the 12-hour empty-room expiration alarm and the 5-minute universal
+   * host-promotion alarm into Durable Object's single alarm slot.
+   */
+  private async syncAlarm(now: number): Promise<void> {
+    const peers = this.joinedPeers();
+    if (peers.length === 0) {
+      let emptySince = await this.ctx.storage.get<number>(EMPTY_SINCE_KEY);
+      if (emptySince === undefined) {
+        emptySince = now;
+        await this.ctx.storage.put(EMPTY_SINCE_KEY, emptySince);
+      }
+      await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_ROOM_TTL_MS));
+      return;
+    }
+
+    if (peers.some(({ att }) => att.host)) {
+      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
+      await this.ctx.storage.deleteAlarm();
+      return;
+    }
+
+    await this.ctx.storage.delete(EMPTY_SINCE_KEY);
+    let goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
+    if (goneAt === undefined) {
+      goneAt = now;
+      await this.ctx.storage.put(HOST_GONE_KEY, goneAt);
+    }
+    await this.ctx.storage.setAlarm(Math.max(now, goneAt + HOST_GRACE_MS));
+  }
+
+  /**
+   * Erase an abandoned room after 12h empty, or promote the earliest connected
+   * non-host member to host after 5m without any host socket.
    */
   override async alarm(): Promise<void> {
-    for (const s of this.ctx.getWebSockets()) {
-      const att = getAttachment(s);
-      if (att?.joined) {
-        // Someone is still here; the room is not abandoned after all.
-        await this.ctx.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS);
+    // Pre-compute replacement host credentials outside blockConcurrencyWhile so no
+    // crypto await ever runs mid-storage transaction.
+    const newHostToken = crypto.randomUUID();
+    const newHostHash = await this.hashSecret(newHostToken, "host");
+
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const now = Date.now();
+      const peers = this.joinedPeers();
+      if (peers.length === 0) {
+        const emptySince = await this.ctx.storage.get<number>(EMPTY_SINCE_KEY);
+        if (emptySince !== undefined && now - emptySince < EMPTY_ROOM_TTL_MS) {
+          await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_ROOM_TTL_MS));
+          return;
+        }
+        await this.ctx.storage.deleteAll();
         return;
       }
-    }
-    await this.ctx.storage.deleteAll();
+
+      if (peers.some(({ att }) => att.host)) {
+        await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
+        await this.ctx.storage.deleteAlarm();
+        return;
+      }
+
+      const goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
+      if (goneAt === undefined) {
+        await this.ctx.storage.put(HOST_GONE_KEY, now);
+        await this.ctx.storage.setAlarm(now + HOST_GRACE_MS);
+        return;
+      }
+      if (now - goneAt < HOST_GRACE_MS) {
+        await this.ctx.storage.setAlarm(Math.max(now, goneAt + HOST_GRACE_MS));
+        return;
+      }
+
+      // Promote earliest connected peer by socket openedAt (never auto-unlock locked rooms).
+      const candidate = [...peers].sort(
+        (a, b) =>
+          (a.att.openedAt ?? Number.MAX_SAFE_INTEGER) - (b.att.openedAt ?? Number.MAX_SAFE_INTEGER) ||
+          a.att.id.localeCompare(b.att.id),
+      )[0];
+      if (!candidate) return;
+
+      await this.ctx.storage.put({ [HOST_KEY]: newHostHash });
+      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
+      await this.ctx.storage.deleteAlarm();
+
+      candidate.att.host = true;
+      try {
+        candidate.ws.serializeAttachment(candidate.att);
+      } catch {
+        /* ignore attachment serialization failure */
+      }
+
+      const roomPassword = await this.ctx.storage.get<string>(ROOM_PASSWORD_KEY);
+      sendSafe(candidate.ws, {
+        t: "host-promoted",
+        hostId: candidate.att.id,
+        hostToken: newHostToken,
+        ...(roomPassword ? { password: roomPassword } : {}),
+      });
+      const publicAnnouncement: ServerMessage = {
+        t: "host-promoted",
+        hostId: candidate.att.id,
+      };
+      for (const { ws } of peers) {
+        if (ws !== candidate.ws) sendSafe(ws, publicAnnouncement);
+      }
+    });
   }
 
   override fetch(request: Request): Promise<Response> {
-    return Promise.resolve(this.handleFetch(request));
+    return this.handleFetch(request);
   }
 
-  private handleFetch(request: Request): Response {
+  private async handleInit(request: Request): Promise<Response> {
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return new Response(JSON.stringify({ error: "Invalid request" }), { status: 400 });
+    }
+    const parsed = InitBodySchema.safeParse(body);
+    if (!parsed.success) {
+      return new Response(JSON.stringify({ error: "Invalid room code" }), { status: 400 });
+    }
+
+    const password = generateRoomPassword();
+    const hostToken = crypto.randomUUID();
+    const passwordHash = await this.hashSecret(password, "password");
+    const hostHash = await this.hashSecret(hostToken, "host");
+
+    return this.ctx.blockConcurrencyWhile(async () => {
+      if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true) {
+        return new Response(JSON.stringify({ error: "Room already initialized" }), { status: 409 });
+      }
+      const now = Date.now();
+      await this.ctx.storage.put({
+        [CLAIMED_KEY]: true,
+        [ROOM_CODE_KEY]: parsed.data.code,
+        [PASSWORD_KEY]: passwordHash,
+        [ROOM_PASSWORD_KEY]: password,
+        [HOST_KEY]: hostHash,
+        [LOCKED_KEY]: false,
+        [EMPTY_SINCE_KEY]: now,
+      });
+      await this.syncAlarm(now);
+      return new Response(JSON.stringify({ code: parsed.data.code, password, hostToken }), {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      });
+    });
+  }
+
+  private async handleFetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.hostname === "internal" && url.pathname === "/init" && request.method === "POST") {
+      return this.handleInit(request);
+    }
+
     const upgradeHeader = request.headers.get("Upgrade");
     if (upgradeHeader?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
@@ -376,7 +555,7 @@ export class RoomDO extends DurableObject<Env> {
     if (origin) {
       try {
         const originHost = new URL(origin).host;
-        const reqHost = new URL(request.url).host;
+        const reqHost = url.host;
         if (originHost !== reqHost) {
           return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
         }
@@ -412,12 +591,13 @@ export class RoomDO extends DurableObject<Env> {
     }
 
     // The room cap counts only *joined* peers, so without a ceiling here a client
-    // could open unbounded sockets that never send `join`. They would never be
-    // rejected, and every subsequent signalling message in the room would have to
-    // walk all of them. Allow headroom for sockets mid-handshake or mid-reconnect.
+    // could open unbounded sockets that never send `join`.
     if (live.length >= MAX_SOCKETS) {
       return rejectUpgrade("rate-limited", "Too many connections to this room", TRY_AGAIN_LATER);
     }
+
+    const wsPathMatch = /^\/ws\/([A-Za-z0-9]+)$/i.exec(url.pathname);
+    const pathRoomCode = wsPathMatch?.[1]?.toUpperCase();
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -432,6 +612,7 @@ export class RoomDO extends DurableObject<Env> {
       sharing: false,
       joined: false,
       ...(clientIp ? { ip: clientIp } : {}),
+      ...(pathRoomCode ? { roomCode: pathRoomCode } : {}),
       openedAt: now,
     };
     server.serializeAttachment(attachment);
@@ -495,16 +676,28 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     clientMsg: ClientMessage,
   ): Promise<void> {
-    if (clientMsg.t === "join") {
-      await this.onJoinMessage(ws, attachment, clientMsg);
-    } else if (clientMsg.t === "kick") {
-      await this.handleKick(ws, attachment, clientMsg);
-    } else if (clientMsg.t === "lock") {
-      await this.handleLock(ws, attachment, clientMsg);
-    } else if (clientMsg.t === "signal") {
-      this.handleSignal(ws, attachment, clientMsg);
-    } else {
-      await this.handleState(ws, attachment, clientMsg);
+    switch (clientMsg.t) {
+      case "join":
+        await this.onJoinMessage(ws, attachment, clientMsg);
+        break;
+      case "kick":
+        await this.handleKick(ws, attachment, clientMsg);
+        break;
+      case "lock":
+        await this.handleLock(ws, attachment, clientMsg);
+        break;
+      case "rotate-password":
+        await this.handleRotatePassword(ws, attachment);
+        break;
+      case "rename":
+        await this.handleRename(ws, attachment, clientMsg);
+        break;
+      case "signal":
+        this.handleSignal(ws, attachment, clientMsg);
+        break;
+      case "state":
+        await this.handleState(ws, attachment, clientMsg);
+        break;
     }
   }
 
@@ -522,6 +715,7 @@ export class RoomDO extends DurableObject<Env> {
       await this.handleJoin(ws, attachment, clientMsg);
     } finally {
       this.joining.delete(joinId);
+      this.gone.delete(joinId);
     }
   }
 
@@ -535,29 +729,50 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
     if (clientMsg.id === attachment.id) return;
-    const target = this.joinedPeers(ws).find(({ att }) => att.id === clientMsg.id);
-    if (!target) {
-      sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
-      return;
-    }
-    const now = Date.now();
-    const rawMembers = await this.getMembers(now);
-    const members = target.att.rejoinHash
-      ? Object.fromEntries(Object.entries(rawMembers).filter(([hash]) => hash !== target.att.rejoinHash))
-      : rawMembers;
-    const writes: Record<string, unknown> = { [MEMBERS_KEY]: members };
-    if (target.att.ip) {
-      const deny = await this.getDenyList(now);
-      deny[target.att.ip] = now + KICK_BAN_MS;
-      writes[DENY_KEY] = deny;
-    }
-    await this.ctx.storage.put(writes);
-    sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
-    await this.handleLeave(target.ws);
-    try {
-      target.ws.close(1008, "Kicked");
-    } catch {
-      /* socket already closed */
+
+    let kicked = false;
+    await this.ctx.blockConcurrencyWhile(async () => {
+      const target = this.joinedPeers(ws).find(({ att }) => att.id === clientMsg.id);
+      if (!target) {
+        sendSafe(ws, { t: "error", code: "unknown-peer", message: "Peer not found" });
+        return;
+      }
+      const now = Date.now();
+      const rawMembers = await this.getMembers(now);
+      // Keep tickets still attached to other active sockets behind the same CGNAT/household IP.
+      const activeHashes = new Set(
+        this.joinedPeers(target.ws)
+          .map(({ att }) => att.rejoinHash)
+          .filter((h): h is string => h !== undefined),
+      );
+      const members = Object.fromEntries(
+        Object.entries(rawMembers).filter(([hash, entry]) => {
+          if (hash === target.att.rejoinHash) return false;
+          if (target.att.ip !== undefined && entry.ip === target.att.ip && !activeHashes.has(hash)) {
+            return false;
+          }
+          return true;
+        }),
+      );
+      const writes: Record<string, unknown> = { [MEMBERS_KEY]: capByExpiry(members, (m) => m.until) };
+      if (target.att.ip) {
+        const deny = await this.getDenyList(now);
+        deny[target.att.ip] = now + KICK_BAN_MS;
+        writes[DENY_KEY] = capByExpiry(deny, (u) => u);
+      }
+      await this.ctx.storage.put(writes);
+      sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
+      await this.handleLeaveInternal(target.ws, { kicked: true, skipAlarmSync: true });
+      try {
+        target.ws.close(1008, "Kicked");
+      } catch {
+        /* socket already closed */
+      }
+      kicked = true;
+    });
+
+    if (kicked) {
+      await this.rotatePasswordInternal();
     }
   }
 
@@ -570,10 +785,114 @@ export class RoomDO extends DurableObject<Env> {
       sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can lock the room" });
       return;
     }
-    await this.ctx.storage.put(LOCKED_KEY, clientMsg.locked);
-    const stateMsg: ServerMessage = { t: "room-state", locked: clientMsg.locked };
-    sendSafe(ws, stateMsg);
-    for (const { ws: s } of this.joinedPeers(ws)) sendSafe(s, stateMsg);
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.put(LOCKED_KEY, clientMsg.locked);
+      const password = !clientMsg.locked ? await this.ctx.storage.get<string>(ROOM_PASSWORD_KEY) : undefined;
+      const stateMsg: ServerMessage = {
+        t: "room-state",
+        locked: clientMsg.locked,
+        ...(password ? { password } : {}),
+      };
+      sendSafe(ws, stateMsg);
+      for (const { ws: s } of this.joinedPeers(ws)) sendSafe(s, stateMsg);
+    });
+  }
+
+  private async handleRotatePassword(ws: WebSocket, attachment: PeerAttachment): Promise<void> {
+    if (!attachment.joined || !attachment.host) {
+      sendSafe(ws, { t: "error", code: "not-host", message: "Only the host can rotate the invite code" });
+      return;
+    }
+    await this.rotatePasswordInternal();
+  }
+
+  private async rotatePasswordInternal(): Promise<void> {
+    const newPassword = generateRoomPassword();
+    const newPasswordHash = await this.hashSecret(newPassword, "password");
+
+    // Pre-generate enough per-peer rejoin credentials outside blockConcurrencyWhile.
+    const currentCount = this.joinedPeers().length;
+    const preMinted: Array<{ token: string; hash: string }> = [];
+    for (let i = 0; i < currentCount + 4; i++) {
+      const token = crypto.randomUUID();
+      preMinted.push({ token, hash: await this.hashSecret(token, "rejoin") });
+    }
+
+    await this.ctx.blockConcurrencyWhile(async () => {
+      if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) return;
+      const now = Date.now();
+      const locked = await this.lockedNow();
+      const peers = this.joinedPeers();
+      const members = await this.getMembers(now);
+
+      // Clamp all previous rejoin tickets (disconnected or pre-rotation) to a short 15s grace.
+      for (const entry of Object.values(members)) {
+        entry.until = Math.min(entry.until, now + ROTATION_REJOIN_GRACE_MS);
+      }
+
+      const pendingNotifications: Array<{ ws: WebSocket; msg: ServerMessage }> = [];
+      let ticketIdx = 0;
+      for (const { ws: peerWs, att } of peers) {
+        const minted = preMinted[ticketIdx++];
+        if (!minted) continue;
+        members[minted.hash] = {
+          until: now + EMPTY_ROOM_TTL_MS,
+          id: att.id,
+          ...(att.sharing ? { sharing: true } : {}),
+          ...(att.ip ? { ip: att.ip } : {}),
+        };
+        att.rejoinHash = minted.hash;
+        try {
+          peerWs.serializeAttachment(att);
+        } catch {
+          /* ignore attachment serialization failure */
+        }
+        const canSeeSecret = att.host === true || !locked;
+        pendingNotifications.push({
+          ws: peerWs,
+          msg: {
+            t: "room-password",
+            ...(canSeeSecret ? { password: newPassword } : {}),
+            rejoinToken: minted.token,
+          },
+        });
+      }
+
+      await this.ctx.storage.put({
+        [PASSWORD_KEY]: newPasswordHash,
+        [ROOM_PASSWORD_KEY]: newPassword,
+        [MEMBERS_KEY]: capByExpiry(members, (m) => m.until),
+      });
+      await this.syncAlarm(now);
+
+      for (const { ws: peerWs, msg } of pendingNotifications) {
+        sendSafe(peerWs, msg);
+      }
+    });
+  }
+
+  private async handleRename(
+    ws: WebSocket,
+    attachment: PeerAttachment,
+    clientMsg: Extract<ClientMessage, { t: "rename" }>,
+  ): Promise<void> {
+    if (!attachment.joined) return;
+    const cleaned = sanitiseName(clientMsg.displayName);
+    if (cleaned === attachment.name) return;
+    attachment.name = cleaned;
+    try {
+      ws.serializeAttachment(attachment);
+    } catch {
+      /* ignore attachment serialization failure */
+    }
+    const renameMsg: ServerMessage = {
+      t: "peer-renamed",
+      id: attachment.id,
+      name: attachment.name,
+    };
+    for (const { ws: s } of this.joinedPeers()) {
+      sendSafe(s, renameMsg);
+    }
   }
 
   private handleSignal(
@@ -622,13 +941,17 @@ export class RoomDO extends DurableObject<Env> {
       /* ignore attachment serialization failure */
     }
     if (attachment.rejoinHash) {
-      const now = Date.now();
-      const members = await this.getMembers(now);
-      const member = members[attachment.rejoinHash];
-      if (member) {
-        member.sharing = attachment.sharing;
-        await this.ctx.storage.put({ [MEMBERS_KEY]: members });
-      }
+      await this.ctx.blockConcurrencyWhile(async () => {
+        const now = Date.now();
+        const members = await this.getMembers(now);
+        const rejoinKey = attachment.rejoinHash;
+        if (!rejoinKey) return;
+        const member = members[rejoinKey];
+        if (member) {
+          member.sharing = attachment.sharing;
+          await this.ctx.storage.put({ [MEMBERS_KEY]: capByExpiry(members, (m) => m.until) });
+        }
+      });
     }
     const stateMsg: ServerMessage = {
       t: "peer-state",
@@ -649,7 +972,7 @@ export class RoomDO extends DurableObject<Env> {
       ({ att }) =>
         (offeredRejoinHash !== null &&
           att.rejoinHash !== undefined &&
-          timingSafeEqual(att.rejoinHash, offeredRejoinHash)) ||
+          timingSafeEqualStr(att.rejoinHash, offeredRejoinHash)) ||
         (isHost && att.host === true),
     );
   }
@@ -700,7 +1023,12 @@ export class RoomDO extends DurableObject<Env> {
     }
     for (const { ws: oldWs } of superseded) {
       this.forgetBudget(oldWs);
-      await this.handleLeave(oldWs);
+      sendSafe(oldWs, {
+        t: "error",
+        code: "session-replaced",
+        message: "Your session was replaced from another tab.",
+      });
+      await this.handleLeaveInternal(oldWs, { skipAlarmSync: true });
       try {
         oldWs.close(1008, "Session replaced");
       } catch {
@@ -713,8 +1041,6 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     offeredRejoinHash: string | null,
     newRejoinHash: string,
-    newHostHash: string,
-    creates: boolean,
     isHost: boolean,
     superseded: Array<{ ws: WebSocket; att: PeerAttachment }>,
   ): Promise<void> {
@@ -728,14 +1054,12 @@ export class RoomDO extends DurableObject<Env> {
       until: now + EMPTY_ROOM_TTL_MS,
       id: attachment.id,
       ...(attachment.sharing ? { sharing: true } : {}),
+      ...(attachment.ip ? { ip: attachment.ip } : {}),
     };
     await this.ctx.storage.put({
-      [MEMBERS_KEY]: members,
-      ...(creates ? { [HOST_KEY]: newHostHash, [CLAIMED_KEY]: true } : {}),
+      [MEMBERS_KEY]: capByExpiry(members, (m) => m.until),
     });
     if (isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
-    // Someone is in the room, so it is not abandoned. Cancel any pending erasure.
-    await this.ctx.storage.deleteAlarm();
   }
 
   /** The join handshake, split out of webSocketMessage; see the call site. */
@@ -744,156 +1068,219 @@ export class RoomDO extends DurableObject<Env> {
     attachment: PeerAttachment,
     clientMsg: Extract<ClientMessage, { t: "join" }>,
   ): Promise<void> {
+    // Reject mismatched room codes before consulting storage when bound to /ws/:code.
+    const msgRoom = clientMsg.room.toUpperCase();
+    if (attachment.roomCode !== undefined && msgRoom !== attachment.roomCode) {
+      this.refuse(ws, "bad-room-code", "Wrong room code for this connection");
+      return;
+    }
+
     // Hash before touching storage, and never between a storage read and the write
     // that depends on it. Durable Object input gates only hold across storage
     // operations; a crypto.subtle await lets another join run in the middle.
+    const normalizedPassword = clientMsg.password?.trim().toUpperCase();
+    const offeredPasswordHash = normalizedPassword
+      ? await this.hashSecret(normalizedPassword, "password")
+      : null;
     const offeredHostHash = clientMsg.hostToken ? await this.hashSecret(clientMsg.hostToken, "host") : null;
     const offeredRejoinHash = clientMsg.rejoinToken
       ? await this.hashSecret(clientMsg.rejoinToken, "rejoin")
       : null;
-    const newHostToken = crypto.randomUUID();
-    const newHostHash = await this.hashSecret(newHostToken, "host");
     const newRejoinToken = crypto.randomUUID();
     const newRejoinHash = await this.hashSecret(newRejoinToken, "rejoin");
 
-    if (this.gone.has(attachment.id)) return;
-    const admission = await this.admit({ offeredHostHash, offeredRejoinHash, ip: attachment.ip });
-    if (!admission.ok) {
-      this.refuse(ws, admission.code, admission.message);
-      return;
-    }
-    const superseded = this.findSupersededPeers(ws, offeredRejoinHash, admission.isHost);
-    const hasMatchingRejoin = superseded.some(
-      ({ att }) =>
+    await this.ctx.blockConcurrencyWhile(async () => {
+      if (this.gone.has(attachment.id)) return;
+
+      const hasActiveSocketMatch =
         offeredRejoinHash !== null &&
-        att.rejoinHash !== undefined &&
-        timingSafeEqual(att.rejoinHash, offeredRejoinHash),
-    );
-    const isResume = clientMsg.resume === true && (admission.returning || hasMatchingRejoin);
-    const supersededSocket = superseded[0];
-    if (isResume) {
-      this.applyResumeAttachment(attachment, clientMsg, supersededSocket, admission.memberTicket);
-    }
+        this.joinedPeers(ws).some(
+          ({ att }) => att.rejoinHash !== undefined && timingSafeEqualStr(att.rejoinHash, offeredRejoinHash),
+        );
 
-    await this.evictSupersededPeers(attachment, isResume, superseded);
+      const admission = await this.admit({
+        msgRoom,
+        pathRoomCode: attachment.roomCode,
+        offeredPasswordHash,
+        offeredHostHash,
+        offeredRejoinHash,
+        hasActiveSocketMatch,
+        ip: attachment.ip,
+      });
+      if (!admission.ok) {
+        this.refuse(ws, admission.code, admission.message);
+        return;
+      }
 
-    const others = this.joinedPeers(ws);
-    if (others.length >= MAX_ROOM_SIZE) {
-      this.refuse(ws, "room-full", "Room is full");
-      return;
-    }
+      const superseded = this.findSupersededPeers(ws, offeredRejoinHash, admission.isHost);
+      const isResume = clientMsg.resume === true && admission.returning;
+      const supersededSocket = superseded[0];
+      const replacesId = supersededSocket?.att.id ?? admission.memberTicket?.id;
 
-    await this.persistMemberRecord(
-      attachment,
-      offeredRejoinHash,
-      newRejoinHash,
-      newHostHash,
-      admission.creates,
-      admission.isHost,
-      superseded,
-    );
+      if (isResume) {
+        this.applyResumeAttachment(attachment, clientMsg, supersededSocket, admission.memberTicket);
+      }
 
-    attachment.name = sanitiseName(clientMsg.displayName);
-    attachment.joined = true;
-    if (!isResume) attachment.sharing = false;
-    attachment.host = admission.isHost;
-    attachment.rejoinHash = newRejoinHash;
-    try {
-      ws.serializeAttachment(attachment);
-    } catch {
-      return;
-    }
+      await this.evictSupersededPeers(attachment, isResume, superseded);
 
-    sendSafe(ws, {
-      t: "welcome",
-      selfId: attachment.id,
-      peers: others.map(({ att }) => ({
-        id: att.id,
-        name: att.name,
-        sharing: att.sharing,
-        ...(att.host ? { host: true } : {}),
-      })),
-      host: admission.isHost,
-      ...(admission.creates ? { hostToken: newHostToken } : {}),
-      rejoinToken: newRejoinToken,
-      locked: admission.locked,
+      const others = this.joinedPeers(ws);
+      if (others.length >= MAX_ROOM_SIZE) {
+        this.refuse(ws, "room-full", "Room is full");
+        return;
+      }
+
+      await this.persistMemberRecord(
+        attachment,
+        offeredRejoinHash,
+        newRejoinHash,
+        admission.isHost,
+        superseded,
+      );
+
+      attachment.name = sanitiseName(clientMsg.displayName);
+      attachment.joined = true;
+      if (!isResume) attachment.sharing = false;
+      attachment.host = admission.isHost;
+      attachment.rejoinHash = newRejoinHash;
+      try {
+        ws.serializeAttachment(attachment);
+      } catch {
+        return;
+      }
+
+      await this.syncAlarm(Date.now());
+
+      const canSeePassword = admission.isHost || !admission.locked;
+      sendSafe(ws, {
+        t: "welcome",
+        selfId: attachment.id,
+        peers: others.map(({ att }) => ({
+          id: att.id,
+          name: att.name,
+          sharing: att.sharing,
+          ...(att.host ? { host: true } : {}),
+        })),
+        host: admission.isHost,
+        ...(canSeePassword && admission.roomPassword ? { password: admission.roomPassword } : {}),
+        rejoinToken: newRejoinToken,
+        locked: admission.locked,
+      });
+
+      broadcastJoinOutcome(
+        attachment,
+        isResume,
+        superseded.length,
+        supersededSocket,
+        admission.isHost,
+        replacesId,
+        others,
+      );
     });
-
-    broadcastJoinOutcome(
-      attachment,
-      isResume,
-      superseded.length,
-      supersededSocket,
-      admission.isHost,
-      others,
-    );
   }
 
   /**
    * Whether a join may enter, evaluated against storage directly before commit.
-   * Storage reads hold the input gate, so the admission check and the commit that
-   * follows it see the same room state.
+   * Performs zero storage writes when unclaimed or authentication fails, and runs
+   * constant-time password verification BEFORE locked/deny/rate-limit checks.
    */
   private async admit(tokens: {
+    msgRoom: string;
+    pathRoomCode: string | undefined;
+    offeredPasswordHash: string | null;
     offeredHostHash: string | null;
     offeredRejoinHash: string | null;
+    hasActiveSocketMatch: boolean;
     ip: string | undefined;
   }): Promise<
     | {
         ok: true;
-        creates: boolean;
         isHost: boolean;
         locked: boolean;
         returning: boolean;
+        roomPassword?: string | undefined;
         memberTicket?: MemberEntry | undefined;
       }
     | { ok: false; code: ErrorCode; message: string }
   > {
     const claimed = (await this.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
+    const expectedPasswordHash = claimed
+      ? ((await this.ctx.storage.get<string>(PASSWORD_KEY)) ?? DUMMY_HASH_HEX)
+      : DUMMY_HASH_HEX;
+    const passwordMatch =
+      timingSafeEqualStr(tokens.offeredPasswordHash ?? DUMMY_HASH_HEX, expectedPasswordHash) &&
+      tokens.offeredPasswordHash !== null;
+
     if (!claimed) {
-      return { ok: true, creates: true, isHost: true, locked: false, returning: false };
+      const rateIp = tokens.ip ?? "unknown";
+      if (!this.passwordFailures.check(rateIp)) {
+        return {
+          ok: false,
+          code: "rate-limited",
+          message: "Too many wrong invite codes. Wait a minute before trying again.",
+        };
+      }
+      return {
+        ok: false,
+        code: "bad-password",
+        message: "Invalid or expired room invite.",
+      };
+    }
+
+    const storedRoomCode = await this.ctx.storage.get<string>(ROOM_CODE_KEY);
+    if (
+      storedRoomCode !== undefined &&
+      (tokens.msgRoom !== storedRoomCode ||
+        (tokens.pathRoomCode !== undefined && tokens.pathRoomCode !== storedRoomCode))
+    ) {
+      return { ok: false, code: "bad-room-code", message: "Wrong room code for this connection" };
     }
 
     const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
     const isHost =
-      tokens.offeredHostHash !== null && hostHash !== null && timingSafeEqual(tokens.offeredHostHash, hostHash);
+      tokens.offeredHostHash !== null &&
+      hostHash !== null &&
+      timingSafeEqualStr(tokens.offeredHostHash, hostHash);
     const now = Date.now();
-    const locked = await this.lockedNow(now);
+    const locked = await this.lockedNow();
     const members = await this.getMembers(now);
     const memberTicket = tokens.offeredRejoinHash !== null ? members[tokens.offeredRejoinHash] : undefined;
-    const returning = memberTicket !== undefined;
+    const returning = memberTicket !== undefined || tokens.hasActiveSocketMatch;
 
-    if (isHost) return { ok: true, creates: false, isHost, locked, returning, memberTicket };
-    if (returning) return { ok: true, creates: false, isHost, locked, returning: true, memberTicket };
+    if (!passwordMatch && !isHost && !returning) {
+      const rateIp = tokens.ip ?? "unknown";
+      if (!this.passwordFailures.check(rateIp)) {
+        return {
+          ok: false,
+          code: "rate-limited",
+          message: "Too many wrong invite codes. Wait a minute before trying again.",
+        };
+      }
+      return {
+        ok: false,
+        code: "bad-password",
+        message: "Invalid or expired room invite.",
+      };
+    }
 
-    if (locked) return { ok: false, code: "room-locked", message: "This room is locked. Ask the host to unlock it." };
+    const roomPassword = await this.ctx.storage.get<string>(ROOM_PASSWORD_KEY);
+    if (isHost) return { ok: true, isHost, locked, returning, roomPassword, memberTicket };
+    if (returning) return { ok: true, isHost, locked, returning: true, roomPassword, memberTicket };
+
+    if (locked) {
+      return { ok: false, code: "room-locked", message: "This room is locked. Ask the host to unlock it." };
+    }
     if (tokens.ip) {
       const deny = await this.getDenyList(now);
       if (deny[tokens.ip] !== undefined) {
         return { ok: false, code: "kicked", message: "You were removed from this room." };
       }
     }
-    return { ok: true, creates: false, isHost, locked, returning: false };
+    return { ok: true, isHost, locked, returning: false, roomPassword };
   }
 
-  /**
-   * The lock flag, dropping a lock the host has left behind. The host token lives in
-   * one browser tab, so a host who closes it leaves a locked room nobody can open.
-   * A refresh must not unlock it, so only a host absence past HOST_GRACE_MS does.
-   */
-  private async lockedNow(now: number): Promise<boolean> {
-    if ((await this.ctx.storage.get<boolean>(LOCKED_KEY)) !== true) return false;
-    if (this.joinedPeers().some(({ att }) => att.host)) return true;
-    const goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
-    if (goneAt === undefined) {
-      await this.ctx.storage.put(HOST_GONE_KEY, now);
-      return true;
-    }
-    if (now - goneAt < HOST_GRACE_MS) return true;
-    await this.ctx.storage.put(LOCKED_KEY, false);
-    const unlocked: ServerMessage = { t: "room-state", locked: false };
-    for (const { ws } of this.joinedPeers()) sendSafe(ws, unlocked);
-    return false;
+  /** Whether the room is currently locked (never auto-unlocked on host absence). */
+  private async lockedNow(): Promise<boolean> {
+    return (await this.ctx.storage.get<boolean>(LOCKED_KEY)) === true;
   }
 
   /** Live rejoin tickets, hash to expiry, with expired ones dropped. */
@@ -939,12 +1326,22 @@ export class RoomDO extends DurableObject<Env> {
     if (!att) return;
     this.budgets.delete(att.id);
     this.badMessages.delete(att.id);
-    // Remembered so a concurrent close does not commit a socket that is already gone.
-    // Ids are UUIDs and never reused, so this only needs to outlive that one join.
-    this.gone.add(att.id);
+    // Remembered only while a join on this socket is in flight (cleaned up in onJoinMessage finally).
+    if (this.joining.has(att.id)) {
+      this.gone.add(att.id);
+    }
   }
 
   private async handleLeave(ws: WebSocket): Promise<void> {
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.handleLeaveInternal(ws);
+    });
+  }
+
+  private async handleLeaveInternal(
+    ws: WebSocket,
+    opts?: { kicked?: boolean; skipAlarmSync?: boolean },
+  ): Promise<void> {
     const attachment = getAttachment(ws);
     if (!attachment || !attachment.joined) {
       return;
@@ -959,28 +1356,30 @@ export class RoomDO extends DurableObject<Env> {
     const leftMsg: ServerMessage = {
       t: "peer-left",
       id: attachment.id,
+      ...(opts?.kicked ? { kicked: true } : {}),
     };
 
-    let remainingJoined = 0;
     for (const s of this.ctx.getWebSockets()) {
       if (s === ws) continue;
       const att = getAttachment(s);
       if (att && att.joined) {
-        remainingJoined++;
         sendSafe(s, leftMsg);
       }
     }
 
-    // Do NOT clear the password here. The room is empty for the duration of any
-    // reconnect, and dropping it in that window would let the next connection claim
-    // the room out from under the peer who is coming back. Arm an erasure far enough
-    // out that only a genuinely abandoned room reaches it.
-    if (remainingJoined === 0) {
-      await this.ctx.storage.setAlarm(Date.now() + EMPTY_ROOM_TTL_MS);
+    // Shrink disconnected non-kicked rejoin ticket TTL to 5 minutes from disconnect.
+    if (!opts?.kicked && attachment.rejoinHash) {
+      const now = Date.now();
+      const members = await this.getMembers(now);
+      const entry = members[attachment.rejoinHash];
+      if (entry) {
+        entry.until = Math.min(entry.until, now + DISCONNECTED_REJOIN_TTL_MS);
+        await this.ctx.storage.put({ [MEMBERS_KEY]: capByExpiry(members, (m) => m.until) });
+      }
     }
-    // The clock for an orphaned lock (see lockedNow) starts when the last host leaves.
-    if (attachment.host && !this.joinedPeers(ws).some(({ att }) => att.host)) {
-      await this.ctx.storage.put(HOST_GONE_KEY, Date.now());
+
+    if (!opts?.skipAlarmSync) {
+      await this.syncAlarm(Date.now());
     }
   }
 }

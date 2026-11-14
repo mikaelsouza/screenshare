@@ -20,7 +20,9 @@ import {
 interface RoomInfo {
   /** Whether we are the room's host. */
   host: boolean;
-  /** Present only on the welcome that created the room. Keep it to stay host. */
+  /** Present when room is unlocked (or always for host) so Invite ▾ can share CODE-SECRET. */
+  password?: string;
+  /** Present on creation or promotion. Keep it to stay host. */
   hostToken?: string;
   /** Fresh on every welcome. Present it on the next join to get back in if locked. */
   rejoinToken?: string;
@@ -29,11 +31,14 @@ interface RoomInfo {
 
 interface SignalingHandlers {
   onWelcome(selfId: PeerId, peers: PeerInfo[], room: RoomInfo): void;
-  onPeerJoined(peer: PeerInfo): void;
-  onPeerLeft(id: PeerId): void;
+  onPeerJoined(peer: PeerInfo, replaces?: PeerId): void;
+  onPeerLeft(id: PeerId, kicked?: boolean): void;
   onSignal(from: PeerId, data: SignalData): void;
   onPeerState(id: PeerId, sharing: boolean): void;
-  onRoomState?(locked: boolean): void;
+  onRoomState?(locked: boolean, password?: string): void;
+  onRoomPassword?(password: string | undefined, rejoinToken: string | undefined): void;
+  onPeerRenamed?(id: PeerId, name: string): void;
+  onHostPromoted?(hostId: PeerId, hostToken?: string, password?: string): void;
   onError(code: string, message: string): void;
   onStatus(status: "connecting" | "open" | "closed"): void;
 }
@@ -53,6 +58,15 @@ const PING_INTERVAL_MS = 15_000;
 const TRY_AGAIN_LATER = 1013;
 const MAX_CAPACITY_RETRIES = 5;
 
+const FATAL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "bad-password",
+  "bad-room-code",
+  "kicked",
+  "room-locked",
+  "session-replaced",
+  "forbidden-origin",
+]);
+
 export class SignalingClient {
   private ws: WebSocket | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,24 +77,25 @@ export class SignalingClient {
   private fatal = false;
   /** Consecutive 1013 refusals, so a full room does not retry indefinitely. */
   private capacityRefusals = 0;
+  private receivedError = false;
   private started = false;
   private welcomed = false;
   private sharing = false;
   private lastReceivedAt = 0;
   private pendingMessages: ClientMessage[] = [];
   private readonly room: string;
-  private readonly displayName: string;
+  private displayName: string;
   private readonly handlers: SignalingHandlers;
   /** Read on every (re)connect, so tokens issued by one welcome are sent on the next join. */
   private readonly tokens:
-    | (() => { hostToken?: string | undefined; rejoinToken?: string | undefined })
+    | (() => { password?: string | undefined; hostToken?: string | undefined; rejoinToken?: string | undefined })
     | undefined;
 
   constructor(
     room: string,
     displayName: string,
     handlers: SignalingHandlers,
-    tokens?: () => { hostToken?: string | undefined; rejoinToken?: string | undefined },
+    tokens?: () => { password?: string | undefined; hostToken?: string | undefined; rejoinToken?: string | undefined },
   ) {
     this.room = room;
     this.displayName = displayName;
@@ -98,6 +113,7 @@ export class SignalingClient {
     if (this.fatal) return;
     this.started = true;
     this.closedByUs = false;
+    this.receivedError = false;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -130,7 +146,8 @@ export class SignalingClient {
         room: this.room,
         displayName: this.displayName,
       };
-      const { hostToken, rejoinToken } = this.tokens?.() ?? {};
+      const { password, hostToken, rejoinToken } = this.tokens?.() ?? {};
+      if (password) joinMsg.password = password;
       if (hostToken) joinMsg.hostToken = hostToken;
       if (rejoinToken) joinMsg.rejoinToken = rejoinToken;
       if (this.welcomed) {
@@ -170,6 +187,9 @@ export class SignalingClient {
       if (ev.code === 1008) {
         this.fatal = true;
         this.pendingMessages = [];
+        if (!this.receivedError) {
+          this.handlers.onError("bad-password", ev.reason || "Invalid or expired room invite.");
+        }
         return;
       }
       // Capacity is transient, so retry — but bounded, and say so when giving up.
@@ -207,16 +227,17 @@ export class SignalingClient {
         }
         this.handlers.onWelcome(msg.selfId, msg.peers, {
           host: msg.host === true,
+          ...(typeof msg.password === "string" ? { password: msg.password } : {}),
           ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
           ...(typeof msg.rejoinToken === "string" ? { rejoinToken: msg.rejoinToken } : {}),
           locked: msg.locked === true,
         });
         break;
       case "peer-joined":
-        this.handlers.onPeerJoined(msg.peer);
+        this.handlers.onPeerJoined(msg.peer, msg.replaces);
         break;
       case "peer-left":
-        this.handlers.onPeerLeft(msg.id);
+        this.handlers.onPeerLeft(msg.id, msg.kicked);
         break;
       case "signal":
         this.handlers.onSignal(msg.from, msg.data);
@@ -225,9 +246,23 @@ export class SignalingClient {
         this.handlers.onPeerState(msg.id, msg.sharing);
         break;
       case "room-state":
-        this.handlers.onRoomState?.(msg.locked);
+        this.handlers.onRoomState?.(msg.locked, msg.password);
+        break;
+      case "room-password":
+        this.handlers.onRoomPassword?.(msg.password, msg.rejoinToken);
+        break;
+      case "peer-renamed":
+        this.handlers.onPeerRenamed?.(msg.id, msg.name);
+        break;
+      case "host-promoted":
+        this.handlers.onHostPromoted?.(msg.hostId, msg.hostToken, msg.password);
         break;
       case "error":
+        this.receivedError = true;
+        if (FATAL_ERROR_CODES.has(msg.code)) {
+          this.fatal = true;
+          this.pendingMessages = [];
+        }
         this.handlers.onError(msg.code, msg.message);
         break;
     }
@@ -265,6 +300,17 @@ export class SignalingClient {
   /** Host only: refuse or allow new joins. */
   setLocked(locked: boolean): void {
     this.send({ t: "lock", locked });
+  }
+
+  /** Host only: rotate the room's invite secret (disconnects are barred unless unlocked or holding a fresh ticket). */
+  rotatePassword(): void {
+    this.send({ t: "rotate-password" });
+  }
+
+  /** Update our display name live inside the room. */
+  rename(displayName: string): void {
+    this.displayName = displayName;
+    this.send({ t: "rename", displayName });
   }
 
   private onVisibilityChange = (): void => {
@@ -316,8 +362,9 @@ export class SignalingClient {
     this.pingTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const isVisible = typeof document === "undefined" || document.visibilityState === "visible";
+        const shouldCheckStale = isVisible || this.sharing;
         if (
-          isVisible &&
+          shouldCheckStale &&
           this.lastReceivedAt > 0 &&
           Date.now() - this.lastReceivedAt > 65_000
         ) {

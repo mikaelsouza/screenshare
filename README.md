@@ -102,17 +102,25 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
 - **Peer-to-peer connections** are direct between peers using STUN
   (`stun:stun.cloudflare.com:3478`) for NAT traversal. Connections are opened only when at
   least one side is sharing; people in the room you connect with can see your IP address.
-- **Host controls:** The join that creates a room becomes its host (`hostToken`). The host
-  can remove people (revoking that session's `rejoinToken` and banning their IPv4 address
-  or IPv6 `/64` for 15 minutes) or lock the room to new joins. Members receive a
-  `rejoinToken` on welcome to resume in place on reconnect or rejoin past a lock; a valid
-  `rejoinToken` also bypasses the IP ban (so other members sharing the address, or a member
-  holding another valid session token, can still rejoin from that address). If the host
-  leaves a locked room for 5 minutes, it unlocks automatically.
-- **The server sees** your IP, the room code and your display name while you are connected.
-  Room state and tokens are erased 12 hours after the room empties. A kicked member's IPv4
-  address or IPv6 `/64` can remain stored after the 15-minute ban expires, until a later
-  kick removes expired entries or room-state cleanup erases them.
+- **Room invites & URL privacy:** Creating a room (`POST /api/room`) atomically mints an
+  8-character room code and a 16-character random invite secret (`CODE-SECRET`). Invite links
+  place `#CODE-SECRET` solely in the URL fragment (never sent to HTTP servers or referrer
+  logs), and the client immediately scrubs the address bar back to `/` after caching credentials
+  in `sessionStorage` so reloads resume cleanly without leaving invite links visible in window
+  title bars or full-screen shares.
+- **Host controls & moderation:** The room creator holds a cryptographic `hostToken`. The host
+  can rotate the invite secret at any time, lock the room to new joins, or remove participants.
+  Removing a participant deletes their `rejoinToken` plus any disconnected rejoin tickets from
+  the same IPv4 address or IPv6 `/64`, bans that address prefix for 15 minutes, and automatically
+  rotates the room's invite secret (while locked, non-host peers never receive plaintext invite
+  secrets). Active members keep their `rejoinToken` while connected and for up to 5 minutes after
+  disconnecting (15 seconds across a rotation). If no host is present in an occupied room for
+  5 minutes, the earliest-joined active member is permanently promoted to host (locked rooms
+  never auto-unlock).
+- **The server sees** your IP, room code, salted hashes of room secrets/tokens, and display
+  name while connected. Uninitialized room codes accept zero persistent writes, and all room
+  state, secrets, and moderation entries are erased 12 hours after a room becomes empty (with
+  stored ticket/ban maps capped at 128 entries).
 
 Known limitations and open defects are tracked in
 [Issues](https://github.com/mikaelsouza/screenshare/issues).
