@@ -36,6 +36,7 @@
     "electron:start": "npm run build && npm run build:electron && electron .",
     "electron:pack": "npm run build && npm run build:electron && electron-builder --dir --publish never",
     "electron:build": "npm run build && npm run build:electron && electron-builder --win --publish never",
+    "electron:store": "npm run build && npm run build:electron && electron-builder --win appx --x64 --publish never",
     "electron:smoke": "npm run build && npm run build:electron && node scripts/smoke-test.ts",
     "electron:smoke:packaged": "cross-env ELECTRON_EXEC_PATH=release/win-unpacked/Screenshare.exe node scripts/smoke-test.ts"
   },

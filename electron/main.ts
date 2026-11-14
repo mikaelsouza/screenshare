@@ -26,6 +26,7 @@ const __dirname = path.dirname(__filename);
 
 const isDev = process.env["ELECTRON_DEV"] === "1" || process.env["NODE_ENV"] === "development";
 const isSmokeTest = process.argv.includes("--smoke-test") || process.env["SMOKE_TEST"] === "1";
+const isWindowsStore = Boolean(process.windowsStore);
 
 // The app loads the hosted site so it shares rooms (signaling via the Cloudflare Worker /
 // Durable Object) with browser users.
@@ -361,7 +362,7 @@ async function initApplication(): Promise<void> {
   }
 }
 
-if (process.platform === "win32" && app.isPackaged) {
+if (process.platform === "win32" && app.isPackaged && !isWindowsStore) {
   app.setAppUserModelId("com.screenshare.app");
 }
 
@@ -371,6 +372,7 @@ const autoUpdate = createAutoUpdateController(
   {
     isPackaged: app.isPackaged,
     platform: process.platform,
+    isWindowsStore,
     isDev,
     isSmokeTest,
   },

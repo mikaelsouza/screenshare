@@ -52,6 +52,7 @@ npm run electron:dev    # Vite dev server + Electron app (frontend UI only witho
 npm run electron:start  # build assets; Electron loads the hosted site by default
 npm run electron:pack   # unpacked directory build for the current host in release/
 npm run electron:build  # Windows x64 NSIS installer in release/
+npm run electron:store  # Windows x64 Microsoft Store (.appx) package in release/
 ```
 
 Room creation (`/api/room`) and signalling (`/ws/:code`) require the Worker. Use

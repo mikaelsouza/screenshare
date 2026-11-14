@@ -11,6 +11,7 @@ import {
 const BASE_ENV: AutoUpdateEnv = {
   isPackaged: true,
   platform: "win32",
+  isWindowsStore: false,
   isDev: false,
   isSmokeTest: false,
 };
@@ -83,14 +84,15 @@ describe("DEFAULT_UPDATE_CHECK_INTERVAL_MS", () => {
 });
 
 describe("shouldEnableAutoUpdate", () => {
-  it("returns true only for installed packaged Windows non-dev non-smoke builds", () => {
+  it("returns true only for non-Store installed packaged Windows non-dev non-smoke builds", () => {
     expect(shouldEnableAutoUpdate(BASE_ENV)).toBe(true);
   });
 
-  it("returns false when unpackaged, non-Windows, dev, or smoke test", () => {
+  it("returns false when unpackaged, non-Windows, Windows Store, dev, or smoke test", () => {
     expect(shouldEnableAutoUpdate({ ...BASE_ENV, isPackaged: false })).toBe(false);
     expect(shouldEnableAutoUpdate({ ...BASE_ENV, platform: "linux" })).toBe(false);
     expect(shouldEnableAutoUpdate({ ...BASE_ENV, platform: "darwin" })).toBe(false);
+    expect(shouldEnableAutoUpdate({ ...BASE_ENV, isWindowsStore: true })).toBe(false);
     expect(shouldEnableAutoUpdate({ ...BASE_ENV, isDev: true })).toBe(false);
     expect(shouldEnableAutoUpdate({ ...BASE_ENV, isSmokeTest: true })).toBe(false);
   });
@@ -106,15 +108,20 @@ describe("createAutoUpdateController", () => {
     vi.restoreAllMocks();
   });
 
-  it("does not create an updater or schedule checks when disabled by environment", async () => {
-    const { deps, mock } = makeDeps();
-    const controller = createAutoUpdateController({ ...BASE_ENV, isSmokeTest: true }, deps);
-    expect(controller.start()).toBe(false);
-    expect(deps.createUpdater).not.toHaveBeenCalled();
-    expect(mock.checkForUpdates).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(DEFAULT_UPDATE_CHECK_INTERVAL_MS);
-    expect(mock.checkForUpdates).not.toHaveBeenCalled();
-    expect(() => controller.stop()).not.toThrow();
+  it("does not create an updater or schedule checks when disabled by environment or Windows Store", async () => {
+    for (const env of [
+      { ...BASE_ENV, isSmokeTest: true },
+      { ...BASE_ENV, isWindowsStore: true },
+    ]) {
+      const { deps, mock } = makeDeps();
+      const controller = createAutoUpdateController(env, deps);
+      expect(controller.start()).toBe(false);
+      expect(deps.createUpdater).not.toHaveBeenCalled();
+      expect(mock.checkForUpdates).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(DEFAULT_UPDATE_CHECK_INTERVAL_MS);
+      expect(mock.checkForUpdates).not.toHaveBeenCalled();
+      expect(() => controller.stop()).not.toThrow();
+    }
   });
 
   it("configures NsisUpdater flags, unrefs interval timer, and checks immediately + periodically", async () => {
