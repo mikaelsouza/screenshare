@@ -1,4 +1,4 @@
-import type { PeerId } from "@shared/protocol";
+import { ROOM_PASSWORD_LENGTH, type InviteParseFailureReason, type PeerId } from "@shared/protocol";
 
 export interface ViewState {
   lobbyHidden: boolean;
@@ -111,10 +111,11 @@ export function deriveOutboundAudioState(
   };
 }
 
-export type PopoverKind = "roster" | "preset" | "codec" | "degradation";
+export type PopoverKind = "invite" | "roster" | "preset" | "codec" | "degradation";
 
 export interface PopoverVisibility {
   active: PopoverKind | null;
+  inviteOpen: boolean;
   rosterOpen: boolean;
   presetOpen: boolean;
   codecOpen: boolean;
@@ -122,7 +123,7 @@ export interface PopoverVisibility {
 }
 
 /**
- * Pure state-machine transition for header & footer popovers (`roster`, `preset`, `codec`, `degradation`).
+ * Pure state-machine transition for header & footer popovers (`invite`, `roster`, `preset`, `codec`, `degradation`).
  * Guarantees at most one popover is open at any time and only when its parent bar is visible.
  */
 export function nextPopoverState(
@@ -132,20 +133,107 @@ export function nextPopoverState(
   sharing: boolean,
 ): PopoverVisibility {
   const requested = current !== target ? target : null;
+  const inviteOpen = connected && requested === "invite";
   const rosterOpen = connected && requested === "roster";
   const presetOpen = connected && sharing && requested === "preset";
   const codecOpen = connected && sharing && requested === "codec";
   const degradationOpen = connected && sharing && requested === "degradation";
-  const active: PopoverKind | null = rosterOpen
-    ? "roster"
-    : presetOpen
-      ? "preset"
-      : codecOpen
-        ? "codec"
-        : degradationOpen
-          ? "degradation"
-          : null;
-  return { active, rosterOpen, presetOpen, codecOpen, degradationOpen };
+  const active: PopoverKind | null = inviteOpen
+    ? "invite"
+    : rosterOpen
+      ? "roster"
+      : presetOpen
+        ? "preset"
+        : codecOpen
+          ? "codec"
+          : degradationOpen
+            ? "degradation"
+            : null;
+  return { active, inviteOpen, rosterOpen, presetOpen, codecOpen, degradationOpen };
+}
+
+export interface InviteMenuState {
+  canCopy: boolean;
+  canShow: boolean;
+  canRotate: boolean;
+  showLockedBanner: boolean;
+  displayCode: string;
+}
+
+/** Mask the secret portion of a room invite code with bullets while preserving the 8-char code prefix. */
+export function maskInviteSecret(code: string): string {
+  return `${code}-${"\u2022".repeat(ROOM_PASSWORD_LENGTH)}`;
+}
+
+export interface InviteMenuParams {
+  roomCode: string | null;
+  roomPassword: string | null;
+  roomLocked: boolean;
+  isHost: boolean;
+  revealed: boolean;
+  signalingReady?: boolean;
+  rotating?: boolean;
+}
+
+/**
+ * Pure derivation of the 1C-2 invite menu's enabled actions, locked state, and displayed code string.
+ */
+export function deriveInviteMenuState(params: InviteMenuParams): InviteMenuState {
+  const { roomCode, roomPassword, roomLocked, isHost, revealed } = params;
+  const signalingReady = params.signalingReady ?? true;
+  const rotating = params.rotating ?? false;
+  const hasCode = roomCode !== null && roomCode.length > 0;
+  const hasSecret = roomPassword !== null && roomPassword.length > 0;
+  const canRotate = isHost && hasCode && signalingReady && !rotating;
+  const canCopy = !roomLocked && !rotating && hasCode && hasSecret;
+  const canShow = canCopy;
+  const displayCode =
+    !hasCode || roomCode === null
+      ? ""
+      : canShow && revealed && roomPassword !== null
+        ? `${roomCode}-${roomPassword}`
+        : maskInviteSecret(roomCode);
+  return {
+    canCopy,
+    canShow,
+    canRotate,
+    showLockedBanner: roomLocked,
+    displayCode,
+  };
+}
+
+/**
+ * Map a parseInviteInput failure reason to concise inline Lobby error copy.
+ */
+export function describeInviteParseFailure(reason: InviteParseFailureReason): string {
+  switch (reason) {
+    case "empty":
+      return "Paste an invite link or code to join.";
+    case "url-missing-invite":
+      return "That link is missing its #CODE-SECRET invite part. Ask someone in the room to use Invite \u25BE \u2192 Copy invite link.";
+    case "missing-secret":
+      return "Room codes now include a secret (CODE-SECRET). Paste the full invite link or code.";
+    case "invalid":
+      return "Invalid invite code or link. Check for typos or ask for a fresh invite.";
+  }
+}
+
+export interface JoinChipArrival {
+  name: string;
+  shortId: string;
+}
+
+/**
+ * Format coalesced arrival notifications for the 2AB-2 bottom-right join chip.
+ */
+export function formatJoinChipText(arrivals: ReadonlyArray<JoinChipArrival>): string {
+  const fmt = (a: JoinChipArrival): string => `${a.name} #${a.shortId.replace(/^#/, "")}`;
+  const first = arrivals[0];
+  if (!first) return "";
+  if (arrivals.length === 1) return `${fmt(first)} joined`;
+  const second = arrivals[1];
+  if (arrivals.length === 2 && second) return `${fmt(first)} & ${fmt(second)} joined`;
+  return `${fmt(first)} + ${arrivals.length - 1} others joined`;
 }
 
 /**
@@ -195,6 +283,8 @@ export interface RosterEntry {
   host: boolean;
   self: boolean;
   canKick: boolean;
+  isNew: boolean;
+  duplicateName: boolean;
 }
 
 export interface RosterSummary {
@@ -202,6 +292,11 @@ export interface RosterSummary {
   sharingCount: number;
   buttonLabel: string;
   entries: RosterEntry[];
+}
+
+export interface RosterOptions {
+  newPeerIds?: ReadonlySet<PeerId>;
+  extraPeerIds?: Iterable<PeerId>;
 }
 
 /**
@@ -215,8 +310,26 @@ export function sortAndFormatRoster(
   isHost: boolean,
   roomLocked: boolean,
   members: ReadonlyMap<PeerId, { name: string; sharing: boolean; host: boolean }>,
+  options?: RosterOptions,
 ): RosterSummary {
-  const entries: RosterEntry[] = [
+  const combined = new Map<PeerId, { name: string; sharing: boolean; host: boolean }>(members);
+  if (options?.extraPeerIds) {
+    for (const id of options.extraPeerIds) {
+      if (id !== selfId && !combined.has(id)) {
+        combined.set(id, { name: "Peer", sharing: false, host: false });
+      }
+    }
+  }
+
+  const baseEntries: Array<{
+    id: PeerId;
+    name: string;
+    shortId: string;
+    sharing: boolean;
+    host: boolean;
+    self: boolean;
+    canKick: boolean;
+  }> = [
     {
       id: selfId,
       name: selfName.trim() || "Anonymous",
@@ -228,12 +341,12 @@ export function sortAndFormatRoster(
     },
   ];
 
-  const others = [...members.entries()]
+  const others = [...combined.entries()]
     .filter(([id]) => id !== selfId)
     .sort((a, b) => a[1].name.localeCompare(b[1].name) || a[0].localeCompare(b[0]));
 
   for (const [id, m] of others) {
-    entries.push({
+    baseEntries.push({
       id,
       name: m.name.trim() || "Anonymous",
       shortId: `#${id.slice(0, 4)}`,
@@ -243,6 +356,18 @@ export function sortAndFormatRoster(
       canKick: isHost,
     });
   }
+
+  const nameCounts = new Map<string, number>();
+  for (const entry of baseEntries) {
+    const key = entry.name.trim().toLowerCase();
+    nameCounts.set(key, (nameCounts.get(key) ?? 0) + 1);
+  }
+
+  const entries: RosterEntry[] = baseEntries.map((entry) => ({
+    ...entry,
+    isNew: !entry.self && (options?.newPeerIds?.has(entry.id) ?? false),
+    duplicateName: (nameCounts.get(entry.name.trim().toLowerCase()) ?? 0) > 1,
+  }));
 
   const totalCount = entries.length;
   const sharingCount = entries.filter((e) => e.sharing).length;

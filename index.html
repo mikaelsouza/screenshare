@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="no-referrer" />
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'%3E%3Cdefs%3E%3ClinearGradient id='b' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%232DD4BF'/%3E%3Cstop offset='1' stop-color='%230D9488'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M98 48 L78 24 M158 48 L178 24' fill='none' stroke='%230D9488' stroke-width='11' stroke-linecap='round'/%3E%3Ccircle cx='78' cy='24' r='9' fill='%235EEAD4'/%3E%3Ccircle cx='178' cy='24' r='9' fill='%235EEAD4'/%3E%3Crect x='64' y='196' width='36' height='26' rx='12' fill='%23115E59'/%3E%3Crect x='156' y='196' width='36' height='26' rx='12' fill='%23115E59'/%3E%3Crect x='28' y='44' width='200' height='162' rx='40' fill='url(%23b)' stroke='%2399F6E4' stroke-width='4'/%3E%3Crect x='50' y='66' width='156' height='118' rx='26' fill='%2318181B'/%3E%3Ccircle cx='96' cy='116' r='12' fill='%23FDE047'/%3E%3Ccircle cx='160' cy='116' r='12' fill='%23FDE047'/%3E%3Cpath d='M106 140 Q128 158 150 140' fill='none' stroke='%23FDE047' stroke-width='10' stroke-linecap='round'/%3E%3C/svg%3E" />
     <title>Screenshare</title>
     <style>
@@ -49,6 +50,7 @@
         flex-shrink: 0;
       }
       header.app-bar {
+        position: relative;
         border-bottom: 1px solid var(--border-color);
       }
       footer.app-bar {
@@ -124,11 +126,6 @@
       .ui-btn.muted-active:hover:not(:disabled) {
         background-color: rgba(245, 158, 11, 0.26);
       }
-      .ui-btn.copied {
-        background-color: #047857;
-        border-color: #047857;
-        color: #ffffff;
-      }
       .ui-input {
         background-color: var(--bg-color);
         cursor: text;
@@ -193,11 +190,6 @@
         cursor: default;
         opacity: 1;
       }
-      #copy-link {
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 12px;
-        letter-spacing: 0.02em;
-      }
       #follow-chip {
         display: inline-flex;
         align-items: center;
@@ -225,29 +217,123 @@
         color: #f87171;
       }
       #room-bar {
+        position: relative;
         display: flex;
         align-items: center;
         gap: 8px;
         margin-left: auto;
       }
 
-      /* Shared Popover Anchors & Menus (Roster, Stream Quality, Video Codec, Stream Priority) */
+      /* Shared Popover Anchors & Menus (Invite, Roster, Stream Quality, Video Codec, Stream Priority) */
       .popover-anchor,
+      .invite-anchor,
       .roster-anchor {
         position: relative;
         display: inline-flex;
       }
+      #invite-menu,
       #roster {
         position: absolute;
         top: calc(100% + 8px);
         right: 0;
-        width: 380px;
         max-width: calc(100vw - 32px);
         z-index: 30;
         display: flex;
         flex-direction: column;
         gap: 10px;
         padding: 12px;
+      }
+      #invite-menu {
+        width: 368px;
+      }
+      #roster {
+        width: 380px;
+      }
+      @media (max-width: 680px) {
+        #room-bar,
+        .invite-anchor,
+        .roster-anchor {
+          position: static;
+        }
+        #invite-menu,
+        #roster {
+          top: calc(100% + 4px);
+          left: 12px;
+          right: 12px;
+          width: auto;
+          max-width: none;
+        }
+      }
+      #invite-rotate-btn {
+        height: 26px;
+        padding: 0 8px;
+        font-size: 12px;
+      }
+      .invite-locked-note {
+        padding: 6px 8px;
+        border-radius: var(--radius);
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        background-color: rgba(245, 158, 11, 0.1);
+        color: #fbbf24;
+        font-size: 12px;
+      }
+      .invite-code-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        min-height: 30px;
+        padding: 4px 8px;
+        border-radius: var(--radius);
+        background-color: var(--bg-color);
+        border: 1px solid var(--border-color);
+      }
+      .invite-code-value {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 11.5px;
+        color: var(--text-primary);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        min-width: 0;
+        flex: 1;
+      }
+      .invite-code-row.is-disabled .invite-code-value {
+        color: var(--text-secondary);
+        opacity: 0.65;
+      }
+      .invite-code-actions {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        flex-shrink: 0;
+      }
+      .invite-inline-btn {
+        height: 22px;
+        padding: 0 8px;
+        font-size: 11px;
+      }
+      .popover-item:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+      .popover-item:disabled:hover {
+        background-color: var(--bg-color);
+      }
+      .invite-feedback-ok {
+        color: #4ade80 !important;
+        border-color: rgba(34, 197, 94, 0.5) !important;
+      }
+      #roster-btn.has-unread {
+        border-color: rgba(34, 197, 94, 0.55);
+        background-color: rgba(34, 197, 94, 0.12);
+      }
+      .roster-unread-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background-color: #22c55e;
+        flex-shrink: 0;
       }
       .popover-up {
         position: absolute;
@@ -362,9 +448,30 @@
         font-size: 11px;
         flex-shrink: 0;
       }
-      .roster-peer .badge {
+      .roster-peer .badge,
+      .roster-peer .role-badge {
         color: var(--text-secondary);
         font-size: 11px;
+        flex-shrink: 0;
+      }
+      .roster-peer .tag-new {
+        padding: 1px 6px;
+        border-radius: 999px;
+        background-color: rgba(34, 197, 94, 0.14);
+        border: 1px solid rgba(34, 197, 94, 0.32);
+        color: #4ade80;
+        font-size: 10px;
+        font-weight: 600;
+        flex-shrink: 0;
+      }
+      .roster-peer .tag-dup {
+        padding: 1px 6px;
+        border-radius: 999px;
+        background-color: rgba(245, 158, 11, 0.14);
+        border: 1px solid rgba(245, 158, 11, 0.35);
+        color: #fbbf24;
+        font-size: 10px;
+        font-weight: 600;
         flex-shrink: 0;
       }
       .roster-meta {
@@ -437,8 +544,15 @@
       }
       #room-code {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
+        font-size: 12.5px;
+      }
+      .ui-input.input-error {
+        border-color: #f87171;
+      }
+      .lobby-error {
+        font-size: 12px;
+        line-height: 1.4;
+        color: #f87171;
       }
       .lobby-join-row {
         display: flex;
@@ -467,6 +581,7 @@
 
       /* Stage & Video Tiles */
       #stage {
+        position: relative;
         flex: 1;
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
@@ -478,6 +593,42 @@
         align-items: center;
         min-height: 0;
         overflow-y: auto;
+      }
+      .join-chip {
+        position: fixed;
+        right: 16px;
+        bottom: 68px;
+        z-index: 25;
+        pointer-events: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        max-width: calc(100% - 32px);
+        padding: 6px 12px;
+        border-radius: var(--radius);
+        background: rgba(9, 9, 11, 0.86);
+        border: 1px solid rgba(34, 197, 94, 0.45);
+        color: var(--text-primary);
+        font-size: 12px;
+        font-weight: 500;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+      }
+      .join-chip::before {
+        content: "";
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background-color: #22c55e;
+        flex-shrink: 0;
+      }
+      .tile:fullscreen .join-chip-mirror {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        z-index: 40;
       }
       .stage-empty {
         display: flex;
@@ -784,9 +935,35 @@
       <span id="status" data-kind="info" aria-live="polite" hidden>Not connected</span>
 
       <div id="room-bar" hidden>
+        <div class="invite-anchor popover-anchor">
+          <button type="button" id="invite-btn" class="ui-btn" aria-expanded="false" aria-controls="invite-menu">
+            Invite &#9662;
+          </button>
+          <section id="invite-menu" class="app-card" hidden aria-labelledby="invite-menu-title">
+            <div class="popover-head">
+              <span id="invite-menu-title">Room invite</span>
+              <button type="button" id="invite-rotate-btn" class="ui-btn" hidden title="Rotate room invite secret">
+                Rotate
+              </button>
+            </div>
+            <p id="invite-locked-note" class="invite-locked-note" hidden>Room is locked — unlock to invite</p>
+            <button type="button" id="invite-copy-link" class="popover-item">
+              <span>Copy invite link</span>
+              <span id="invite-link-feedback" class="popover-item-right"></span>
+            </button>
+            <div id="invite-code-row" class="invite-code-row">
+              <code id="invite-code-value" class="invite-code-value"></code>
+              <div class="invite-code-actions">
+                <button type="button" id="invite-show-btn" class="ui-btn invite-inline-btn">Show</button>
+                <button type="button" id="invite-copy-code" class="ui-btn invite-inline-btn">Copy</button>
+              </div>
+            </div>
+          </section>
+        </div>
         <div class="roster-anchor popover-anchor">
           <button type="button" id="roster-btn" class="ui-btn" aria-expanded="false" aria-controls="roster">
-            1 in room · 0 sharing &#9662;
+            <span id="roster-unread-dot" class="roster-unread-dot" hidden aria-hidden="true"></span>
+            <span id="roster-btn-label">1 in room · 0 sharing &#9662;</span>
           </button>
           <section id="roster" class="app-card" hidden aria-labelledby="roster-title">
             <div class="roster-head">
@@ -802,7 +979,6 @@
             </div>
           </section>
         </div>
-        <button type="button" id="copy-link" class="ui-btn" hidden title="Copy room invite link to clipboard"></button>
       </div>
     </header>
 
@@ -814,13 +990,14 @@
           <input type="text" id="display-name" class="ui-input name-input" placeholder="Your name" maxlength="32" autocomplete="nickname" spellcheck="false" />
         </div>
         <button type="button" id="create" class="ui-btn primary">Create new room</button>
-        <div class="lobby-divider">or join with code</div>
+        <div class="lobby-divider">or join with invite</div>
         <div class="lobby-field">
-          <label for="room-code">Room code</label>
+          <label for="room-code">Invite code or link</label>
           <div class="lobby-join-row">
-            <input type="text" id="room-code" class="ui-input" placeholder="8-CHAR CODE" maxlength="8" autocomplete="off" spellcheck="false" />
+            <input type="text" id="room-code" class="ui-input" placeholder="CODE-SECRET or link" maxlength="256" autocomplete="off" spellcheck="false" />
             <button type="button" id="join" class="ui-btn">Join room</button>
           </div>
+          <p id="lobby-error" class="lobby-error" role="alert" hidden></p>
         </div>
       </div>
     </div>
@@ -837,6 +1014,7 @@
           Click "Share screen" below to start, or wait for someone to share.
         </p>
       </div>
+      <div id="join-chip" class="join-chip" role="status" aria-live="polite" hidden></div>
     </main>
 
     <footer id="controls" class="app-bar" hidden>

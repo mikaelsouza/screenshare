@@ -175,6 +175,7 @@ describe("Mesh and PeerLink", () => {
 
   it("negotiates offers and answers between peers", async () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addMember("bob", true);
     mesh.addPeer("bob");
     const pc = FakeRTCPeerConnection.instances[0]!;
 
@@ -423,6 +424,7 @@ describe("Mesh and PeerLink", () => {
   it("handles offer collisions on impolite peer by ignoring colliding offer", async () => {
     // alice > aaron: alice is impolite (!polite)
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addMember("aaron", true);
     mesh.addPeer("aaron");
     const pc = FakeRTCPeerConnection.instances[0]!;
 
@@ -436,6 +438,7 @@ describe("Mesh and PeerLink", () => {
 
   it("handles errors gracefully in addIce and setDescription", async () => {
     const mesh = new Mesh("alice", defaultOptions, (to, data) => sentSignals.push({ to, data }), callbacks);
+    mesh.addMember("bob", true);
     mesh.addPeer("bob");
     const pc = FakeRTCPeerConnection.instances[0]!;
 
@@ -822,10 +825,36 @@ describe("negotiation recovery", () => {
     expect(r.playoutDelayHint).toBe(0.15);
   });
 
-  it("adds unknown member on setMemberSharing and retries offer on glare during createOffer", async () => {
+  it("ignores setMemberSharing and handleSignal for unknown non-members", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", opts, (to, data) => signals.push({ to, data }), cb());
+    mesh.setMemberSharing("ghost", true);
+    expect(mesh.memberIds()).toEqual([]);
+    await mesh.handleSignal("ghost", { k: "offer", sdp: "v=0\r\n" });
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+
+    await mesh.setCapture(capture());
+    mesh.setMemberSharing("ghost", false);
+    expect(mesh.memberIds()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+    await mesh.setCapture(null);
+  });
+
+  it("exposes memberIds matching room membership even without P2P links", () => {
+    const mesh = new Mesh("me", opts, () => {}, cb());
+    mesh.addMember("bob", false);
+    mesh.addMember("carol", false);
+    expect(mesh.peers()).toEqual([]);
+    expect(mesh.memberIds()).toEqual(["bob", "carol"]);
+    mesh.removeMember("bob");
+    expect(mesh.memberIds()).toEqual(["carol"]);
+  });
+
+  it("retries offer on glare during createOffer when member exists", async () => {
     const signals: Array<{ to: string; data: SignalData }> = [];
     const mesh = new Mesh("alice", opts, (to, data) => signals.push({ to, data }), cb());
-    mesh.setMemberSharing("bob", true);
+    mesh.addMember("bob", true);
     await mesh.setCapture(capture());
     const [pc] = FakeRTCPeerConnection.instances;
     if (!pc) throw new Error("Expected peer connection");

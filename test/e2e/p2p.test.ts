@@ -11,12 +11,11 @@ import {
   type ServerHandle,
 } from "./helpers.ts";
 
-// Fresh per run: wrangler dev keeps Durable Object storage between runs, and a room
-// claimed by an earlier run has a host this run cannot be.
-const ROOM = Array.from(
-  crypto.getRandomValues(new Uint8Array(8)),
-  (byteVal) => "ABCDEFGHJKMNPQRSTUVWXYZ23456789"[byteVal % 31] ?? "A",
-).join("");
+// Initialized via POST /api/room in the first test so the Durable Object holds its
+// password and creator hostToken before any browser navigates to /#CODE-SECRET.
+let ROOM = "";
+let INVITE = "";
+let HOST_TOKEN = "";
 const PORT = 8890;
 const BASE_URL = baseUrl(PORT);
 
@@ -159,11 +158,22 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     await stopServer(server);
   });
 
-  await it("serves the app and mints a room code", async () => {
-    const res = await fetch(`${BASE_URL}/api/room`);
+  await it("serves the app and mints a room code, invite secret, and hostToken via POST", async () => {
+    const getRes = await fetch(`${BASE_URL}/api/room`);
+    assert.equal(getRes.status, 405);
+    const res = await fetch(`${BASE_URL}/api/room`, { method: "POST" });
     assert.equal(res.status, 200);
-    const { code } = (await res.json()) as { code: string };
+    const { code, password, hostToken } = (await res.json()) as {
+      code: string;
+      password: string;
+      hostToken: string;
+    };
     assert.match(code, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{8}$/);
+    assert.match(password, /^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{16}$/);
+    assert.ok(hostToken.length > 0);
+    ROOM = code;
+    INVITE = `${code}-${password}`;
+    HOST_TOKEN = hostToken;
   });
 
   await it("routes /ws and /api past the static assets", async () => {
@@ -241,15 +251,22 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
         assert.equal(lobbyGeometry.stageHidden, true);
         assert.equal(lobbyGeometry.controlsHidden, true);
       }
-      await page.evaluate((peerName) => localStorage.setItem("name", peerName), name);
-      // Navigate via about:blank so opening /#ROOM is a genuine document navigation
+      await page.evaluate(
+        ({ peerName, isCreator, roomCode, token }) => {
+          localStorage.setItem("name", peerName);
+          if (isCreator) sessionStorage.setItem(`host:${roomCode}`, token);
+        },
+        { peerName: name, isCreator: name === "sharer", roomCode: ROOM, token: HOST_TOKEN },
+      );
+      // Navigate via about:blank so opening /#CODE-SECRET is a genuine document navigation
       // (a same-origin hash change in Chromium does not re-run the page's load init).
       await page.goto("about:blank");
-      await page.goto(`${BASE_URL}/#${ROOM}`);
+      await page.goto(`${BASE_URL}/#${INVITE}`);
       await waitFor(page, () => Boolean(document.getElementById("status")?.textContent?.includes("In room")), {
         label: `${name} to join from the link`,
       });
-      assert.equal(await page.inputValue("#room-code"), ROOM);
+      assert.equal(await page.inputValue("#room-code"), "");
+      assert.equal(await page.evaluate(() => window.location.hash), "", "URL hash must be scrubbed on join");
     }
 
     watchingGeometry = await sharer.evaluate(() => {
@@ -257,13 +274,16 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
       const h1Rect = document.querySelector("header.app-bar h1")?.getBoundingClientRect();
       const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
       const shareRect = document.getElementById("share")?.getBoundingClientRect();
+      const inviteBtnRect = document.getElementById("invite-btn")?.getBoundingClientRect();
       const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
-      const copyLinkRect = document.getElementById("copy-link")?.getBoundingClientRect();
-      if (!headerRect || !h1Rect || !controlsRect || !shareRect || !rosterBtnRect || !copyLinkRect) {
+      if (!headerRect || !h1Rect || !controlsRect || !shareRect || !inviteBtnRect || !rosterBtnRect) {
         throw new Error("Missing room bar elements");
       }
-      if (rosterBtnRect.right > copyLinkRect.left) {
-        throw new Error("#roster-btn must be positioned to the left of #copy-link");
+      if (inviteBtnRect.right > rosterBtnRect.left) {
+        throw new Error("#invite-btn must be positioned to the left of #roster-btn");
+      }
+      if (document.getElementById("copy-link") !== null) {
+        throw new Error("#copy-link button must not exist");
       }
       if (document.getElementById("leave") !== null) {
         throw new Error("#leave button must not exist");
@@ -865,9 +885,12 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
   });
 
   await it("lets only the room's creator remove people and lock the room", async () => {
-    await sharer.click("#roster-btn");
-    await viewer.click("#roster-btn");
-    // The sharer joined first, so it created the room and is its host.
+    for (const p of [sharer, viewer]) {
+      if (await p.evaluate(() => document.getElementById("roster")?.hidden ?? true)) {
+        await p.click("#roster-btn");
+      }
+    }
+    // The sharer joined first with hostToken, so it created the room and is its host.
     const removeButtons = (page: Page): Promise<number> =>
       page.evaluate(() => document.querySelectorAll("#roster-list button").length);
     assert.equal(await removeButtons(sharer), 2, "host should see a Remove button per other person");
@@ -888,9 +911,19 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     );
 
     await sharer.click("#roster-list li:has-text('viewer2') button");
-    await waitFor(viewer2, () => Boolean(document.getElementById("status")?.textContent?.includes("removed")), {
-      label: "viewer2 to be told it was removed",
-    });
+    await waitFor(
+      viewer2,
+      () => {
+        const el = document.getElementById("lobby-error");
+        return Boolean(
+          document.getElementById("lobby")?.hidden === false &&
+            el &&
+            !el.hidden &&
+            el.textContent?.includes("removed"),
+        );
+      },
+      { label: "viewer2 to be returned to lobby and told it was removed" },
+    );
     for (const page of [sharer, viewer]) {
       await waitFor(page, () => document.querySelectorAll("#roster-list li").length === 2, {
         label: "viewer2 to leave the participant list",

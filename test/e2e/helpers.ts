@@ -56,7 +56,7 @@ export async function startServer(port: number): Promise<ServerHandle> {
   while (Date.now() < deadline) {
     if (proc.exitCode !== null) throw new Error(`wrangler exited early:\n${log}`);
     try {
-      const res = await fetch(`${BASE_URL}/api/room`);
+      const res = await fetch(`${BASE_URL}/`);
       if (res.ok) return { proc, log: () => log };
     } catch {
       /* not up yet */

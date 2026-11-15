@@ -3,6 +3,7 @@ import fc from "fast-check";
 import {
   computeVolumeState,
   deriveOutboundAudioState,
+  formatJoinChipText,
   nextPopoverState,
   sortAndFormatRoster,
   type PopoverKind,
@@ -29,7 +30,14 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
 
   it("nextPopoverState and deriveOutboundAudioState preserve invariants across random action traces", () => {
     const stepArb = fc.record({
-      target: fc.constantFrom<PopoverKind | null>(null, "roster", "preset", "codec", "degradation"),
+      target: fc.constantFrom<PopoverKind | null>(
+        null,
+        "invite",
+        "roster",
+        "preset",
+        "codec",
+        "degradation",
+      ),
       connected: fc.boolean(),
       sharing: fc.boolean(),
       hasAudio: fc.boolean(),
@@ -42,6 +50,7 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
         for (const step of steps) {
           const pop = nextPopoverState(current, step.target, step.connected, step.sharing);
           const openCount =
+            Number(pop.inviteOpen) +
             Number(pop.rosterOpen) +
             Number(pop.presetOpen) +
             Number(pop.codecOpen) +
@@ -113,6 +122,92 @@ describe("Fuzzing Suite: UI Model Volume, Popover & Roster Formatting", () => {
         },
       ),
       { numRuns: 500 },
+    );
+  });
+
+  it("sortAndFormatRoster preserves invariants when newPeerIds and extraPeerIds options are supplied", () => {
+    const peerArb = fc.record({
+      id: fc.uuid(),
+      name: fc.string({ maxLength: 40 }),
+      sharing: fc.boolean(),
+      host: fc.boolean(),
+    });
+
+    fc.assert(
+      fc.property(
+        fc.uuid(),
+        fc.string({ maxLength: 40 }),
+        fc.boolean(),
+        fc.boolean(),
+        fc.boolean(),
+        fc.array(peerArb, { maxLength: 15 }),
+        fc.array(fc.uuid(), { maxLength: 10 }),
+        fc.array(fc.uuid(), { maxLength: 10 }),
+        (selfId, selfName, selfSharing, isHost, roomLocked, peerList, newIds, extraIds) => {
+          const map = new Map<string, { name: string; sharing: boolean; host: boolean }>();
+          for (const peer of peerList) {
+            if (peer.id !== selfId) {
+              map.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host });
+            }
+          }
+          const newPeerIds = new Set<string>([selfId, ...newIds]);
+          const extraPeerIds = [selfId, ...extraIds];
+
+          const expectedIds = new Set<string>(map.keys());
+          for (const id of extraPeerIds) {
+            if (id !== selfId) expectedIds.add(id);
+          }
+
+          const res = sortAndFormatRoster(selfId, selfName, selfSharing, isHost, roomLocked, map, {
+            newPeerIds,
+            extraPeerIds,
+          });
+
+          expect(res.totalCount).toBe(expectedIds.size + 1);
+          expect(res.entries[0]?.self).toBe(true);
+          expect(res.entries[0]?.isNew).toBe(false);
+
+          for (const entry of res.entries.slice(1)) {
+            expect(entry.isNew).toBe(newPeerIds.has(entry.id));
+            if (!map.has(entry.id)) {
+              expect(entry.name).toBe("Peer");
+              expect(entry.sharing).toBe(false);
+              expect(entry.host).toBe(false);
+            }
+          }
+          return true;
+        },
+      ),
+      { numRuns: 400 },
+    );
+  });
+
+  it("formatJoinChipText handles 0, 1, 2, and N arrivals consistently", () => {
+    const arrivalArb = fc.record({
+      name: fc.string({ minLength: 1, maxLength: 32 }),
+      shortId: fc.stringMatching(/^#?[0-9a-f]{4}$/),
+    });
+
+    fc.assert(
+      fc.property(fc.array(arrivalArb, { maxLength: 12 }), (arrivals) => {
+        const text = formatJoinChipText(arrivals);
+        const [first, second] = arrivals;
+        if (!first) {
+          expect(text).toBe("");
+        } else if (!second) {
+          expect(text).toBe(`${first.name} #${first.shortId.replace(/^#/, "")} joined`);
+        } else if (arrivals.length === 2) {
+          expect(text).toBe(
+            `${first.name} #${first.shortId.replace(/^#/, "")} & ${second.name} #${second.shortId.replace(/^#/, "")} joined`,
+          );
+        } else {
+          expect(text).toBe(
+            `${first.name} #${first.shortId.replace(/^#/, "")} + ${arrivals.length - 1} others joined`,
+          );
+        }
+        return true;
+      }),
+      { numRuns: 400 },
     );
   });
 });

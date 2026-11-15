@@ -6,7 +6,9 @@
 
 import {
   MAX_ROOM_SIZE,
+  formatInviteCode,
   isValidRoomCode,
+  parseInviteInput,
   parseNewRoomResponse,
   type PeerId,
   type PeerInfo,
@@ -31,11 +33,15 @@ import { SignalingClient } from "./signaling";
 import { LinkMonitor, summarize } from "./stats";
 import {
   computeVolumeState,
+  deriveInviteMenuState,
   deriveOutboundAudioState,
   deriveViewState,
+  describeInviteParseFailure,
+  formatJoinChipText,
   nextPopoverState,
   shouldRequestRemoteVideo,
   sortAndFormatRoster,
+  type JoinChipArrival,
   type PopoverKind,
   type RosterEntry,
   type RosterSummary,
@@ -55,12 +61,24 @@ const ui = {
   nameInput: el<HTMLInputElement>("display-name"),
   roomNameInput: el<HTMLInputElement>("room-name"),
   roomInput: el<HTMLInputElement>("room-code"),
+  lobbyError: el<HTMLElement>("lobby-error"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
   brandHomeBtn: el<HTMLButtonElement>("brand-home"),
   roomBar: el<HTMLElement>("room-bar"),
-  copyLinkBtn: el<HTMLButtonElement>("copy-link"),
+  inviteBtn: el<HTMLButtonElement>("invite-btn"),
+  inviteMenu: el<HTMLElement>("invite-menu"),
+  inviteRotateBtn: el<HTMLButtonElement>("invite-rotate-btn"),
+  inviteLockedNote: el<HTMLElement>("invite-locked-note"),
+  inviteCopyLinkBtn: el<HTMLButtonElement>("invite-copy-link"),
+  inviteLinkFeedback: el<HTMLElement>("invite-link-feedback"),
+  inviteCodeRow: el<HTMLElement>("invite-code-row"),
+  inviteCodeValue: el<HTMLElement>("invite-code-value"),
+  inviteShowBtn: el<HTMLButtonElement>("invite-show-btn"),
+  inviteCopyCodeBtn: el<HTMLButtonElement>("invite-copy-code"),
   rosterBtn: el<HTMLButtonElement>("roster-btn"),
+  rosterUnreadDot: el<HTMLElement>("roster-unread-dot"),
+  rosterBtnLabel: el<HTMLElement>("roster-btn-label"),
   roster: el<HTMLElement>("roster"),
   rosterTitle: el<HTMLElement>("roster-title"),
   rosterList: el<HTMLUListElement>("roster-list"),
@@ -70,6 +88,7 @@ const ui = {
   followChipText: el<HTMLElement>("follow-chip-text"),
   status: el<HTMLElement>("status"),
   stage: el<HTMLDivElement>("stage"),
+  joinChip: el<HTMLElement>("join-chip"),
   stageEmpty: el<HTMLElement>("stage-empty"),
   stageEmptyTitle: el<HTMLElement>("stage-empty-title"),
   stageEmptySub: el<HTMLElement>("stage-empty-sub"),
@@ -178,10 +197,29 @@ const members = new Map<PeerId, { name: string; sharing: boolean; host: boolean 
 /** Whether we are this room's host, and whether the room refuses new joins. */
 let isHost = false;
 let roomLocked = false;
+let roomPassword: string | null = null;
 /** Our own id in the current room, once welcomed. */
 let selfId: PeerId | null = null;
 /** The room of the current connection, so it can be redone in place. */
 let lastJoin: { code: string } | null = null;
+
+/** Arrivals since `#roster` was last opened/viewed (cleared when closing roster). */
+const unreadPeerIds = new Set<PeerId>();
+/** Short departure window so reconnects / F5 reloads suppress duplicate join notifications. */
+const recentDepartures = new Map<PeerId, number>();
+const RECENT_DEPARTURE_MS = 8_000;
+const joinChipArrivals: JoinChipArrival[] = [];
+let joinChipTimer: ReturnType<typeof setTimeout> | null = null;
+let joinChipMirror: HTMLElement | null = null;
+const JOIN_CHIP_DURATION_MS = 2_800;
+
+let inviteRevealed = false;
+let inviteRevealTimer: ReturnType<typeof setTimeout> | null = null;
+let linkFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+let codeFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+let rotateFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+let inviteRotatePending = false;
+let inviteRotateTimeout: ReturnType<typeof setTimeout> | null = null;
 
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
@@ -252,7 +290,6 @@ function syncViewState(): ViewState {
   ui.stageEmptyTitle.textContent = state.stageEmptyTitle;
   ui.stageEmptySub.textContent = state.stageEmptySubtitle;
   ui.roomBar.hidden = state.roomBarHidden;
-  ui.copyLinkBtn.hidden = state.roomBarHidden;
   ui.controls.hidden = state.controlsHidden;
   ui.liveControls.hidden = state.liveControlsHidden;
   ui.muteAudioBtn.hidden = state.muteAudioHidden;
@@ -303,16 +340,15 @@ function setStatus(text: string, kind: "info" | "warn" | "error" = "info"): void
   ui.status.hidden = kind === "info" || text.length === 0;
 }
 
-let copyFeedbackTimeout: ReturnType<typeof setTimeout> | null = null;
-
-function defaultCopyLinkLabel(): string {
-  const code = lastJoin?.code ?? ui.roomInput.value.trim().toUpperCase();
-  return code ? `${code} · Copy link` : "Copy link";
+function setLobbyError(message: string | null): void {
+  ui.lobbyError.textContent = message ?? "";
+  ui.lobbyError.hidden = message === null || message.length === 0;
+  ui.roomInput.classList.toggle("input-error", message !== null && message.length > 0);
 }
 
-function syncCopyLinkButton(): void {
-  if (copyFeedbackTimeout !== null) return;
-  ui.copyLinkBtn.textContent = defaultCopyLinkLabel();
+function formatTileLabel(peerId: PeerId, name: string): string {
+  if (peerId === SELF_TILE) return "You";
+  return `${name} #${peerId.slice(0, 4)}`;
 }
 
 /**
@@ -337,7 +373,7 @@ function tileFor(peerId: PeerId): HTMLVideoElement {
 
   const label = document.createElement("span");
   label.className = "tile-label";
-  label.textContent = names.get(peerId) ?? peerId.slice(0, 6);
+  label.textContent = formatTileLabel(peerId, names.get(peerId) ?? "Peer");
 
   const health = document.createElement("span");
   health.className = "tile-health";
@@ -859,6 +895,7 @@ function removeTile(peerId: PeerId): void {
 
 document.addEventListener("fullscreenchange", () => {
   for (const id of tileControls.keys()) renderTileControls(id);
+  renderJoinChip();
 });
 
 /**
@@ -896,7 +933,7 @@ function startHealthPolling(): void {
 
     // 2. Outbound stats per viewer for the roster while streaming
     if (capture) {
-      const peerIds = [...members.keys()];
+      const peerIds = [...new Set([...members.keys(), ...activeMesh.peers()])];
       runBackground(
         Promise.all(
           peerIds.map(async (peerId) => {
@@ -963,37 +1000,236 @@ function renderSelfPreview(stream: MediaStream | null): void {
 
 // ---- participants --------------------------------------------------------
 
-function hostTokenFor(code: string): string | undefined {
+const memorySession = new Map<string, string>();
+
+function readSession(key: string): string | undefined {
+  const cached = memorySession.get(key);
+  if (cached !== undefined) return cached;
   try {
-    return sessionStorage.getItem(`host:${code}`) ?? undefined;
+    return sessionStorage.getItem(key) ?? undefined;
   } catch {
     return undefined;
   }
+}
+
+function writeSession(key: string, value: string | undefined): void {
+  if (value !== undefined) memorySession.set(key, value);
+  else memorySession.delete(key);
+  try {
+    if (value !== undefined) sessionStorage.setItem(key, value);
+    else sessionStorage.removeItem(key);
+  } catch {
+    /* sessionStorage unavailable */
+  }
+}
+
+function activeRoomFor(): string | undefined {
+  return readSession("activeRoom");
+}
+
+function saveActiveRoom(code: string | undefined): void {
+  writeSession("activeRoom", code);
+}
+
+function hostTokenFor(code: string): string | undefined {
+  return readSession(`host:${code}`);
 }
 
 function rejoinTokenFor(code: string): string | undefined {
-  try {
-    return sessionStorage.getItem(`rejoin:${code}`) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return readSession(`rejoin:${code}`);
 }
 
 function saveRejoinToken(code: string, token: string | undefined): void {
+  writeSession(`rejoin:${code}`, token);
+}
+
+function saveHostToken(code: string, token: string | undefined): void {
+  writeSession(`host:${code}`, token);
+}
+
+function clearRoomSession(code?: string): void {
+  const target = code ?? lastJoin?.code ?? activeRoomFor();
+  saveActiveRoom(undefined);
+  if (!target) return;
+  saveRejoinToken(target, undefined);
+  saveHostToken(target, undefined);
+}
+
+function scrubRoomUrl(): void {
+  if (location.hash.length === 0) return;
+  history.replaceState(null, "", location.pathname + location.search);
+}
+
+async function copyTextToClipboard(text: string): Promise<boolean> {
   try {
-    if (token) sessionStorage.setItem(`rejoin:${code}`, token);
-    else sessionStorage.removeItem(`rejoin:${code}`);
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (err) {
+    console.warn("[main] clipboard.writeText failed, using fallback", err);
+  }
+  const prevFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "0";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus({ preventScroll: true });
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    prevFocus?.focus?.({ preventScroll: true });
+    return ok;
   } catch {
-    /* sessionStorage unavailable */
+    prevFocus?.focus?.({ preventScroll: true });
+    return false;
   }
 }
 
-function saveHostToken(code: string, token: string): void {
-  try {
-    sessionStorage.setItem(`host:${code}`, token);
-  } catch {
-    /* sessionStorage unavailable */
+function clearRotatePendingTimer(): void {
+  if (inviteRotateTimeout !== null) {
+    clearTimeout(inviteRotateTimeout);
+    inviteRotateTimeout = null;
   }
+}
+
+function resetInviteCopyFeedback(): void {
+  if (linkFeedbackTimer !== null) {
+    clearTimeout(linkFeedbackTimer);
+    linkFeedbackTimer = null;
+  }
+  if (codeFeedbackTimer !== null) {
+    clearTimeout(codeFeedbackTimer);
+    codeFeedbackTimer = null;
+  }
+  ui.inviteLinkFeedback.textContent = "";
+  ui.inviteLinkFeedback.classList.remove("invite-feedback-ok");
+  ui.inviteCopyLinkBtn.classList.remove("invite-feedback-ok");
+  ui.inviteCopyCodeBtn.textContent = "Copy";
+  ui.inviteCopyCodeBtn.classList.remove("invite-feedback-ok");
+}
+
+function setInviteRevealed(revealed: boolean): void {
+  if (inviteRevealTimer !== null) {
+    clearTimeout(inviteRevealTimer);
+    inviteRevealTimer = null;
+  }
+  inviteRevealed = revealed;
+  if (revealed) {
+    inviteRevealTimer = setTimeout(() => {
+      inviteRevealTimer = null;
+      inviteRevealed = false;
+      renderInviteMenu();
+    }, 10_000);
+  }
+  renderInviteMenu();
+}
+
+function renderInviteMenu(): void {
+  const code = lastJoin?.code ?? null;
+  const state = deriveInviteMenuState({
+    roomCode: code,
+    roomPassword,
+    roomLocked,
+    isHost,
+    revealed: inviteRevealed,
+    signalingReady: Boolean(client?.isReady),
+    rotating: inviteRotatePending,
+  });
+  ui.inviteMenu.hidden = activePopover !== "invite";
+  ui.inviteRotateBtn.hidden = !isHost || code === null;
+  ui.inviteRotateBtn.disabled = !state.canRotate;
+  if (!inviteRotatePending && ui.inviteRotateBtn.textContent === "Rotating\u2026") {
+    ui.inviteRotateBtn.textContent = "Rotate";
+  }
+  ui.inviteLockedNote.hidden = !state.showLockedBanner;
+  ui.inviteCopyLinkBtn.disabled = !state.canCopy;
+  ui.inviteCodeRow.classList.toggle("is-disabled", !state.canCopy);
+  ui.inviteCodeValue.textContent = state.displayCode;
+  ui.inviteShowBtn.disabled = !state.canShow;
+  ui.inviteShowBtn.textContent = inviteRevealed && state.canShow ? "Hide" : "Show";
+  ui.inviteCopyCodeBtn.disabled = !state.canCopy;
+}
+
+function pruneDepartures(now: number): void {
+  for (const [k, ts] of recentDepartures) {
+    if (now - ts >= RECENT_DEPARTURE_MS) recentDepartures.delete(k);
+  }
+}
+
+function recordDeparture(id: PeerId): void {
+  const now = Date.now();
+  pruneDepartures(now);
+  recentDepartures.set(id, now);
+}
+
+function wasRecentDeparture(id: PeerId): boolean {
+  const now = Date.now();
+  pruneDepartures(now);
+  return recentDepartures.has(id);
+}
+
+function renderRosterUnreadDot(): void {
+  const hasUnread = unreadPeerIds.size > 0 && activePopover !== "roster";
+  ui.rosterUnreadDot.hidden = !hasUnread;
+  ui.rosterBtn.classList.toggle("has-unread", hasUnread);
+}
+
+function renderJoinChip(): void {
+  if (joinChipMirror) {
+    joinChipMirror.remove();
+    joinChipMirror = null;
+  }
+  const text = formatJoinChipText(joinChipArrivals);
+  if (!text || !client || selfId === null) {
+    ui.joinChip.textContent = "";
+    ui.joinChip.hidden = true;
+    return;
+  }
+  ui.joinChip.textContent = text;
+  ui.joinChip.hidden = false;
+
+  const fsEl = typeof document !== "undefined" ? document.fullscreenElement : null;
+  if (fsEl instanceof HTMLElement && fsEl.classList.contains("tile")) {
+    const mirror = document.createElement("div");
+    mirror.className = "join-chip join-chip-mirror";
+    mirror.setAttribute("role", "status");
+    mirror.setAttribute("aria-live", "polite");
+    mirror.textContent = text;
+    fsEl.append(mirror);
+    joinChipMirror = mirror;
+  }
+}
+
+function pauseJoinChipTimer(): void {
+  if (joinChipTimer !== null) {
+    clearTimeout(joinChipTimer);
+    joinChipTimer = null;
+  }
+}
+
+function clearJoinChip(): void {
+  pauseJoinChipTimer();
+  joinChipArrivals.length = 0;
+  renderJoinChip();
+}
+
+function armJoinChipTimer(): void {
+  pauseJoinChipTimer();
+  if (joinChipArrivals.length === 0) return;
+  if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
+    return;
+  }
+  joinChipTimer = setTimeout(() => {
+    joinChipTimer = null;
+    joinChipArrivals.length = 0;
+    renderJoinChip();
+  }, JOIN_CHIP_DURATION_MS);
 }
 
 function formatRosterHeaderTitle(totalCount: number): string {
@@ -1008,7 +1244,13 @@ function formatRosterHeaderTitle(totalCount: number): string {
 
 function updateRosterStatsInPlace(): void {
   if (!client || selfId === null) return;
-  ui.rosterTitle.textContent = formatRosterHeaderTitle(members.size + 1);
+  const distinctPeers = new Set<string>([
+    ...members.keys(),
+    ...(mesh ? mesh.memberIds() : []),
+    ...(mesh ? mesh.peers() : []),
+  ]);
+  distinctPeers.delete(selfId);
+  ui.rosterTitle.textContent = formatRosterHeaderTitle(distinctPeers.size + 1);
   for (const elNode of ui.rosterList.querySelectorAll<HTMLElement>(".peer-stats")) {
     const pid = elNode.dataset["peer"];
     if (!pid) continue;
@@ -1020,8 +1262,10 @@ function renderRoster(): void {
   if (!client || selfId === null) {
     ui.roster.hidden = true;
     ui.rosterList.replaceChildren();
+    renderRosterUnreadDot();
     return;
   }
+  const extraPeerIds = mesh ? [...mesh.memberIds(), ...mesh.peers()] : [];
   const summary: RosterSummary = sortAndFormatRoster(
     selfId,
     currentName(),
@@ -1029,10 +1273,15 @@ function renderRoster(): void {
     isHost,
     roomLocked,
     members,
+    {
+      newPeerIds: unreadPeerIds,
+      extraPeerIds,
+    },
   );
 
   ui.roster.hidden = activePopover !== "roster";
-  ui.rosterBtn.textContent = summary.buttonLabel;
+  ui.rosterBtnLabel.textContent = summary.buttonLabel;
+  renderRosterUnreadDot();
   ui.rosterTitle.textContent = formatRosterHeaderTitle(summary.totalCount);
   ui.lockBtn.hidden = !isHost;
   ui.lockBtn.textContent = roomLocked ? "Unlock room" : "Lock room";
@@ -1049,19 +1298,48 @@ function renderRoster(): void {
 
     const nameEl = document.createElement("span");
     nameEl.className = "peer-name";
-    nameEl.textContent = `${entry.name}${entry.self ? " (you)" : ""}${entry.host ? " (host)" : ""}`;
+    nameEl.textContent = entry.name;
+
+    left.append(dot, nameEl);
+
+    if (entry.self) {
+      const youBadge = document.createElement("span");
+      youBadge.className = "role-badge";
+      youBadge.textContent = "you";
+      left.append(youBadge);
+    }
+
+    if (entry.host) {
+      const hostBadge = document.createElement("span");
+      hostBadge.className = "role-badge";
+      hostBadge.textContent = "host";
+      left.append(hostBadge);
+    }
 
     const idEl = document.createElement("span");
     idEl.className = "peer-id";
     idEl.textContent = entry.shortId;
-
-    left.append(dot, nameEl, idEl);
+    left.append(idEl);
 
     if (entry.sharing) {
       const badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = "sharing";
       left.append(badge);
+    }
+
+    if (entry.isNew) {
+      const newTag = document.createElement("span");
+      newTag.className = "tag-new";
+      newTag.textContent = "new";
+      left.append(newTag);
+    }
+
+    if (entry.duplicateName) {
+      const dupTag = document.createElement("span");
+      dupTag.className = "tag-dup";
+      dupTag.textContent = "same name";
+      left.append(dupTag);
     }
 
     const right = document.createElement("div");
@@ -1081,7 +1359,10 @@ function renderRoster(): void {
       kick.className = "ui-btn kick-btn";
       kick.textContent = "Remove";
       kick.title = `Remove ${entry.name} from the room. They can't rejoin for 15 minutes.`;
-      kick.addEventListener("click", () => client?.kick(entry.id));
+      kick.addEventListener("click", () => {
+        client?.kick(entry.id);
+        if (!members.has(entry.id)) teardownPeer(entry.id);
+      });
       right.append(kick);
     }
 
@@ -1207,6 +1488,9 @@ async function startSharing(): Promise<void> {
 
 async function startSharingInner(): Promise<void> {
   if (!mesh) return;
+  const shareGen = joinGeneration;
+  closeAllPopovers();
+  setInviteRevealed(false);
 
   const blocked = captureBlockedReason();
   if (blocked) {
@@ -1225,6 +1509,11 @@ async function startSharingInner(): Promise<void> {
     console.warn("[main] capture cancelled or failed", err);
     return;
   }
+  if (shareGen !== joinGeneration || !mesh) {
+    captureController.stop();
+    capture = null;
+    return;
+  }
 
   selfPreviewHidden = false;
   if (capture.audio) watchAudioEnded(capture.audio);
@@ -1236,6 +1525,10 @@ async function startSharingInner(): Promise<void> {
   } catch (err) {
     console.error("[main] failed to attach capture to peers", err);
     setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
+    await stopSharing();
+    return;
+  }
+  if (shareGen !== joinGeneration || !mesh) {
     await stopSharing();
     return;
   }
@@ -1313,36 +1606,79 @@ function teardownPeer(peerId: PeerId): void {
   renderRoster();
 }
 
-async function joinRoom(code: string): Promise<void> {
+const SESSION_WIPING_ERRORS: ReadonlySet<string> = new Set([
+  "kicked",
+  "room-locked",
+  "bad-password",
+  "bad-room-code",
+  "session-replaced",
+  "forbidden-origin",
+]);
+
+async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
-    setStatus("That doesn't look like a valid room code.", "error");
+    setLobbyError(describeInviteParseFailure("invalid"));
     return;
   }
 
   const codeToJoin = code;
-  if (capture && lastJoin && lastJoin.code !== code) await stopSharing();
+  const preGen = ++joinGeneration;
+  if (capture && lastJoin && lastJoin.code !== code) {
+    await stopSharing();
+    if (preGen !== joinGeneration) return;
+  }
+  const previousCode = lastJoin?.code;
+  if (previousCode && previousCode !== code) {
+    clearRoomSession(previousCode);
+  }
   leaveRoom();
-  const generation = ++joinGeneration;
-  if (generation !== joinGeneration) return;
+  const activeGen = ++joinGeneration;
   const displayName = currentName();
   lastJoin = { code };
-  syncCopyLinkButton();
+  saveActiveRoom(code);
+  roomPassword = initialPassword ?? null;
+  inviteRotatePending = false;
+  clearRotatePendingTimer();
+  let hasWelcomed = false;
 
-  client = new SignalingClient(
+  const activeClient = new SignalingClient(
     code,
     displayName,
     {
       onStatus: (status) => {
+        if (activeGen !== joinGeneration) return;
         if (status === "open") {
           setStatus(`In room ${code}`, "info");
         } else {
           setStatus(`Connection ${status}…`, "warn");
         }
+        if (selfId !== null) renderInviteMenu();
       },
 
       onWelcome: (selfIdFromServer, peers, room) => {
+        if (activeGen !== joinGeneration) return;
+        hasWelcomed = true;
+        inviteRotatePending = false;
+        clearRotatePendingTimer();
+        ui.roomInput.value = "";
+        setLobbyError(null);
+        scrubRoomUrl();
+
         for (const timer of peerLeftTimers.values()) clearTimeout(timer);
         peerLeftTimers.clear();
+
+        if (!room.host) {
+          saveHostToken(code, undefined);
+        } else if (room.hostToken) {
+          saveHostToken(code, room.hostToken);
+        }
+        saveRejoinToken(code, room.rejoinToken);
+        if (room.password) {
+          roomPassword = room.password;
+        } else if (room.locked && !room.host) {
+          roomPassword = null;
+          setInviteRevealed(false);
+        }
 
         if (
           mesh !== null &&
@@ -1350,37 +1686,56 @@ async function joinRoom(code: string): Promise<void> {
           selfId === selfIdFromServer
         ) {
           const activeMesh = mesh;
-          if (room.hostToken) saveHostToken(code, room.hostToken);
-          saveRejoinToken(code, room.rejoinToken);
           isHost = room.host;
           roomLocked = room.locked;
 
+          const prevMemberIds = new Set(members.keys());
+          const prevMeshIds = new Set(activeMesh.memberIds());
           const welcomePeerIds = new Set(peers.map((p) => p.id));
-          for (const id of [...members.keys()]) {
+          welcomePeerIds.delete(selfIdFromServer);
+          const allTrackedIds = new Set([...prevMemberIds, ...prevMeshIds, ...activeMesh.peers()]);
+          for (const id of allTrackedIds) {
             if (!welcomePeerIds.has(id)) {
               teardownPeer(id);
+              unreadPeerIds.delete(id);
             }
           }
 
+          members.clear();
           for (const p of peers) {
+            if (p.id === selfIdFromServer) continue;
+            const wasKnown = prevMemberIds.has(p.id) || prevMeshIds.has(p.id);
             names.set(p.id, p.name);
             members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
             const existingVideo = tiles.get(p.id);
             if (existingVideo) {
               const label = existingVideo.closest(".tile")?.querySelector(".tile-label");
-              if (label) label.textContent = p.name;
+              if (label) label.textContent = formatTileLabel(p.id, p.name);
               if (!p.sharing) removeTile(p.id);
             }
-            activeMesh.setMemberSharing(p.id, p.sharing);
+            if (!prevMeshIds.has(p.id)) {
+              activeMesh.addMember(p.id, p.sharing);
+            } else {
+              activeMesh.setMemberSharing(p.id, p.sharing);
+            }
+            if (!wasKnown && !wasRecentDeparture(p.id) && activePopover !== "roster") {
+              unreadPeerIds.add(p.id);
+              joinChipArrivals.push({
+                name: p.name.trim() || "Anonymous",
+                shortId: p.id.slice(0, 4),
+              });
+            }
           }
+          renderJoinChip();
+          if (joinChipArrivals.length > 0) armJoinChipTimer();
 
           if (capture) {
             client?.setSharing(true);
             if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           }
 
-          setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
-          syncCopyLinkButton();
+          setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
+          renderInviteMenu();
           syncViewState();
           startHealthPolling();
           renderRoster();
@@ -1397,9 +1752,10 @@ async function joinRoom(code: string): Promise<void> {
         peerOutboundText.clear();
         members.clear();
         listening.clear();
+        unreadPeerIds.clear();
+        recentDepartures.clear();
+        clearJoinChip();
         selfId = null;
-        if (room.hostToken) saveHostToken(code, room.hostToken);
-        saveRejoinToken(code, room.rejoinToken);
 
         for (const id of [...tiles.keys()]) {
           if (id !== SELF_TILE) removeTile(id);
@@ -1420,6 +1776,7 @@ async function joinRoom(code: string): Promise<void> {
           (to, data) => client?.signal(to, data),
           {
             onRemoteStream: (peerId, stream) => {
+              if (members.get(peerId)?.sharing !== true) return;
               const video = tileFor(peerId);
               if (video.srcObject !== stream) {
                 video.srcObject = stream;
@@ -1444,17 +1801,18 @@ async function joinRoom(code: string): Promise<void> {
 
         selfId = selfIdFromServer;
         for (const p of peers) {
+          if (p.id === selfIdFromServer) continue;
           names.set(p.id, p.name);
           members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
           mesh.addMember(p.id, p.sharing);
         }
-        setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
+        setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
         if (capture) {
           client?.setSharing(true);
           if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           void mesh.setCapture(capture);
         }
-        syncCopyLinkButton();
+        renderInviteMenu();
         syncViewState();
         startHealthPolling();
         renderRoster();
@@ -1464,18 +1822,41 @@ async function joinRoom(code: string): Promise<void> {
         }
       },
 
-      onPeerJoined: (peer: PeerInfo) => {
+      onPeerJoined: (peer: PeerInfo, replaces?: PeerId) => {
+        if (activeGen !== joinGeneration) return;
+        if (replaces && replaces !== peer.id) {
+          teardownPeer(replaces);
+          unreadPeerIds.delete(replaces);
+        }
         if (peerLeftTimers.has(peer.id)) {
           clearTimeout(peerLeftTimers.get(peer.id));
           peerLeftTimers.delete(peer.id);
         }
+        const isReconnect = replaces !== undefined || wasRecentDeparture(peer.id);
         names.set(peer.id, peer.name);
         members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
         mesh?.addMember(peer.id, peer.sharing);
+        if (!isReconnect && activePopover !== "roster") {
+          unreadPeerIds.add(peer.id);
+          joinChipArrivals.push({
+            name: peer.name.trim() || "Anonymous",
+            shortId: peer.id.slice(0, 4),
+          });
+          renderJoinChip();
+          armJoinChipTimer();
+        }
         setStatus(`${peer.name} joined room ${code}`, "info");
         renderRoster();
       },
-      onPeerLeft: (id) => {
+
+      onPeerLeft: (id, kicked) => {
+        if (activeGen !== joinGeneration) return;
+        if (!kicked) recordDeparture(id);
+        unreadPeerIds.delete(id);
+        if (kicked) {
+          teardownPeer(id);
+          return;
+        }
         if (mesh?.hasConnectedLink(id)) {
           if (peerLeftTimers.has(id)) {
             clearTimeout(peerLeftTimers.get(id));
@@ -1488,8 +1869,11 @@ async function joinRoom(code: string): Promise<void> {
           teardownPeer(id);
         }
       },
+
       onSignal: (from, data) => void mesh?.handleSignal(from, data),
+
       onPeerState: (id, sharing) => {
+        if (activeGen !== joinGeneration) return;
         if (peerLeftTimers.has(id)) {
           clearTimeout(peerLeftTimers.get(id));
           peerLeftTimers.delete(id);
@@ -1500,46 +1884,151 @@ async function joinRoom(code: string): Promise<void> {
         mesh?.setMemberSharing(id, sharing);
         renderRoster();
       },
-      onRoomState: (locked) => {
+
+      onRoomState: (locked, password) => {
+        if (activeGen !== joinGeneration) return;
         roomLocked = locked;
+        if (locked) {
+          setInviteRevealed(false);
+          resetInviteCopyFeedback();
+          if (!isHost) roomPassword = null;
+        } else if (password) {
+          roomPassword = password;
+        }
+        renderRoster();
+        renderInviteMenu();
+      },
+
+      onRoomPassword: (password, rejoinToken) => {
+        if (activeGen !== joinGeneration) return;
+        const wasRotating = inviteRotatePending;
+        inviteRotatePending = false;
+        clearRotatePendingTimer();
+        setInviteRevealed(false);
+        resetInviteCopyFeedback();
+        if (rejoinToken !== undefined) {
+          saveRejoinToken(code, rejoinToken);
+        }
+        if (password !== undefined) {
+          roomPassword = password;
+        } else if (roomLocked && !isHost) {
+          roomPassword = null;
+        }
+        if (wasRotating) {
+          if (rotateFeedbackTimer !== null) clearTimeout(rotateFeedbackTimer);
+          ui.inviteRotateBtn.textContent = "Rotated!";
+          ui.inviteRotateBtn.classList.add("invite-feedback-ok");
+          rotateFeedbackTimer = setTimeout(() => {
+            rotateFeedbackTimer = null;
+            ui.inviteRotateBtn.textContent = "Rotate";
+            ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
+          }, 1600);
+        }
+        renderInviteMenu();
+      },
+
+      onPeerRenamed: (id, name) => {
+        if (activeGen !== joinGeneration) return;
+        names.set(id, name);
+        const m = members.get(id);
+        if (m) m.name = name;
+        if (id === selfId) {
+          ui.nameInput.value = name;
+          ui.roomNameInput.value = name;
+        }
+        const existingVideo = tiles.get(id);
+        if (existingVideo) {
+          const label = existingVideo.closest(".tile")?.querySelector(".tile-label");
+          if (label) label.textContent = formatTileLabel(id, name);
+        }
         renderRoster();
       },
-      onError: (codeErr, message) => {
-        if (codeErr === "kicked") {
-          void stopSharing();
-          saveRejoinToken(codeToJoin, undefined);
-          lastJoin = null;
-          leaveRoom();
-          setStatus("You were removed from this room by its host.", "error");
-          return;
+
+      onHostPromoted: (hostId, hostToken, password) => {
+        if (activeGen !== joinGeneration) return;
+        isHost = hostId === selfId;
+        for (const [id, m] of members) {
+          m.host = id === hostId;
         }
-        if (codeErr === "room-locked") {
+        if (isHost) {
+          if (hostToken) saveHostToken(code, hostToken);
+          if (password) {
+            roomPassword = password;
+          }
+        }
+        renderRoster();
+        renderInviteMenu();
+      },
+
+      onError: (codeErr, message) => {
+        if (activeGen !== joinGeneration) return;
+        const friendlyMessages: Record<string, string> = {
+          kicked: "You were removed from this room by its host.",
+          "room-locked": `Room ${codeToJoin} is locked. Ask its host to unlock it.`,
+          "session-replaced": "Connected from another tab. This session was closed.",
+          "bad-password": "Invalid or expired room invite.",
+          "join-timeout": "Connection timed out while joining the room. Please try again.",
+          "connection-failed": "Could not connect to that room. Check your connection and try again.",
+          "bad-message": "Disconnected due to a protocol error. Please rejoin the room.",
+        };
+        const friendly = friendlyMessages[codeErr] ?? message;
+        if (activeClient.isFatal) {
           void stopSharing();
+          if (SESSION_WIPING_ERRORS.has(codeErr)) {
+            clearRoomSession(codeToJoin);
+          } else if (!hasWelcomed) {
+            saveActiveRoom(undefined);
+          }
           lastJoin = null;
           leaveRoom();
-          setStatus(`Room ${codeToJoin} is locked. Ask its host to unlock it.`, "error");
+          setLobbyError(friendly);
+          setStatus("", "info");
           return;
         }
         if (codeErr === "not-host") {
-          setStatus(message, "warn");
+          setStatus(friendly, "warn");
           return;
         }
         if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
           return;
         }
-        setStatus(`${codeErr}: ${message}`, "error");
+        setStatus(codeErr === "rate-limited" ? friendly : `${codeErr}: ${friendly}`, "error");
       },
     },
-    () => ({ hostToken: hostTokenFor(code), rejoinToken: rejoinTokenFor(code) }),
+    () => ({
+      password: roomPassword ?? undefined,
+      hostToken: hostTokenFor(code),
+      rejoinToken: rejoinTokenFor(code),
+    }),
   );
 
-  client.connect();
-  location.hash = code;
+  client = activeClient;
+  activeClient.connect();
+  scrubRoomUrl();
 }
 
 function leaveRoom(): void {
   joinGeneration++;
   reopenRosterOnWelcome = false;
+  inviteRotatePending = false;
+  clearRotatePendingTimer();
+  if (inviteRevealTimer !== null) {
+    clearTimeout(inviteRevealTimer);
+    inviteRevealTimer = null;
+  }
+  inviteRevealed = false;
+  resetInviteCopyFeedback();
+  if (rotateFeedbackTimer !== null) {
+    clearTimeout(rotateFeedbackTimer);
+    rotateFeedbackTimer = null;
+  }
+  ui.inviteRotateBtn.textContent = "Rotate";
+  ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
+
+  recentDepartures.clear();
+  unreadPeerIds.clear();
+  clearJoinChip();
+
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   stopHealthPolling();
@@ -1561,7 +2050,9 @@ function leaveRoom(): void {
   selfId = null;
   isHost = false;
   roomLocked = false;
+  roomPassword = null;
   setFocusedTile(null);
+  renderInviteMenu();
   renderRoster();
   syncViewState();
 }
@@ -1587,31 +2078,54 @@ function applyPopoverState(target: PopoverKind | null): void {
     capture !== null,
   );
   activePopover = state.active;
+  ui.inviteMenu.hidden = !state.inviteOpen;
   ui.roster.hidden = !state.rosterOpen;
   ui.presetMenu.hidden = !state.presetOpen;
   ui.codecMenu.hidden = !state.codecOpen;
   ui.degradationMenu.hidden = !state.degradationOpen;
+  ui.inviteBtn.setAttribute("aria-expanded", String(state.inviteOpen));
   ui.rosterBtn.setAttribute("aria-expanded", String(state.rosterOpen));
   ui.presetBtn.setAttribute("aria-expanded", String(state.presetOpen));
   ui.codecBtn.setAttribute("aria-expanded", String(state.codecOpen));
   ui.degradationBtn.setAttribute("aria-expanded", String(state.degradationOpen));
+
+  if (state.inviteOpen) {
+    renderInviteMenu();
+  }
+  if (previous === "invite" && state.active !== "invite") {
+    setInviteRevealed(false);
+  }
+  if (state.rosterOpen) {
+    clearJoinChip();
+    renderRosterUnreadDot();
+  }
+  if (previous === "roster" && state.active !== "roster") {
+    unreadPeerIds.clear();
+    renderRosterUnreadDot();
+    renderRoster();
+  }
+
   if (previous !== null && previous !== state.active) {
     const menu =
-      previous === "roster"
-        ? ui.roster
-        : previous === "preset"
-          ? ui.presetMenu
-          : previous === "codec"
-            ? ui.codecMenu
-            : ui.degradationMenu;
+      previous === "invite"
+        ? ui.inviteMenu
+        : previous === "roster"
+          ? ui.roster
+          : previous === "preset"
+            ? ui.presetMenu
+            : previous === "codec"
+              ? ui.codecMenu
+              : ui.degradationMenu;
     const trigger =
-      previous === "roster"
-        ? ui.rosterBtn
-        : previous === "preset"
-          ? ui.presetBtn
-          : previous === "codec"
-            ? ui.codecBtn
-            : ui.degradationBtn;
+      previous === "invite"
+        ? ui.inviteBtn
+        : previous === "roster"
+          ? ui.rosterBtn
+          : previous === "preset"
+            ? ui.presetBtn
+            : previous === "codec"
+              ? ui.codecBtn
+              : ui.degradationBtn;
     if (menu.contains(document.activeElement)) trigger.focus();
   }
 }
@@ -1780,10 +2294,104 @@ function initQualityControls(): void {
 
 initQualityControls();
 
-// ---- roster & header controls --------------------------------------------
+// ---- roster, invite & header controls ------------------------------------
+
+async function copyInvite(mode: "link" | "code"): Promise<void> {
+  const code = lastJoin?.code;
+  if (!code || !roomPassword || roomLocked) return;
+  const invite = formatInviteCode(code, roomPassword);
+  const text = mode === "link" ? `${location.origin}/#${invite}` : invite;
+  const copied = await copyTextToClipboard(text);
+  if (!copied) {
+    setStatus("Could not copy automatically. Use Show to view and copy manually.", "warn");
+    return;
+  }
+  if (mode === "link") {
+    if (linkFeedbackTimer !== null) clearTimeout(linkFeedbackTimer);
+    ui.inviteLinkFeedback.textContent = "Copied!";
+    ui.inviteLinkFeedback.classList.add("invite-feedback-ok");
+    ui.inviteCopyLinkBtn.classList.add("invite-feedback-ok");
+    linkFeedbackTimer = setTimeout(() => {
+      linkFeedbackTimer = null;
+      ui.inviteLinkFeedback.textContent = "";
+      ui.inviteLinkFeedback.classList.remove("invite-feedback-ok");
+      ui.inviteCopyLinkBtn.classList.remove("invite-feedback-ok");
+    }, 2000);
+  } else {
+    if (codeFeedbackTimer !== null) clearTimeout(codeFeedbackTimer);
+    ui.inviteCopyCodeBtn.textContent = "Copied!";
+    ui.inviteCopyCodeBtn.classList.add("invite-feedback-ok");
+    codeFeedbackTimer = setTimeout(() => {
+      codeFeedbackTimer = null;
+      ui.inviteCopyCodeBtn.textContent = "Copy";
+      ui.inviteCopyCodeBtn.classList.remove("invite-feedback-ok");
+    }, 2000);
+  }
+}
+
+ui.inviteBtn.addEventListener("click", () => {
+  togglePopover("invite");
+});
+
+ui.inviteShowBtn.addEventListener("click", () => {
+  if (roomLocked || !roomPassword) return;
+  setInviteRevealed(!inviteRevealed);
+});
+
+ui.inviteCopyLinkBtn.addEventListener("click", () => {
+  runBackground(copyInvite("link"));
+});
+
+ui.inviteCopyCodeBtn.addEventListener("click", () => {
+  runBackground(copyInvite("code"));
+});
+
+ui.inviteRotateBtn.addEventListener("click", () => {
+  if (!client || !isHost || !lastJoin?.code || inviteRotatePending) return;
+  setInviteRevealed(false);
+  if (!client.rotatePassword()) {
+    renderInviteMenu();
+    return;
+  }
+  inviteRotatePending = true;
+  resetInviteCopyFeedback();
+  if (rotateFeedbackTimer !== null) {
+    clearTimeout(rotateFeedbackTimer);
+    rotateFeedbackTimer = null;
+  }
+  ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
+  ui.inviteRotateBtn.textContent = "Rotating\u2026";
+  renderInviteMenu();
+  clearRotatePendingTimer();
+  inviteRotateTimeout = setTimeout(() => {
+    inviteRotateTimeout = null;
+    if (!inviteRotatePending) return;
+    inviteRotatePending = false;
+    ui.inviteRotateBtn.textContent = "Rotate";
+    renderInviteMenu();
+  }, 10_000);
+});
 
 ui.rosterBtn.addEventListener("click", () => {
   togglePopover("roster");
+});
+
+window.addEventListener("blur", () => {
+  pauseJoinChipTimer();
+  if (inviteRevealed) setInviteRevealed(false);
+});
+
+window.addEventListener("focus", () => {
+  armJoinChipTimer();
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    pauseJoinChipTimer();
+    if (inviteRevealed) setInviteRevealed(false);
+    return;
+  }
+  if (document.hasFocus()) armJoinChipTimer();
 });
 
 document.addEventListener("click", (ev) => {
@@ -1806,9 +2414,11 @@ ui.brandHomeBtn.addEventListener("click", () => {
   if (!client && !lastJoin && !capture) return;
   closeAllPopovers();
   runBackground(stopSharing());
+  clearRoomSession();
   lastJoin = null;
   leaveRoom();
-  history.replaceState(null, "", location.pathname + location.search);
+  scrubRoomUrl();
+  setLobbyError(null);
   setStatus("", "info");
 });
 
@@ -1829,11 +2439,8 @@ ui.roomNameInput.addEventListener("keydown", (ev) => {
 
 ui.roomNameInput.addEventListener("change", () => {
   syncNameInputs(ui.roomNameInput.value);
-  // Only reconnect in place when not actively sharing so renaming never interrupts an active stream.
-  if (client && lastJoin && !capture) {
-    const wasOpen = activePopover === "roster";
-    runBackground(joinRoom(lastJoin.code));
-    reopenRosterOnWelcome = wasOpen;
+  if (client && selfId !== null) {
+    client.rename(currentName());
   }
 });
 
@@ -1847,87 +2454,74 @@ ui.roomNameInput.addEventListener("change", () => {
 
 // ---- lobby & deep-link wiring --------------------------------------------
 
+async function enterInvite(code: string, password: string): Promise<void> {
+  if (capture && lastJoin && lastJoin.code !== code) {
+    const confirmed = window.confirm("Leave your current room and stop sharing your screen to join the new room?");
+    if (!confirmed) return;
+  }
+  const previous = lastJoin?.code ?? activeRoomFor();
+  if (previous && previous !== code) {
+    clearRoomSession(previous);
+  }
+  saveActiveRoom(code);
+  scrubRoomUrl();
+  await joinRoom(code, password);
+}
+
+async function submitLobbyJoin(): Promise<void> {
+  const parsed = parseInviteInput(ui.roomInput.value);
+  if (!parsed.ok) {
+    setLobbyError(describeInviteParseFailure(parsed.reason));
+    ui.roomInput.focus();
+    return;
+  }
+  setLobbyError(null);
+  await enterInvite(parsed.code, parsed.password);
+}
+
+ui.roomInput.addEventListener("input", () => {
+  setLobbyError(null);
+});
+
 ui.joinBtn.addEventListener("click", () => {
-  runBackground(joinRoom(ui.roomInput.value.trim().toUpperCase()));
+  runBackground(submitLobbyJoin());
 });
 
 ui.roomInput.addEventListener("keydown", (ev) => {
   if (ev.key !== "Enter") return;
   ev.preventDefault();
-  const code = ui.roomInput.value.trim().toUpperCase();
-  runBackground(joinRoom(code));
+  runBackground(submitLobbyJoin());
 });
 
 ui.createBtn.addEventListener("click", () => {
+  if (ui.createBtn.disabled) return;
+  setLobbyError(null);
+  ui.createBtn.disabled = true;
+  const genBeforeFetch = joinGeneration;
   runBackground(
     (async () => {
       try {
-        const res = await fetch("/api/room");
+        const res = await fetch("/api/room", { method: "POST" });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const parsed = parseNewRoomResponse(await res.json());
-        if (!parsed) throw new Error("server returned an invalid room code");
-        const { code } = parsed;
-        ui.roomInput.value = code;
-        await joinRoom(code);
+        if (!parsed) throw new Error("server returned an invalid room response");
+        if (genBeforeFetch !== joinGeneration) return;
+        const { code, password, hostToken } = parsed;
+        const previous = lastJoin?.code ?? activeRoomFor();
+        if (previous && previous !== code) clearRoomSession(previous);
+        saveActiveRoom(code);
+        saveHostToken(code, hostToken);
+        ui.roomInput.value = "";
+        scrubRoomUrl();
+        await joinRoom(code, password);
       } catch (err) {
         console.error("[main] could not create a room", err);
-        setStatus("Could not create a room. Check your connection and try again.", "error");
+        setLobbyError("Could not create a room. Check your connection and try again.");
+      } finally {
+        ui.createBtn.disabled = false;
       }
     })(),
   );
-});
-
-async function copyRoomLink(): Promise<void> {
-  const code = (lastJoin?.code ?? ui.roomInput.value.trim()).toUpperCase();
-  if (!isValidRoomCode(code)) {
-    setStatus("Enter or create a room first to copy its link.", "warn");
-    ui.roomInput.focus();
-    return;
-  }
-  const url = `${location.origin}/#${code}`;
-  let copied = false;
-  try {
-    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-      await navigator.clipboard.writeText(url);
-      copied = true;
-    }
-  } catch (err) {
-    console.warn("[main] clipboard.writeText failed, using fallback", err);
-  }
-  if (!copied) {
-    try {
-      const ta = document.createElement("textarea");
-      ta.value = url;
-      ta.setAttribute("readonly", "");
-      ta.style.position = "fixed";
-      ta.style.top = "0";
-      ta.style.left = "0";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      copied = document.execCommand("copy");
-      ta.remove();
-    } catch {
-      /* execCommand fallback failed */
-    }
-  }
-  if (copied) {
-    if (copyFeedbackTimeout !== null) clearTimeout(copyFeedbackTimeout);
-    ui.copyLinkBtn.textContent = `${code} · Copied!`;
-    ui.copyLinkBtn.classList.add("copied");
-    setStatus(`Copied room link: ${url}`, "info");
-    copyFeedbackTimeout = setTimeout(() => {
-      ui.copyLinkBtn.classList.remove("copied");
-      copyFeedbackTimeout = null;
-      syncCopyLinkButton();
-    }, 2000);
-  } else {
-    setStatus(`Could not copy link automatically. Room link: ${url}`, "warn");
-  }
-}
-
-ui.copyLinkBtn.addEventListener("click", () => {
-  runBackground(copyRoomLink());
 });
 
 ui.shareBtn.addEventListener("click", () => {
@@ -1937,14 +2531,38 @@ ui.shareBtn.addEventListener("click", () => {
 window.addEventListener("beforeunload", () => leaveRoom());
 window.addEventListener("pagehide", () => leaveRoom());
 
-function joinFromHash(): void {
-  const fromHash = location.hash.replace(/^#/, "").toUpperCase();
-  if (!isValidRoomCode(fromHash)) return;
-  if (lastJoin?.code === fromHash && client) return;
-  ui.roomInput.value = fromHash;
-  runBackground(joinRoom(fromHash));
+function joinFromBootOrHash(isHashChange: boolean): void {
+  const rawHash = location.hash;
+  if (rawHash.length > 0) {
+    scrubRoomUrl();
+    const parsed = parseInviteInput(rawHash);
+    if (!parsed.ok) {
+      const msg = describeInviteParseFailure(parsed.reason);
+      if (client && selfId !== null) setStatus(msg, "warn");
+      else setLobbyError(msg);
+      return;
+    }
+    if (lastJoin?.code === parsed.code && selfId !== null && client !== null && !client.isFatal) {
+      if (!client.isReady) {
+        roomPassword = parsed.password;
+        client.connect();
+      }
+      return;
+    }
+    setLobbyError(null);
+    runBackground(enterInvite(parsed.code, parsed.password));
+    return;
+  }
+
+  if (isHashChange) return;
+  const savedRoom = activeRoomFor();
+  if (savedRoom && isValidRoomCode(savedRoom) && Boolean(rejoinTokenFor(savedRoom) ?? hostTokenFor(savedRoom))) {
+    runBackground(joinRoom(savedRoom));
+  } else if (savedRoom) {
+    clearRoomSession(savedRoom);
+  }
 }
 
 syncViewState();
-joinFromHash();
-window.addEventListener("hashchange", joinFromHash);
+joinFromBootOrHash(false);
+window.addEventListener("hashchange", () => joinFromBootOrHash(true));

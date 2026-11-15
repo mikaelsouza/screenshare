@@ -142,31 +142,118 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
             headers: { "Content-Type": "application/json" },
           });
     }
+    // Reject non-WebSocket probes and cross-origin handshake attempts at the edge before
+    // charging the per-IP limiter or routing to a Durable Object.
+    if (!isUpgrade(request)) {
+      return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+    const secFetchSite = request.headers.get("Sec-Fetch-Site");
+    if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+      return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
+    }
+    const origin = request.headers.get("Origin");
+    if (origin !== null) {
+      let parsedOrigin: string;
+      try {
+        parsedOrigin = new URL(origin).origin;
+      } catch {
+        return rejectUpgrade("forbidden-origin", "Malformed Origin header");
+      }
+      if (parsedOrigin !== url.origin) {
+        return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
+      }
+    }
     const clientIp = request.headers.get("CF-Connecting-IP");
-    if (clientIp && !(await allowed(env.WS_LIMITER, wsUpgradeLimit, ipKey(clientIp)))) {
-      return isUpgrade(request)
-        ? rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER)
-        : new Response(JSON.stringify({ error: "Too many connection attempts" }), {
-            status: 429,
-            headers: { "Content-Type": "application/json", "Retry-After": "60" },
-          });
+    const rateKey = ipKey(clientIp ?? "unknown");
+    if (!(await allowed(env.WS_LIMITER, wsUpgradeLimit, rateKey))) {
+      return rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER);
     }
     const id = env.ROOMS.idFromName(code);
     const stub = env.ROOMS.get(id);
-    return stub.fetch(request);
+    try {
+      return await stub.fetch(request);
+    } catch {
+      return rejectUpgrade("rate-limited", "Room temporarily unavailable", TRY_AGAIN_LATER);
+    }
   }
 
-  // GET /api/room -> { code: generateRoomCode() } as JSON.
-  if (request.method === "GET" && url.pathname === "/api/room") {
+  // POST /api/room -> initialize DO room state and return { code, password, hostToken }.
+  if (url.pathname === "/api/room") {
+    if (request.method !== "POST") {
+      return new Response(
+        JSON.stringify({ error: "Method not allowed — reload the page to update Screenshare." }),
+        {
+          status: 405,
+          headers: { "Content-Type": "application/json", Allow: "POST" },
+        },
+      );
+    }
+
+    const secFetchSite = request.headers.get("Sec-Fetch-Site");
+    if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+      return new Response(JSON.stringify({ error: "Cross-origin room creation is not allowed" }), {
+        status: 403,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    const origin = request.headers.get("Origin");
+    if (origin !== null) {
+      let originSame = false;
+      try {
+        originSame = new URL(origin).origin === url.origin;
+      } catch {
+        originSame = false;
+      }
+      if (!originSame) {
+        return new Response(JSON.stringify({ error: "Cross-origin room creation is not allowed" }), {
+          status: 403,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
     const clientIp = request.headers.get("CF-Connecting-IP");
-    if (clientIp && !(await allowed(env.ROOM_LIMITER, roomCreationLimit, ipKey(clientIp)))) {
+    const rateKey = ipKey(clientIp ?? "unknown");
+    if (!(await allowed(env.ROOM_LIMITER, roomCreationLimit, rateKey))) {
       return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
         status: 429,
         headers: { "Content-Type": "application/json", "Retry-After": "60" },
       });
     }
-    // A fresh code per request; a cached one would hand two people the same room.
-    return Response.json({ code: generateRoomCode() }, { headers: { "Cache-Control": "no-store" } });
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const code = generateRoomCode();
+      const id = env.ROOMS.idFromName(code);
+      const stub = env.ROOMS.get(id);
+      let initRes: Response;
+      try {
+        initRes = await stub.fetch("https://internal/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+      } catch {
+        continue;
+      }
+      if (initRes.status === 200) {
+        return new Response(initRes.body, {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        });
+      }
+      await initRes.body?.cancel();
+      if (initRes.status !== 409) {
+        return new Response(JSON.stringify({ error: "Could not initialize room" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+    }
+
+    return new Response(JSON.stringify({ error: "Could not allocate room" }), {
+      status: 503,
+      headers: { "Content-Type": "application/json" },
+    });
   }
 
   return env.ASSETS.fetch(request);

@@ -4,9 +4,14 @@ import {
   MAX_SDP_LENGTH,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
+  ROOM_PASSWORD_LENGTH,
+  formatInviteCode,
   generateRoomCode,
+  generateRoomPassword,
   isValidRoomCode,
+  isValidRoomPassword,
   parseClientMessage,
+  parseInviteInput,
   parseNewRoomResponse,
   parseServerMessage,
 } from "@shared/protocol";
@@ -237,14 +242,48 @@ describe("parseClientMessage join options", () => {
     });
   });
 
-  it("parses hostToken, kick, and lock messages", () => {
+  it("parses hostToken, password, kick, lock, rotate-password, and rename messages", () => {
     expect(
-      parseClientMessage(JSON.stringify({ t: "join", room: "ABCDEFGH", displayName: "alice", hostToken: "htok" })),
-    ).toEqual({ t: "join", room: "ABCDEFGH", displayName: "alice", hostToken: "htok" });
+      parseClientMessage(
+        JSON.stringify({
+          t: "join",
+          room: "ABCDEFGH",
+          displayName: "alice",
+          password: "pw-secret",
+          hostToken: "htok",
+        }),
+      ),
+    ).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+      password: "pw-secret",
+      hostToken: "htok",
+    });
+    expect(
+      parseClientMessage(
+        JSON.stringify({
+          t: "join",
+          room: "ABCDEFGH",
+          displayName: "alice",
+          password: "x".repeat(129),
+        }),
+      ),
+    ).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+    });
     expect(parseClientMessage(JSON.stringify({ t: "kick", id: P1 }))).toEqual({ t: "kick", id: P1 });
     expect(parseClientMessage(JSON.stringify({ t: "kick", id: "not-a-uuid" }))).toBeNull();
     expect(parseClientMessage(JSON.stringify({ t: "lock", locked: true }))).toEqual({ t: "lock", locked: true });
     expect(parseClientMessage(JSON.stringify({ t: "lock", locked: "yes" }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "rotate-password" }))).toEqual({ t: "rotate-password" });
+    expect(parseClientMessage(JSON.stringify({ t: "rename", displayName: "  bob  " }))).toEqual({
+      t: "rename",
+      displayName: "  bob  ",
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "rename", displayName: "x".repeat(129) }))).toBeNull();
   });
 
   it("ignores non-boolean or false resume and sharing values", () => {
@@ -263,10 +302,29 @@ describe("parseClientMessage join options", () => {
       displayName: "alice",
     });
   });
+
+  it("strips empty password, hostToken, and rejoinToken strings on join", () => {
+    const parsed = parseClientMessage(
+      JSON.stringify({
+        t: "join",
+        room: "ABCDEFGH",
+        displayName: "alice",
+        password: "",
+        hostToken: "",
+        rejoinToken: "",
+      }),
+    );
+    expect(parsed).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+    });
+  });
 });
 
 describe("parseServerMessage", () => {
-  it("parses welcome, peer-joined, peer-left, signal, peer-state, room-state, and error messages", () => {
+  it("parses welcome, peer-joined, peer-left, signal, peer-state, room-state, rotation, rename, promotion, and error messages", () => {
+    const pw = generateRoomPassword();
     expect(
       parseServerMessage(
         JSON.stringify({
@@ -274,6 +332,7 @@ describe("parseServerMessage", () => {
           selfId: P1,
           peers: [{ id: "p2", name: "bob", sharing: true, host: true }],
           host: true,
+          password: pw,
           hostToken: "htok",
           rejoinToken: "rtok",
           locked: false,
@@ -284,18 +343,22 @@ describe("parseServerMessage", () => {
       selfId: P1,
       peers: [{ id: "p2", name: "bob", sharing: true, host: true }],
       host: true,
+      password: pw,
       hostToken: "htok",
       rejoinToken: "rtok",
       locked: false,
     });
 
     expect(
-      parseServerMessage(JSON.stringify({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false } })),
-    ).toEqual({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false } });
+      parseServerMessage(
+        JSON.stringify({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false }, replaces: P1 }),
+      ),
+    ).toEqual({ t: "peer-joined", peer: { id: "p2", name: "bob", sharing: false }, replaces: P1 });
 
-    expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "p2" }))).toEqual({
+    expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "p2", kicked: true }))).toEqual({
       t: "peer-left",
       id: "p2",
+      kicked: true,
     });
 
     expect(
@@ -308,14 +371,42 @@ describe("parseServerMessage", () => {
       sharing: true,
     });
 
-    expect(parseServerMessage(JSON.stringify({ t: "room-state", locked: true }))).toEqual({
+    expect(parseServerMessage(JSON.stringify({ t: "room-state", locked: false, password: pw }))).toEqual({
       t: "room-state",
-      locked: true,
+      locked: false,
+      password: pw,
+    });
+
+    expect(parseServerMessage(JSON.stringify({ t: "room-password", password: pw, rejoinToken: "rtok2" }))).toEqual({
+      t: "room-password",
+      password: pw,
+      rejoinToken: "rtok2",
+    });
+
+    expect(parseServerMessage(JSON.stringify({ t: "peer-renamed", id: "p2", name: "charlie" }))).toEqual({
+      t: "peer-renamed",
+      id: "p2",
+      name: "charlie",
     });
 
     expect(
-      parseServerMessage(JSON.stringify({ t: "error", code: "room-full", message: "Room is full" })),
-    ).toEqual({ t: "error", code: "room-full", message: "Room is full" });
+      parseServerMessage(
+        JSON.stringify({ t: "host-promoted", hostId: "p2", hostToken: "htok2", password: pw }),
+      ),
+    ).toEqual({
+      t: "host-promoted",
+      hostId: "p2",
+      hostToken: "htok2",
+      password: pw,
+    });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "error", code: "bad-password", message: "Invalid room invite" })),
+    ).toEqual({ t: "error", code: "bad-password", message: "Invalid room invite" });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "error", code: "session-replaced", message: "Replaced" })),
+    ).toEqual({ t: "error", code: "session-replaced", message: "Replaced" });
   });
 
   it("rejects malformed or invalid server messages", () => {
@@ -323,14 +414,60 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(JSON.stringify({ t: "unknown" }))).toBeNull();
     expect(parseServerMessage(JSON.stringify({ t: "error", code: "not-a-code", message: "x" }))).toBeNull();
     expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "" }))).toBeNull();
+    expect(
+      parseServerMessage(JSON.stringify({ t: "welcome", selfId: P1, peers: [], hostToken: "" })),
+    ).toBeNull();
+    expect(
+      parseServerMessage(JSON.stringify({ t: "welcome", selfId: P1, peers: [], rejoinToken: "" })),
+    ).toBeNull();
+  });
+});
+
+describe("room password and invite parsing", () => {
+  it("generates and validates 16-char passwords from the room alphabet", () => {
+    for (let i = 0; i < 50; i++) {
+      const password = generateRoomPassword();
+      expect(password).toHaveLength(ROOM_PASSWORD_LENGTH);
+      for (const ch of password) expect(ROOM_CODE_ALPHABET).toContain(ch);
+      expect(isValidRoomPassword(password)).toBe(true);
+    }
+    expect(isValidRoomPassword("TOO-SHORT")).toBe(false);
+    expect(isValidRoomPassword(`${"A".repeat(15)}O`)).toBe(false);
+  });
+
+  it("formats and parses combined invite codes and full invite URLs", () => {
+    const code = generateRoomCode();
+    const password = generateRoomPassword();
+    const combined = formatInviteCode(code, password);
+    expect(combined).toBe(`${code}-${password}`);
+    expect(parseInviteInput(combined)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`  ${combined.toLowerCase()}  `)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`https://example.com/#${combined}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`/#${combined}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`#${combined}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`${code}${password}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`https://example.com/#${code}%2D${password}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`#${code}%2D${password}`)).toEqual({ ok: true, code, password });
+
+    expect(parseInviteInput("   ")).toEqual({ ok: false, reason: "empty" });
+    expect(parseInviteInput("https://example.com/")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("https://[")).toEqual({ ok: false, reason: "invalid" });
+    expect(parseInviteInput(code)).toEqual({ ok: false, reason: "missing-secret" });
+    expect(parseInviteInput(`https://example.com/#${code}`)).toEqual({ ok: false, reason: "missing-secret" });
+    expect(parseInviteInput("not-valid-invite")).toEqual({ ok: false, reason: "invalid" });
   });
 });
 
 describe("parseNewRoomResponse", () => {
-  it("accepts a valid room code response and rejects malformed responses", () => {
+  it("accepts a valid room creation response and rejects malformed responses", () => {
     const code = generateRoomCode();
-    expect(parseNewRoomResponse({ code })).toEqual({ code });
-    expect(parseNewRoomResponse({ code: "bad" })).toBeNull();
+    const password = generateRoomPassword();
+    const hostToken = "htok-1234";
+    expect(parseNewRoomResponse({ code, password, hostToken })).toEqual({ code, password, hostToken });
+    expect(parseNewRoomResponse({ code })).toBeNull();
+    expect(parseNewRoomResponse({ code: "bad", password, hostToken })).toBeNull();
+    expect(parseNewRoomResponse({ code, password: "bad", hostToken })).toBeNull();
+    expect(parseNewRoomResponse({ code, password, hostToken: "" })).toBeNull();
     expect(parseNewRoomResponse(null)).toBeNull();
   });
 });

@@ -3,9 +3,15 @@ import fc from "fast-check";
 import {
   parseClientMessage,
   parseServerMessage,
+  parseInviteInput,
+  isValidRoomCode,
+  isValidRoomPassword,
   type ClientMessage,
   MAX_SDP_LENGTH,
   MAX_CANDIDATE_LENGTH,
+  ROOM_CODE_ALPHABET,
+  ROOM_CODE_LENGTH,
+  ROOM_PASSWORD_LENGTH,
 } from "@shared/protocol";
 
 describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", () => {
@@ -27,7 +33,9 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
 
         if (result !== null) {
           expect(typeof result).toBe("object");
-          expect(["join", "signal", "state", "kick", "lock"]).toContain(result.t);
+          expect(["join", "signal", "state", "kick", "lock", "rotate-password", "rename"]).toContain(
+            result.t,
+          );
         }
         return true;
       }),
@@ -76,6 +84,10 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
   function assertJoinInvariants(result: Extract<ReturnType<typeof parseClientMessage>, { t: "join" }>): void {
     expect(typeof result.room).toBe("string");
     expect(typeof result.displayName).toBe("string");
+    if (result.password !== undefined) {
+      expect(typeof result.password).toBe("string");
+      expect(result.password.length).toBeLessThanOrEqual(128);
+    }
     if (result.hostToken !== undefined) {
       expect(typeof result.hostToken).toBe("string");
       expect(result.hostToken.length).toBeLessThanOrEqual(64);
@@ -128,11 +140,88 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         else if (result.t === "signal") assertSignalInvariants(result);
         else if (result.t === "state") expect(typeof result.sharing).toBe("boolean");
         else if (result.t === "kick") expect(PEER_ID_REGEX.test(result.id)).toBe(true);
-        else expect(typeof result.locked).toBe("boolean");
+        else if (result.t === "lock") expect(typeof result.locked).toBe("boolean");
+        else if (result.t === "rotate-password") expect(result.t).toBe("rotate-password");
+        else {
+          expect(typeof result.displayName).toBe("string");
+          expect(result.displayName.length).toBeLessThanOrEqual(128);
+        }
 
         return true;
       }),
       { numRuns: 1000 },
+    );
+  });
+
+  it("enforces structural invariants across structured 7-variant ClientMessage fuzzing", () => {
+    const signalDataArb = fc.oneof(
+      fc.record({ k: fc.constant("offer" as const), sdp: fc.string({ maxLength: 512 }) }),
+      fc.record({ k: fc.constant("answer" as const), sdp: fc.string({ maxLength: 512 }) }),
+      fc.record({
+        k: fc.constant("ice" as const),
+        candidate: fc.record({
+          candidate: fc.string({ maxLength: 256 }),
+          sdpMid: fc.option(fc.string({ maxLength: 32 }), { nil: null }),
+          sdpMLineIndex: fc.option(fc.nat({ max: 16 }), { nil: null }),
+          usernameFragment: fc.option(fc.string({ maxLength: 32 }), { nil: null }),
+        }),
+      }),
+    );
+
+    const optStr = (maxLength: number) => fc.option(fc.string({ maxLength }), { nil: undefined });
+    const clientMessageArb = fc.oneof(
+      fc.record({
+        t: fc.constant("join" as const),
+        room: fc.string({ maxLength: 32 }),
+        displayName: fc.string({ maxLength: 600 }),
+        password: optStr(160),
+        hostToken: optStr(96),
+        rejoinToken: optStr(96),
+        resume: fc.option(fc.oneof(fc.boolean(), fc.string({ maxLength: 8 })), { nil: undefined }),
+        sharing: fc.option(fc.oneof(fc.boolean(), fc.string({ maxLength: 8 })), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("signal" as const),
+        to: fc.oneof(fc.uuid(), fc.string({ maxLength: 40 })),
+        data: signalDataArb,
+      }),
+      fc.record({ t: fc.constant("state" as const), sharing: fc.boolean() }),
+      fc.record({ t: fc.constant("kick" as const), id: fc.oneof(fc.uuid(), fc.string({ maxLength: 40 })) }),
+      fc.record({ t: fc.constant("lock" as const), locked: fc.boolean() }),
+      fc.record({ t: fc.constant("rotate-password" as const) }),
+      fc.record({ t: fc.constant("rename" as const), displayName: fc.string({ maxLength: 160 }) }),
+    );
+
+    fc.assert(
+      fc.property(clientMessageArb, (payload) => {
+        const result = parseClientMessage(JSON.stringify(payload));
+        if (result === null) {
+          if (payload.t === "join") expect(payload.displayName.length).toBeGreaterThan(512);
+          else if (payload.t === "rename") expect(payload.displayName.length).toBeGreaterThan(128);
+          return true;
+        }
+        if (result.t === "join") {
+          assertJoinInvariants(result);
+          expect(result.displayName.length).toBeLessThanOrEqual(512);
+          expect(result.hostToken).not.toBe("");
+          expect(result.rejoinToken).not.toBe("");
+          expect(result.password).not.toBe("");
+        } else if (result.t === "signal") {
+          assertSignalInvariants(result);
+        } else if (result.t === "state") {
+          expect(typeof result.sharing).toBe("boolean");
+        } else if (result.t === "kick") {
+          expect(PEER_ID_REGEX.test(result.id)).toBe(true);
+        } else if (result.t === "lock") {
+          expect(typeof result.locked).toBe("boolean");
+        } else if (result.t === "rotate-password") {
+          expect(result.t).toBe("rotate-password");
+        } else {
+          expect(result.displayName.length).toBeLessThanOrEqual(128);
+        }
+        return true;
+      }),
+      { numRuns: 700 },
     );
   });
 
@@ -144,6 +233,9 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
       "signal",
       "peer-state",
       "room-state",
+      "room-password",
+      "peer-renamed",
+      "host-promoted",
       "error",
     ];
 
@@ -158,17 +250,97 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
       { numRuns: 300 },
     );
 
+    const peerInfoArb = fc.record({
+      id: fc.string({ maxLength: 40 }),
+      name: fc.string({ maxLength: 40 }),
+      sharing: fc.boolean(),
+      host: fc.option(fc.boolean(), { nil: undefined }),
+    });
+    const serverSignalDataArb = fc.oneof(
+      fc.record({ k: fc.constant("offer" as const), sdp: fc.string({ maxLength: 256 }) }),
+      fc.record({ k: fc.constant("answer" as const), sdp: fc.string({ maxLength: 256 }) }),
+      fc.record({
+        k: fc.constant("ice" as const),
+        candidate: fc.record({
+          candidate: fc.string({ maxLength: 128 }),
+          sdpMid: fc.option(fc.string({ maxLength: 16 }), { nil: null }),
+          sdpMLineIndex: fc.option(fc.nat({ max: 8 }), { nil: null }),
+        }),
+      }),
+    );
+
     const serverMessageArb = fc.oneof(
       fc.jsonValue(),
       fc.record({
-        t: fc.constantFrom(...validTypes, "unknown"),
-        selfId: fc.string(),
-        id: fc.string(),
-        from: fc.string(),
-        locked: fc.boolean(),
+        t: fc.constant("welcome" as const),
+        selfId: fc.string({ maxLength: 40 }),
+        peers: fc.array(peerInfoArb, { maxLength: 5 }),
+        host: fc.option(fc.boolean(), { nil: undefined }),
+        password: fc.option(fc.string({ maxLength: 64 }), { nil: undefined }),
+        hostToken: fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+        rejoinToken: fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+        locked: fc.option(fc.boolean(), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("peer-joined" as const),
+        peer: peerInfoArb,
+        replaces: fc.option(fc.string({ maxLength: 40 }), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("peer-left" as const),
+        id: fc.string({ maxLength: 40 }),
+        kicked: fc.option(fc.boolean(), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("signal" as const),
+        from: fc.string({ maxLength: 40 }),
+        data: serverSignalDataArb,
+      }),
+      fc.record({
+        t: fc.constant("peer-state" as const),
+        id: fc.string({ maxLength: 40 }),
         sharing: fc.boolean(),
-        code: fc.constantFrom("room-full", "bad-message", "invalid-code"),
-        message: fc.string(),
+      }),
+      fc.record({
+        t: fc.constant("room-state" as const),
+        locked: fc.boolean(),
+        password: fc.option(fc.string({ maxLength: 64 }), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("room-password" as const),
+        password: fc.option(fc.string({ maxLength: 64 }), { nil: undefined }),
+        rejoinToken: fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("peer-renamed" as const),
+        id: fc.string({ maxLength: 40 }),
+        name: fc.string({ maxLength: 40 }),
+      }),
+      fc.record({
+        t: fc.constant("host-promoted" as const),
+        hostId: fc.string({ maxLength: 40 }),
+        hostToken: fc.option(fc.string({ maxLength: 80 }), { nil: undefined }),
+        password: fc.option(fc.string({ maxLength: 64 }), { nil: undefined }),
+      }),
+      fc.record({
+        t: fc.constant("error" as const),
+        code: fc.constantFrom(
+          "room-full",
+          "bad-message",
+          "unknown-peer",
+          "bad-room-code",
+          "bad-password",
+          "session-replaced",
+          "forbidden-origin",
+          "rate-limited",
+          "join-timeout",
+          "kicked",
+          "room-locked",
+          "not-host",
+          "not-sharing",
+          "unknown-code",
+        ),
+        message: fc.string({ maxLength: 120 }),
       }),
     );
 
@@ -177,10 +349,70 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         const res = parseServerMessage(JSON.stringify(payload));
         if (res !== null) {
           expect(validTypes).toContain(res.t);
+          if (res.t === "welcome") {
+            expect(res.selfId.length).toBeGreaterThan(0);
+            expect(res.hostToken).not.toBe("");
+            expect(res.rejoinToken).not.toBe("");
+            expect(res.password).not.toBe("");
+          }
+        }
+        return true;
+      }),
+      { numRuns: 700 },
+    );
+  });
+
+  it("parseInviteInput never throws and handles arbitrary and structured invites/URLs", () => {
+    const validReasons = ["empty", "url-missing-invite", "missing-secret", "invalid"];
+    const alphabetChars = ROOM_CODE_ALPHABET.split("");
+    const codeArb = fc
+      .array(fc.constantFrom(...alphabetChars), { minLength: ROOM_CODE_LENGTH, maxLength: ROOM_CODE_LENGTH })
+      .map((chars) => chars.join(""));
+    const passArb = fc
+      .array(fc.constantFrom(...alphabetChars), {
+        minLength: ROOM_PASSWORD_LENGTH,
+        maxLength: ROOM_PASSWORD_LENGTH,
+      })
+      .map((chars) => chars.join(""));
+
+    fc.assert(
+      fc.property(fc.string(), (raw) => {
+        const res = parseInviteInput(raw);
+        if (res.ok) {
+          expect(isValidRoomCode(res.code)).toBe(true);
+          expect(isValidRoomPassword(res.password)).toBe(true);
+        } else {
+          expect(validReasons).toContain(res.reason);
         }
         return true;
       }),
       { numRuns: 500 },
+    );
+
+    fc.assert(
+      fc.property(
+        codeArb,
+        passArb,
+        fc.constantFrom("-", ".", "%2D", ""),
+        fc.constantFrom("", "#", "/#", "https://example.com/#", "https://sub-domain.example.com/r#"),
+        fc.boolean(),
+        fc.boolean(),
+        (code, password, sep, prefix, lowercase, padSpace) => {
+          const body = `${code}${sep}${password}`;
+          const formattedBody = lowercase ? body.toLowerCase() : body;
+          const raw = padSpace ? `  ${prefix}${formattedBody}  ` : `${prefix}${formattedBody}`;
+          // "%2D" only decodes after "#" (URL/hash inputs); bare strings keep "%2D" literal and reject as invalid.
+          const expectsOk = sep !== "%2D" || prefix.includes("#");
+          const res = parseInviteInput(raw);
+          if (expectsOk) {
+            expect(res).toEqual({ ok: true, code, password });
+          } else {
+            expect(res.ok).toBe(false);
+          }
+          return true;
+        },
+      ),
+      { numRuns: 400 },
     );
   });
 });

@@ -548,10 +548,7 @@ export class Mesh {
   /** A member started or stopped sharing: connect, or drop a link nobody needs now. */
   setMemberSharing(peerId: PeerId, sharing: boolean): void {
     const m = this.members.get(peerId);
-    if (!m) {
-      this.addMember(peerId, sharing);
-      return;
-    }
+    if (!m) return;
     m.sharing = sharing;
     // Starting to share is not a reason to connect from here: their offer does that.
     if (!this.wantsLink(peerId)) this.removePeer(peerId);
@@ -562,6 +559,7 @@ export class Mesh {
   }
 
   async handleSignal(from: PeerId, data: SignalData): Promise<void> {
+    if (!this.members.has(from)) return;
     // The sharer's link on this side is created by its first offer. A sharer
     // announces sharing before it offers, and the server relays in order, so its
     // peer-state is already here. The server only relays signals from peers joined
@@ -660,6 +658,10 @@ export class Mesh {
 
   peers(): PeerId[] {
     return [...this.links.keys()];
+  }
+
+  memberIds(): PeerId[] {
+    return [...this.members.keys()];
   }
 
   hasConnectedLink(peerId: PeerId): boolean {

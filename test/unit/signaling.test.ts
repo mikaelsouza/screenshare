@@ -12,7 +12,7 @@ class FakeWebSocket {
   readyState = 1;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
-  onclose: ((ev: { code: number }) => void) | null = null;
+  onclose: ((ev: { code: number; reason?: string }) => void) | null = null;
   onerror: (() => void) | null = null;
   sent: string[] = [];
 
@@ -24,7 +24,7 @@ class FakeWebSocket {
 
   open(): void { this.onopen?.(); }
   /** Simulate the server closing with a given code. */
-  serverClose(code: number): void { this.readyState = 3; this.onclose?.({ code }); }
+  serverClose(code: number, reason = ""): void { this.readyState = 3; this.onclose?.({ code, reason }); }
 }
 
 const handlers = () => ({
@@ -132,13 +132,13 @@ describe("SignalingClient reconnection", () => {
     ws.onmessage?.({
       data: JSON.stringify({ t: "peer-joined", peer: { id: "p2", name: "charlie", sharing: true } }),
     });
-    expect(h.onPeerJoined).toHaveBeenCalledWith({ id: "p2", name: "charlie", sharing: true });
+    expect(h.onPeerJoined).toHaveBeenCalledWith({ id: "p2", name: "charlie", sharing: true }, undefined);
 
     // peer-left
     ws.onmessage?.({
       data: JSON.stringify({ t: "peer-left", id: "p2" }),
     });
-    expect(h.onPeerLeft).toHaveBeenCalledWith("p2");
+    expect(h.onPeerLeft).toHaveBeenCalledWith("p2", undefined);
 
     // signal
     ws.onmessage?.({
@@ -173,6 +173,8 @@ describe("SignalingClient reconnection", () => {
       displayName: "alice",
     });
 
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+
     sigClient.signal("p1", { k: "answer", sdp: "v=0" });
     expect(JSON.parse(ws.sent[1]!)).toEqual({
       t: "signal",
@@ -185,18 +187,6 @@ describe("SignalingClient reconnection", () => {
       t: "state",
       sharing: true,
     });
-  });
-
-  it("sends pings every 30 seconds when open", () => {
-    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
-    c.connect();
-    const ws = FakeWebSocket.instances[0]!;
-    ws.open();
-
-    vi.advanceTimersByTime(30_000);
-    expect(ws.sent).toContain("ping");
-
-    c.close();
   });
 
   it("uses ws: protocol when running on http:", () => {
@@ -398,7 +388,7 @@ describe("SignalingClient capacity refusals", () => {
     token = "tok";
 
     ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
-    expect(handlerMock.onRoomState).toHaveBeenCalledWith(true);
+    expect(handlerMock.onRoomState).toHaveBeenCalledWith(true, undefined);
 
     ws.serverClose(1006);
     vi.advanceTimersByTime(20_000);
@@ -745,6 +735,228 @@ describe("SignalingClient keepalive and session resumption", () => {
     vi.advanceTimersByTime(15_000);
     expect(FakeWebSocket.instances.length).toBe(2);
     c.close();
+  });
+
+  it("sends password on join and supports rotatePassword, rename, and new PR 1 server messages", () => {
+    const h = {
+      ...handlers(),
+      onRoomState: vi.fn(),
+      onRoomPassword: vi.fn(),
+      onPeerRenamed: vi.fn(),
+      onHostPromoted: vi.fn(),
+    };
+    const c = new SignalingClient("ABCDEFGH", "alice", h, () => ({
+      password: "SECRET23456789AB",
+      hostToken: "htok",
+    }));
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    expect(JSON.parse(ws.sent[0]!)).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+      password: "SECRET23456789AB",
+      hostToken: "htok",
+    });
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        t: "welcome",
+        selfId: "me",
+        peers: [],
+        host: true,
+        password: "SECRET23456789AB",
+        hostToken: "htok",
+        locked: false,
+      }),
+    });
+
+    c.rotatePassword();
+    c.rename("alice-2");
+    expect(JSON.parse(ws.sent[1]!)).toEqual({ t: "rotate-password" });
+    expect(JSON.parse(ws.sent[2]!)).toEqual({ t: "rename", displayName: "alice-2" });
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        t: "peer-joined",
+        peer: { id: "p2", name: "bob", sharing: false },
+        replaces: "p0",
+      }),
+    });
+    expect(h.onPeerJoined).toHaveBeenCalledWith({ id: "p2", name: "bob", sharing: false }, "p0");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "peer-left", id: "p2", kicked: true }),
+    });
+    expect(h.onPeerLeft).toHaveBeenCalledWith("p2", true);
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "room-password", password: "NEWPASS23456789A", rejoinToken: "rtok2" }),
+    });
+    expect(h.onRoomPassword).toHaveBeenCalledWith("NEWPASS23456789A", "rtok2");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "peer-renamed", id: "p3", name: "bob-new" }),
+    });
+    expect(h.onPeerRenamed).toHaveBeenCalledWith("p3", "bob-new");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "host-promoted", hostId: "me", hostToken: "htok2", password: "NEWPASS23456789A" }),
+    });
+    expect(h.onHostPromoted).toHaveBeenCalledWith("me", "htok2", "NEWPASS23456789A");
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "room-state", locked: false, password: "NEWPASS23456789A" }),
+    });
+    expect(h.onRoomState).toHaveBeenCalledWith(false, "NEWPASS23456789A");
+    c.close();
+  });
+
+  it("synthesizes bad-password on bare 1008 close without prior error frame and does not double-fire after fatal error", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.serverClose(1008, "Invite expired");
+    expect(h.onError).toHaveBeenCalledTimes(1);
+    expect(h.onError).toHaveBeenCalledWith("bad-password", "Invite expired");
+
+    const h2 = handlers();
+    const c2 = new SignalingClient("ABCDEFGH", "alice", h2);
+    c2.connect();
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    ws2.onmessage?.({ data: JSON.stringify({ t: "error", code: "kicked", message: "Removed" }) });
+    ws2.serverClose(1008, "Removed");
+    expect(h2.onError).toHaveBeenCalledTimes(1);
+    expect(h2.onError).toHaveBeenCalledWith("kicked", "Removed");
+    vi.advanceTimersByTime(60_000);
+    expect(FakeWebSocket.instances.length).toBe(2);
+  });
+
+  it("keeps the dead-socket watchdog active when sharing in a backgrounded tab, unlike passive hidden tabs", () => {
+    const doc = {
+      visibilityState: "hidden",
+      addEventListener: (ev: string, fn: () => void) => { docListeners[ev] = fn; },
+      removeEventListener: (ev: string) => { delete docListeners[ev]; },
+    };
+    vi.stubGlobal("document", doc);
+
+    const passive = new SignalingClient("ABCDEFGH", "alice", handlers());
+    passive.connect();
+    FakeWebSocket.instances[0]!.open();
+    vi.advanceTimersByTime(75_000);
+    expect(FakeWebSocket.instances.length).toBe(1);
+    passive.close();
+
+    const sharer = new SignalingClient("ABCDEFGH", "bob", handlers());
+    sharer.setSharing(true);
+    sharer.connect();
+    FakeWebSocket.instances[1]!.open();
+    vi.advanceTimersByTime(75_000);
+    expect(FakeWebSocket.instances.length).toBe(3);
+    sharer.close();
+  });
+
+  it("buffers pre-welcome messages until initial welcome and drops stale signals when selfId changes", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+
+    // Before initial welcome, signaling is not ready and messages stay buffered behind join.
+    expect(c.isReady).toBe(false);
+    c.signal("p2", { k: "offer", sdp: "o1" });
+    c.setSharing(true);
+    expect(ws1.sent).toHaveLength(1);
+
+    ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }) });
+    expect(c.isReady).toBe(true);
+    expect(ws1.sent).toHaveLength(3);
+    expect(JSON.parse(ws1.sent[1]!)).toEqual({ t: "signal", to: "p2", data: { k: "offer", sdp: "o1" } });
+    expect(JSON.parse(ws1.sent[2]!)).toEqual({ t: "state", sharing: true });
+
+    // Disconnect, queue a signal + state update, then resume under a different selfId.
+    ws1.serverClose(1006);
+    c.signal("p2", { k: "offer", sdp: "stale-offer" });
+    c.setSharing(false);
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    ws2.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1-new", peers: [] }) });
+
+    // Stale signal must be dropped while state update still flushes.
+    expect(ws2.sent).toHaveLength(2);
+    expect(JSON.parse(ws2.sent[1]!)).toEqual({ t: "state", sharing: false });
+    c.close();
+  });
+
+  it("returns whether rotatePassword() actually transmitted on a welcomed open socket", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    expect(c.rotatePassword()).toBe(false);
+
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    expect(c.rotatePassword()).toBe(false);
+
+    ws.open();
+    expect(c.rotatePassword()).toBe(false);
+
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [], host: true }) });
+    expect(c.rotatePassword()).toBe(true);
+    expect(JSON.parse(ws.sent[1]!)).toEqual({ t: "rotate-password" });
+
+    ws.serverClose(1006);
+    expect(c.rotatePassword()).toBe(false);
+    c.close();
+  });
+
+  it("marks fatal and detaches listeners on 1008 close following a non-fatal rate-limited error", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }) });
+
+    ws.onmessage?.({
+      data: JSON.stringify({ t: "error", code: "rate-limited", message: "Too many messages" }),
+    });
+    expect(c.isFatal).toBe(false);
+
+    ws.serverClose(1008, "Rate limit exceeded");
+    expect(c.isFatal).toBe(true);
+    expect(h.onError).toHaveBeenCalledWith("rate-limited", "Too many messages");
+    expect(docListeners["visibilitychange"]).toBeUndefined();
+    expect(winListeners["online"]).toBeUndefined();
+
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.instances.length).toBe(1);
+  });
+
+  it("stops retrying after MAX_INITIAL_RETRIES pre-welcome 1006 disconnects", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+
+    for (let i = 0; i < 8; i++) {
+      const ws = FakeWebSocket.instances[i]!;
+      ws.open();
+      ws.serverClose(1006);
+      if (i < 7) {
+        vi.advanceTimersByTime(20_000);
+      }
+    }
+
+    expect(FakeWebSocket.instances.length).toBe(8);
+    expect(c.isFatal).toBe(true);
+    expect(h.onError).toHaveBeenCalledWith("connection-failed", expect.any(String));
+
+    vi.advanceTimersByTime(120_000);
+    expect(FakeWebSocket.instances.length).toBe(8);
   });
 });
 
