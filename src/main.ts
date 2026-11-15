@@ -206,7 +206,7 @@ let lastJoin: { code: string } | null = null;
 /** Arrivals since `#roster` was last opened/viewed (cleared when closing roster). */
 const unreadPeerIds = new Set<PeerId>();
 /** Short departure window so reconnects / F5 reloads suppress duplicate join notifications. */
-const recentDepartures = new Map<string, number>();
+const recentDepartures = new Map<PeerId, number>();
 const RECENT_DEPARTURE_MS = 8_000;
 const joinChipArrivals: JoinChipArrival[] = [];
 let joinChipTimer: ReturnType<typeof setTimeout> | null = null;
@@ -218,6 +218,8 @@ let inviteRevealTimer: ReturnType<typeof setTimeout> | null = null;
 let linkFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let codeFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let rotateFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
+let inviteRotatePending = false;
+let inviteRotateTimeout: ReturnType<typeof setTimeout> | null = null;
 
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
@@ -998,79 +1000,57 @@ function renderSelfPreview(stream: MediaStream | null): void {
 
 // ---- participants --------------------------------------------------------
 
-function activeRoomFor(): string | undefined {
+const memorySession = new Map<string, string>();
+
+function readSession(key: string): string | undefined {
+  const cached = memorySession.get(key);
+  if (cached !== undefined) return cached;
   try {
-    return sessionStorage.getItem("activeRoom") ?? undefined;
+    return sessionStorage.getItem(key) ?? undefined;
   } catch {
     return undefined;
   }
+}
+
+function writeSession(key: string, value: string | undefined): void {
+  if (value !== undefined) memorySession.set(key, value);
+  else memorySession.delete(key);
+  try {
+    if (value !== undefined) sessionStorage.setItem(key, value);
+    else sessionStorage.removeItem(key);
+  } catch {
+    /* sessionStorage unavailable */
+  }
+}
+
+function activeRoomFor(): string | undefined {
+  return readSession("activeRoom");
 }
 
 function saveActiveRoom(code: string | undefined): void {
-  try {
-    if (code) sessionStorage.setItem("activeRoom", code);
-    else sessionStorage.removeItem("activeRoom");
-  } catch {
-    /* sessionStorage unavailable */
-  }
-}
-
-function passwordFor(code: string): string | undefined {
-  try {
-    return sessionStorage.getItem(`pass:${code}`) ?? undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function savePassword(code: string, secret: string | undefined): void {
-  try {
-    if (secret) sessionStorage.setItem(`pass:${code}`, secret);
-    else sessionStorage.removeItem(`pass:${code}`);
-  } catch {
-    /* sessionStorage unavailable */
-  }
+  writeSession("activeRoom", code);
 }
 
 function hostTokenFor(code: string): string | undefined {
-  try {
-    return sessionStorage.getItem(`host:${code}`) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return readSession(`host:${code}`);
 }
 
 function rejoinTokenFor(code: string): string | undefined {
-  try {
-    return sessionStorage.getItem(`rejoin:${code}`) ?? undefined;
-  } catch {
-    return undefined;
-  }
+  return readSession(`rejoin:${code}`);
 }
 
 function saveRejoinToken(code: string, token: string | undefined): void {
-  try {
-    if (token) sessionStorage.setItem(`rejoin:${code}`, token);
-    else sessionStorage.removeItem(`rejoin:${code}`);
-  } catch {
-    /* sessionStorage unavailable */
-  }
+  writeSession(`rejoin:${code}`, token);
 }
 
 function saveHostToken(code: string, token: string | undefined): void {
-  try {
-    if (token) sessionStorage.setItem(`host:${code}`, token);
-    else sessionStorage.removeItem(`host:${code}`);
-  } catch {
-    /* sessionStorage unavailable */
-  }
+  writeSession(`host:${code}`, token);
 }
 
 function clearRoomSession(code?: string): void {
   const target = code ?? lastJoin?.code ?? activeRoomFor();
   saveActiveRoom(undefined);
   if (!target) return;
-  savePassword(target, undefined);
   saveRejoinToken(target, undefined);
   saveHostToken(target, undefined);
 }
@@ -1089,6 +1069,7 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
   } catch (err) {
     console.warn("[main] clipboard.writeText failed, using fallback", err);
   }
+  const prevFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   try {
     const ta = document.createElement("textarea");
     ta.value = text;
@@ -1098,13 +1079,39 @@ async function copyTextToClipboard(text: string): Promise<boolean> {
     ta.style.left = "0";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
+    ta.focus({ preventScroll: true });
     ta.select();
     const ok = document.execCommand("copy");
     ta.remove();
+    prevFocus?.focus?.({ preventScroll: true });
     return ok;
   } catch {
+    prevFocus?.focus?.({ preventScroll: true });
     return false;
   }
+}
+
+function clearRotatePendingTimer(): void {
+  if (inviteRotateTimeout !== null) {
+    clearTimeout(inviteRotateTimeout);
+    inviteRotateTimeout = null;
+  }
+}
+
+function resetInviteCopyFeedback(): void {
+  if (linkFeedbackTimer !== null) {
+    clearTimeout(linkFeedbackTimer);
+    linkFeedbackTimer = null;
+  }
+  if (codeFeedbackTimer !== null) {
+    clearTimeout(codeFeedbackTimer);
+    codeFeedbackTimer = null;
+  }
+  ui.inviteLinkFeedback.textContent = "";
+  ui.inviteLinkFeedback.classList.remove("invite-feedback-ok");
+  ui.inviteCopyLinkBtn.classList.remove("invite-feedback-ok");
+  ui.inviteCopyCodeBtn.textContent = "Copy";
+  ui.inviteCopyCodeBtn.classList.remove("invite-feedback-ok");
 }
 
 function setInviteRevealed(revealed: boolean): void {
@@ -1131,10 +1138,15 @@ function renderInviteMenu(): void {
     roomLocked,
     isHost,
     revealed: inviteRevealed,
+    signalingReady: Boolean(client?.isReady),
+    rotating: inviteRotatePending,
   });
   ui.inviteMenu.hidden = activePopover !== "invite";
-  ui.inviteRotateBtn.hidden = !state.canRotate;
+  ui.inviteRotateBtn.hidden = !isHost || code === null;
   ui.inviteRotateBtn.disabled = !state.canRotate;
+  if (!inviteRotatePending && ui.inviteRotateBtn.textContent === "Rotating\u2026") {
+    ui.inviteRotateBtn.textContent = "Rotate";
+  }
   ui.inviteLockedNote.hidden = !state.showLockedBanner;
   ui.inviteCopyLinkBtn.disabled = !state.canCopy;
   ui.inviteCodeRow.classList.toggle("is-disabled", !state.canCopy);
@@ -1150,20 +1162,16 @@ function pruneDepartures(now: number): void {
   }
 }
 
-function recordDeparture(id: PeerId, name: string): void {
+function recordDeparture(id: PeerId): void {
   const now = Date.now();
   pruneDepartures(now);
   recentDepartures.set(id, now);
-  const trimmed = name.trim().toLowerCase();
-  if (trimmed) recentDepartures.set(`n:${trimmed}`, now);
 }
 
-function wasRecentDeparture(id: PeerId, name: string): boolean {
+function wasRecentDeparture(id: PeerId): boolean {
   const now = Date.now();
   pruneDepartures(now);
-  if (recentDepartures.has(id)) return true;
-  const trimmed = name.trim().toLowerCase();
-  return trimmed.length > 0 && recentDepartures.has(`n:${trimmed}`);
+  return recentDepartures.has(id);
 }
 
 function renderRosterUnreadDot(): void {
@@ -1190,17 +1198,29 @@ function renderJoinChip(): void {
   if (fsEl instanceof HTMLElement && fsEl.classList.contains("tile")) {
     const mirror = document.createElement("div");
     mirror.className = "join-chip join-chip-mirror";
+    mirror.setAttribute("role", "status");
+    mirror.setAttribute("aria-live", "polite");
     mirror.textContent = text;
     fsEl.append(mirror);
     joinChipMirror = mirror;
   }
 }
 
-function armJoinChipTimer(): void {
+function pauseJoinChipTimer(): void {
   if (joinChipTimer !== null) {
     clearTimeout(joinChipTimer);
     joinChipTimer = null;
   }
+}
+
+function clearJoinChip(): void {
+  pauseJoinChipTimer();
+  joinChipArrivals.length = 0;
+  renderJoinChip();
+}
+
+function armJoinChipTimer(): void {
+  pauseJoinChipTimer();
   if (joinChipArrivals.length === 0) return;
   if (typeof document !== "undefined" && (document.hidden || !document.hasFocus())) {
     return;
@@ -1224,7 +1244,13 @@ function formatRosterHeaderTitle(totalCount: number): string {
 
 function updateRosterStatsInPlace(): void {
   if (!client || selfId === null) return;
-  ui.rosterTitle.textContent = formatRosterHeaderTitle(members.size + 1);
+  const distinctPeers = new Set<string>([
+    ...members.keys(),
+    ...(mesh ? mesh.memberIds() : []),
+    ...(mesh ? mesh.peers() : []),
+  ]);
+  distinctPeers.delete(selfId);
+  ui.rosterTitle.textContent = formatRosterHeaderTitle(distinctPeers.size + 1);
   for (const elNode of ui.rosterList.querySelectorAll<HTMLElement>(".peer-stats")) {
     const pid = elNode.dataset["peer"];
     if (!pid) continue;
@@ -1580,7 +1606,16 @@ function teardownPeer(peerId: PeerId): void {
   renderRoster();
 }
 
-async function joinRoom(code: string): Promise<void> {
+const SESSION_WIPING_ERRORS: ReadonlySet<string> = new Set([
+  "kicked",
+  "room-locked",
+  "bad-password",
+  "bad-room-code",
+  "session-replaced",
+  "forbidden-origin",
+]);
+
+async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setLobbyError(describeInviteParseFailure("invalid"));
     return;
@@ -1592,14 +1627,19 @@ async function joinRoom(code: string): Promise<void> {
     await stopSharing();
     if (preGen !== joinGeneration) return;
   }
+  const previousCode = lastJoin?.code;
+  if (previousCode && previousCode !== code) {
+    clearRoomSession(previousCode);
+  }
   leaveRoom();
   const activeGen = ++joinGeneration;
   const displayName = currentName();
   lastJoin = { code };
   saveActiveRoom(code);
-  roomPassword = passwordFor(code) ?? null;
+  roomPassword = initialPassword ?? null;
+  inviteRotatePending = false;
+  clearRotatePendingTimer();
   let hasWelcomed = false;
-  let lastErrorHandled = false;
 
   const activeClient = new SignalingClient(
     code,
@@ -1611,18 +1651,15 @@ async function joinRoom(code: string): Promise<void> {
           setStatus(`In room ${code}`, "info");
         } else {
           setStatus(`Connection ${status}…`, "warn");
-          if (status === "closed" && !hasWelcomed && !lastErrorHandled) {
-            clearRoomSession(codeToJoin);
-            lastJoin = null;
-            leaveRoom();
-            setLobbyError("Could not connect to that room. Check your invite and try again.");
-          }
         }
+        if (selfId !== null) renderInviteMenu();
       },
 
       onWelcome: (selfIdFromServer, peers, room) => {
         if (activeGen !== joinGeneration) return;
         hasWelcomed = true;
+        inviteRotatePending = false;
+        clearRotatePendingTimer();
         ui.roomInput.value = "";
         setLobbyError(null);
         scrubRoomUrl();
@@ -1638,10 +1675,8 @@ async function joinRoom(code: string): Promise<void> {
         saveRejoinToken(code, room.rejoinToken);
         if (room.password) {
           roomPassword = room.password;
-          savePassword(code, room.password);
         } else if (room.locked && !room.host) {
           roomPassword = null;
-          savePassword(code, undefined);
           setInviteRevealed(false);
         }
 
@@ -1654,15 +1689,22 @@ async function joinRoom(code: string): Promise<void> {
           isHost = room.host;
           roomLocked = room.locked;
 
+          const prevMemberIds = new Set(members.keys());
+          const prevMeshIds = new Set(activeMesh.memberIds());
           const welcomePeerIds = new Set(peers.map((p) => p.id));
-          const allTrackedIds = new Set([...members.keys(), ...activeMesh.memberIds(), ...activeMesh.peers()]);
+          welcomePeerIds.delete(selfIdFromServer);
+          const allTrackedIds = new Set([...prevMemberIds, ...prevMeshIds, ...activeMesh.peers()]);
           for (const id of allTrackedIds) {
             if (!welcomePeerIds.has(id)) {
               teardownPeer(id);
+              unreadPeerIds.delete(id);
             }
           }
 
+          members.clear();
           for (const p of peers) {
+            if (p.id === selfIdFromServer) continue;
+            const wasKnown = prevMemberIds.has(p.id) || prevMeshIds.has(p.id);
             names.set(p.id, p.name);
             members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
             const existingVideo = tiles.get(p.id);
@@ -1671,15 +1713,28 @@ async function joinRoom(code: string): Promise<void> {
               if (label) label.textContent = formatTileLabel(p.id, p.name);
               if (!p.sharing) removeTile(p.id);
             }
-            activeMesh.setMemberSharing(p.id, p.sharing);
+            if (!prevMeshIds.has(p.id)) {
+              activeMesh.addMember(p.id, p.sharing);
+            } else {
+              activeMesh.setMemberSharing(p.id, p.sharing);
+            }
+            if (!wasKnown && !wasRecentDeparture(p.id) && activePopover !== "roster") {
+              unreadPeerIds.add(p.id);
+              joinChipArrivals.push({
+                name: p.name.trim() || "Anonymous",
+                shortId: p.id.slice(0, 4),
+              });
+            }
           }
+          renderJoinChip();
+          if (joinChipArrivals.length > 0) armJoinChipTimer();
 
           if (capture) {
             client?.setSharing(true);
             if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           }
 
-          setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
+          setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
           renderInviteMenu();
           syncViewState();
           startHealthPolling();
@@ -1699,8 +1754,7 @@ async function joinRoom(code: string): Promise<void> {
         listening.clear();
         unreadPeerIds.clear();
         recentDepartures.clear();
-        joinChipArrivals.length = 0;
-        renderJoinChip();
+        clearJoinChip();
         selfId = null;
 
         for (const id of [...tiles.keys()]) {
@@ -1747,11 +1801,12 @@ async function joinRoom(code: string): Promise<void> {
 
         selfId = selfIdFromServer;
         for (const p of peers) {
+          if (p.id === selfIdFromServer) continue;
           names.set(p.id, p.name);
           members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
           mesh.addMember(p.id, p.sharing);
         }
-        setStatus(`In room ${code} — ${peers.length + 1}/${MAX_ROOM_SIZE} connected`, "info");
+        setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
         if (capture) {
           client?.setSharing(true);
           if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
@@ -1769,17 +1824,24 @@ async function joinRoom(code: string): Promise<void> {
 
       onPeerJoined: (peer: PeerInfo, replaces?: PeerId) => {
         if (activeGen !== joinGeneration) return;
+        if (replaces && replaces !== peer.id) {
+          teardownPeer(replaces);
+          unreadPeerIds.delete(replaces);
+        }
         if (peerLeftTimers.has(peer.id)) {
           clearTimeout(peerLeftTimers.get(peer.id));
           peerLeftTimers.delete(peer.id);
         }
-        const isReconnect = replaces !== undefined || wasRecentDeparture(peer.id, peer.name);
+        const isReconnect = replaces !== undefined || wasRecentDeparture(peer.id);
         names.set(peer.id, peer.name);
         members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
         mesh?.addMember(peer.id, peer.sharing);
-        if (!isReconnect) {
+        if (!isReconnect && activePopover !== "roster") {
           unreadPeerIds.add(peer.id);
-          joinChipArrivals.push({ name: peer.name, shortId: peer.id.slice(0, 4) });
+          joinChipArrivals.push({
+            name: peer.name.trim() || "Anonymous",
+            shortId: peer.id.slice(0, 4),
+          });
           renderJoinChip();
           armJoinChipTimer();
         }
@@ -1789,7 +1851,7 @@ async function joinRoom(code: string): Promise<void> {
 
       onPeerLeft: (id, kicked) => {
         if (activeGen !== joinGeneration) return;
-        recordDeparture(id, names.get(id) ?? members.get(id)?.name ?? "");
+        if (!kicked) recordDeparture(id);
         unreadPeerIds.delete(id);
         if (kicked) {
           teardownPeer(id);
@@ -1826,13 +1888,12 @@ async function joinRoom(code: string): Promise<void> {
       onRoomState: (locked, password) => {
         if (activeGen !== joinGeneration) return;
         roomLocked = locked;
-        if (locked && !isHost) {
-          roomPassword = null;
-          savePassword(code, undefined);
+        if (locked) {
           setInviteRevealed(false);
-        } else if (!locked && password) {
+          resetInviteCopyFeedback();
+          if (!isHost) roomPassword = null;
+        } else if (password) {
           roomPassword = password;
-          savePassword(code, password);
         }
         renderRoster();
         renderInviteMenu();
@@ -1840,16 +1901,28 @@ async function joinRoom(code: string): Promise<void> {
 
       onRoomPassword: (password, rejoinToken) => {
         if (activeGen !== joinGeneration) return;
+        const wasRotating = inviteRotatePending;
+        inviteRotatePending = false;
+        clearRotatePendingTimer();
         setInviteRevealed(false);
+        resetInviteCopyFeedback();
         if (rejoinToken !== undefined) {
           saveRejoinToken(code, rejoinToken);
         }
         if (password !== undefined) {
           roomPassword = password;
-          savePassword(code, password);
         } else if (roomLocked && !isHost) {
           roomPassword = null;
-          savePassword(code, undefined);
+        }
+        if (wasRotating) {
+          if (rotateFeedbackTimer !== null) clearTimeout(rotateFeedbackTimer);
+          ui.inviteRotateBtn.textContent = "Rotated!";
+          ui.inviteRotateBtn.classList.add("invite-feedback-ok");
+          rotateFeedbackTimer = setTimeout(() => {
+            rotateFeedbackTimer = null;
+            ui.inviteRotateBtn.textContent = "Rotate";
+            ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
+          }, 1600);
         }
         renderInviteMenu();
       },
@@ -1881,7 +1954,6 @@ async function joinRoom(code: string): Promise<void> {
           if (hostToken) saveHostToken(code, hostToken);
           if (password) {
             roomPassword = password;
-            savePassword(code, password);
           }
         }
         renderRoster();
@@ -1890,46 +1962,41 @@ async function joinRoom(code: string): Promise<void> {
 
       onError: (codeErr, message) => {
         if (activeGen !== joinGeneration) return;
-        if (
-          codeErr === "kicked" ||
-          codeErr === "room-locked" ||
-          codeErr === "bad-password" ||
-          codeErr === "bad-room-code" ||
-          codeErr === "session-replaced" ||
-          codeErr === "forbidden-origin" ||
-          codeErr === "join-timeout"
-        ) {
-          lastErrorHandled = true;
+        const friendlyMessages: Record<string, string> = {
+          kicked: "You were removed from this room by its host.",
+          "room-locked": `Room ${codeToJoin} is locked. Ask its host to unlock it.`,
+          "session-replaced": "Connected from another tab. This session was closed.",
+          "bad-password": "Invalid or expired room invite.",
+          "join-timeout": "Connection timed out while joining the room. Please try again.",
+          "connection-failed": "Could not connect to that room. Check your connection and try again.",
+          "bad-message": "Disconnected due to a protocol error. Please rejoin the room.",
+        };
+        const friendly = friendlyMessages[codeErr] ?? message;
+        if (activeClient.isFatal) {
           void stopSharing();
-          clearRoomSession(codeToJoin);
+          if (SESSION_WIPING_ERRORS.has(codeErr)) {
+            clearRoomSession(codeToJoin);
+          } else if (!hasWelcomed) {
+            saveActiveRoom(undefined);
+          }
           lastJoin = null;
           leaveRoom();
-          const friendly =
-            codeErr === "kicked"
-              ? "You were removed from this room by its host."
-              : codeErr === "room-locked"
-                ? `Room ${codeToJoin} is locked. Ask its host to unlock it.`
-                : codeErr === "session-replaced"
-                  ? "Connected from another tab. This session was closed."
-                  : codeErr === "bad-password"
-                    ? "Invalid or expired room invite."
-                    : message;
           setLobbyError(friendly);
           setStatus("", "info");
           return;
         }
         if (codeErr === "not-host") {
-          setStatus(message, "warn");
+          setStatus(friendly, "warn");
           return;
         }
         if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
           return;
         }
-        setStatus(`${codeErr}: ${message}`, "error");
+        setStatus(codeErr === "rate-limited" ? friendly : `${codeErr}: ${friendly}`, "error");
       },
     },
     () => ({
-      password: roomPassword ?? passwordFor(code),
+      password: roomPassword ?? undefined,
       hostToken: hostTokenFor(code),
       rejoinToken: rejoinTokenFor(code),
     }),
@@ -1943,39 +2010,24 @@ async function joinRoom(code: string): Promise<void> {
 function leaveRoom(): void {
   joinGeneration++;
   reopenRosterOnWelcome = false;
+  inviteRotatePending = false;
+  clearRotatePendingTimer();
   if (inviteRevealTimer !== null) {
     clearTimeout(inviteRevealTimer);
     inviteRevealTimer = null;
   }
   inviteRevealed = false;
-  if (linkFeedbackTimer !== null) {
-    clearTimeout(linkFeedbackTimer);
-    linkFeedbackTimer = null;
-  }
-  if (codeFeedbackTimer !== null) {
-    clearTimeout(codeFeedbackTimer);
-    codeFeedbackTimer = null;
-  }
+  resetInviteCopyFeedback();
   if (rotateFeedbackTimer !== null) {
     clearTimeout(rotateFeedbackTimer);
     rotateFeedbackTimer = null;
   }
-  ui.inviteLinkFeedback.textContent = "";
-  ui.inviteLinkFeedback.classList.remove("invite-feedback-ok");
-  ui.inviteCopyLinkBtn.classList.remove("invite-feedback-ok");
-  ui.inviteCopyCodeBtn.textContent = "Copy";
-  ui.inviteCopyCodeBtn.classList.remove("invite-feedback-ok");
   ui.inviteRotateBtn.textContent = "Rotate";
   ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
 
-  if (joinChipTimer !== null) {
-    clearTimeout(joinChipTimer);
-    joinChipTimer = null;
-  }
-  joinChipArrivals.length = 0;
   recentDepartures.clear();
   unreadPeerIds.clear();
-  renderJoinChip();
+  clearJoinChip();
 
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
@@ -2044,6 +2096,7 @@ function applyPopoverState(target: PopoverKind | null): void {
     setInviteRevealed(false);
   }
   if (state.rosterOpen) {
+    clearJoinChip();
     renderRosterUnreadDot();
   }
   if (previous === "roster" && state.active !== "roster") {
@@ -2294,17 +2347,29 @@ ui.inviteCopyCodeBtn.addEventListener("click", () => {
 });
 
 ui.inviteRotateBtn.addEventListener("click", () => {
-  if (!client || !isHost) return;
+  if (!client || !isHost || !lastJoin?.code || inviteRotatePending) return;
   setInviteRevealed(false);
-  client.rotatePassword();
-  if (rotateFeedbackTimer !== null) clearTimeout(rotateFeedbackTimer);
-  ui.inviteRotateBtn.textContent = "Rotated!";
-  ui.inviteRotateBtn.classList.add("invite-feedback-ok");
-  rotateFeedbackTimer = setTimeout(() => {
+  if (!client.rotatePassword()) {
+    renderInviteMenu();
+    return;
+  }
+  inviteRotatePending = true;
+  resetInviteCopyFeedback();
+  if (rotateFeedbackTimer !== null) {
+    clearTimeout(rotateFeedbackTimer);
     rotateFeedbackTimer = null;
+  }
+  ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
+  ui.inviteRotateBtn.textContent = "Rotating\u2026";
+  renderInviteMenu();
+  clearRotatePendingTimer();
+  inviteRotateTimeout = setTimeout(() => {
+    inviteRotateTimeout = null;
+    if (!inviteRotatePending) return;
+    inviteRotatePending = false;
     ui.inviteRotateBtn.textContent = "Rotate";
-    ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
-  }, 2000);
+    renderInviteMenu();
+  }, 10_000);
 });
 
 ui.rosterBtn.addEventListener("click", () => {
@@ -2312,6 +2377,7 @@ ui.rosterBtn.addEventListener("click", () => {
 });
 
 window.addEventListener("blur", () => {
+  pauseJoinChipTimer();
   if (inviteRevealed) setInviteRevealed(false);
 });
 
@@ -2321,6 +2387,7 @@ window.addEventListener("focus", () => {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
+    pauseJoinChipTimer();
     if (inviteRevealed) setInviteRevealed(false);
     return;
   }
@@ -2392,13 +2459,13 @@ async function enterInvite(code: string, password: string): Promise<void> {
     const confirmed = window.confirm("Leave your current room and stop sharing your screen to join the new room?");
     if (!confirmed) return;
   }
-  if (lastJoin && lastJoin.code !== code) {
-    clearRoomSession(lastJoin.code);
+  const previous = lastJoin?.code ?? activeRoomFor();
+  if (previous && previous !== code) {
+    clearRoomSession(previous);
   }
   saveActiveRoom(code);
-  savePassword(code, password);
   scrubRoomUrl();
-  await joinRoom(code);
+  await joinRoom(code, password);
 }
 
 async function submitLobbyJoin(): Promise<void> {
@@ -2427,7 +2494,10 @@ ui.roomInput.addEventListener("keydown", (ev) => {
 });
 
 ui.createBtn.addEventListener("click", () => {
+  if (ui.createBtn.disabled) return;
   setLobbyError(null);
+  ui.createBtn.disabled = true;
+  const genBeforeFetch = joinGeneration;
   runBackground(
     (async () => {
       try {
@@ -2435,17 +2505,20 @@ ui.createBtn.addEventListener("click", () => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const parsed = parseNewRoomResponse(await res.json());
         if (!parsed) throw new Error("server returned an invalid room response");
+        if (genBeforeFetch !== joinGeneration) return;
         const { code, password, hostToken } = parsed;
-        if (lastJoin && lastJoin.code !== code) clearRoomSession(lastJoin.code);
+        const previous = lastJoin?.code ?? activeRoomFor();
+        if (previous && previous !== code) clearRoomSession(previous);
         saveActiveRoom(code);
-        savePassword(code, password);
         saveHostToken(code, hostToken);
         ui.roomInput.value = "";
         scrubRoomUrl();
-        await joinRoom(code);
+        await joinRoom(code, password);
       } catch (err) {
         console.error("[main] could not create a room", err);
         setLobbyError("Could not create a room. Check your connection and try again.");
+      } finally {
+        ui.createBtn.disabled = false;
       }
     })(),
   );
@@ -2469,10 +2542,7 @@ function joinFromBootOrHash(isHashChange: boolean): void {
       else setLobbyError(msg);
       return;
     }
-    if (lastJoin?.code === parsed.code && client) {
-      savePassword(parsed.code, parsed.password);
-      roomPassword = parsed.password;
-      renderInviteMenu();
+    if (lastJoin?.code === parsed.code && selfId !== null && client !== null && !client.isFatal) {
       return;
     }
     setLobbyError(null);
@@ -2482,7 +2552,7 @@ function joinFromBootOrHash(isHashChange: boolean): void {
 
   if (isHashChange) return;
   const savedRoom = activeRoomFor();
-  if (savedRoom && isValidRoomCode(savedRoom) && (passwordFor(savedRoom) || rejoinTokenFor(savedRoom) || hostTokenFor(savedRoom))) {
+  if (savedRoom && isValidRoomCode(savedRoom) && Boolean(rejoinTokenFor(savedRoom) ?? hostTokenFor(savedRoom))) {
     runBackground(joinRoom(savedRoom));
   } else if (savedRoom) {
     clearRoomSession(savedRoom);

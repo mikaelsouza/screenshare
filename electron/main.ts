@@ -266,16 +266,20 @@ function setupMediaHandlers(): void {
     if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
   });
 
-  // 2. Permission request handler for display-capture & media (trusted origin only,
+  // 2. Permission request handler for display-capture, media & clipboard (trusted origin only,
   //    since the app now loads remote content)
   session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const allowed = (permission as string) === "display-capture" || permission === "media";
+    const perm = permission as string;
+    const allowed =
+      perm === "display-capture" || perm === "media" || perm === "clipboard-sanitized-write";
     callback(allowed && isTrustedUrl(details.requestingUrl || webContents.getURL()));
   });
 
   // 3. Permission check handler
   session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
-    const allowed = (permission as string) === "display-capture" || permission === "media";
+    const perm = permission as string;
+    const allowed =
+      perm === "display-capture" || perm === "media" || perm === "clipboard-sanitized-write";
     return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL());
   });
 }

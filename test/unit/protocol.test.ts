@@ -302,6 +302,24 @@ describe("parseClientMessage join options", () => {
       displayName: "alice",
     });
   });
+
+  it("strips empty password, hostToken, and rejoinToken strings on join", () => {
+    const parsed = parseClientMessage(
+      JSON.stringify({
+        t: "join",
+        room: "ABCDEFGH",
+        displayName: "alice",
+        password: "",
+        hostToken: "",
+        rejoinToken: "",
+      }),
+    );
+    expect(parsed).toEqual({
+      t: "join",
+      room: "ABCDEFGH",
+      displayName: "alice",
+    });
+  });
 });
 
 describe("parseServerMessage", () => {
@@ -396,6 +414,12 @@ describe("parseServerMessage", () => {
     expect(parseServerMessage(JSON.stringify({ t: "unknown" }))).toBeNull();
     expect(parseServerMessage(JSON.stringify({ t: "error", code: "not-a-code", message: "x" }))).toBeNull();
     expect(parseServerMessage(JSON.stringify({ t: "peer-left", id: "" }))).toBeNull();
+    expect(
+      parseServerMessage(JSON.stringify({ t: "welcome", selfId: P1, peers: [], hostToken: "" })),
+    ).toBeNull();
+    expect(
+      parseServerMessage(JSON.stringify({ t: "welcome", selfId: P1, peers: [], rejoinToken: "" })),
+    ).toBeNull();
   });
 });
 
@@ -421,9 +445,13 @@ describe("room password and invite parsing", () => {
     expect(parseInviteInput(`https://example.com/#${combined}`)).toEqual({ ok: true, code, password });
     expect(parseInviteInput(`/#${combined}`)).toEqual({ ok: true, code, password });
     expect(parseInviteInput(`#${combined}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`${code}${password}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`https://example.com/#${code}%2D${password}`)).toEqual({ ok: true, code, password });
+    expect(parseInviteInput(`#${code}%2D${password}`)).toEqual({ ok: true, code, password });
 
     expect(parseInviteInput("   ")).toEqual({ ok: false, reason: "empty" });
     expect(parseInviteInput("https://example.com/")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("https://[")).toEqual({ ok: false, reason: "invalid" });
     expect(parseInviteInput(code)).toEqual({ ok: false, reason: "missing-secret" });
     expect(parseInviteInput(`https://example.com/#${code}`)).toEqual({ ok: false, reason: "missing-secret" });
     expect(parseInviteInput("not-valid-invite")).toEqual({ ok: false, reason: "invalid" });

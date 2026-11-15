@@ -192,10 +192,10 @@ const JoinClientMessageSchema = z
   .object({
     t: z.literal("join"),
     room: z.string(),
-    displayName: z.string(),
+    displayName: z.string().max(512),
     password: z.string().min(1).max(MAX_PASSWORD_WIRE_LENGTH).optional().catch(undefined),
-    hostToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
-    rejoinToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
+    hostToken: z.string().min(1).max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
+    rejoinToken: z.string().min(1).max(MAX_HOST_TOKEN_LENGTH).optional().catch(undefined),
     resume: z.literal(true).optional().catch(undefined),
     sharing: z.boolean().optional().catch(undefined),
   })
@@ -282,8 +282,8 @@ const WelcomeServerMessageSchema = z
     // compatibility with older welcome payloads and unit tests; do not make them required.
     host: z.boolean().optional().default(false),
     password: z.string().min(1).max(MAX_PASSWORD_WIRE_LENGTH).optional(),
-    hostToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
-    rejoinToken: z.string().max(MAX_HOST_TOKEN_LENGTH).optional(),
+    hostToken: z.string().min(1).max(MAX_HOST_TOKEN_LENGTH).optional(),
+    rejoinToken: z.string().min(1).max(MAX_HOST_TOKEN_LENGTH).optional(),
     locked: z.boolean().optional().default(false),
   })
   .transform(({ t, selfId, peers, host, password, hostToken, rejoinToken, locked }) => ({
@@ -473,7 +473,11 @@ export function parseInviteInput(raw: string): InviteParseResult {
     }
     const fragment = parsedUrl.hash.replace(/^#+/, "").trim();
     if (!fragment) return { ok: false, reason: "url-missing-invite" };
-    candidate = fragment;
+    try {
+      candidate = decodeURIComponent(fragment).trim();
+    } catch {
+      candidate = fragment;
+    }
   } else {
     const hashIdx = trimmed.indexOf("#");
     if (hashIdx !== -1) {
@@ -484,7 +488,11 @@ export function parseInviteInput(raw: string): InviteParseResult {
           ? { ok: false, reason: "url-missing-invite" }
           : { ok: false, reason: "empty" };
       }
-      candidate = afterHash;
+      try {
+        candidate = decodeURIComponent(afterHash).trim();
+      } catch {
+        candidate = afterHash;
+      }
     } else if (/^(?:\/|[a-z0-9.-]+\.[a-z]{2,}\/)/i.test(trimmed)) {
       return { ok: false, reason: "url-missing-invite" };
     }

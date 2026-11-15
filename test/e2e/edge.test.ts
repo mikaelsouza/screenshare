@@ -421,6 +421,11 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       label: "host sees Rotated! feedback",
     });
     await host.click("#invite-show-btn");
+    await waitFor(
+      host,
+      () => /^[A-Z2-9]{8}-[A-Z2-9]{16}$/.test(document.getElementById("invite-code-value")?.textContent?.trim() ?? ""),
+      { label: "rotated invite code is revealed" },
+    );
     inviteCode = ((await host.textContent("#invite-code-value")) ?? "").trim();
     assert.notEqual(inviteCode, beforeRotate, "Rotate must mint a new invite secret");
     await host.click("#invite-btn");

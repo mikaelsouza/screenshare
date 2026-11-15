@@ -165,22 +165,30 @@ export function maskInviteSecret(code: string): string {
   return `${code}-${"\u2022".repeat(ROOM_PASSWORD_LENGTH)}`;
 }
 
-/**
- * Pure derivation of the 1C-2 invite menu's enabled actions, locked state, and displayed code string.
- */
-export function deriveInviteMenuState(params: {
+export interface InviteMenuParams {
   roomCode: string | null;
   roomPassword: string | null;
   roomLocked: boolean;
   isHost: boolean;
   revealed: boolean;
-}): InviteMenuState {
+  signalingReady?: boolean;
+  rotating?: boolean;
+}
+
+/**
+ * Pure derivation of the 1C-2 invite menu's enabled actions, locked state, and displayed code string.
+ */
+export function deriveInviteMenuState(params: InviteMenuParams): InviteMenuState {
   const { roomCode, roomPassword, roomLocked, isHost, revealed } = params;
-  const canRotate = isHost && roomCode !== null;
-  const canCopy = !roomLocked && roomCode !== null && roomPassword !== null;
+  const signalingReady = params.signalingReady ?? true;
+  const rotating = params.rotating ?? false;
+  const hasCode = roomCode !== null && roomCode.length > 0;
+  const hasSecret = roomPassword !== null && roomPassword.length > 0;
+  const canRotate = isHost && hasCode && signalingReady && !rotating;
+  const canCopy = !roomLocked && !rotating && hasCode && hasSecret;
   const canShow = canCopy;
   const displayCode =
-    roomCode === null
+    !hasCode || roomCode === null
       ? ""
       : canShow && revealed && roomPassword !== null
         ? `${roomCode}-${roomPassword}`

@@ -128,6 +128,7 @@ class Client {
   next(timeoutMs = 2000): Promise<ServerMessage> {
     const queued = this.queue.shift();
     if (queued) return Promise.resolve(queued);
+    const timeoutErr = new Error("timed out waiting for message");
     return new Promise((resolve, reject) => {
       const waiter = (m: ServerMessage): void => {
         clearTimeout(timer);
@@ -139,7 +140,7 @@ class Client {
         // that follows a deliberate timeout such as silentFor().
         const i = this.waiters.indexOf(waiter);
         if (i !== -1) this.waiters.splice(i, 1);
-        reject(new Error("timed out waiting for message"));
+        reject(timeoutErr);
       }, timeoutMs);
       this.waiters.push(waiter);
     });
@@ -732,21 +733,23 @@ describe("RoomDO signalling", () => {
     other.close();
   });
 
-  it("handles binary ArrayBuffer WebSocket messages", async () => {
+  it("rejects binary ArrayBuffer WebSocket messages with bad-message and close code 1008", async () => {
     const a = await Client.connect();
-    await a.join("alice");
+    const wa = await a.join("alice");
     const b = await Client.connect();
     await b.join("bob");
     await a.nextOf("peer-joined");
 
+    const closed = closeCodeOf(a.ws);
     const encoder = new TextEncoder();
     const binaryData = encoder.encode(JSON.stringify({ t: "state", sharing: true }));
     a.ws.send(binaryData);
 
-    const st = await b.nextOf("peer-state");
-    expect(st.sharing).toBe(true);
+    expect((await a.nextOf("error")).code).toBe("bad-message");
+    expect(await closed).toBe(1008);
+    expect(await b.next()).toEqual({ t: "peer-left", id: wa.selfId });
+    expect(await b.silentFor(100)).toBe(true);
 
-    a.close();
     b.close();
   });
 
@@ -1623,10 +1626,16 @@ describe("RoomDO final review fixes", () => {
     b.close();
   });
 
-  it("in-place resume preserves message budget and does not retain preservedId in gone set after superseded socket closes", async () => {
+  it("in-place resume preserves message budget, carries over badMessages, and delivers session-replaced before 1008", async () => {
     const a1 = await Client.connect();
     const wa1 = await a1.join("alice");
     const a1Closed = closeCodeOf(a1.ws);
+
+    // Accumulate 3 bad messages (below MAX_BAD_MESSAGES = 5) on a1 before resuming.
+    for (let i = 0; i < 3; i++) {
+      a1.ws.send("not-json");
+      expect((await a1.nextOf("error")).code).toBe("bad-message");
+    }
 
     // In-place resume on a2 while a1 is open
     const a2 = await Client.connect();
@@ -1641,17 +1650,26 @@ describe("RoomDO final review fixes", () => {
     const wa2 = await a2.nextOf("welcome");
     expect(wa2.selfId).toBe(wa1.selfId);
 
-    // Ensure a1 is closed and webSocketClose lifecycle has completed
+    // Superseded socket receives session-replaced before closing with 1008
+    expect((await a1.nextOf("error")).code).toBe("session-replaced");
     expect(await a1Closed).toBe(1008);
     await new Promise((r) => setTimeout(r, 100));
 
-    // Send messages on a2 to confirm rate-limit budget was not erased or broken by a1's close
+    // Send valid messages on a2 to confirm rate-limit budget survived in-place close
     for (let i = 0; i < 20; i++) {
       a2.send({ t: "state", sharing: false });
     }
     expect(await a2.silentFor(200)).toBe(true);
 
-    a2.close();
+    // 3 more bad messages (3 + 3 = 6 > MAX_BAD_MESSAGES) refuse and close a2 with 1008
+    const a2Closed = closeCodeOf(a2.ws);
+    for (let i = 0; i < 2; i++) {
+      a2.ws.send("not-json");
+      expect((await a2.nextOf("error")).code).toBe("bad-message");
+    }
+    a2.ws.send("not-json");
+    expect((await a2.nextOf("error")).code).toBe("bad-message");
+    expect(await a2Closed).toBe(1008);
   });
 
   it("in-place resume after socket closed recovers sharing state from member ticket when sharing is omitted in join message", async () => {
@@ -1807,7 +1825,8 @@ describe("RoomDO security & PR 1 flows", () => {
     expiredAttempt.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
     expect((await expiredAttempt.nextOf("error")).code).toBe("bad-password");
 
-    // Seed >128 members and >128 deny entries in storage, then trigger write to enforce cap at 128.
+    // Seed >128 members and >128 deny entries in storage, then verify rotate-password enforces 128 cap on members
+    // BEFORE kick tests both deny capping (128) and purge of disconnected members (leaving only active host).
     await runInDurableObject(stub, async (_i, state) => {
       const now = Date.now();
       const bigMembers: Record<string, { until: number; id: string }> = {};
@@ -1819,9 +1838,18 @@ describe("RoomDO security & PR 1 flows", () => {
       await state.storage.put({ members: bigMembers, deny: bigDeny });
     });
 
-    // Kick triggers a write to both members and deny via capByExpiry(..., 128).
+    h.send({ t: "rotate-password" });
+    const rot = await h.nextOf("room-password");
+    expect(rot.password).toBeTruthy();
+
+    const membersAfterRotate = await runInDurableObject(stub, async (_i, state) =>
+      Object.keys((await state.storage.get<Record<string, unknown>>("members")) ?? {}).length,
+    );
+    expect(membersAfterRotate).toBe(128);
+
+    // Kick triggers deny cap at 128 and purges all disconnected members (leaving only host h).
     const c = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.222" });
-    const wc = await c.join("carol");
+    const wc = await c.join("carol", rot.password ? { password: rot.password } : undefined);
     await h.nextOf("peer-joined");
     h.send({ t: "kick", id: wc.selfId });
     await h.nextOf("peer-left");
@@ -1831,8 +1859,8 @@ describe("RoomDO security & PR 1 flows", () => {
       members: Object.keys((await state.storage.get<Record<string, unknown>>("members")) ?? {}).length,
       deny: Object.keys((await state.storage.get<Record<string, unknown>>("deny")) ?? {}).length,
     }));
-    expect(counts.members).toBeLessThanOrEqual(128);
-    expect(counts.deny).toBeLessThanOrEqual(128);
+    expect(counts.members).toBe(1);
+    expect(counts.deny).toBe(128);
     h.close();
   });
 
@@ -1920,5 +1948,281 @@ describe("RoomDO security & PR 1 flows", () => {
 
     h.close();
     b2.close();
+  });
+
+  it("manual invite rotation keeps previous rejoinToken usable during 25s grace for half-open reconnects in locked rooms", async () => {
+    const h = await Client.connect();
+    await h.joinAsHost("host");
+
+    const b1 = await Client.connect();
+    const wb1 = await b1.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b1.nextOf("room-state");
+    const b1Closed = closeCodeOf(b1.ws);
+
+    // Host rotates invite secret; b1 simulates a half-open socket that never acts on the new rejoinToken.
+    h.send({ t: "rotate-password" });
+    await h.nextOf("room-password");
+
+    const b2 = await Client.connect();
+    b2.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      rejoinToken: wb1.rejoinToken,
+      resume: true,
+    });
+    const wb2 = await b2.nextOf("welcome");
+    expect(wb2.selfId).toBe(wb1.selfId);
+    expect((await b1.nextOf("error")).code).toBe("session-replaced");
+    expect(await b1Closed).toBe(1008);
+    expect(await h.silentFor(150)).toBe(true);
+
+    h.close();
+    b2.close();
+  });
+
+  it("clears stale hostGoneAt when the last peer disconnects and the room becomes empty", async () => {
+    const h = await Client.connect();
+    await h.joinAsHost("host");
+    const b = await Client.connect();
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.close();
+    await b.nextOf("peer-left");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const whileOccupied = await runInDurableObject(stub, (_i, state) => state.storage.get<number>("hostGoneAt"));
+    expect(typeof whileOccupied).toBe("number");
+
+    b.close();
+    await new Promise((r) => setTimeout(r, 100));
+
+    const whenEmpty = await runInDurableObject(stub, async (_i, state) => ({
+      hostGoneAt: await state.storage.get<number>("hostGoneAt"),
+      emptySince: await state.storage.get<number>("emptySince"),
+    }));
+    expect(whenEmpty.hostGoneAt).toBeUndefined();
+    expect(typeof whenEmpty.emptySince).toBe("number");
+  });
+
+  it("kicking a peer purges all disconnected rejoin tickets across IPs", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.230" });
+    await h.joinAsHost("host");
+
+    // Attacker session 1 connects, captures a valid rejoinToken, then disconnects.
+    const e1 = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.10" });
+    const we1 = await e1.join("eve");
+    await h.nextOf("peer-joined");
+    e1.close();
+    await h.nextOf("peer-left");
+
+    // Attacker session 2 joins from a different IP and is kicked by the host.
+    const e2 = await Client.connect(CODE, { "CF-Connecting-IP": "203.0.113.11" });
+    const we2 = await e2.join("eve2");
+    await h.nextOf("peer-joined");
+    h.send({ t: "kick", id: we2.selfId });
+    await h.nextOf("peer-left");
+    await h.nextOf("room-password");
+
+    // Pre-stashed rejoinToken from e1 must no longer be accepted even from an unbanned IP.
+    const e3 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.155" });
+    const e3Closed = closeCodeOf(e3.ws);
+    e3.send({ t: "join", room: CODE, displayName: "eve3", rejoinToken: we1.rejoinToken });
+    expect((await e3.nextOf("error")).code).toBe("bad-password");
+    expect(await e3Closed).toBe(1008);
+    h.close();
+  });
+
+  it("rejects cross-origin, cross-site, and non-upgrade /ws requests before charging WS_LIMITER", async () => {
+    const ip = "198.51.100.177";
+
+    for (let i = 0; i < 65; i++) {
+      const crossOrigin = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+        headers: { Upgrade: "websocket", "CF-Connecting-IP": ip, Origin: "https://evil.example" },
+      });
+      if (crossOrigin.webSocket) {
+        crossOrigin.webSocket.accept();
+        crossOrigin.webSocket.close();
+      }
+      if (i === 0) expect(crossOrigin.status).toBe(101);
+
+      const crossSite = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+        headers: { Upgrade: "websocket", "CF-Connecting-IP": ip, "Sec-Fetch-Site": "cross-site" },
+      });
+      if (crossSite.webSocket) {
+        crossSite.webSocket.accept();
+        crossSite.webSocket.close();
+      }
+      if (i === 0) expect(crossSite.status).toBe(101);
+
+      const nonUpgrade = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+        headers: { "CF-Connecting-IP": ip },
+      });
+      expect(nonUpgrade.status).toBe(426);
+    }
+
+    const legitimate = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: {
+        Upgrade: "websocket",
+        "CF-Connecting-IP": ip,
+        Origin: "https://example.com",
+        "Sec-Fetch-Site": "same-origin",
+      },
+    });
+    expect(legitimate.status).toBe(101);
+    legitimate.webSocket?.accept();
+    legitimate.webSocket?.close();
+  });
+
+  it("rejects binary WebSocket frames with bad-message and close code 1008", async () => {
+    const c = await Client.connect();
+    const closed = closeCodeOf(c.ws);
+    c.ws.send(new Uint8Array([1, 2, 3, 4]).buffer);
+    expect((await c.nextOf("error")).code).toBe("bad-message");
+    expect(await closed).toBe(1008);
+  });
+
+  it("preserves joinedAt promotion tenure across reconnects, recovers promotedHost token, and broadcasts peer-renamed", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.240" });
+    await h.joinAsHost("host");
+
+    const b1 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.241" });
+    const wb1 = await b1.join("bob");
+    await h.nextOf("peer-joined");
+
+    // Ensure carol has a strictly later joinedAt timestamp than bob.
+    await new Promise((r) => setTimeout(r, 20));
+    const c = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.242" });
+    await c.join("carol");
+    await h.nextOf("peer-joined");
+    await b1.nextOf("peer-joined");
+
+    // Bob resumes in-place with a new display name; carol must receive peer-renamed.
+    const b2 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.241" });
+    b2.send({
+      t: "join",
+      room: CODE,
+      displayName: "bobby",
+      rejoinToken: wb1.rejoinToken,
+      resume: true,
+    });
+    const wb2 = await b2.nextOf("welcome");
+    expect(wb2.selfId).toBe(wb1.selfId);
+    const renamedMsg = await c.nextOf("peer-renamed");
+    expect(renamedMsg).toEqual({ t: "peer-renamed", id: wb1.selfId, name: "bobby" });
+
+    // Host leaves and grace expires: bob (earliest joinedAt despite reconnecting later than carol) is promoted.
+    h.close();
+    await b2.nextOf("peer-left");
+    await c.nextOf("peer-left");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.put("hostGoneAt", Date.now() - 6 * 60_000);
+    });
+    await runDurableObjectAlarm(stub);
+
+    const promoBob = await b2.nextOf("host-promoted");
+    const promoCarol = await c.nextOf("host-promoted");
+    expect(promoBob.hostId).toBe(wb1.selfId);
+    expect(promoCarol.hostId).toBe(wb1.selfId);
+
+    const storedPromo = await runInDurableObject(stub, (_i, state) => state.storage.get("promotedHost"));
+    expect(storedPromo).toBeDefined();
+
+    // Simulate bob having been half-open when promoted: resuming with rejoinToken (without hostToken) recovers hostToken.
+    const b3 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.241" });
+    b3.send({
+      t: "join",
+      room: CODE,
+      displayName: "bobby",
+      rejoinToken: wb2.rejoinToken,
+      resume: true,
+    });
+    const wb3 = await b3.nextOf("welcome");
+    expect(wb3.host).toBe(true);
+    expect(typeof wb3.hostToken).toBe("string");
+
+    const clearedPromo = await runInDurableObject(stub, (_i, state) => state.storage.get("promotedHost"));
+    expect(clearedPromo).toBeUndefined();
+
+    b3.close();
+    c.close();
+  });
+
+  it("retains disconnect tickets for >12h active members in locked rooms and rotates across 20 peers", async () => {
+    const h = await Client.connect();
+    await h.joinAsHost("host");
+
+    const b = await Client.connect();
+    const wb = await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b.nextOf("room-state");
+
+    // Simulate >12h passing while b stayed actively connected: backdate stored ticket until.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, async (_i, state) => {
+      const raw = (await state.storage.get<Record<string, { until: number; id: string }>>("members")) ?? {};
+      for (const entry of Object.values(raw)) {
+        if (entry.id === wb.selfId) entry.until = Date.now() - 1000;
+      }
+      await state.storage.put("members", raw);
+    });
+
+    // Disconnecting grants a fresh 5-minute ticket despite the prior 12h ticket expiry.
+    b.close();
+    await h.nextOf("peer-left");
+
+    const b2 = await Client.connect();
+    b2.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });
+    const wb2 = await b2.nextOf("welcome");
+    expect(wb2.locked).toBe(true);
+    h.close();
+    b2.close();
+
+    // Verify full 20-peer room password rotation issues a fresh rejoinToken to every member.
+    const fullCode = freshRoom();
+    const fullInit = await initRoom(fullCode);
+    const fullHost = await Client.connect(fullCode, { "CF-Connecting-IP": "198.51.101.1" });
+    fullHost.send({
+      t: "join",
+      room: fullCode,
+      displayName: "host",
+      password: fullInit.password,
+      hostToken: fullInit.hostToken,
+    });
+    await fullHost.nextOf("welcome");
+
+    const guests: Client[] = [];
+    for (let i = 1; i < MAX_ROOM_SIZE; i++) {
+      const guest = await Client.connect(fullCode, { "CF-Connecting-IP": `198.51.101.${i + 1}` });
+      guest.send({ t: "join", room: fullCode, displayName: `guest-${i}`, password: fullInit.password });
+      await guest.nextOf("welcome");
+      await fullHost.nextOf("peer-joined");
+      for (const prevGuest of guests) await prevGuest.nextOf("peer-joined");
+      guests.push(guest);
+    }
+
+    fullHost.send({ t: "rotate-password" });
+    const hostRot = await fullHost.nextOf("room-password");
+    expect(typeof hostRot.rejoinToken).toBe("string");
+    expect(hostRot.rejoinToken?.length).toBeGreaterThan(0);
+
+    for (const guest of guests) {
+      const guestRot = await guest.nextOf("room-password");
+      expect(typeof guestRot.rejoinToken).toBe("string");
+      expect(guestRot.rejoinToken?.length).toBeGreaterThan(0);
+    }
+
+    fullHost.close();
+    for (const guest of guests) guest.close();
   });
 });

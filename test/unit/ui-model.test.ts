@@ -472,6 +472,45 @@ describe("deriveInviteMenuState & maskInviteSecret", () => {
       displayCode: "",
     });
   });
+
+  it("disables rotation when signalingReady is false while leaving copy/show available when unlocked", () => {
+    expect(
+      deriveInviteMenuState({
+        roomCode: "ABCDEFGH",
+        roomPassword: "JKMNPQRSTUVWXYZ2",
+        roomLocked: false,
+        isHost: true,
+        revealed: false,
+        signalingReady: false,
+      }),
+    ).toEqual({
+      canCopy: true,
+      canShow: true,
+      canRotate: false,
+      showLockedBanner: false,
+      displayCode: maskInviteSecret("ABCDEFGH"),
+    });
+  });
+
+  it("disables copy, show, and rotate and masks displayCode while rotating is true", () => {
+    expect(
+      deriveInviteMenuState({
+        roomCode: "ABCDEFGH",
+        roomPassword: "JKMNPQRSTUVWXYZ2",
+        roomLocked: false,
+        isHost: true,
+        revealed: true,
+        signalingReady: true,
+        rotating: true,
+      }),
+    ).toEqual({
+      canCopy: false,
+      canShow: false,
+      canRotate: false,
+      showLockedBanner: false,
+      displayCode: maskInviteSecret("ABCDEFGH"),
+    });
+  });
 });
 
 describe("describeInviteParseFailure", () => {

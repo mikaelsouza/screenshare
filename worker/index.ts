@@ -142,28 +142,51 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
             headers: { "Content-Type": "application/json" },
           });
     }
+    // Reject non-WebSocket probes and cross-origin handshake attempts at the edge before
+    // charging the per-IP limiter or routing to a Durable Object.
+    if (!isUpgrade(request)) {
+      return new Response("Expected Upgrade: websocket", { status: 426 });
+    }
+    const secFetchSite = request.headers.get("Sec-Fetch-Site");
+    if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+      return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
+    }
+    const origin = request.headers.get("Origin");
+    if (origin !== null) {
+      let parsedOrigin: string;
+      try {
+        parsedOrigin = new URL(origin).origin;
+      } catch {
+        return rejectUpgrade("forbidden-origin", "Malformed Origin header");
+      }
+      if (parsedOrigin !== url.origin) {
+        return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
+      }
+    }
     const clientIp = request.headers.get("CF-Connecting-IP");
     const rateKey = ipKey(clientIp ?? "unknown");
     if (!(await allowed(env.WS_LIMITER, wsUpgradeLimit, rateKey))) {
-      return isUpgrade(request)
-        ? rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER)
-        : new Response(JSON.stringify({ error: "Too many connection attempts" }), {
-            status: 429,
-            headers: { "Content-Type": "application/json", "Retry-After": "60" },
-          });
+      return rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER);
     }
     const id = env.ROOMS.idFromName(code);
     const stub = env.ROOMS.get(id);
-    return stub.fetch(request);
+    try {
+      return await stub.fetch(request);
+    } catch {
+      return rejectUpgrade("rate-limited", "Room temporarily unavailable", TRY_AGAIN_LATER);
+    }
   }
 
   // POST /api/room -> initialize DO room state and return { code, password, hostToken }.
   if (url.pathname === "/api/room") {
     if (request.method !== "POST") {
-      return new Response(JSON.stringify({ error: "Method not allowed" }), {
-        status: 405,
-        headers: { "Content-Type": "application/json", Allow: "POST" },
-      });
+      return new Response(
+        JSON.stringify({ error: "Method not allowed — reload the page to update Screenshare." }),
+        {
+          status: 405,
+          headers: { "Content-Type": "application/json", Allow: "POST" },
+        },
+      );
     }
 
     const secFetchSite = request.headers.get("Sec-Fetch-Site");
@@ -202,11 +225,16 @@ async function route(request: Request, env: Env, url: URL): Promise<Response> {
       const code = generateRoomCode();
       const id = env.ROOMS.idFromName(code);
       const stub = env.ROOMS.get(id);
-      const initRes = await stub.fetch("https://internal/init", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      });
+      let initRes: Response;
+      try {
+        initRes = await stub.fetch("https://internal/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code }),
+        });
+      } catch {
+        continue;
+      }
       if (initRes.status === 200) {
         return new Response(initRes.body, {
           status: 200,
