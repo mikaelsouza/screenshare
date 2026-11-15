@@ -2135,7 +2135,14 @@ describe("RoomDO security & PR 1 flows", () => {
     const storedPromo = await runInDurableObject(stub, (_i, state) => state.storage.get("promotedHost"));
     expect(storedPromo).toBeDefined();
 
-    // Simulate bob having been half-open when promoted: resuming with rejoinToken (without hostToken) recovers hostToken.
+    // Even if all peers briefly disconnect before claiming the promotion, promotedHost survives until recovery or expiry.
+    b2.close();
+    c.close();
+    await new Promise((r) => setTimeout(r, 80));
+    const promoWhileEmpty = await runInDurableObject(stub, (_i, state) => state.storage.get("promotedHost"));
+    expect(promoWhileEmpty).toBeDefined();
+
+    // Resuming with rejoinToken (without hostToken) recovers hostToken and clears promotedHost.
     const b3 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.241" });
     b3.send({
       t: "join",
@@ -2152,7 +2159,6 @@ describe("RoomDO security & PR 1 flows", () => {
     expect(clearedPromo).toBeUndefined();
 
     b3.close();
-    c.close();
   });
 
   it("retains disconnect tickets for >12h active members in locked rooms and rotates across 20 peers", async () => {
@@ -2167,19 +2173,26 @@ describe("RoomDO security & PR 1 flows", () => {
     await h.nextOf("room-state");
     await b.nextOf("room-state");
 
-    // Simulate >12h passing while b stayed actively connected: backdate stored ticket until.
+    // Simulate disconnecting just 10s before the ordinary 12h ticket deadline (<= 25s without rotationGrace).
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     await runInDurableObject(stub, async (_i, state) => {
       const raw = (await state.storage.get<Record<string, { until: number; id: string }>>("members")) ?? {};
       for (const entry of Object.values(raw)) {
-        if (entry.id === wb.selfId) entry.until = Date.now() - 1000;
+        if (entry.id === wb.selfId) entry.until = Date.now() + 10_000;
       }
       await state.storage.put("members", raw);
     });
 
-    // Disconnecting grants a fresh 5-minute ticket despite the prior 12h ticket expiry.
+    // Disconnecting grants a full 5-minute disconnect window instead of preserving the 10s deadline.
     b.close();
     await h.nextOf("peer-left");
+    await new Promise((r) => setTimeout(r, 60));
+
+    const bobTicketUntil = await runInDurableObject(stub, async (_i, state) => {
+      const raw = (await state.storage.get<Record<string, { until: number; id: string }>>("members")) ?? {};
+      return Object.values(raw).find((entry) => entry.id === wb.selfId)?.until ?? 0;
+    });
+    expect(bobTicketUntil).toBeGreaterThan(Date.now() + 4 * 60_000);
 
     const b2 = await Client.connect();
     b2.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wb.rejoinToken });

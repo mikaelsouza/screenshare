@@ -2543,6 +2543,10 @@ function joinFromBootOrHash(isHashChange: boolean): void {
       return;
     }
     if (lastJoin?.code === parsed.code && selfId !== null && client !== null && !client.isFatal) {
+      if (!client.isReady) {
+        roomPassword = parsed.password;
+        client.connect();
+      }
       return;
     }
     setLobbyError(null);

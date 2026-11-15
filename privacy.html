@@ -178,10 +178,11 @@
               <strong>What the signalling server sees:</strong> While you are connected to a room, our Cloudflare Workers
               and Durable Objects signalling service processes your IPv4 address or IPv6 <code>/64</code> prefix (used
               for connection rate limiting, brute-force protection, and host moderation enforcement), the 8-character
-              room code, your chosen display name, salted SHA-256 hashes of room secrets and random session tokens
-              (<code>hostToken</code> and <code>rejoinToken</code>), and the active room invite secret (retained only
-              while the room exists so unlocked rooms and promoted hosts can share invites). It never inspects SDP media
-              contents or sees video/audio frames.
+              room code, your chosen display name, session tokens (<code>hostToken</code> and <code>rejoinToken</code>)
+              presented on <code>join</code> along with salted SHA-256 hashes of room secrets and tokens, a temporary
+              promoted <code>hostToken</code> recovery record until claimed on reconnect, and the active room invite
+              secret (retained only while the room exists so unlocked rooms and promoted hosts can share invites). It
+              never inspects SDP media contents or sees video/audio frames.
             </li>
             <li>
               <strong>Invite URL scrubbing &amp; token lifetimes:</strong> Invite links carry <code>#CODE-SECRET</code>

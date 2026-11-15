@@ -133,6 +133,7 @@ interface MemberEntry {
   sharing?: boolean;
   ip?: string;
   joinedAt?: number;
+  rotationGrace?: boolean;
 }
 
 const MemberEntrySchema: z.ZodType<MemberEntry> = z
@@ -142,14 +143,16 @@ const MemberEntrySchema: z.ZodType<MemberEntry> = z
     sharing: z.boolean().optional(),
     ip: z.string().optional(),
     joinedAt: z.number().optional(),
+    rotationGrace: z.boolean().optional(),
   })
   .transform(
-    ({ until, id, sharing, ip, joinedAt }): MemberEntry => ({
+    ({ until, id, sharing, ip, joinedAt, rotationGrace }): MemberEntry => ({
       until,
       ...(id !== undefined ? { id } : {}),
       ...(sharing !== undefined ? { sharing } : {}),
       ...(ip !== undefined ? { ip } : {}),
       ...(joinedAt !== undefined ? { joinedAt } : {}),
+      ...(rotationGrace ? { rotationGrace: true } : {}),
     }),
   );
 
@@ -458,7 +461,7 @@ export class RoomDO extends DurableObject<Env> {
   private async syncAlarm(now: number): Promise<void> {
     const peers = this.joinedPeers();
     if (peers.length === 0) {
-      await this.ctx.storage.delete([HOST_GONE_KEY, PROMOTED_HOST_KEY]);
+      await this.ctx.storage.delete(HOST_GONE_KEY);
       let emptySince = await this.ctx.storage.get<number>(EMPTY_SINCE_KEY);
       if (emptySince === undefined) {
         emptySince = now;
@@ -834,6 +837,7 @@ export class RoomDO extends DurableObject<Env> {
         nextMembers[hash] = {
           ...entry,
           until: Math.min(entry.until, now + ROTATION_REJOIN_GRACE_MS),
+          rotationGrace: true,
         };
       }
     }
@@ -1549,12 +1553,9 @@ export class RoomDO extends DurableObject<Env> {
       const now = Date.now();
       const members = await this.getMembers(now, new Set([attachment.rejoinHash]));
       const existing = members[attachment.rejoinHash];
-      // Preserve an active short rotation-grace window, otherwise grant 5m disconnect TTL
-      // (including recovering members whose initial 12h entry elapsed while connected).
-      const nextUntil =
-        existing && existing.until > now && existing.until <= now + ROTATION_REJOIN_GRACE_MS
-          ? existing.until
-          : now + DISCONNECTED_REJOIN_TTL_MS;
+      // Preserve an active short rotation-grace window, otherwise grant the full 5m disconnect TTL.
+      const isRotationGrace = existing?.rotationGrace === true && existing.until > now;
+      const nextUntil = isRotationGrace ? existing.until : now + DISCONNECTED_REJOIN_TTL_MS;
       const ip = existing?.ip ?? attachment.ip;
       const joinedAt = existing?.joinedAt ?? attachment.joinedAt ?? attachment.openedAt;
       members[attachment.rejoinHash] = {
@@ -1563,6 +1564,7 @@ export class RoomDO extends DurableObject<Env> {
         ...(attachment.sharing ? { sharing: true } : {}),
         ...(ip !== undefined ? { ip } : {}),
         ...(joinedAt !== undefined ? { joinedAt } : {}),
+        ...(isRotationGrace ? { rotationGrace: true } : {}),
       };
       await this.ctx.storage.put({
         [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, this.activeRejoinHashes()),

@@ -118,12 +118,13 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   (25 seconds across a manual rotation). If no host is present in an occupied room for 5 minutes,
   the earliest-joined active member is permanently promoted to host (locked rooms never
   auto-unlock).
-- **The server sees** your IPv4 address or IPv6 `/64` prefix, room code, display name, salted
-  SHA-256 hashes of room secrets/tokens, and (for the lifetime of the room) the active room
-  invite secret so unlocked rooms and promoted hosts can continue sharing invites. Uninitialized
-  room codes accept zero persistent writes, and all room state, secrets, and moderation entries
-  are erased 12 hours after a room becomes empty (with stored ticket and ban maps capped at 128
-  entries).
+- **The server sees** your IPv4 address or IPv6 `/64` prefix, room code, display name,
+  `hostToken`/`rejoinToken` values sent in `join` messages, salted SHA-256 hashes of room
+  secrets/tokens, and (for the lifetime of the room) the active room invite secret (plus a
+  temporary promoted `hostToken` until recovered on reconnect) so unlocked rooms and promoted
+  hosts can continue sharing invites. Uninitialized room codes accept zero persistent writes, and
+  all room state, secrets, and moderation entries are erased 12 hours after a room becomes empty
+  (with stored ticket and ban maps capped at 128 entries).
 
 Known limitations and open defects are tracked in
 [Issues](https://github.com/mikaelsouza/screenshare/issues).
