@@ -2551,20 +2551,20 @@ describe("RoomDO security & PR 1 flows", () => {
     bobNext.close();
   });
 
-  it("backfills creatorHostTokenHash for legacy rooms lacking it before mid-session guest promotion", async () => {
+  it("backfills creatorHostTokenHash for unjoined pre-deploy rooms and restores creator after promotion", async () => {
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
-    // Simulate a legacy pre-deploy room with hostTokenHash only (no creatorHostTokenHash).
-    await runInDurableObject(stub, (_i, state) => state.storage.delete("creatorHostTokenHash"));
+    // Exact storage shape of an unjoined room initialized before this PR deployed.
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.delete(["creatorHostTokenHash", "sessionCleaned", "everJoined", "lastHostActiveAt"]),
+    );
 
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.72" });
     await h.joinAsHost("host");
-    const backfilledOnJoin = await runInDurableObject(stub, (_i, state) =>
+    const backfilledCreatorHash = await runInDurableObject(stub, (_i, state) =>
       state.storage.get<string>("creatorHostTokenHash"),
     );
-    expect(typeof backfilledOnJoin).toBe("string");
+    expect(typeof backfilledCreatorHash).toBe("string");
 
-    // Also cover the case where no creator joined after deployment before guest promotion runs.
-    await runInDurableObject(stub, (_i, state) => state.storage.delete("creatorHostTokenHash"));
     const bob = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.73" });
     await bob.join("bob");
     await h.nextOf("peer-joined");
@@ -2577,11 +2577,6 @@ describe("RoomDO security & PR 1 flows", () => {
     const promo = await bob.nextOf("host-promoted");
     const guestPromotedToken = promo.hostToken ?? "";
     expect(guestPromotedToken).not.toBe("");
-
-    const backfilledBeforePromotion = await runInDurableObject(stub, (_i, state) =>
-      state.storage.get<string>("creatorHostTokenHash"),
-    );
-    expect(backfilledBeforePromotion).toBe(backfilledOnJoin);
 
     bob.close();
     await waitForRoomEmpty(stub);
@@ -2604,6 +2599,69 @@ describe("RoomDO security & PR 1 flows", () => {
     expect((await bobNext.nextOf("welcome")).host).toBe(false);
 
     hNext.close();
+    bobNext.close();
+  });
+
+  it("revokes temporary host authority on 15m reset in legacy rooms where creatorHostTokenHash is absent", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.74" });
+    await h.joinAsHost("host");
+    const bob = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.75" });
+    const wBob = await bob.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.close();
+    await bob.nextOf("peer-left");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const promo = await bob.nextOf("host-promoted");
+    const promotedToken = promo.hostToken ?? "";
+    expect(promotedToken).not.toBe("");
+
+    // Simulate a legacy already-promoted room with promotedHost set and creatorHostTokenHash absent.
+    await runInDurableObject(stub, (_i, state) => state.storage.delete("creatorHostTokenHash"));
+    bob.close();
+    await waitForRoomEmpty(stub);
+
+    // First reconnect consumes promotedHost via rejoinToken, deleting promotedHost from storage.
+    const bobResume1 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.75" });
+    bobResume1.send({ t: "join", room: CODE, displayName: "bob", rejoinToken: wBob.rejoinToken });
+    const wResume1 = await bobResume1.nextOf("welcome");
+    expect(wResume1.host).toBe(true);
+    expect(wResume1.hostToken).toBe(promotedToken);
+    bobResume1.close();
+    await waitForRoomEmpty(stub);
+
+    // Second reconnect with promotedToken (after promotedHost was deleted) must not backfill creatorHostTokenHash.
+    const bobResume2 = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.75" });
+    bobResume2.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      hostToken: promotedToken,
+      rejoinToken: wResume1.rejoinToken,
+    });
+    expect((await bobResume2.nextOf("welcome")).host).toBe(true);
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.get("creatorHostTokenHash"))).toBeUndefined();
+
+    bobResume2.close();
+    await waitForRoomEmpty(stub);
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", Date.now() - 16 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.get("hostTokenHash"))).toBeUndefined();
+
+    // Next session: temporary promoted token is revoked and bob joins as a regular participant.
+    const bobNext = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.75" });
+    bobNext.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      password: PASSWORD,
+      hostToken: promotedToken,
+    });
+    expect((await bobNext.nextOf("welcome")).host).toBe(false);
     bobNext.close();
   });
 

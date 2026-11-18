@@ -580,7 +580,13 @@ export class RoomDO extends DurableObject<Env> {
       this.ctx.storage.get<boolean>(LOCKED_KEY),
       this.ctx.storage.get<string>(CREATOR_HOST_KEY),
     ]);
-    await this.ctx.storage.delete([MEMBERS_KEY, DENY_KEY, PROMOTED_HOST_KEY, HOST_GONE_KEY]);
+    await this.ctx.storage.delete([
+      MEMBERS_KEY,
+      DENY_KEY,
+      PROMOTED_HOST_KEY,
+      HOST_GONE_KEY,
+      ...(creatorHostHash === undefined ? [HOST_KEY] : []),
+    ]);
     await this.ctx.storage.put({
       [LOCKED_KEY]: false,
       [SESSION_CLEANED_KEY]: true,
@@ -589,6 +595,32 @@ export class RoomDO extends DurableObject<Env> {
         ? { [PASSWORD_KEY]: preRotated.passwordHash, [ROOM_PASSWORD_KEY]: preRotated.password }
         : {}),
     });
+  }
+
+  /**
+   * Backfill `CREATOR_HOST_KEY` from `HOST_KEY` only for pre-deploy rooms that have never been
+   * joined (`!everJoined && !sessionCleaned && members === undefined && promotedHost === undefined`).
+   */
+  private async backfillUnjoinedLegacyCreatorHash(): Promise<void> {
+    if (this.joinedPeers().length > 0) return;
+    const [creatorHash, hostHash, everJoined, sessionCleaned, members, promoted] = await Promise.all([
+      this.ctx.storage.get<string>(CREATOR_HOST_KEY),
+      this.ctx.storage.get<string>(HOST_KEY),
+      this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
+      this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
+      this.ctx.storage.get<unknown>(MEMBERS_KEY),
+      this.ctx.storage.get<unknown>(PROMOTED_HOST_KEY),
+    ]);
+    if (
+      creatorHash === undefined &&
+      hostHash !== undefined &&
+      everJoined !== true &&
+      sessionCleaned !== true &&
+      members === undefined &&
+      promoted === undefined
+    ) {
+      await this.ctx.storage.put(CREATOR_HOST_KEY, hostHash);
+    }
   }
 
   /**
@@ -706,6 +738,7 @@ export class RoomDO extends DurableObject<Env> {
           await this.expireRoom();
           return;
         }
+        await this.backfillUnjoinedLegacyCreatorHash();
         if (!sessionCleaned) {
           if (now - emptySince < EMPTY_SESSION_CLEANUP_MS) {
             await this.scheduleAlarmWithUnjoined(
@@ -752,12 +785,10 @@ export class RoomDO extends DurableObject<Env> {
       )[0];
       if (!candidate) return;
 
-      const backfillCreatorHash = await this.legacyCreatorHashToBackfill();
       const promotedRecord: PromotedHostRecord = { id: candidate.att.id, token: newHostToken };
       await this.ctx.storage.put({
         [HOST_KEY]: newHostHash,
         [PROMOTED_HOST_KEY]: promotedRecord,
-        ...(backfillCreatorHash !== undefined ? { [CREATOR_HOST_KEY]: backfillCreatorHash } : {}),
       });
       await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
       await this.scheduleAlarmWithUnjoined(now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
@@ -1401,16 +1432,6 @@ export class RoomDO extends DurableObject<Env> {
     }
   }
 
-  /** For pre-deploy rooms without `CREATOR_HOST_KEY`, treat unpromoted `HOST_KEY` as the creator hash to backfill. */
-  private async legacyCreatorHashToBackfill(): Promise<string | undefined> {
-    const [storedCreatorHash, storedHostHash, storedPromoted] = await Promise.all([
-      this.ctx.storage.get<string>(CREATOR_HOST_KEY),
-      this.ctx.storage.get<string>(HOST_KEY),
-      this.ctx.storage.get<unknown>(PROMOTED_HOST_KEY),
-    ]);
-    return storedCreatorHash === undefined && storedPromoted === undefined ? storedHostHash : undefined;
-  }
-
   private async persistMemberRecord(
     attachment: PeerAttachment,
     offeredRejoinHash: string | null,
@@ -1434,12 +1455,10 @@ export class RoomDO extends DurableObject<Env> {
     };
     const protectedHashes = this.activeRejoinHashes();
     protectedHashes.add(newRejoinHash);
-    const backfillCreatorHash = attachment.creatorHost === true ? await this.legacyCreatorHashToBackfill() : undefined;
     await this.ctx.storage.put({
       [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, protectedHashes),
       [EVER_JOINED_KEY]: true,
       ...(attachment.creatorHost === true ? { [LAST_HOST_ACTIVE_KEY]: now } : {}),
-      ...(backfillCreatorHash !== undefined ? { [CREATOR_HOST_KEY]: backfillCreatorHash } : {}),
     });
     if (isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
   }
@@ -1476,6 +1495,7 @@ export class RoomDO extends DurableObject<Env> {
         await this.expireRoom(ws);
         return "expired";
       }
+      await this.backfillUnjoinedLegacyCreatorHash();
       await this.ctx.storage.put(EMPTY_SINCE_KEY, now);
       return "ok";
     }
@@ -1484,6 +1504,7 @@ export class RoomDO extends DurableObject<Env> {
       await this.expireRoom(ws);
       return "expired";
     }
+    await this.backfillUnjoinedLegacyCreatorHash();
     if (!sessionCleaned && now - emptySince >= EMPTY_SESSION_CLEANUP_MS) {
       await this.resetEmptySessionState(now, preRotated);
     }
@@ -1711,14 +1732,8 @@ export class RoomDO extends DurableObject<Env> {
       return { ok: false, code: "bad-room-code", message: "Wrong room code for this connection" };
     }
 
-    const [hostHashRaw, creatorHostHashRaw, promotedRaw] = await Promise.all([
-      this.ctx.storage.get<string>(HOST_KEY),
-      this.ctx.storage.get<string>(CREATOR_HOST_KEY),
-      this.ctx.storage.get<unknown>(PROMOTED_HOST_KEY),
-    ]);
-    const hostHash = hostHashRaw ?? null;
-    const creatorHostHash =
-      creatorHostHashRaw ?? (promotedRaw === undefined ? hostHashRaw : undefined) ?? null;
+    const hostHash = (await this.ctx.storage.get<string>(HOST_KEY)) ?? null;
+    const creatorHostHash = (await this.ctx.storage.get<string>(CREATOR_HOST_KEY)) ?? null;
     const isHost =
       tokens.offeredHostHash !== null &&
       hostHash !== null &&
