@@ -3,17 +3,28 @@ import { isValidRoomCode, z } from "@shared/protocol";
 /** Storage key for bounded localStorage persistence of room host tokens. */
 export const HOST_ROOMS_STORAGE_KEY = "host-rooms";
 
+/** Web Lock name serializing cross-tab read-modify-write updates to `host-rooms`. */
+export const HOST_ROOMS_LOCK_NAME = "screenshare:host-rooms";
+
 /** Maximum number of recently hosted rooms retained in localStorage. */
 export const MAX_STORED_HOST_ROOMS = 20;
 
-/** Retention window matching the server-side 90-day room credential TTL. */
+/** Local 90-day retention window counted from when this device last saved or refreshed a room's creator token. */
 export const HOST_TOKEN_TTL_MS: number = 90 * 24 * 60 * 60 * 1000;
+
+/** Maximum allowed forward clock skew on stored timestamps so future-dated entries expire reliably. */
+export const MAX_CLOCK_SKEW_MS: number = 5 * 60 * 1000;
 
 /** Minimal Storage subset needed for reading and writing persisted host tokens. */
 export interface StorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
+}
+
+/** Minimal Web Locks API subset used to serialize cross-tab storage updates. */
+export interface LockManagerLike {
+  request(name: string, callback: () => Promise<void> | void): Promise<unknown>;
 }
 
 interface HostRoomEntry {
@@ -52,12 +63,29 @@ function loadHostRooms(storage: StorageLike, now: number): HostRoomEntry[] {
     const code = res.data.code.trim().toUpperCase();
     if (!isValidRoomCode(code)) continue;
     if (now - res.data.updatedAt >= HOST_TOKEN_TTL_MS) continue;
+    if (res.data.updatedAt > now + MAX_CLOCK_SKEW_MS) continue;
     const existing = byCode.get(code);
     if (!existing || res.data.updatedAt >= existing.updatedAt) {
       byCode.set(code, { code, token: res.data.token, updatedAt: res.data.updatedAt });
     }
   }
   return [...byCode.values()];
+}
+
+function persistEntries(storage: StorageLike, entries: HostRoomEntry[]): void {
+  entries.sort((a, b) => a.updatedAt - b.updatedAt);
+  const bounded =
+    entries.length > MAX_STORED_HOST_ROOMS ? entries.slice(entries.length - MAX_STORED_HOST_ROOMS) : entries;
+
+  try {
+    if (bounded.length === 0) {
+      storage.removeItem(HOST_ROOMS_STORAGE_KEY);
+    } else {
+      storage.setItem(HOST_ROOMS_STORAGE_KEY, JSON.stringify(bounded));
+    }
+  } catch {
+    /* ignore unavailable storage or quota errors */
+  }
 }
 
 /**
@@ -71,6 +99,17 @@ export function readPersistedHostToken(
   const upper = code.trim().toUpperCase();
   if (!storage || !isValidRoomCode(upper)) return undefined;
   return loadHostRooms(storage, now).find((entry) => entry.code === upper)?.token;
+}
+
+/**
+ * Return true if `storage` holds at least one valid, non-expired host token.
+ */
+export function hasAnyPersistedHostTokens(
+  storage: StorageLike | null | undefined,
+  now: number = Date.now(),
+): boolean {
+  if (!storage) return false;
+  return loadHostRooms(storage, now).length > 0;
 }
 
 /**
@@ -89,17 +128,62 @@ export function writePersistedHostToken(
   if (token !== undefined && token.length > 0 && token.length <= 64) {
     entries.push({ code: upper, token, updatedAt: now });
   }
-  entries.sort((a, b) => a.updatedAt - b.updatedAt);
-  const bounded =
-    entries.length > MAX_STORED_HOST_ROOMS ? entries.slice(entries.length - MAX_STORED_HOST_ROOMS) : entries;
+  persistEntries(storage, entries);
+}
 
+/**
+ * Delete the persisted host token for `code` only if it matches `expectedToken` (preserving newer cross-tab tokens).
+ */
+export function removePersistedHostTokenIfMatching(
+  storage: StorageLike | null | undefined,
+  code: string,
+  expectedToken: string | undefined,
+  now: number = Date.now(),
+): boolean {
+  const upper = code.trim().toUpperCase();
+  if (!storage || !expectedToken || !isValidRoomCode(upper)) return false;
+
+  const entries = loadHostRooms(storage, now);
+  const current = entries.find((entry) => entry.code === upper);
+  if (!current || current.token !== expectedToken) return false;
+
+  persistEntries(
+    storage,
+    entries.filter((entry) => entry.code !== upper),
+  );
+  return true;
+}
+
+/**
+ * Remove all persisted host tokens from `storage`.
+ */
+export function clearAllPersistedHostTokens(storage: StorageLike | null | undefined): void {
+  if (!storage) return;
   try {
-    if (bounded.length === 0) {
-      storage.removeItem(HOST_ROOMS_STORAGE_KEY);
-    } else {
-      storage.setItem(HOST_ROOMS_STORAGE_KEY, JSON.stringify(bounded));
-    }
+    storage.removeItem(HOST_ROOMS_STORAGE_KEY);
   } catch {
-    /* ignore unavailable storage or quota errors */
+    /* ignore unavailable storage errors */
+  }
+}
+
+/**
+ * Serialize a storage read-modify-write callback across tabs via the Web Locks API when available.
+ */
+export async function runWithHostRoomsLock(
+  locks: LockManagerLike | null | undefined,
+  fn: () => void,
+): Promise<void> {
+  if (!locks) {
+    fn();
+    return;
+  }
+  let ran = false;
+  try {
+    await locks.request(HOST_ROOMS_LOCK_NAME, () => {
+      ran = true;
+      fn();
+    });
+  } catch {
+    if (!ran) fn();
   }
 }

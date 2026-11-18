@@ -527,10 +527,28 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
   });
 
   await it("preserves host controls across Return to lobby and sessionStorage reset when revisiting the invite link", async () => {
-    // Rejoin via the invite link after clicking Return to lobby (#brand-home).
-    await host.goto("about:blank");
-    await host.goto(`${BASE_URL}/#${inviteCode}`);
-    await waitFor(host, inRoom, { label: "host re-enters room via invite link after Return to lobby" });
+    // Rejoin first, then explicitly click Return to lobby (#brand-home) inside this test so clearRoomSession() is exercised directly.
+    await joinWith(host, inviteCode);
+    await waitFor(host, inRoom, { label: "host enters room before clicking Return to lobby" });
+    await host.click("#brand-home");
+    await waitFor(
+      host,
+      () => document.getElementById("lobby")?.hidden === false && document.getElementById("room-bar")?.hidden === true,
+      { label: "host returns to lobby via #brand-home" },
+    );
+
+    // clearRoomSession() must not wipe localStorage host-rooms, and sessionStorage should never retain a redundant host: copy.
+    const afterLobby = await host.evaluate((roomCode) => ({
+      legacyHostSession: sessionStorage.getItem(`host:${roomCode}`),
+      persistedHosts: localStorage.getItem("host-rooms") ?? "",
+      forgetLobbyHidden: document.getElementById("lobby-forget-hosts")?.hidden ?? true,
+    }), code);
+    assert.equal(afterLobby.legacyHostSession, null, "sessionStorage must not keep a redundant host: copy");
+    assert.ok(afterLobby.persistedHosts.includes(code), "Return to lobby must keep host-rooms entry in localStorage");
+    assert.equal(afterLobby.forgetLobbyHidden, false, "#lobby-forget-hosts should be visible while saved host rooms exist");
+
+    await joinWith(host, inviteCode);
+    await waitFor(host, inRoom, { label: "host re-enters room via invite after Return to lobby" });
     await openRoster(host);
     await waitFor(host, () => !document.getElementById("lock-btn")?.hidden, {
       label: "host retains #lock-btn after Return to lobby",
@@ -549,12 +567,41 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       label: "host retains #lock-btn via persisted localStorage hostToken",
     });
 
-    // Verify localStorage stores only hostToken metadata and never the invite secret.
+    // Verify localStorage stores only hostToken metadata and never the invite secret or sessionStorage host: copy.
     const [, secretPart = ""] = inviteCode.split("-");
     assert.ok(secretPart.length > 0);
-    const storedRaw = await host.evaluate(() => localStorage.getItem("host-rooms") ?? "");
-    assert.ok(storedRaw.includes(code), "localStorage host-rooms should track the hosted room code");
-    assert.equal(storedRaw.includes(secretPart), false, "localStorage must never store the invite secret");
+    const storageSnapshot = await host.evaluate((roomCode) => ({
+      storedRaw: localStorage.getItem("host-rooms") ?? "",
+      legacyHostSession: sessionStorage.getItem(`host:${roomCode}`),
+    }), code);
+    assert.ok(storageSnapshot.storedRaw.includes(code), "localStorage host-rooms should track the hosted room code");
+    assert.equal(storageSnapshot.storedRaw.includes(secretPart), false, "localStorage must never store the invite secret");
+    assert.equal(storageSnapshot.legacyHostSession, null, "sessionStorage must not retain host: key");
+
+    // Verify the explicit Forget host button inside Invite ▾ removes persisted host access on this device.
+    await openInvite(host);
+    await waitFor(host, () => document.getElementById("invite-forget-host")?.hidden === false, {
+      label: "#invite-forget-host button is visible for saved creator room",
+    });
+    await host.click("#invite-forget-host");
+    await waitFor(
+      host,
+      () => localStorage.getItem("host-rooms") === null,
+      { label: "localStorage host-rooms cleared after clicking Forget host on this device" },
+    );
+    await waitFor(
+      host,
+      () => (document.getElementById("status")?.textContent ?? "").includes("Removed saved host access"),
+      { label: "status confirms host access removed on this device" },
+    );
+    await host.click("#brand-home");
+    await waitFor(
+      host,
+      () =>
+        document.getElementById("lobby")?.hidden === false &&
+        document.getElementById("lobby-forget-hosts")?.hidden === true,
+      { label: "#lobby-forget-hosts hides once all saved host rooms are forgotten" },
+    );
   });
 
   await it("serves /privacy.html with strict CSP headers and zero CSP violations", async () => {

@@ -84,6 +84,30 @@ function closeCodeOf(ws: WebSocket, timeoutMs = 3000): Promise<number> {
   });
 }
 
+/** Poll until all DO sockets are closed and empty-room storage markers are settled. */
+async function waitForRoomEmpty(
+  stub: ReturnType<typeof env.ROOMS.get>,
+  timeoutMs = 2_000,
+): Promise<{ emptySince: number }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const stateSnapshot = await runInDurableObject(stub, async (_i, state) => ({
+      socketCount: state.getWebSockets().length,
+      emptySince: await state.storage.get<number>("emptySince"),
+      hostGoneAt: await state.storage.get<number>("hostGoneAt"),
+    }));
+    if (
+      stateSnapshot.socketCount === 0 &&
+      typeof stateSnapshot.emptySince === "number" &&
+      stateSnapshot.hostGoneAt === undefined
+    ) {
+      return { emptySince: stateSnapshot.emptySince };
+    }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  throw new Error("Timed out waiting for Durable Object sockets to close and room to become empty");
+}
+
 /** How many sockets one IP may hold in a room; mirrors MAX_SOCKETS_PER_IP. */
 const PER_IP_CAP = MAX_ROOM_SIZE * 2;
 
@@ -583,10 +607,10 @@ describe("RoomDO membership", () => {
   it("erases an abandoned room when the alarm fires", async () => {
     const aliceClient = await Client.connect();
     await aliceClient.joinAsHost("alice");
-    aliceClient.close();
-    await new Promise((resolve) => setTimeout(resolve, 100));
-
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    aliceClient.close();
+    await waitForRoomEmpty(stub);
+
     await runInDurableObject(stub, (_instance, state) =>
       state.storage.put("emptySince", Date.now() - (90 * 24 * 60 + 1) * 60_000),
     );
@@ -2138,7 +2162,7 @@ describe("RoomDO security & PR 1 flows", () => {
     // Even if all peers briefly disconnect before claiming the promotion, promotedHost survives until recovery or expiry.
     b2.close();
     c.close();
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForRoomEmpty(stub);
     const promoWhileEmpty = await runInDurableObject(stub, (_i, state) => state.storage.get("promotedHost"));
     expect(promoWhileEmpty).toBeDefined();
 
@@ -2239,7 +2263,7 @@ describe("RoomDO security & PR 1 flows", () => {
     for (const guest of guests) guest.close();
   });
 
-  it("clears ephemeral session/IP state and resets room lock after 15m empty while keeping credentials intact", async () => {
+  it("clears ephemeral session/IP state, resets room lock, and rotates the invite secret when a locked room empties for 15m", async () => {
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.10" });
     await h.joinAsHost("host");
 
@@ -2254,8 +2278,8 @@ describe("RoomDO security & PR 1 flows", () => {
     h.send({ t: "kick", id: wEve.selfId });
     await h.nextOf("peer-left");
     const rotMsg = await h.nextOf("room-password");
-    const rotatedPassword = rotMsg.password ?? "";
-    expect(rotatedPassword).not.toBe("");
+    const preResetPassword = rotMsg.password ?? "";
+    expect(preResetPassword).not.toBe("");
 
     // Also place a stale promotedHost record to verify empty-session cleanup removes it.
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
@@ -2264,7 +2288,7 @@ describe("RoomDO security & PR 1 flows", () => {
     );
 
     h.close();
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForRoomEmpty(stub);
 
     await runInDurableObject(stub, (_i, state) =>
       state.storage.put("emptySince", Date.now() - 16 * 60_000),
@@ -2286,7 +2310,8 @@ describe("RoomDO security & PR 1 flows", () => {
 
     expect(snapshot.claimed).toBe(true);
     expect(snapshot.passwordHash).toBeDefined();
-    expect(snapshot.roomPassword).toBe(rotatedPassword);
+    expect(snapshot.roomPassword).toBeTruthy();
+    expect(snapshot.roomPassword).not.toBe(preResetPassword);
     expect(snapshot.hostTokenHash).toBeDefined();
     expect(snapshot.locked).toBe(false);
     expect(snapshot.sessionCleaned).toBe(true);
@@ -2294,9 +2319,23 @@ describe("RoomDO security & PR 1 flows", () => {
     expect(snapshot.deny).toBeUndefined();
     expect(snapshot.promotedHost).toBeUndefined();
     expect(snapshot.hostGoneAt).toBeUndefined();
+
+    // Leaked pre-lock secret stays invalid after auto-unlock, while creator enters via hostToken and receives the rotated secret.
+    const leaked = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.21" });
+    leaked.send({ t: "join", room: CODE, displayName: "mallory", password: preResetPassword });
+    expect((await leaked.nextOf("error")).code).toBe("bad-password");
+    leaked.close();
+
+    const creatorBack = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.10" });
+    creatorBack.send({ t: "join", room: CODE, displayName: "host", hostToken: HOST_TOKEN });
+    const wCreator = await creatorBack.nextOf("welcome");
+    expect(wCreator.host).toBe(true);
+    expect(wCreator.locked).toBe(false);
+    expect(wCreator.password).toBe(snapshot.roomPassword);
+    creatorBack.close();
   });
 
-  it("allows next-day link reuse with immediate hostToken recognition, preserves rotated revocation, and slides 90d TTL", async () => {
+  it("allows next-day link reuse for unlocked rooms, preserves rotated revocation, and caps 90d TTL by creator activity", async () => {
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.30" });
     await h.joinAsHost("host");
     const b = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.31" });
@@ -2309,16 +2348,12 @@ describe("RoomDO security & PR 1 flows", () => {
     const activePassword = rotHost.password ?? "";
     expect(activePassword).not.toBe(PASSWORD);
 
-    h.send({ t: "lock", locked: true });
-    await h.nextOf("room-state");
-    await b.nextOf("room-state");
-
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     h.close();
     b.close();
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForRoomEmpty(stub);
 
-    // Simulate 25 hours passing empty and Stage 1 alarm firing.
-    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    // Simulate 25 hours passing empty and Stage 1 alarm firing on an unlocked room.
     const oldEmptySince = Date.now() - 25 * 60 * 60_000;
     await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", oldEmptySince));
     expect(await runDurableObjectAlarm(stub)).toBe(true);
@@ -2335,8 +2370,11 @@ describe("RoomDO security & PR 1 flows", () => {
     const wbNext = await bNextDay.nextOf("welcome");
     expect(wbNext.locked).toBe(false);
     expect(wbNext.host).toBe(false);
+    const afterGuestVisit = await runInDurableObject(stub, (_i, state) =>
+      state.storage.get<number>("lastHostActiveAt"),
+    );
 
-    // Original creator returns with persisted hostToken and regains host controls immediately.
+    // Original creator returns with persisted hostToken and regains host controls immediately, sliding lastHostActiveAt.
     const hNextDay = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.30" });
     hNextDay.send({
       t: "join",
@@ -2349,51 +2387,184 @@ describe("RoomDO security & PR 1 flows", () => {
     expect(whNext.host).toBe(true);
     await bNextDay.nextOf("peer-joined");
 
-    // Leaving refreshes emptySince to the current time (sliding 90-day TTL).
     hNextDay.close();
     bNextDay.close();
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForRoomEmpty(stub);
 
     const refreshed = await runInDurableObject(stub, async (_i, state) => ({
       emptySince: await state.storage.get<number>("emptySince"),
+      lastHostActiveAt: await state.storage.get<number>("lastHostActiveAt"),
       sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
     }));
     expect(refreshed.emptySince).toBeGreaterThan(oldEmptySince + 24 * 60 * 60_000);
+    expect(refreshed.lastHostActiveAt).toBeGreaterThanOrEqual(afterGuestVisit ?? 0);
     expect(refreshed.sessionCleaned).toBeUndefined();
+
+    // Even if a non-host visited recently (emptySince = 1h ago), once lastHostActiveAt exceeds 90d the room expires.
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put({
+        emptySince: Date.now() - 60 * 60_000,
+        lastHostActiveAt: Date.now() - (90 * 24 * 60 + 5) * 60_000,
+      }),
+    );
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const claimedAfterCap = await runInDurableObject(stub, (_i, state) => state.storage.get<boolean>("claimed"));
+    expect(claimedAfterCap).toBeUndefined();
   });
 
-  it("enforces 15m session cleanup and 90d expiry lazily on join even if alarm has not yet fired", async () => {
+  it("expires never-joined rooms after 12 hours instead of 90 days", async () => {
+    const unusedCode = freshRoom();
+    await initRoom(unusedCode);
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(unusedCode));
+
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("emptySince", Date.now() - 13 * 60 * 60_000),
+    );
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
+    expect(remainingKeys).toBe(0);
+  });
+
+  it("arms a 15-minute safety fallback alarm while occupied and recovers if last-leave event was missed", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.60" });
+    await h.joinAsHost("host");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+
+    const alarmAt = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+    expect(alarmAt).not.toBeNull();
+    expect(alarmAt!).toBeLessThanOrEqual(Date.now() + 16 * 60_000);
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    h.close();
+    await waitForRoomEmpty(stub);
+
+    // Simulate a missed last-leave event where emptySince and sessionCleaned were never persisted.
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.delete(["emptySince", "sessionCleaned"]);
+      await state.storage.put("locked", true);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const recovered = await runInDurableObject(stub, async (_i, state) => ({
+      locked: await state.storage.get<boolean>("locked"),
+      sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
+      members: await state.storage.get("members"),
+    }));
+    expect(recovered.locked).toBe(false);
+    expect(recovered.sessionCleaned).toBe(true);
+    expect(recovered.members).toBeUndefined();
+  });
+
+  it("restores creator host authority after 15m empty-session reset following mid-session guest promotion", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.70" });
+    await h.joinAsHost("host");
+    const bob = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.71" });
+    await bob.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.close();
+    await bob.nextOf("peer-left");
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const promo = await bob.nextOf("host-promoted");
+    const guestPromotedToken = promo.hostToken ?? "";
+    expect(guestPromotedToken).not.toBe("");
+
+    bob.close();
+    await waitForRoomEmpty(stub);
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", Date.now() - 16 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    // Original creator regains host: true next day, while guest's old session-promoted token does not.
+    const hNext = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.70" });
+    hNext.send({ t: "join", room: CODE, displayName: "host", hostToken: HOST_TOKEN });
+    expect((await hNext.nextOf("welcome")).host).toBe(true);
+
+    const bobNext = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.71" });
+    bobNext.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      password: PASSWORD,
+      hostToken: guestPromotedToken,
+    });
+    expect((await bobNext.nextOf("welcome")).host).toBe(false);
+
+    hNext.close();
+    bobNext.close();
+  });
+
+  it("sweeps stale unjoined sockets via 10s alarm even in an already-cleaned empty room", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.80" });
+    await h.joinAsHost("host");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    h.close();
+    await waitForRoomEmpty(stub);
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", Date.now() - 16 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const idle = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.81" });
+    const idleClosed = closeCodeOf(idle.ws);
+    const scheduled = await runInDurableObject(stub, (_i, state) => state.storage.getAlarm());
+    expect(scheduled).not.toBeNull();
+    expect(scheduled!).toBeLessThanOrEqual(Date.now() + 11_000);
+
+    await runInDurableObject(stub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { openedAt?: number };
+        ws.serializeAttachment({ ...att, openedAt: Date.now() - 20_000 });
+      }
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await idleClosed).toBe(1008);
+  });
+
+  it("enforces 15m cleanup and 90d expiry lazily on join without charging password failure rate limits", async () => {
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.40" });
     await h.joinAsHost("host");
     const eve = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.41" });
     const wEve = await eve.join("eve");
     await h.nextOf("peer-joined");
 
-    h.send({ t: "lock", locked: true });
-    await h.nextOf("room-state");
-    await eve.nextOf("room-state");
-
-    // Ban an IP and leave the room empty.
+    // Ban an IP in an unlocked room and leave it empty.
     h.send({ t: "kick", id: wEve.selfId });
     await h.nextOf("peer-left");
     const rot = await h.nextOf("room-password");
     const activePassword = rot.password ?? "";
-    h.close();
-    await new Promise((r) => setTimeout(r, 80));
-
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    h.close();
+    await waitForRoomEmpty(stub);
+
     // Jump 16 minutes ahead WITHOUT calling runDurableObjectAlarm.
     await runInDurableObject(stub, (_i, state) =>
       state.storage.put("emptySince", Date.now() - 16 * 60_000),
     );
 
-    // Even the formerly banned IP after 15m + locked room can now enter once 15m empty elapsed.
+    // Formerly banned IP enters after 15m cleanup once alarm has not run yet.
     const lateVisitor = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.41" });
     lateVisitor.send({ t: "join", room: CODE, displayName: "eve", password: activePassword });
     const wLate = await lateVisitor.nextOf("welcome");
     expect(wLate.locked).toBe(false);
     lateVisitor.close();
-    await new Promise((r) => setTimeout(r, 80));
+    await waitForRoomEmpty(stub);
+
+    // Exhaust 15 wrong-password attempts from IP 198.51.100.42, then verify lazy expiry still returns bad-password
+    // (not rate-limited) and closes any sibling unjoined socket with 1001.
+    for (let i = 0; i < 15; i++) {
+      const bad = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.42" });
+      bad.send({ t: "join", room: CODE, displayName: "guesser", password: "WRONG23456789ABC" });
+      expect((await bad.nextOf("error")).code).toBe("bad-password");
+      bad.close();
+    }
+
+    const sibling = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.43" });
+    const siblingClosed = closeCodeOf(sibling.ws);
 
     // Jump > 90 days ahead WITHOUT calling runDurableObjectAlarm.
     await runInDurableObject(stub, (_i, state) =>
@@ -2403,6 +2574,7 @@ describe("RoomDO security & PR 1 flows", () => {
     expiredAttempt.send({ t: "join", room: CODE, displayName: "alice", password: activePassword });
     expect((await expiredAttempt.nextOf("error")).code).toBe("bad-password");
     expiredAttempt.close();
+    expect(await siblingClosed).toBe(1001);
 
     const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
     expect(remainingKeys).toBe(0);

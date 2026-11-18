@@ -21,7 +21,15 @@ import {
   type QualityPresetName,
 } from "./capture";
 import { Mesh } from "./mesh";
-import { readPersistedHostToken, writePersistedHostToken } from "./host-tokens";
+import {
+  HOST_ROOMS_STORAGE_KEY,
+  clearAllPersistedHostTokens,
+  hasAnyPersistedHostTokens,
+  readPersistedHostToken,
+  removePersistedHostTokenIfMatching,
+  runWithHostRoomsLock,
+  writePersistedHostToken,
+} from "./host-tokens";
 import { createCaptureController } from "./platform";
 import type { EndReason, FollowState } from "./platform/types";
 import {
@@ -63,6 +71,7 @@ const ui = {
   roomNameInput: el<HTMLInputElement>("room-name"),
   roomInput: el<HTMLInputElement>("room-code"),
   lobbyError: el<HTMLElement>("lobby-error"),
+  lobbyForgetHostsBtn: el<HTMLButtonElement>("lobby-forget-hosts"),
   joinBtn: el<HTMLButtonElement>("join"),
   createBtn: el<HTMLButtonElement>("create"),
   brandHomeBtn: el<HTMLButtonElement>("brand-home"),
@@ -77,6 +86,7 @@ const ui = {
   inviteCodeValue: el<HTMLElement>("invite-code-value"),
   inviteShowBtn: el<HTMLButtonElement>("invite-show-btn"),
   inviteCopyCodeBtn: el<HTMLButtonElement>("invite-copy-code"),
+  inviteForgetHostBtn: el<HTMLButtonElement>("invite-forget-host"),
   rosterBtn: el<HTMLButtonElement>("roster-btn"),
   rosterUnreadDot: el<HTMLElement>("roster-unread-dot"),
   rosterBtnLabel: el<HTMLElement>("roster-btn-label"),
@@ -221,8 +231,9 @@ let codeFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let rotateFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let inviteRotatePending = false;
 let inviteRotateTimeout: ReturnType<typeof setTimeout> | null = null;
-let pendingKickPeerName: string | null = null;
-let kickNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+const pendingKicks = new Map<PeerId, { name: string; timer: ReturnType<typeof setTimeout> }>();
+let transientNoticeTimer: ReturnType<typeof setTimeout> | null = null;
+let activeTransientNotice: string | null = null;
 
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
@@ -1005,10 +1016,19 @@ function renderSelfPreview(stream: MediaStream | null): void {
 
 const memorySession = new Map<string, string>();
 const memoryHostTokens = new Map<string, string>();
+const creatorHostCodes = new Set<string>();
 
 function safeLocalStorage(): Storage | null {
   try {
     return typeof localStorage !== "undefined" ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeLocks(): LockManager | null {
+  try {
+    return typeof navigator !== "undefined" && "locks" in navigator ? navigator.locks : null;
   } catch {
     return null;
   }
@@ -1043,12 +1063,71 @@ function saveActiveRoom(code: string | undefined): void {
   writeSession("activeRoom", code);
 }
 
-function hostTokenFor(code: string): string | undefined {
-  return (
-    memoryHostTokens.get(code) ??
-    readPersistedHostToken(safeLocalStorage(), code) ??
-    readSession(`host:${code}`)
+function syncForgetHostUi(): void {
+  const hasSaved = creatorHostCodes.size > 0 || hasAnyPersistedHostTokens(safeLocalStorage());
+  ui.lobbyForgetHostsBtn.hidden = !hasSaved;
+  if (lastJoin !== null) {
+    const code = lastJoin.code;
+    ui.inviteForgetHostBtn.hidden = !(
+      creatorHostCodes.has(code) || readPersistedHostToken(safeLocalStorage(), code) !== undefined
+    );
+  } else {
+    ui.inviteForgetHostBtn.hidden = true;
+  }
+}
+
+function saveCreatorHostToken(code: string, token: string): void {
+  creatorHostCodes.add(code);
+  memoryHostTokens.set(code, token);
+  syncForgetHostUi();
+  runBackground(
+    runWithHostRoomsLock(safeLocks(), () => {
+      writePersistedHostToken(safeLocalStorage(), code, token);
+      syncForgetHostUi();
+    }),
   );
+}
+
+function saveSessionHostToken(code: string, token: string): void {
+  creatorHostCodes.delete(code);
+  memoryHostTokens.set(code, token);
+  syncForgetHostUi();
+}
+
+function forgetCreatorHostToken(code: string, onlyIfMatching?: string): void {
+  if (onlyIfMatching === undefined || memoryHostTokens.get(code) === onlyIfMatching) {
+    memoryHostTokens.delete(code);
+    creatorHostCodes.delete(code);
+  }
+  writeSession(`host:${code}`, undefined);
+  syncForgetHostUi();
+  runBackground(
+    runWithHostRoomsLock(safeLocks(), () => {
+      if (onlyIfMatching !== undefined) {
+        removePersistedHostTokenIfMatching(safeLocalStorage(), code, onlyIfMatching);
+      } else {
+        writePersistedHostToken(safeLocalStorage(), code, undefined);
+      }
+      syncForgetHostUi();
+    }),
+  );
+}
+
+function hostTokenFor(code: string): string | undefined {
+  const inMemory = memoryHostTokens.get(code);
+  if (inMemory !== undefined) return inMemory;
+  const persisted = readPersistedHostToken(safeLocalStorage(), code);
+  if (persisted !== undefined) {
+    creatorHostCodes.add(code);
+    return persisted;
+  }
+  const legacy = readSession(`host:${code}`);
+  if (legacy !== undefined) {
+    writeSession(`host:${code}`, undefined);
+    saveCreatorHostToken(code, legacy);
+    return legacy;
+  }
+  return undefined;
 }
 
 function rejoinTokenFor(code: string): string | undefined {
@@ -1057,13 +1136,6 @@ function rejoinTokenFor(code: string): string | undefined {
 
 function saveRejoinToken(code: string, token: string | undefined): void {
   writeSession(`rejoin:${code}`, token);
-}
-
-function saveHostToken(code: string, token: string | undefined): void {
-  if (token !== undefined) memoryHostTokens.set(code, token);
-  else memoryHostTokens.delete(code);
-  writePersistedHostToken(safeLocalStorage(), code, token);
-  writeSession(`host:${code}`, token);
 }
 
 function clearRoomSession(code?: string): void {
@@ -1172,6 +1244,9 @@ function renderInviteMenu(): void {
   ui.inviteShowBtn.disabled = !state.canShow;
   ui.inviteShowBtn.textContent = inviteRevealed && state.canShow ? "Hide" : "Show";
   ui.inviteCopyCodeBtn.disabled = !state.canCopy;
+  ui.inviteForgetHostBtn.hidden = !(
+    code !== null && (creatorHostCodes.has(code) || readPersistedHostToken(safeLocalStorage(), code) !== undefined)
+  );
 }
 
 function pruneDepartures(now: number): void {
@@ -1376,10 +1451,17 @@ function renderRoster(): void {
       kick.type = "button";
       kick.className = "ui-btn kick-btn";
       kick.textContent = "Remove";
+      kick.disabled = pendingKicks.has(entry.id);
       kick.title = `Remove ${entry.name} from the room and rotate the invite link (blocks their network for 15 minutes).`;
       kick.addEventListener("click", () => {
-        if (client?.isReady) pendingKickPeerName = entry.name;
-        client?.kick(entry.id);
+        if (!client?.isReady || pendingKicks.has(entry.id)) return;
+        kick.disabled = true;
+        const timer = setTimeout(() => {
+          pendingKicks.delete(entry.id);
+          renderRoster();
+        }, 10_000);
+        pendingKicks.set(entry.id, { name: entry.name, timer });
+        client.kick(entry.id);
         if (!members.has(entry.id)) teardownPeer(entry.id);
       });
       right.append(kick);
@@ -1640,6 +1722,59 @@ const HOST_TOKEN_WIPING_ERRORS: ReadonlySet<string> = new Set([
   "bad-room-code",
 ]);
 
+function connectedRoomStatusText(code: string): string {
+  return `In room ${code} \u2014 ${members.size + 1}/${MAX_ROOM_SIZE} connected`;
+}
+
+function clearTransientNoticeTimer(): void {
+  if (transientNoticeTimer !== null) {
+    clearTimeout(transientNoticeTimer);
+    transientNoticeTimer = null;
+  }
+}
+
+function dismissTransientRoomNotice(): void {
+  clearTransientNoticeTimer();
+  if (
+    activeTransientNotice !== null &&
+    ui.status.textContent === activeTransientNotice &&
+    client?.isReady === true &&
+    selfId !== null &&
+    lastJoin !== null
+  ) {
+    setStatus(connectedRoomStatusText(lastJoin.code), "info");
+  }
+  activeTransientNotice = null;
+}
+
+function showTransientRoomNotice(message: string, durationMs = 6_000): void {
+  clearTransientNoticeTimer();
+  activeTransientNotice = message;
+  setStatus(message, "warn");
+  transientNoticeTimer = setTimeout(() => {
+    transientNoticeTimer = null;
+    if (
+      activeTransientNotice === message &&
+      ui.status.textContent === message &&
+      client?.isReady === true &&
+      selfId !== null &&
+      lastJoin !== null
+    ) {
+      setStatus(connectedRoomStatusText(lastJoin.code), "info");
+    }
+    if (activeTransientNotice === message) {
+      activeTransientNotice = null;
+    }
+  }, durationMs);
+}
+
+function clearPendingKicks(): void {
+  for (const pending of pendingKicks.values()) {
+    clearTimeout(pending.timer);
+  }
+  pendingKicks.clear();
+}
+
 async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setLobbyError(describeInviteParseFailure("invalid"));
@@ -1665,6 +1800,7 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   inviteRotatePending = false;
   clearRotatePendingTimer();
   let hasWelcomed = false;
+  let lastPresentedHostToken: string | undefined;
 
   const activeClient = new SignalingClient(
     code,
@@ -1672,9 +1808,12 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
     {
       onStatus: (status) => {
         if (activeGen !== joinGeneration) return;
+        clearTransientNoticeTimer();
+        activeTransientNotice = null;
         if (status === "open") {
           setStatus(`In room ${code}`, "info");
         } else {
+          clearPendingKicks();
           setStatus(`Connection ${status}…`, "warn");
         }
         if (selfId !== null) renderInviteMenu();
@@ -1682,21 +1821,33 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
 
       onWelcome: (selfIdFromServer, peers, room) => {
         if (activeGen !== joinGeneration) return;
+        const wasFirstWelcome = !hasWelcomed;
         hasWelcomed = true;
+        const rejectedStoredHostToken = !room.host && wasFirstWelcome && lastPresentedHostToken !== undefined;
         inviteRotatePending = false;
         clearRotatePendingTimer();
+        clearTransientNoticeTimer();
+        activeTransientNotice = null;
         ui.roomInput.value = "";
         setLobbyError(null);
         scrubRoomUrl();
 
         for (const timer of peerLeftTimers.values()) clearTimeout(timer);
         peerLeftTimers.clear();
+        clearPendingKicks();
 
         if (!room.host) {
-          saveHostToken(code, undefined);
+          memoryHostTokens.delete(code);
+          creatorHostCodes.delete(code);
+          syncForgetHostUi();
         } else {
-          const effectiveHostToken = room.hostToken ?? hostTokenFor(code);
-          if (effectiveHostToken) saveHostToken(code, effectiveHostToken);
+          const persisted = readPersistedHostToken(safeLocalStorage(), code);
+          if (creatorHostCodes.has(code) || persisted !== undefined) {
+            const creatorToken = room.hostToken ?? lastPresentedHostToken ?? persisted;
+            if (creatorToken !== undefined) saveCreatorHostToken(code, creatorToken);
+          } else if (room.hostToken) {
+            saveSessionHostToken(code, room.hostToken);
+          }
         }
         saveRejoinToken(code, room.rejoinToken);
         if (room.password) {
@@ -1760,7 +1911,10 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
             if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
           }
 
-          setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
+          setStatus(connectedRoomStatusText(code), "info");
+          if (rejectedStoredHostToken) {
+            showTransientRoomNotice("Joined as participant \u2014 another member is hosting this session.");
+          }
           renderInviteMenu();
           syncViewState();
           startHealthPolling();
@@ -1832,7 +1986,10 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
           mesh.addMember(p.id, p.sharing);
         }
-        setStatus(`In room ${code} — ${members.size + 1}/${MAX_ROOM_SIZE} connected`, "info");
+        setStatus(connectedRoomStatusText(code), "info");
+        if (rejectedStoredHostToken) {
+          showTransientRoomNotice("Joined as participant \u2014 another member is hosting this session.");
+        }
         if (capture) {
           client?.setSharing(true);
           if (!tiles.has(SELF_TILE)) renderSelfPreview(capture.stream);
@@ -1877,6 +2034,16 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
 
       onPeerLeft: (id, kicked) => {
         if (activeGen !== joinGeneration) return;
+        const pendingKick = pendingKicks.get(id);
+        if (pendingKick) {
+          clearTimeout(pendingKick.timer);
+          pendingKicks.delete(id);
+          if (kicked && isHost) {
+            showTransientRoomNotice(
+              `Removed ${pendingKick.name} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
+            );
+          }
+        }
         if (!kicked) recordDeparture(id);
         unreadPeerIds.delete(id);
         if (kicked) {
@@ -1949,20 +2116,6 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
             ui.inviteRotateBtn.textContent = "Rotate";
             ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
           }, 1600);
-        } else if (pendingKickPeerName !== null && isHost) {
-          const removedName = pendingKickPeerName;
-          pendingKickPeerName = null;
-          clearKickNoticeTimer();
-          setStatus(
-            `Removed ${removedName} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
-            "warn",
-          );
-          kickNoticeTimer = setTimeout(() => {
-            kickNoticeTimer = null;
-            if (client && selfId !== null && lastJoin) {
-              setStatus(`In room ${lastJoin.code}`, "info");
-            }
-          }, 6_000);
         }
         renderInviteMenu();
       },
@@ -1991,7 +2144,7 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           m.host = id === hostId;
         }
         if (isHost) {
-          if (hostToken) saveHostToken(code, hostToken);
+          if (hostToken) saveSessionHostToken(code, hostToken);
           if (password) {
             roomPassword = password;
           }
@@ -2020,7 +2173,13 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
             saveActiveRoom(undefined);
           }
           if (HOST_TOKEN_WIPING_ERRORS.has(codeErr)) {
-            saveHostToken(codeToJoin, undefined);
+            if (lastPresentedHostToken !== undefined) {
+              forgetCreatorHostToken(codeToJoin, lastPresentedHostToken);
+            } else {
+              memoryHostTokens.delete(codeToJoin);
+              creatorHostCodes.delete(codeToJoin);
+              syncForgetHostUi();
+            }
           }
           lastJoin = null;
           leaveRoom();
@@ -2029,23 +2188,32 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           return;
         }
         if (codeErr === "not-host") {
-          pendingKickPeerName = null;
+          clearPendingKicks();
+          renderRoster();
           setStatus(friendly, "warn");
           return;
         }
         if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
-          if (codeErr === "unknown-peer") pendingKickPeerName = null;
+          if (codeErr === "unknown-peer") {
+            clearPendingKicks();
+            renderRoster();
+          }
           return;
         }
-        pendingKickPeerName = null;
+        clearPendingKicks();
+        renderRoster();
         setStatus(codeErr === "rate-limited" ? friendly : `${codeErr}: ${friendly}`, "error");
       },
     },
-    () => ({
-      password: roomPassword ?? undefined,
-      hostToken: hostTokenFor(code),
-      rejoinToken: rejoinTokenFor(code),
-    }),
+    () => {
+      const hostToken = hostTokenFor(code);
+      lastPresentedHostToken = hostToken;
+      return {
+        password: roomPassword ?? undefined,
+        hostToken,
+        rejoinToken: rejoinTokenFor(code),
+      };
+    },
   );
 
   client = activeClient;
@@ -2053,20 +2221,14 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   scrubRoomUrl();
 }
 
-function clearKickNoticeTimer(): void {
-  if (kickNoticeTimer !== null) {
-    clearTimeout(kickNoticeTimer);
-    kickNoticeTimer = null;
-  }
-}
-
 function leaveRoom(): void {
   joinGeneration++;
   reopenRosterOnWelcome = false;
   inviteRotatePending = false;
   clearRotatePendingTimer();
-  pendingKickPeerName = null;
-  clearKickNoticeTimer();
+  clearPendingKicks();
+  clearTransientNoticeTimer();
+  activeTransientNotice = null;
   if (inviteRevealTimer !== null) {
     clearTimeout(inviteRevealTimer);
     inviteRevealTimer = null;
@@ -2110,6 +2272,7 @@ function leaveRoom(): void {
   renderInviteMenu();
   renderRoster();
   syncViewState();
+  syncForgetHostUi();
 }
 
 // ---- quality & audio controls --------------------------------------------
@@ -2358,16 +2521,12 @@ async function copyInvite(mode: "link" | "code"): Promise<void> {
   const text = mode === "link" ? `${location.origin}/#${invite}` : invite;
   const copied = await copyTextToClipboard(text);
   if (!copied) {
-    clearKickNoticeTimer();
+    clearTransientNoticeTimer();
+    activeTransientNotice = null;
     setStatus("Could not copy automatically. Use Show to view and copy manually.", "warn");
     return;
   }
-  if (kickNoticeTimer !== null) {
-    clearKickNoticeTimer();
-    if (client && selfId !== null && lastJoin) {
-      setStatus(`In room ${lastJoin.code}`, "info");
-    }
-  }
+  dismissTransientRoomNotice();
   if (mode === "link") {
     if (linkFeedbackTimer !== null) clearTimeout(linkFeedbackTimer);
     ui.inviteLinkFeedback.textContent = "Copied!";
@@ -2406,6 +2565,26 @@ ui.inviteCopyLinkBtn.addEventListener("click", () => {
 
 ui.inviteCopyCodeBtn.addEventListener("click", () => {
   runBackground(copyInvite("code"));
+});
+
+ui.inviteForgetHostBtn.addEventListener("click", () => {
+  const code = lastJoin?.code;
+  if (!code) return;
+  forgetCreatorHostToken(code);
+  closeAllPopovers();
+  showTransientRoomNotice("Removed saved host access for this room on this device.");
+});
+
+ui.lobbyForgetHostsBtn.addEventListener("click", () => {
+  memoryHostTokens.clear();
+  creatorHostCodes.clear();
+  syncForgetHostUi();
+  runBackground(
+    runWithHostRoomsLock(safeLocks(), () => {
+      clearAllPersistedHostTokens(safeLocalStorage());
+      syncForgetHostUi();
+    }),
+  );
 });
 
 ui.inviteRotateBtn.addEventListener("click", () => {
@@ -2572,7 +2751,7 @@ ui.createBtn.addEventListener("click", () => {
         const previous = lastJoin?.code ?? activeRoomFor();
         if (previous && previous !== code) clearRoomSession(previous);
         saveActiveRoom(code);
-        saveHostToken(code, hostToken);
+        saveCreatorHostToken(code, hostToken);
         ui.roomInput.value = "";
         scrubRoomUrl();
         await joinRoom(code, password);
@@ -2625,6 +2804,22 @@ function joinFromBootOrHash(isHashChange: boolean): void {
   }
 }
 
+window.addEventListener("storage", (ev) => {
+  if (ev.key !== HOST_ROOMS_STORAGE_KEY && ev.key !== null) return;
+  const storage = safeLocalStorage();
+  for (const code of [...creatorHostCodes]) {
+    const current = readPersistedHostToken(storage, code);
+    if (current === undefined) {
+      creatorHostCodes.delete(code);
+      memoryHostTokens.delete(code);
+    } else {
+      memoryHostTokens.set(code, current);
+    }
+  }
+  syncForgetHostUi();
+});
+
+syncForgetHostUi();
 syncViewState();
 joinFromBootOrHash(false);
 window.addEventListener("hashchange", () => joinFromBootOrHash(true));

@@ -188,21 +188,26 @@
               <strong>Invite URL scrubbing &amp; token lifetimes:</strong> Invite links carry <code>#CODE-SECRET</code>
               in the URL fragment only (never transmitted in HTTP requests), and the app immediately scrubs the browser
               address bar to <code>/</code> while keeping temporary <code>rejoinToken</code> state in
-              <code>sessionStorage</code> (for page refreshes) and bounded <code>hostToken</code> records in
-              <code>localStorage</code> (never storing invite secrets on disk) so room creators retain host controls
-              across sessions. Disconnected <code>rejoinToken</code> tickets expire <strong>5 minutes</strong> after
-              leaving (or <strong>25 seconds</strong> after a manual invite rotation); if no host is present in an
-              occupied room for <strong>5 minutes</strong>, the earliest-joined active participant is promoted to host
-              without unlocking occupied locked rooms.
+              <code>sessionStorage</code> (for page refreshes). Room creators also store a bounded
+              <code>hostToken</code> in <code>localStorage</code> (up to 20 rooms, 90-day local expiry) that grants
+              creator host re-entry and recovers the current invite link—cleared anytime via <strong>Forget host on
+              this device</strong>; temporary session-promoted hosts keep their <code>hostToken</code> in memory only.
+              Disconnected <code>rejoinToken</code> tickets expire <strong>5 minutes</strong> after leaving (or
+              <strong>25 seconds</strong> after a manual invite rotation); if no host is present in an occupied room
+              for <strong>5 minutes</strong>, the earliest-joined active participant is temporarily promoted for that
+              session without unlocking occupied locked rooms.
             </li>
             <li>
-              <strong>Automatic erasure:</strong> Ephemeral session tokens, stored IPv4 / IPv6 <code>/64</code> prefixes
-              (membership ticket and kick-ban maps, each capped at 128 entries), pending host-promotion records, and
-              room locks are erased automatically <strong>15 minutes</strong> after a room becomes empty. Room invite
-              credentials (<code>roomCode</code>, <code>roomPassword</code> / <code>passwordHash</code>, and
-              <code>hostTokenHash</code>) are retained for <strong>90 days</strong> after the room&rsquo;s last activity
-              so recurring <code>#CODE-SECRET</code> links remain reusable (with rotated or kicked secrets staying
-              revoked), then erased automatically. Uninitialized room probes perform zero persistent storage writes.
+              <strong>Automatic erasure:</strong> Unused rooms that are never joined expire automatically after
+              <strong>12 hours</strong>. Once a used room empties, ephemeral session tokens, stored IPv4 / IPv6
+              <code>/64</code> prefixes (membership ticket and kick-ban maps, each capped at 128 entries), pending or
+              session host promotions, and room locks are erased automatically <strong>15 minutes</strong> after the
+              room becomes empty (rotating the invite secret if the room was locked when emptied so pre-lock leaked
+              links stay invalid, and restoring the creator&rsquo;s host authority). Room invite credentials
+              (<code>roomCode</code>, <code>roomPassword</code> / <code>passwordHash</code>, and creator
+              <code>hostTokenHash</code>) are retained for up to <strong>90 days</strong> from the creator&rsquo;s last
+              activity (non-host visits do not extend this cap, and rotated or kicked secrets stay revoked), then erased
+              automatically. Uninitialized room probes perform zero persistent storage writes.
             </li>
             <li>
               <strong>Host kick bans &amp; auto-rotation:</strong> If a room host removes a participant, all
@@ -218,9 +223,9 @@
           <h2>4. Local Storage &amp; App Updates</h2>
           <p>
             Your browser or desktop app stores only lightweight local preferences (such as your chosen display name,
-            temporary <code>sessionStorage</code> rejoin tokens, bounded <code>localStorage</code> <code>hostToken</code>
-            records for up to 20 rooms with a 90-day expiry—never invite secrets—and standard window state) on your
-            device.
+            temporary <code>sessionStorage</code> rejoin tokens, bounded <code>localStorage</code> creator
+            <code>hostToken</code> credentials for up to 20 rooms with a 90-day expiry that can recover the room&rsquo;s
+            invite link—erasable via the app&rsquo;s forget-host buttons—and standard window state) on your device.
           </p>
           <p>
             Versions installed through the <strong>Microsoft Store</strong> are updated automatically by the Microsoft
