@@ -2551,6 +2551,62 @@ describe("RoomDO security & PR 1 flows", () => {
     bobNext.close();
   });
 
+  it("backfills creatorHostTokenHash for legacy rooms lacking it before mid-session guest promotion", async () => {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    // Simulate a legacy pre-deploy room with hostTokenHash only (no creatorHostTokenHash).
+    await runInDurableObject(stub, (_i, state) => state.storage.delete("creatorHostTokenHash"));
+
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.72" });
+    await h.joinAsHost("host");
+    const backfilledOnJoin = await runInDurableObject(stub, (_i, state) =>
+      state.storage.get<string>("creatorHostTokenHash"),
+    );
+    expect(typeof backfilledOnJoin).toBe("string");
+
+    // Also cover the case where no creator joined after deployment before guest promotion runs.
+    await runInDurableObject(stub, (_i, state) => state.storage.delete("creatorHostTokenHash"));
+    const bob = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.73" });
+    await bob.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.close();
+    await bob.nextOf("peer-left");
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const promo = await bob.nextOf("host-promoted");
+    const guestPromotedToken = promo.hostToken ?? "";
+    expect(guestPromotedToken).not.toBe("");
+
+    const backfilledBeforePromotion = await runInDurableObject(stub, (_i, state) =>
+      state.storage.get<string>("creatorHostTokenHash"),
+    );
+    expect(backfilledBeforePromotion).toBe(backfilledOnJoin);
+
+    bob.close();
+    await waitForRoomEmpty(stub);
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", Date.now() - 16 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const hNext = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.72" });
+    hNext.send({ t: "join", room: CODE, displayName: "host", hostToken: HOST_TOKEN });
+    expect((await hNext.nextOf("welcome")).host).toBe(true);
+
+    const bobNext = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.73" });
+    bobNext.send({
+      t: "join",
+      room: CODE,
+      displayName: "bob",
+      password: PASSWORD,
+      hostToken: guestPromotedToken,
+    });
+    expect((await bobNext.nextOf("welcome")).host).toBe(false);
+
+    hNext.close();
+    bobNext.close();
+  });
+
   it("sweeps stale unjoined sockets via 10s alarm even in an already-cleaned empty room", async () => {
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.80" });
     await h.joinAsHost("host");
