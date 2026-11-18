@@ -2447,6 +2447,25 @@ describe("RoomDO security & PR 1 flows", () => {
     });
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
+    // First alarm starts the 15-minute grace window and keeps members during the window.
+    const duringGrace = await runInDurableObject(stub, async (_i, state) => ({
+      emptySince: await state.storage.get<number>("emptySince"),
+      locked: await state.storage.get<boolean>("locked"),
+      sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
+      members: await state.storage.get("members"),
+      nextAlarm: await state.storage.getAlarm(),
+    }));
+    expect(typeof duringGrace.emptySince).toBe("number");
+    expect(duringGrace.locked).toBe(true);
+    expect(duringGrace.sessionCleaned).toBeUndefined();
+    expect(duringGrace.members).toBeDefined();
+    expect(duringGrace.nextAlarm).not.toBeNull();
+    expect(duringGrace.nextAlarm!).toBeLessThanOrEqual(duringGrace.emptySince! + 15 * 60_000 + 100);
+
+    // Once 15 minutes have elapsed past emptySince, cleanup unlocks and clears ephemeral state.
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", Date.now() - 16 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
     const recovered = await runInDurableObject(stub, async (_i, state) => ({
       locked: await state.storage.get<boolean>("locked"),
       sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
@@ -2455,6 +2474,39 @@ describe("RoomDO security & PR 1 flows", () => {
     expect(recovered.locked).toBe(false);
     expect(recovered.sessionCleaned).toBe(true);
     expect(recovered.members).toBeUndefined();
+  });
+
+  it("enforces the 90d creator-activity cap even while promoted guests remain connected", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.65" });
+    await h.joinAsHost("host");
+    const bob = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.66" });
+    await bob.join("bob");
+    await h.nextOf("peer-joined");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+
+    // While the creator is connected, firing the fallback alarm refreshes lastHostActiveAt.
+    const staleStamp = Date.now() - 10 * 24 * 60 * 60_000;
+    await runInDurableObject(stub, (_i, state) => state.storage.put("lastHostActiveAt", staleStamp));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    const refreshedTs = await runInDurableObject(stub, (_i, state) => state.storage.get<number>("lastHostActiveAt"));
+    expect(refreshedTs).toBeGreaterThan(staleStamp);
+
+    // Creator leaves and bob stays connected and is promoted; after 90d without creator activity, alarm expires the room.
+    h.close();
+    await bob.nextOf("peer-left");
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    await bob.nextOf("host-promoted");
+
+    const bobClosed = closeCodeOf(bob.ws);
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("lastHostActiveAt", Date.now() - (90 * 24 * 60 + 5) * 60_000),
+    );
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await bobClosed).toBe(1001);
+
+    const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
+    expect(remainingKeys).toBe(0);
   });
 
   it("restores creator host authority after 15m empty-session reset following mid-session guest promotion", async () => {

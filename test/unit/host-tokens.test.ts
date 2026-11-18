@@ -6,12 +6,14 @@ import {
   MAX_CLOCK_SKEW_MS,
   MAX_STORED_HOST_ROOMS,
   clearAllPersistedHostTokens,
+  clearLegacySessionHostTokens,
   hasAnyPersistedHostTokens,
   readPersistedHostToken,
   removePersistedHostTokenIfMatching,
   runWithHostRoomsLock,
   writePersistedHostToken,
   type LockManagerLike,
+  type SessionStorageLike,
   type StorageLike,
 } from "@src/host-tokens";
 
@@ -212,5 +214,37 @@ describe("host-tokens localStorage persistence", () => {
     expect(() => writePersistedHostToken(throwing, "ABCDEFGH", "tok")).not.toThrow();
     expect(() => writePersistedHostToken(throwing, "ABCDEFGH", undefined)).not.toThrow();
     expect(() => clearAllPersistedHostTokens(throwing)).not.toThrow();
+  });
+
+  it("removes legacy host: sessionStorage entries while keeping unrelated session keys", () => {
+    const store = new Map<string, string>([
+      ["host:ABCDEFGH", "legacy-1"],
+      ["host:JKMNPQRS", "legacy-2"],
+      ["activeRoom", "ABCDEFGH"],
+      ["rejoin:ABCDEFGH", "rejoin-1"],
+      ["name", "Alice"],
+    ]);
+    const sessionMock: SessionStorageLike = {
+      get length() {
+        return store.size;
+      },
+      key: (index) => [...store.keys()][index] ?? null,
+      removeItem: (k) => {
+        store.delete(k);
+      },
+    };
+
+    clearLegacySessionHostTokens(null);
+    clearLegacySessionHostTokens(sessionMock);
+    expect([...store.keys()]).toEqual(["activeRoom", "rejoin:ABCDEFGH", "name"]);
+
+    const throwingSession: SessionStorageLike = {
+      get length(): number {
+        throw new Error("denied");
+      },
+      key: () => null,
+      removeItem: () => undefined,
+    };
+    expect(() => clearLegacySessionHostTokens(throwingSession)).not.toThrow();
   });
 });

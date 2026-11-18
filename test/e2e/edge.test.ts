@@ -602,6 +602,32 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         document.getElementById("lobby-forget-hosts")?.hidden === true,
       { label: "#lobby-forget-hosts hides once all saved host rooms are forgotten" },
     );
+
+    // Create another room to test #lobby-forget-hosts, including purging legacy host: entries from sessionStorage.
+    await host.click("#create");
+    await waitFor(host, inRoom, { label: "host creates second room" });
+    await host.click("#brand-home");
+    await waitFor(
+      host,
+      () =>
+        document.getElementById("lobby")?.hidden === false &&
+        document.getElementById("lobby-forget-hosts")?.hidden === false,
+      { label: "#lobby-forget-hosts is visible for newly created room" },
+    );
+    await host.evaluate(() => {
+      sessionStorage.setItem("host:MNPQRSTU", "legacy-token");
+      sessionStorage.setItem("unrelatedKey", "keep");
+    });
+    await host.click("#lobby-forget-hosts");
+    await waitFor(
+      host,
+      () =>
+        localStorage.getItem("host-rooms") === null &&
+        sessionStorage.getItem("host:MNPQRSTU") === null &&
+        sessionStorage.getItem("unrelatedKey") === "keep" &&
+        document.getElementById("lobby-forget-hosts")?.hidden === true,
+      { label: "#lobby-forget-hosts clears host-rooms and legacy host: entries while keeping unrelated sessionStorage keys" },
+    );
   });
 
   await it("serves /privacy.html with strict CSP headers and zero CSP violations", async () => {

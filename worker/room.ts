@@ -161,6 +161,7 @@ interface MemberEntry {
   ip?: string;
   joinedAt?: number;
   rotationGrace?: boolean;
+  creatorHost?: boolean;
 }
 
 const MemberEntrySchema: z.ZodType<MemberEntry> = z
@@ -171,15 +172,17 @@ const MemberEntrySchema: z.ZodType<MemberEntry> = z
     ip: z.string().optional(),
     joinedAt: z.number().optional(),
     rotationGrace: z.boolean().optional(),
+    creatorHost: z.boolean().optional(),
   })
   .transform(
-    ({ until, id, sharing, ip, joinedAt, rotationGrace }): MemberEntry => ({
+    ({ until, id, sharing, ip, joinedAt, rotationGrace, creatorHost }): MemberEntry => ({
       until,
       ...(id !== undefined ? { id } : {}),
       ...(sharing !== undefined ? { sharing } : {}),
       ...(ip !== undefined ? { ip } : {}),
       ...(joinedAt !== undefined ? { joinedAt } : {}),
       ...(rotationGrace ? { rotationGrace: true } : {}),
+      ...(creatorHost ? { creatorHost: true } : {}),
     }),
   );
 
@@ -541,6 +544,19 @@ export class RoomDO extends DurableObject<Env> {
       if (s === exceptWs) continue;
       this.refused.add(s);
       this.forgetBudget(s);
+      const att = getAttachment(s);
+      if (att) {
+        // Clear joined state before closing so asynchronous webSocketClose cannot rewrite storage.
+        att.joined = false;
+        att.host = false;
+        att.creatorHost = false;
+        delete att.rejoinHash;
+        try {
+          s.serializeAttachment(att);
+        } catch {
+          /* already closed */
+        }
+      }
       try {
         s.close(1001, "Room expired");
       } catch {
@@ -576,6 +592,28 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
+   * Return the creator-anchored 90-day credential cap for an occupied room, refreshing
+   * `LAST_HOST_ACTIVE_KEY` whenever the room creator is currently connected.
+   */
+  private async creatorActivityCap(
+    peers: Array<{ ws: WebSocket; att: PeerAttachment }>,
+    now: number,
+  ): Promise<number> {
+    if (peers.some(({ att }) => att.creatorHost === true)) {
+      await this.ctx.storage.put(LAST_HOST_ACTIVE_KEY, now);
+      return now + EMPTY_ROOM_TTL_MS;
+    }
+    const [everJoinedRaw, lastHostActiveAt] = await Promise.all([
+      this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
+      this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
+    ]);
+    if (everJoinedRaw === true && lastHostActiveAt !== undefined) {
+      return lastHostActiveAt + EMPTY_ROOM_TTL_MS;
+    }
+    return Number.POSITIVE_INFINITY;
+  }
+
+  /**
    * Multiplex the 15-minute empty-session reset, 12h/90d credential expiration, 5-minute
    * host-promotion, 15-minute occupied safety fallback, and 10s unjoined-socket sweep into one alarm slot.
    */
@@ -603,10 +641,13 @@ export class RoomDO extends DurableObject<Env> {
       return;
     }
 
+    const creatorCap = await this.creatorActivityCap(peers, now);
+
     if (peers.some(({ att }) => att.host)) {
       await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-      // Keep a short 15m safety fallback alarm so missed last-leave events still clean up promptly.
-      await this.scheduleAlarmWithUnjoined(now, now + OCCUPIED_FALLBACK_ALARM_MS);
+      // Keep a short 15m safety fallback alarm so missed last-leave events still clean up promptly,
+      // bounded by the creator-activity 90d retention cap if non-creator guests stay indefinitely.
+      await this.scheduleAlarmWithUnjoined(now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
       return;
     }
 
@@ -616,7 +657,7 @@ export class RoomDO extends DurableObject<Env> {
       goneAt = now;
       await this.ctx.storage.put(HOST_GONE_KEY, goneAt);
     }
-    await this.scheduleAlarmWithUnjoined(now, goneAt + HOST_GRACE_MS);
+    await this.scheduleAlarmWithUnjoined(now, Math.min(goneAt + HOST_GRACE_MS, creatorCap));
   }
 
   /**
@@ -648,19 +689,17 @@ export class RoomDO extends DurableObject<Env> {
           this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
           this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
         ]);
-        let sessionCleaned = sessionCleanedRaw === true;
+        const sessionCleaned = sessionCleanedRaw === true;
         const everJoined = everJoinedRaw === true;
         if (emptySince === undefined) {
           if (everJoined && lastHostActiveAt !== undefined && now >= lastHostActiveAt + EMPTY_ROOM_TTL_MS) {
             await this.expireRoom();
             return;
           }
+          // Start the 15-minute grace window now when the leave marker is missing rather than
+          // immediately clearing active rejoin tickets on a brief disconnect just before fallback.
           emptySince = now;
           await this.ctx.storage.put(EMPTY_SINCE_KEY, emptySince);
-          if (!sessionCleaned) {
-            await this.resetEmptySessionState(now, preRotated);
-            sessionCleaned = true;
-          }
         }
         const credentialExpiry = computeCredentialExpiry(emptySince, everJoined, lastHostActiveAt);
         if (now >= credentialExpiry) {
@@ -681,20 +720,26 @@ export class RoomDO extends DurableObject<Env> {
         return;
       }
 
+      const creatorCap = await this.creatorActivityCap(peers, now);
+      if (now >= creatorCap) {
+        await this.expireRoom();
+        return;
+      }
+
       if (peers.some(({ att }) => att.host)) {
         await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-        await this.scheduleAlarmWithUnjoined(now, now + OCCUPIED_FALLBACK_ALARM_MS);
+        await this.scheduleAlarmWithUnjoined(now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
         return;
       }
 
       const goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
       if (goneAt === undefined) {
         await this.ctx.storage.put(HOST_GONE_KEY, now);
-        await this.scheduleAlarmWithUnjoined(now, now + HOST_GRACE_MS);
+        await this.scheduleAlarmWithUnjoined(now, Math.min(now + HOST_GRACE_MS, creatorCap));
         return;
       }
       if (now - goneAt < HOST_GRACE_MS) {
-        await this.scheduleAlarmWithUnjoined(now, goneAt + HOST_GRACE_MS);
+        await this.scheduleAlarmWithUnjoined(now, Math.min(goneAt + HOST_GRACE_MS, creatorCap));
         return;
       }
 
@@ -713,7 +758,7 @@ export class RoomDO extends DurableObject<Env> {
         [PROMOTED_HOST_KEY]: promotedRecord,
       });
       await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-      await this.scheduleAlarmWithUnjoined(now, now + OCCUPIED_FALLBACK_ALARM_MS);
+      await this.scheduleAlarmWithUnjoined(now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
 
       candidate.att.host = true;
       try {
@@ -1026,6 +1071,7 @@ export class RoomDO extends DurableObject<Env> {
         ...(att.sharing ? { sharing: true } : {}),
         ...(att.ip ? { ip: att.ip } : {}),
         ...((att.joinedAt ?? att.openedAt) !== undefined ? { joinedAt: att.joinedAt ?? att.openedAt } : {}),
+        ...(att.creatorHost ? { creatorHost: true } : {}),
       };
       att.rejoinHash = minted.hash;
       try {
@@ -1372,6 +1418,7 @@ export class RoomDO extends DurableObject<Env> {
       ...(attachment.sharing ? { sharing: true } : {}),
       ...(attachment.ip ? { ip: attachment.ip } : {}),
       ...(attachment.joinedAt !== undefined ? { joinedAt: attachment.joinedAt } : {}),
+      ...(attachment.creatorHost ? { creatorHost: true } : {}),
     };
     const protectedHashes = this.activeRejoinHashes();
     protectedHashes.add(newRejoinHash);
@@ -1392,8 +1439,16 @@ export class RoomDO extends DurableObject<Env> {
     now: number,
     preRotated: { password: string; passwordHash: string },
   ): Promise<"expired" | "ok"> {
-    if (this.joinedPeers(ws).length > 0) return "ok";
     if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) return "ok";
+    const existingPeers = this.joinedPeers(ws);
+    if (existingPeers.length > 0) {
+      const creatorCap = await this.creatorActivityCap(existingPeers, now);
+      if (now >= creatorCap) {
+        await this.expireRoom(ws);
+        return "expired";
+      }
+      return "ok";
+    }
     const [emptySince, sessionCleanedRaw, everJoinedRaw, lastHostActiveAt] = await Promise.all([
       this.ctx.storage.get<number>(EMPTY_SINCE_KEY),
       this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
@@ -1408,9 +1463,6 @@ export class RoomDO extends DurableObject<Env> {
         return "expired";
       }
       await this.ctx.storage.put(EMPTY_SINCE_KEY, now);
-      if (!sessionCleaned) {
-        await this.resetEmptySessionState(now, preRotated);
-      }
       return "ok";
     }
     const credentialExpiry = computeCredentialExpiry(emptySince, everJoined, lastHostActiveAt);
@@ -1536,7 +1588,10 @@ export class RoomDO extends DurableObject<Env> {
       attachment.joined = true;
       if (!isResume) attachment.sharing = false;
       attachment.host = effectiveIsHost;
-      attachment.creatorHost = admission.isCreatorHost || supersededSocket?.att.creatorHost === true;
+      attachment.creatorHost =
+        admission.isCreatorHost ||
+        admission.memberTicket?.creatorHost === true ||
+        supersededSocket?.att.creatorHost === true;
       attachment.rejoinHash = newRejoinHash;
 
       await this.persistMemberRecord(
@@ -1780,6 +1835,10 @@ export class RoomDO extends DurableObject<Env> {
       }
     }
 
+    if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) {
+      return;
+    }
+
     // Upsert/shrink disconnected non-kicked rejoin ticket TTL to 5 minutes from disconnect.
     if (!opts?.kicked && attachment.rejoinHash) {
       const now = Date.now();
@@ -1790,6 +1849,7 @@ export class RoomDO extends DurableObject<Env> {
       const nextUntil = isRotationGrace ? existing.until : now + DISCONNECTED_REJOIN_TTL_MS;
       const ip = existing?.ip ?? attachment.ip;
       const joinedAt = existing?.joinedAt ?? attachment.joinedAt ?? attachment.openedAt;
+      const creatorHost = existing?.creatorHost === true || attachment.creatorHost === true;
       members[attachment.rejoinHash] = {
         until: nextUntil,
         id: attachment.id,
@@ -1797,6 +1857,7 @@ export class RoomDO extends DurableObject<Env> {
         ...(ip !== undefined ? { ip } : {}),
         ...(joinedAt !== undefined ? { joinedAt } : {}),
         ...(isRotationGrace ? { rotationGrace: true } : {}),
+        ...(creatorHost ? { creatorHost: true } : {}),
       };
       await this.ctx.storage.put({
         [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, this.activeRejoinHashes()),

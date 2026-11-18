@@ -24,6 +24,7 @@ import { Mesh } from "./mesh";
 import {
   HOST_ROOMS_STORAGE_KEY,
   clearAllPersistedHostTokens,
+  clearLegacySessionHostTokens,
   hasAnyPersistedHostTokens,
   readPersistedHostToken,
   removePersistedHostTokenIfMatching,
@@ -1015,12 +1016,20 @@ function renderSelfPreview(stream: MediaStream | null): void {
 // ---- participants --------------------------------------------------------
 
 const memorySession = new Map<string, string>();
-const memoryHostTokens = new Map<string, string>();
-const creatorHostCodes = new Set<string>();
+const creatorHostTokens = new Map<string, string>();
+const sessionHostTokens = new Map<string, string>();
 
 function safeLocalStorage(): Storage | null {
   try {
     return typeof localStorage !== "undefined" ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+function safeSessionStorage(): Storage | null {
+  try {
+    return typeof sessionStorage !== "undefined" ? sessionStorage : null;
   } catch {
     return null;
   }
@@ -1063,22 +1072,22 @@ function saveActiveRoom(code: string | undefined): void {
   writeSession("activeRoom", code);
 }
 
+function hasSavedCreatorHostFor(code: string): boolean {
+  return creatorHostTokens.has(code) || readPersistedHostToken(safeLocalStorage(), code) !== undefined;
+}
+
 function syncForgetHostUi(): void {
-  const hasSaved = creatorHostCodes.size > 0 || hasAnyPersistedHostTokens(safeLocalStorage());
+  const hasSaved = creatorHostTokens.size > 0 || hasAnyPersistedHostTokens(safeLocalStorage());
   ui.lobbyForgetHostsBtn.hidden = !hasSaved;
   if (lastJoin !== null) {
-    const code = lastJoin.code;
-    ui.inviteForgetHostBtn.hidden = !(
-      creatorHostCodes.has(code) || readPersistedHostToken(safeLocalStorage(), code) !== undefined
-    );
+    ui.inviteForgetHostBtn.hidden = !hasSavedCreatorHostFor(lastJoin.code);
   } else {
     ui.inviteForgetHostBtn.hidden = true;
   }
 }
 
 function saveCreatorHostToken(code: string, token: string): void {
-  creatorHostCodes.add(code);
-  memoryHostTokens.set(code, token);
+  creatorHostTokens.set(code, token);
   syncForgetHostUi();
   runBackground(
     runWithHostRoomsLock(safeLocks(), () => {
@@ -1089,17 +1098,20 @@ function saveCreatorHostToken(code: string, token: string): void {
 }
 
 function saveSessionHostToken(code: string, token: string): void {
-  creatorHostCodes.delete(code);
-  memoryHostTokens.set(code, token);
+  sessionHostTokens.set(code, token);
   syncForgetHostUi();
 }
 
 function forgetCreatorHostToken(code: string, onlyIfMatching?: string): void {
-  if (onlyIfMatching === undefined || memoryHostTokens.get(code) === onlyIfMatching) {
-    memoryHostTokens.delete(code);
-    creatorHostCodes.delete(code);
+  if (onlyIfMatching === undefined || sessionHostTokens.get(code) === onlyIfMatching) {
+    sessionHostTokens.delete(code);
   }
-  writeSession(`host:${code}`, undefined);
+  if (onlyIfMatching === undefined || creatorHostTokens.get(code) === onlyIfMatching) {
+    creatorHostTokens.delete(code);
+  }
+  if (onlyIfMatching === undefined) {
+    writeSession(`host:${code}`, undefined);
+  }
   syncForgetHostUi();
   runBackground(
     runWithHostRoomsLock(safeLocks(), () => {
@@ -1114,11 +1126,13 @@ function forgetCreatorHostToken(code: string, onlyIfMatching?: string): void {
 }
 
 function hostTokenFor(code: string): string | undefined {
-  const inMemory = memoryHostTokens.get(code);
-  if (inMemory !== undefined) return inMemory;
+  const promoted = sessionHostTokens.get(code);
+  if (promoted !== undefined) return promoted;
+  const inMemoryCreator = creatorHostTokens.get(code);
+  if (inMemoryCreator !== undefined) return inMemoryCreator;
   const persisted = readPersistedHostToken(safeLocalStorage(), code);
   if (persisted !== undefined) {
-    creatorHostCodes.add(code);
+    creatorHostTokens.set(code, persisted);
     return persisted;
   }
   const legacy = readSession(`host:${code}`);
@@ -1142,6 +1156,7 @@ function clearRoomSession(code?: string): void {
   const target = code ?? lastJoin?.code ?? activeRoomFor();
   saveActiveRoom(undefined);
   if (!target) return;
+  sessionHostTokens.delete(target);
   saveRejoinToken(target, undefined);
 }
 
@@ -1244,9 +1259,7 @@ function renderInviteMenu(): void {
   ui.inviteShowBtn.disabled = !state.canShow;
   ui.inviteShowBtn.textContent = inviteRevealed && state.canShow ? "Hide" : "Show";
   ui.inviteCopyCodeBtn.disabled = !state.canCopy;
-  ui.inviteForgetHostBtn.hidden = !(
-    code !== null && (creatorHostCodes.has(code) || readPersistedHostToken(safeLocalStorage(), code) !== undefined)
-  );
+  ui.inviteForgetHostBtn.hidden = !(code !== null && hasSavedCreatorHostFor(code));
 }
 
 function pruneDepartures(now: number): void {
@@ -1716,9 +1729,8 @@ const SESSION_WIPING_ERRORS: ReadonlySet<string> = new Set([
   "forbidden-origin",
 ]);
 
-const HOST_TOKEN_WIPING_ERRORS: ReadonlySet<string> = new Set([
+const CREATOR_TOKEN_WIPING_ERRORS: ReadonlySet<string> = new Set([
   "kicked",
-  "bad-password",
   "bad-room-code",
 ]);
 
@@ -1837,16 +1849,14 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
         clearPendingKicks();
 
         if (!room.host) {
-          memoryHostTokens.delete(code);
-          creatorHostCodes.delete(code);
+          sessionHostTokens.delete(code);
           syncForgetHostUi();
+        } else if (room.hostToken) {
+          saveSessionHostToken(code, room.hostToken);
         } else {
-          const persisted = readPersistedHostToken(safeLocalStorage(), code);
-          if (creatorHostCodes.has(code) || persisted !== undefined) {
-            const creatorToken = room.hostToken ?? lastPresentedHostToken ?? persisted;
-            if (creatorToken !== undefined) saveCreatorHostToken(code, creatorToken);
-          } else if (room.hostToken) {
-            saveSessionHostToken(code, room.hostToken);
+          const knownCreator = creatorHostTokens.get(code) ?? readPersistedHostToken(safeLocalStorage(), code);
+          if (lastPresentedHostToken !== undefined && lastPresentedHostToken === knownCreator) {
+            saveCreatorHostToken(code, knownCreator);
           }
         }
         saveRejoinToken(code, room.rejoinToken);
@@ -2172,12 +2182,13 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           } else if (!hasWelcomed) {
             saveActiveRoom(undefined);
           }
-          if (HOST_TOKEN_WIPING_ERRORS.has(codeErr)) {
+          if (codeErr === "bad-password" || CREATOR_TOKEN_WIPING_ERRORS.has(codeErr)) {
+            sessionHostTokens.delete(codeToJoin);
+          }
+          if (CREATOR_TOKEN_WIPING_ERRORS.has(codeErr)) {
             if (lastPresentedHostToken !== undefined) {
               forgetCreatorHostToken(codeToJoin, lastPresentedHostToken);
             } else {
-              memoryHostTokens.delete(codeToJoin);
-              creatorHostCodes.delete(codeToJoin);
               syncForgetHostUi();
             }
           }
@@ -2576,8 +2587,12 @@ ui.inviteForgetHostBtn.addEventListener("click", () => {
 });
 
 ui.lobbyForgetHostsBtn.addEventListener("click", () => {
-  memoryHostTokens.clear();
-  creatorHostCodes.clear();
+  creatorHostTokens.clear();
+  sessionHostTokens.clear();
+  for (const key of [...memorySession.keys()]) {
+    if (key.startsWith("host:")) memorySession.delete(key);
+  }
+  clearLegacySessionHostTokens(safeSessionStorage());
   syncForgetHostUi();
   runBackground(
     runWithHostRoomsLock(safeLocks(), () => {
@@ -2807,13 +2822,12 @@ function joinFromBootOrHash(isHashChange: boolean): void {
 window.addEventListener("storage", (ev) => {
   if (ev.key !== HOST_ROOMS_STORAGE_KEY && ev.key !== null) return;
   const storage = safeLocalStorage();
-  for (const code of [...creatorHostCodes]) {
+  for (const code of [...creatorHostTokens.keys()]) {
     const current = readPersistedHostToken(storage, code);
     if (current === undefined) {
-      creatorHostCodes.delete(code);
-      memoryHostTokens.delete(code);
+      creatorHostTokens.delete(code);
     } else {
-      memoryHostTokens.set(code, current);
+      creatorHostTokens.set(code, current);
     }
   }
   syncForgetHostUi();

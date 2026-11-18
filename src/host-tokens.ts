@@ -22,6 +22,13 @@ export interface StorageLike {
   removeItem(key: string): void;
 }
 
+/** Minimal iterable Storage subset used to purge legacy `host:<code>` sessionStorage entries. */
+export interface SessionStorageLike {
+  readonly length: number;
+  key(index: number): string | null;
+  removeItem(key: string): void;
+}
+
 /** Minimal Web Locks API subset used to serialize cross-tab storage updates. */
 export interface LockManagerLike {
   request(name: string, callback: () => Promise<void> | void): Promise<unknown>;
@@ -163,6 +170,27 @@ export function clearAllPersistedHostTokens(storage: StorageLike | null | undefi
     storage.removeItem(HOST_ROOMS_STORAGE_KEY);
   } catch {
     /* ignore unavailable storage errors */
+  }
+}
+
+/**
+ * Remove all legacy `host:<code>` keys from `sessionStorage` while leaving unrelated session keys intact.
+ */
+export function clearLegacySessionHostTokens(storage: SessionStorageLike | null | undefined): void {
+  if (!storage) return;
+  try {
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < storage.length; i++) {
+      const k = storage.key(i);
+      if (k !== null && k.startsWith("host:")) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const k of keysToRemove) {
+      storage.removeItem(k);
+    }
+  } catch {
+    /* ignore unavailable storage */
   }
 }
 
