@@ -105,9 +105,11 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
 - **Room invites & URL privacy:** Creating a room (`POST /api/room`) atomically mints an
   8-character room code and a 16-character random invite secret (`CODE-SECRET`). Invite links
   place `#CODE-SECRET` solely in the URL fragment (never sent to HTTP servers or referrer
-  logs), and the client immediately scrubs the address bar back to `/` after caching temporary
-  session tokens in `sessionStorage` (keeping the invite secret in memory only) so reloads
-  resume cleanly without leaving invite links visible in window title bars or full-screen shares.
+  logs), and the client immediately scrubs the address bar back to `/` while caching temporary
+  rejoin state in `sessionStorage` and bounded room `hostToken`s (up to 20 rooms, 90-day expiry)
+  in `localStorage`—never storing invite secrets on disk—so reloads resume cleanly and creators
+  keep host controls across sessions without leaving invite links visible in window title bars
+  or full-screen shares.
 - **Host controls & moderation:** The room creator holds a cryptographic `hostToken`. The host
   can rotate the invite secret at any time, lock the room to new joins, or remove participants.
   Removing a participant revokes all pre-issued disconnected `rejoinToken` tickets across the
@@ -116,15 +118,18 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   invite secret (while locked, non-host peers never receive plaintext invite secrets). Active
   members keep their `rejoinToken` while connected and for up to 5 minutes after disconnecting
   (25 seconds across a manual rotation). If no host is present in an occupied room for 5 minutes,
-  the earliest-joined active member is permanently promoted to host (locked rooms never
+  the earliest-joined active member is permanently promoted to host (occupied locked rooms never
   auto-unlock).
 - **The server sees** your IPv4 address or IPv6 `/64` prefix, room code, display name,
   `hostToken`/`rejoinToken` values sent in `join` messages, salted SHA-256 hashes of room
   secrets/tokens, and (for the lifetime of the room) the active room invite secret (plus a
   temporary promoted `hostToken` until recovered on reconnect) so unlocked rooms and promoted
   hosts can continue sharing invites. Uninitialized room codes accept zero persistent writes, and
-  all room state, secrets, and moderation entries are erased 12 hours after a room becomes empty
-  (with stored ticket and ban maps capped at 128 entries).
+  stored ticket and ban maps are capped at 128 entries. Ephemeral session state (rejoin tickets,
+  kick-ban IPs, pending host promotions, and room locks) is cleared **15 minutes** after a room
+  becomes empty, while room credentials (`#CODE-SECRET` and `hostToken` hash) remain reusable
+  for **90 days** of inactivity (refreshed on each visit, with rotated or kicked secrets staying
+  revoked) before all remaining room state is erased automatically.
 
 Known limitations and open defects are tracked in
 [Issues](https://github.com/mikaelsouza/screenshare/issues).

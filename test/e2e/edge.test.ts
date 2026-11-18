@@ -312,8 +312,26 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await waitFor(host, () => document.querySelectorAll("#roster-list button").length === 2, {
       label: "Remove buttons for both others",
     });
+    const kickTitle = await host.getAttribute("#roster-list li:has-text('late') button.kick-btn", "title");
+    assert.ok(
+      kickTitle && /rotate the invite link/i.test(kickTitle),
+      `expected Remove tooltip to explain invite rotation, got ${JSON.stringify(kickTitle)}`,
+    );
     const oldInvite = inviteCode;
     await host.click("#roster-list li:has-text('late') button");
+    await waitFor(
+      host,
+      () => {
+        const st = document.getElementById("status");
+        return Boolean(
+          st &&
+            !st.hidden &&
+            st.dataset["kind"] === "warn" &&
+            (st.textContent ?? "").includes("invite link rotated"),
+        );
+      },
+      { label: "host sees warning notice that invite link rotated after removal" },
+    );
     await waitFor(
       late,
       () => {
@@ -455,6 +473,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       () => (window.__gdmStreams ?? []).every((st) => st.getTracks().every((track) => track.readyState === "ended")),
       { label: "every captured track to be stopped" },
     );
+    // Removing `other` also auto-rotated the room secret; read the latest invite before leaving.
+    inviteCode = await readHostInvite(host);
   });
 
   await it("maintains 52px bars, header button order, and zero horizontal overflow across viewport resizes", async () => {
@@ -504,6 +524,37 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         window.location.hash === "",
       { label: "host to return to the lobby when clicking #brand-home" },
     );
+  });
+
+  await it("preserves host controls across Return to lobby and sessionStorage reset when revisiting the invite link", async () => {
+    // Rejoin via the invite link after clicking Return to lobby (#brand-home).
+    await host.goto("about:blank");
+    await host.goto(`${BASE_URL}/#${inviteCode}`);
+    await waitFor(host, inRoom, { label: "host re-enters room via invite link after Return to lobby" });
+    await openRoster(host);
+    await waitFor(host, () => !document.getElementById("lock-btn")?.hidden, {
+      label: "host retains #lock-btn after Return to lobby",
+    });
+
+    // Simulate closing the browser/desktop app (clearing tab-scoped sessionStorage while preserving localStorage).
+    await host.evaluate(() => {
+      sessionStorage.clear();
+    });
+    await host.goto("about:blank");
+    await host.goto(`${BASE_URL}/#${inviteCode}`);
+    await waitFor(host, inRoom, { label: "host re-enters room via invite link after sessionStorage reset" });
+    assert.equal(await host.evaluate(() => window.location.hash), "", "URL hash must be scrubbed on revisit");
+    await openRoster(host);
+    await waitFor(host, () => !document.getElementById("lock-btn")?.hidden, {
+      label: "host retains #lock-btn via persisted localStorage hostToken",
+    });
+
+    // Verify localStorage stores only hostToken metadata and never the invite secret.
+    const [, secretPart = ""] = inviteCode.split("-");
+    assert.ok(secretPart.length > 0);
+    const storedRaw = await host.evaluate(() => localStorage.getItem("host-rooms") ?? "");
+    assert.ok(storedRaw.includes(code), "localStorage host-rooms should track the hosted room code");
+    assert.equal(storedRaw.includes(secretPart), false, "localStorage must never store the invite secret");
   });
 
   await it("serves /privacy.html with strict CSP headers and zero CSP violations", async () => {

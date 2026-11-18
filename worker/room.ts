@@ -64,8 +64,11 @@ const MEMBERS_KEY = "members";
 /** Storage key: when the last host socket left, for 5-minute universal host promotion. */
 const HOST_GONE_KEY = "hostGoneAt";
 
-/** Storage key: when the last joined peer left, for 12-hour room expiration. */
+/** Storage key: when the last joined peer left, for 15-minute session cleanup and 90-day room expiration. */
 const EMPTY_SINCE_KEY = "emptySince";
+
+/** Storage key: true once empty-session state (members, bans, promotedHost, lock) has been cleared. */
+const SESSION_CLEANED_KEY = "sessionCleaned";
 
 /** Storage key: host promotion credential waiting to be delivered on half-open resume. */
 const PROMOTED_HOST_KEY = "promotedHost";
@@ -78,6 +81,12 @@ const DISCONNECTED_REJOIN_TTL_MS = 5 * 60 * 1000;
 
 /** Overlap window exceeding max client reconnect backoff so in-flight reconnects survive manual rotation. */
 const ROTATION_REJOIN_GRACE_MS = 25_000;
+
+/** Baseline TTL for connected rejoin tickets; activeRejoinHashes() keeps live sockets valid past this, and handleLeaveInternal() shrinks disconnected tickets to 5m. */
+const CONNECTED_TICKET_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** How long an empty room keeps ephemeral session state (tickets, IP bans, lock, pending host promotion) before resetting for the next session. */
+const EMPTY_SESSION_CLEANUP_MS = 15 * 60 * 1000;
 
 /** Hard cap on stored ticket/deny maps so a single DO key stays well below Cloudflare's 128 KiB limit. */
 const MAX_STORED_ENTRIES = 128;
@@ -96,9 +105,9 @@ const DENY_KEY = "deny";
 const KICK_BAN_MS = 15 * 60 * 1000;
 
 /**
- * How long an empty room keeps its state before the object erases itself.
+ * How long an empty room keeps its credentials before the object erases itself.
  */
-const EMPTY_ROOM_TTL_MS = 12 * 60 * 60 * 1000;
+const EMPTY_ROOM_TTL_MS = 90 * 24 * 60 * 60 * 1000;
 
 /** Fixed-length sentinel hex digest so uninitialized rooms still run constant-time comparison. */
 const DUMMY_HASH_HEX = "0".repeat(64);
@@ -454,9 +463,19 @@ export class RoomDO extends DurableObject<Env> {
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
+  /** Clear ephemeral session/IP maps and reset room lock once a room has been empty past 15 minutes. */
+  private async resetEmptySessionState(now: number): Promise<void> {
+    this.closeStaleUnjoined(now);
+    await this.ctx.storage.delete([MEMBERS_KEY, DENY_KEY, PROMOTED_HOST_KEY, HOST_GONE_KEY]);
+    await this.ctx.storage.put({
+      [LOCKED_KEY]: false,
+      [SESSION_CLEANED_KEY]: true,
+    });
+  }
+
   /**
-   * Multiplex the 12-hour empty-room expiration alarm and the 5-minute universal
-   * host-promotion alarm into Durable Object's single alarm slot.
+   * Multiplex the 15-minute empty-session reset, the 90-day empty-room expiration alarm,
+   * and the 5-minute universal host-promotion alarm into Durable Object's single alarm slot.
    */
   private async syncAlarm(now: number): Promise<void> {
     const peers = this.joinedPeers();
@@ -467,18 +486,20 @@ export class RoomDO extends DurableObject<Env> {
         emptySince = now;
         await this.ctx.storage.put(EMPTY_SINCE_KEY, emptySince);
       }
-      await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_ROOM_TTL_MS));
+      const sessionCleaned = (await this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY)) === true;
+      const targetMs = sessionCleaned ? EMPTY_ROOM_TTL_MS : EMPTY_SESSION_CLEANUP_MS;
+      await this.ctx.storage.setAlarm(Math.max(now, emptySince + targetMs));
       return;
     }
 
     if (peers.some(({ att }) => att.host)) {
-      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
-      // Keep a 12h safety fallback alarm armed in case an unexpected lifecycle drops an event.
+      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
+      // Keep a safety fallback alarm armed in case an unexpected lifecycle drops an event.
       await this.ctx.storage.setAlarm(now + EMPTY_ROOM_TTL_MS);
       return;
     }
 
-    await this.ctx.storage.delete(EMPTY_SINCE_KEY);
+    await this.ctx.storage.delete([EMPTY_SINCE_KEY, SESSION_CLEANED_KEY]);
     let goneAt = await this.ctx.storage.get<number>(HOST_GONE_KEY);
     if (goneAt === undefined) {
       goneAt = now;
@@ -488,8 +509,8 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
-   * Erase an abandoned room after 12h empty, or promote the earliest joined
-   * non-host member to host after 5m without any host socket.
+   * Clear ephemeral session state and auto-unlock after 15m empty, erase an abandoned room
+   * after 90d inactive, or promote the earliest joined member to host after 5m without a host.
    */
   override async alarm(): Promise<void> {
     // Pre-compute replacement host credentials outside blockConcurrencyWhile so no
@@ -498,29 +519,48 @@ export class RoomDO extends DurableObject<Env> {
     const newHostHash = await this.hashSecret(newHostToken, "host");
 
     await this.ctx.blockConcurrencyWhile(async () => {
+      if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) {
+        await this.ctx.storage.deleteAlarm();
+        return;
+      }
+
       const now = Date.now();
       const peers = this.joinedPeers();
       if (peers.length === 0) {
         const emptySince = await this.ctx.storage.get<number>(EMPTY_SINCE_KEY);
-        if (emptySince !== undefined && now - emptySince < EMPTY_ROOM_TTL_MS) {
-          await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_ROOM_TTL_MS));
+        const sessionCleaned = (await this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY)) === true;
+        if (emptySince === undefined) {
+          await this.ctx.storage.put(EMPTY_SINCE_KEY, now);
+          await this.ctx.storage.setAlarm(now + (sessionCleaned ? EMPTY_ROOM_TTL_MS : EMPTY_SESSION_CLEANUP_MS));
           return;
         }
-        for (const ws of this.ctx.getWebSockets()) {
-          this.refused.add(ws);
-          this.forgetBudget(ws);
-          try {
-            ws.close(1001, "Room expired");
-          } catch {
-            /* already closed */
+        if (now - emptySince >= EMPTY_ROOM_TTL_MS) {
+          for (const ws of this.ctx.getWebSockets()) {
+            this.refused.add(ws);
+            this.forgetBudget(ws);
+            try {
+              ws.close(1001, "Room expired");
+            } catch {
+              /* already closed */
+            }
           }
+          await this.ctx.storage.deleteAlarm();
+          await this.ctx.storage.deleteAll();
+          return;
         }
-        await this.ctx.storage.deleteAll();
+        if (!sessionCleaned) {
+          if (now - emptySince < EMPTY_SESSION_CLEANUP_MS) {
+            await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_SESSION_CLEANUP_MS));
+            return;
+          }
+          await this.resetEmptySessionState(now);
+        }
+        await this.ctx.storage.setAlarm(Math.max(now, emptySince + EMPTY_ROOM_TTL_MS));
         return;
       }
 
       if (peers.some(({ att }) => att.host)) {
-        await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
+        await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
         await this.ctx.storage.setAlarm(now + EMPTY_ROOM_TTL_MS);
         return;
       }
@@ -550,7 +590,7 @@ export class RoomDO extends DurableObject<Env> {
         [HOST_KEY]: newHostHash,
         [PROMOTED_HOST_KEY]: promotedRecord,
       });
-      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY]);
+      await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
       await this.ctx.storage.setAlarm(now + EMPTY_ROOM_TTL_MS);
 
       candidate.att.host = true;
@@ -611,6 +651,7 @@ export class RoomDO extends DurableObject<Env> {
         [HOST_KEY]: hostHash,
         [LOCKED_KEY]: false,
         [EMPTY_SINCE_KEY]: now,
+        [SESSION_CLEANED_KEY]: true,
       });
       await this.syncAlarm(now);
       return new Response(JSON.stringify({ code: parsed.data.code, password, hostToken }), {
@@ -848,7 +889,7 @@ export class RoomDO extends DurableObject<Env> {
       const minted = creds.tickets[ticketIdx++];
       if (!minted) continue;
       nextMembers[minted.hash] = {
-        until: now + EMPTY_ROOM_TTL_MS,
+        until: now + CONNECTED_TICKET_TTL_MS,
         id: att.id,
         ...(att.sharing ? { sharing: true } : {}),
         ...(att.ip ? { ip: att.ip } : {}),
@@ -1194,7 +1235,7 @@ export class RoomDO extends DurableObject<Env> {
       if (att.rejoinHash) delete members[att.rejoinHash];
     }
     members[newRejoinHash] = {
-      until: now + EMPTY_ROOM_TTL_MS,
+      until: now + CONNECTED_TICKET_TTL_MS,
       id: attachment.id,
       ...(attachment.sharing ? { sharing: true } : {}),
       ...(attachment.ip ? { ip: attachment.ip } : {}),
@@ -1206,6 +1247,28 @@ export class RoomDO extends DurableObject<Env> {
       [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, protectedHashes),
     });
     if (isHost) await this.ctx.storage.delete(HOST_GONE_KEY);
+  }
+
+  /**
+   * Enforce empty-room 15-minute session cleanup and 90-day credential expiry lazily
+   * if an alarm was delayed, while performing zero storage writes on unclaimed rooms.
+   */
+  private async reconcileEmptyTimersBeforeAdmit(ws: WebSocket, now: number): Promise<void> {
+    if (this.joinedPeers(ws).length > 0) return;
+    if ((await this.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) return;
+    const emptySince = await this.ctx.storage.get<number>(EMPTY_SINCE_KEY);
+    if (emptySince === undefined) return;
+    if (now - emptySince >= EMPTY_ROOM_TTL_MS) {
+      await this.ctx.storage.deleteAlarm();
+      await this.ctx.storage.deleteAll();
+      return;
+    }
+    if (
+      now - emptySince >= EMPTY_SESSION_CLEANUP_MS &&
+      (await this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY)) !== true
+    ) {
+      await this.resetEmptySessionState(now);
+    }
   }
 
   /** The join handshake, split out of webSocketMessage; see the call site. */
@@ -1237,6 +1300,9 @@ export class RoomDO extends DurableObject<Env> {
 
     await this.ctx.blockConcurrencyWhile(async () => {
       if (this.gone.has(attachment.id) || this.refused.has(ws)) return;
+
+      const now = Date.now();
+      await this.reconcileEmptyTimersBeforeAdmit(ws, now);
 
       const hasActiveSocketMatch =
         offeredRejoinHash !== null &&
@@ -1289,8 +1355,8 @@ export class RoomDO extends DurableObject<Env> {
           }
         : undefined;
 
-      const now = Date.now();
-      attachment.joinedAt = supersededSocket?.att.joinedAt ?? admission.memberTicket?.joinedAt ?? now;
+      const joinNow = Date.now();
+      attachment.joinedAt = supersededSocket?.att.joinedAt ?? admission.memberTicket?.joinedAt ?? joinNow;
 
       if (isResume) {
         this.applyResumeAttachment(attachment, clientMsg, supersededSocket, admission.memberTicket);
@@ -1319,7 +1385,7 @@ export class RoomDO extends DurableObject<Env> {
         newRejoinHash,
         effectiveIsHost,
         superseded,
-        now,
+        joinNow,
       );
 
       try {
@@ -1328,7 +1394,7 @@ export class RoomDO extends DurableObject<Env> {
         return;
       }
 
-      await this.syncAlarm(now);
+      await this.syncAlarm(joinNow);
 
       const canSeePassword = effectiveIsHost || !admission.locked;
       sendSafe(ws, {
@@ -1458,7 +1524,7 @@ export class RoomDO extends DurableObject<Env> {
     return { ok: true, isHost, locked, returning: false, roomPassword };
   }
 
-  /** Whether the room is currently locked (never auto-unlocked on host absence). */
+  /** Whether the room is currently locked (occupied rooms never auto-unlock on host absence; empty rooms reset after 15m). */
   private async lockedNow(): Promise<boolean> {
     return (await this.ctx.storage.get<boolean>(LOCKED_KEY)) === true;
   }

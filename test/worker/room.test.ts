@@ -588,7 +588,7 @@ describe("RoomDO membership", () => {
 
     const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     await runInDurableObject(stub, (_instance, state) =>
-      state.storage.put("emptySince", Date.now() - 13 * 60 * 60_000),
+      state.storage.put("emptySince", Date.now() - (90 * 24 * 60 + 1) * 60_000),
     );
     expect(await runDurableObjectAlarm(stub)).toBe(true);
 
@@ -2237,5 +2237,174 @@ describe("RoomDO security & PR 1 flows", () => {
 
     fullHost.close();
     for (const guest of guests) guest.close();
+  });
+
+  it("clears ephemeral session/IP state and resets room lock after 15m empty while keeping credentials intact", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.10" });
+    await h.joinAsHost("host");
+
+    const eve = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.20" });
+    const wEve = await eve.join("eve");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await eve.nextOf("room-state");
+
+    h.send({ t: "kick", id: wEve.selfId });
+    await h.nextOf("peer-left");
+    const rotMsg = await h.nextOf("room-password");
+    const rotatedPassword = rotMsg.password ?? "";
+    expect(rotatedPassword).not.toBe("");
+
+    // Also place a stale promotedHost record to verify empty-session cleanup removes it.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("promotedHost", { id: wEve.selfId, token: "stale-promo" }),
+    );
+
+    h.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("emptySince", Date.now() - 16 * 60_000),
+    );
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    const snapshot = await runInDurableObject(stub, async (_i, state) => ({
+      claimed: await state.storage.get<boolean>("claimed"),
+      passwordHash: await state.storage.get<string>("passwordHash"),
+      roomPassword: await state.storage.get<string>("roomPassword"),
+      hostTokenHash: await state.storage.get<string>("hostTokenHash"),
+      locked: await state.storage.get<boolean>("locked"),
+      sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
+      members: await state.storage.get("members"),
+      deny: await state.storage.get("deny"),
+      promotedHost: await state.storage.get("promotedHost"),
+      hostGoneAt: await state.storage.get("hostGoneAt"),
+    }));
+
+    expect(snapshot.claimed).toBe(true);
+    expect(snapshot.passwordHash).toBeDefined();
+    expect(snapshot.roomPassword).toBe(rotatedPassword);
+    expect(snapshot.hostTokenHash).toBeDefined();
+    expect(snapshot.locked).toBe(false);
+    expect(snapshot.sessionCleaned).toBe(true);
+    expect(snapshot.members).toBeUndefined();
+    expect(snapshot.deny).toBeUndefined();
+    expect(snapshot.promotedHost).toBeUndefined();
+    expect(snapshot.hostGoneAt).toBeUndefined();
+  });
+
+  it("allows next-day link reuse with immediate hostToken recognition, preserves rotated revocation, and slides 90d TTL", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.30" });
+    await h.joinAsHost("host");
+    const b = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.31" });
+    await b.join("bob");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "rotate-password" });
+    const rotHost = await h.nextOf("room-password");
+    await b.nextOf("room-password");
+    const activePassword = rotHost.password ?? "";
+    expect(activePassword).not.toBe(PASSWORD);
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await b.nextOf("room-state");
+
+    h.close();
+    b.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Simulate 25 hours passing empty and Stage 1 alarm firing.
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const oldEmptySince = Date.now() - 25 * 60 * 60_000;
+    await runInDurableObject(stub, (_i, state) => state.storage.put("emptySince", oldEmptySince));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+    // Pre-rotation invite secret remains permanently revoked the next day.
+    const oldInviteClient = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.32" });
+    oldInviteClient.send({ t: "join", room: CODE, displayName: "mallory", password: PASSWORD });
+    expect((await oldInviteClient.nextOf("error")).code).toBe("bad-password");
+    oldInviteClient.close();
+
+    // Friend can enter the unlocked room the next day using the valid invite link.
+    const bNextDay = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.31" });
+    bNextDay.send({ t: "join", room: CODE, displayName: "bob", password: activePassword });
+    const wbNext = await bNextDay.nextOf("welcome");
+    expect(wbNext.locked).toBe(false);
+    expect(wbNext.host).toBe(false);
+
+    // Original creator returns with persisted hostToken and regains host controls immediately.
+    const hNextDay = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.30" });
+    hNextDay.send({
+      t: "join",
+      room: CODE,
+      displayName: "host",
+      password: activePassword,
+      hostToken: HOST_TOKEN,
+    });
+    const whNext = await hNextDay.nextOf("welcome");
+    expect(whNext.host).toBe(true);
+    await bNextDay.nextOf("peer-joined");
+
+    // Leaving refreshes emptySince to the current time (sliding 90-day TTL).
+    hNextDay.close();
+    bNextDay.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const refreshed = await runInDurableObject(stub, async (_i, state) => ({
+      emptySince: await state.storage.get<number>("emptySince"),
+      sessionCleaned: await state.storage.get<boolean>("sessionCleaned"),
+    }));
+    expect(refreshed.emptySince).toBeGreaterThan(oldEmptySince + 24 * 60 * 60_000);
+    expect(refreshed.sessionCleaned).toBeUndefined();
+  });
+
+  it("enforces 15m session cleanup and 90d expiry lazily on join even if alarm has not yet fired", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.40" });
+    await h.joinAsHost("host");
+    const eve = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.41" });
+    const wEve = await eve.join("eve");
+    await h.nextOf("peer-joined");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await eve.nextOf("room-state");
+
+    // Ban an IP and leave the room empty.
+    h.send({ t: "kick", id: wEve.selfId });
+    await h.nextOf("peer-left");
+    const rot = await h.nextOf("room-password");
+    const activePassword = rot.password ?? "";
+    h.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    // Jump 16 minutes ahead WITHOUT calling runDurableObjectAlarm.
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("emptySince", Date.now() - 16 * 60_000),
+    );
+
+    // Even the formerly banned IP after 15m + locked room can now enter once 15m empty elapsed.
+    const lateVisitor = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.41" });
+    lateVisitor.send({ t: "join", room: CODE, displayName: "eve", password: activePassword });
+    const wLate = await lateVisitor.nextOf("welcome");
+    expect(wLate.locked).toBe(false);
+    lateVisitor.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Jump > 90 days ahead WITHOUT calling runDurableObjectAlarm.
+    await runInDurableObject(stub, (_i, state) =>
+      state.storage.put("emptySince", Date.now() - (90 * 24 * 60 + 5) * 60_000),
+    );
+    const expiredAttempt = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.42" });
+    expiredAttempt.send({ t: "join", room: CODE, displayName: "alice", password: activePassword });
+    expect((await expiredAttempt.nextOf("error")).code).toBe("bad-password");
+    expiredAttempt.close();
+
+    const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
+    expect(remainingKeys).toBe(0);
   });
 });

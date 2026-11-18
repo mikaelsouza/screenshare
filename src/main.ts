@@ -21,6 +21,7 @@ import {
   type QualityPresetName,
 } from "./capture";
 import { Mesh } from "./mesh";
+import { readPersistedHostToken, writePersistedHostToken } from "./host-tokens";
 import { createCaptureController } from "./platform";
 import type { EndReason, FollowState } from "./platform/types";
 import {
@@ -220,6 +221,8 @@ let codeFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let rotateFeedbackTimer: ReturnType<typeof setTimeout> | null = null;
 let inviteRotatePending = false;
 let inviteRotateTimeout: ReturnType<typeof setTimeout> | null = null;
+let pendingKickPeerName: string | null = null;
+let kickNoticeTimer: ReturnType<typeof setTimeout> | null = null;
 
 const tiles = new Map<PeerId, HTMLVideoElement>();
 const healthEls = new Map<PeerId, HTMLElement>();
@@ -1001,6 +1004,15 @@ function renderSelfPreview(stream: MediaStream | null): void {
 // ---- participants --------------------------------------------------------
 
 const memorySession = new Map<string, string>();
+const memoryHostTokens = new Map<string, string>();
+
+function safeLocalStorage(): Storage | null {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
 
 function readSession(key: string): string | undefined {
   const cached = memorySession.get(key);
@@ -1032,7 +1044,11 @@ function saveActiveRoom(code: string | undefined): void {
 }
 
 function hostTokenFor(code: string): string | undefined {
-  return readSession(`host:${code}`);
+  return (
+    memoryHostTokens.get(code) ??
+    readPersistedHostToken(safeLocalStorage(), code) ??
+    readSession(`host:${code}`)
+  );
 }
 
 function rejoinTokenFor(code: string): string | undefined {
@@ -1044,6 +1060,9 @@ function saveRejoinToken(code: string, token: string | undefined): void {
 }
 
 function saveHostToken(code: string, token: string | undefined): void {
+  if (token !== undefined) memoryHostTokens.set(code, token);
+  else memoryHostTokens.delete(code);
+  writePersistedHostToken(safeLocalStorage(), code, token);
   writeSession(`host:${code}`, token);
 }
 
@@ -1052,7 +1071,6 @@ function clearRoomSession(code?: string): void {
   saveActiveRoom(undefined);
   if (!target) return;
   saveRejoinToken(target, undefined);
-  saveHostToken(target, undefined);
 }
 
 function scrubRoomUrl(): void {
@@ -1358,8 +1376,9 @@ function renderRoster(): void {
       kick.type = "button";
       kick.className = "ui-btn kick-btn";
       kick.textContent = "Remove";
-      kick.title = `Remove ${entry.name} from the room. They can't rejoin for 15 minutes.`;
+      kick.title = `Remove ${entry.name} from the room and rotate the invite link (blocks their network for 15 minutes).`;
       kick.addEventListener("click", () => {
+        if (client?.isReady) pendingKickPeerName = entry.name;
         client?.kick(entry.id);
         if (!members.has(entry.id)) teardownPeer(entry.id);
       });
@@ -1615,6 +1634,12 @@ const SESSION_WIPING_ERRORS: ReadonlySet<string> = new Set([
   "forbidden-origin",
 ]);
 
+const HOST_TOKEN_WIPING_ERRORS: ReadonlySet<string> = new Set([
+  "kicked",
+  "bad-password",
+  "bad-room-code",
+]);
+
 async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   if (!isValidRoomCode(code)) {
     setLobbyError(describeInviteParseFailure("invalid"));
@@ -1669,8 +1694,9 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
 
         if (!room.host) {
           saveHostToken(code, undefined);
-        } else if (room.hostToken) {
-          saveHostToken(code, room.hostToken);
+        } else {
+          const effectiveHostToken = room.hostToken ?? hostTokenFor(code);
+          if (effectiveHostToken) saveHostToken(code, effectiveHostToken);
         }
         saveRejoinToken(code, room.rejoinToken);
         if (room.password) {
@@ -1923,6 +1949,20 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
             ui.inviteRotateBtn.textContent = "Rotate";
             ui.inviteRotateBtn.classList.remove("invite-feedback-ok");
           }, 1600);
+        } else if (pendingKickPeerName !== null && isHost) {
+          const removedName = pendingKickPeerName;
+          pendingKickPeerName = null;
+          clearKickNoticeTimer();
+          setStatus(
+            `Removed ${removedName} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
+            "warn",
+          );
+          kickNoticeTimer = setTimeout(() => {
+            kickNoticeTimer = null;
+            if (client && selfId !== null && lastJoin) {
+              setStatus(`In room ${lastJoin.code}`, "info");
+            }
+          }, 6_000);
         }
         renderInviteMenu();
       },
@@ -1979,6 +2019,9 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           } else if (!hasWelcomed) {
             saveActiveRoom(undefined);
           }
+          if (HOST_TOKEN_WIPING_ERRORS.has(codeErr)) {
+            saveHostToken(codeToJoin, undefined);
+          }
           lastJoin = null;
           leaveRoom();
           setLobbyError(friendly);
@@ -1986,12 +2029,15 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
           return;
         }
         if (codeErr === "not-host") {
+          pendingKickPeerName = null;
           setStatus(friendly, "warn");
           return;
         }
         if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
+          if (codeErr === "unknown-peer") pendingKickPeerName = null;
           return;
         }
+        pendingKickPeerName = null;
         setStatus(codeErr === "rate-limited" ? friendly : `${codeErr}: ${friendly}`, "error");
       },
     },
@@ -2007,11 +2053,20 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   scrubRoomUrl();
 }
 
+function clearKickNoticeTimer(): void {
+  if (kickNoticeTimer !== null) {
+    clearTimeout(kickNoticeTimer);
+    kickNoticeTimer = null;
+  }
+}
+
 function leaveRoom(): void {
   joinGeneration++;
   reopenRosterOnWelcome = false;
   inviteRotatePending = false;
   clearRotatePendingTimer();
+  pendingKickPeerName = null;
+  clearKickNoticeTimer();
   if (inviteRevealTimer !== null) {
     clearTimeout(inviteRevealTimer);
     inviteRevealTimer = null;
@@ -2303,8 +2358,15 @@ async function copyInvite(mode: "link" | "code"): Promise<void> {
   const text = mode === "link" ? `${location.origin}/#${invite}` : invite;
   const copied = await copyTextToClipboard(text);
   if (!copied) {
+    clearKickNoticeTimer();
     setStatus("Could not copy automatically. Use Show to view and copy manually.", "warn");
     return;
+  }
+  if (kickNoticeTimer !== null) {
+    clearKickNoticeTimer();
+    if (client && selfId !== null && lastJoin) {
+      setStatus(`In room ${lastJoin.code}`, "info");
+    }
   }
   if (mode === "link") {
     if (linkFeedbackTimer !== null) clearTimeout(linkFeedbackTimer);
