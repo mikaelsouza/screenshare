@@ -21,6 +21,7 @@
     "lint:knip": "knip --include-entry-exports --treat-config-hints-as-errors --max-issues 0 && knip --cycles",
     "lint:deadcode": "oxlint -c .oxlintrc.json --type-aware --type-check --report-unused-disable-directives-severity error --ignore-path .gitignore --deny-warnings",
     "lint:all": "npm run lint:knip && npm run lint:deadcode",
+    "check:guardrails": "node scripts/check-guardrails-diff.ts",
     "preview": "npm run build && wrangler dev",
     "deploy": "npm run build && wrangler deploy",
     "postinstall": "node -e \"if(process.platform!=='win32')try{require('child_process').execSync('./scripts/patch-workerd.sh')}catch(e){}\"",
