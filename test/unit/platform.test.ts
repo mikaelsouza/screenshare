@@ -639,4 +639,72 @@ describe("desktop WASAPI audio integration", () => {
     expect(displayAudio!.stopped).toBe(true);
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
   });
+
+  it("stops video, disposes late PCM track, and stops main-process audio when controller.stop() runs while createPcmTrack is pending", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, displayAudio, pcmTrack } = makeDeps("window", true);
+    const cb = callbacks();
+    let resolvePcm!: (t: MediaStreamTrack) => void;
+    deps.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm = resolve;
+        }),
+    );
+
+    const c = createElectronCaptureController(bridge, cb, deps);
+    const startPromise = c.start(preset);
+
+    // Wait until captureScreen + startWindowAudio have resolved and createPcmTrack is pending
+    await flush();
+    expect(deps.createPcmTrack).toHaveBeenCalledTimes(1);
+    expect(displayAudio!.stopped).toBe(true);
+
+    // Caller stops the controller mid-addModule
+    c.stop();
+
+    // Now the pending createPcmTrack resolves late
+    resolvePcm(pcmTrack);
+    await startPromise.catch(() => {});
+
+    expect(video.stopped).toBe(true);
+    expect(pcmTrack.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalled();
+
+    // No zombie ended listener should remain attached after stop()
+    video.end();
+    expect(cb.onEnded).not.toHaveBeenCalled();
+  });
+
+  it("stops video and skips/stops audio when controller.stop() runs while startWindowAudio is pending", async () => {
+    const bridge = makeAudioBridge();
+    let resolveStartAudio!: (ok: boolean) => void;
+    bridge.startWindowAudio.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveStartAudio = resolve;
+        }),
+    );
+    const { deps, video, displayAudio, pcmTrack } = makeDeps("window", true);
+    const cb = callbacks();
+    const c = createElectronCaptureController(bridge, cb, deps);
+    const startPromise = c.start(preset);
+
+    await flush();
+    expect(bridge.startWindowAudio).toHaveBeenCalledTimes(1);
+
+    c.stop();
+    resolveStartAudio(true);
+    await startPromise.catch(() => {});
+
+    expect(video.stopped).toBe(true);
+    expect(displayAudio!.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalled();
+    if ((deps.createPcmTrack as ReturnType<typeof vi.fn>).mock.calls.length > 0) {
+      expect(pcmTrack.stopped).toBe(true);
+    }
+    video.end();
+    expect(cb.onEnded).not.toHaveBeenCalled();
+  });
 });
+

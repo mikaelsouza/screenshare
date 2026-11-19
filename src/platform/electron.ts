@@ -36,7 +36,7 @@ export interface ElectronCaptureDeps {
   /** Captures one desktop source by id, with no picker and no user gesture. */
   captureSource: (sourceId: string, preset: QualityPreset) => Promise<MediaStreamTrack>;
   makeStream: (tracks: MediaStreamTrack[]) => MediaStream;
-  createPcmTrack: (bridge: PcmAudioBridge) => MediaStreamTrack;
+  createPcmTrack: (bridge: PcmAudioBridge) => Promise<MediaStreamTrack> | MediaStreamTrack;
   audioSource?: AudioSourceProvider;
 }
 
@@ -97,7 +97,7 @@ function buildDefaultAudioProvider(
     const ok = useWindow ? await api.startWindowAudio() : await api.startSystemAudio();
     if (!ok) return capture.audio;
     capture.audio?.stop();
-    return deps.createPcmTrack({ onAudioPcm: api.onAudioPcm, stopAudio: api.stopAudio });
+    return await deps.createPcmTrack({ onAudioPcm: api.onAudioPcm, stopAudio: api.stopAudio });
   };
 }
 
@@ -187,22 +187,27 @@ export function createElectronCaptureController(
     async start(p) {
       // following, sourceId and pending are already clear: they start that way and
       // stop() (or a failed start) clears them again.
+      const gen = ++generation;
       preset = p;
       // Subscribe first: the main process starts following as soon as the window is
       // picked, which can be before getDisplayMedia resolves here.
       unsubscribe = api.onFollowUpdate(handle);
       let result: CaptureResult | null = null;
+      let chosenAudio: MediaStreamTrack | null = null;
       try {
         result = await deps.captureScreen(p);
-        const chosenAudio = await audioProvider(result);
+        if (gen !== generation) throw new Error("Capture stopped before starting");
+        chosenAudio = await audioProvider(result);
+        if (gen !== generation) throw new Error("Capture stopped before starting");
         if (chosenAudio !== result.audio) {
           result.audio = chosenAudio;
           result.stream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
         }
       } catch (err) {
+        if (chosenAudio && chosenAudio !== result?.audio) chosenAudio.stop();
         if (result) stopCapture(result);
         api.stopAudio?.();
-        release();
+        if (gen === generation) release();
         throw err;
       }
       capture = result;
