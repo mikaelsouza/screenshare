@@ -12,15 +12,8 @@
 import { z, type IceCandidateInit, type PeerId, type SignalData } from "@shared/protocol";
 import type { CaptureResult, QualityPreset } from "./capture";
 import {
-  applyAudioEncoding,
-  applyVideoEncoding,
-  type CodecName,
-  DEFAULT_DEGRADATION_MODE,
-  type DegradationMode,
-  mungeOpusSdp,
-  mungeVideoSdp,
-  preferCodec,
-  tuneReceiverLatency,
+  applyAudioEncoding, applyVideoEncoding, type CodecName, DEFAULT_DEGRADATION_MODE,
+  type DegradationMode, mungeOpusSdp, mungeVideoSdp, preferCodec, tuneReceiverLatency,
 } from "./quality";
 
 function mungeSdp(sdp: string): string {
@@ -95,8 +88,13 @@ class PeerLink {
   /** What we last asked the far end for; flushed when the channel opens. */
   private desiredView: boolean | null = null;
 
-  private videoSender: RTCRtpSender | null = null;
-  private audioSender: RTCRtpSender | null = null;
+  private videoTransceiver: RTCRtpTransceiver | null = null;
+  private audioTransceiver: RTCRtpTransceiver | null = null;
+  private isSending = false;
+  private closed = false;
+  private lastNegotiatedCodec: CodecName | null = null;
+  private mediaQueue: Promise<void> = Promise.resolve();
+  private captureGeneration = 0;
   private remoteStream: MediaStream | null = null;
   readonly selfId: PeerId;
   readonly peerId: PeerId;
@@ -104,12 +102,17 @@ class PeerLink {
   private readonly send: (data: SignalData) => void;
   private readonly cb: MeshCallbacks;
 
+  private isClosed(): boolean {
+    return this.closed || this.pc.signalingState === "closed";
+  }
+
+  private isStale(gen: number): boolean {
+    return gen !== this.captureGeneration || this.isClosed();
+  }
+
   constructor(
-    selfId: PeerId,
-    peerId: PeerId,
-    opts: MeshOptions,
-    send: (data: SignalData) => void,
-    cb: MeshCallbacks,
+    selfId: PeerId, peerId: PeerId, opts: MeshOptions,
+    send: (data: SignalData) => void, cb: MeshCallbacks,
     /** Whether this side opens the control channel; see Mesh.addPeer. */
     createsControl: boolean = selfId >= peerId,
   ) {
@@ -119,32 +122,19 @@ class PeerLink {
     this.send = send;
     this.cb = cb;
     this.polite = selfId < peerId;
-    this.pc = new RTCPeerConnection({
-      iceServers: opts.iceServers,
-      bundlePolicy: "max-bundle",
-      rtcpMuxPolicy: "require",
-    });
+    this.pc = new RTCPeerConnection({ iceServers: opts.iceServers, bundlePolicy: "max-bundle", rtcpMuxPolicy: "require" });
 
     this.pc.onnegotiationneeded = () => void this.negotiate();
-    this.pc.onicecandidate = ({ candidate }) => {
-      if (candidate) {
-        this.send({
-          k: "ice",
-          candidate: {
-            candidate: candidate.candidate,
-            sdpMid: candidate.sdpMid,
-            sdpMLineIndex: candidate.sdpMLineIndex,
-            usernameFragment: candidate.usernameFragment,
-          },
-        });
-      }
+    this.pc.onicecandidate = ({ candidate: c }) => {
+      if (!c) return;
+      this.send({ k: "ice", candidate: { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex, usernameFragment: c.usernameFragment } });
     };
     this.pc.onconnectionstatechange = () => {
       // A network change (Wi-Fi to Ethernet, a VPN) can kill the path a link chose.
       // The sharing side restarts ICE, which renegotiates through the usual offer
       // path; left alone, the viewer's picture just froze until someone rejoined.
       // Only the sender, so both sides do not restart into a glare.
-      if (this.pc.connectionState === "failed" && this.videoSender) this.pc.restartIce();
+      if (this.pc.connectionState === "failed" && this.isSending) this.pc.restartIce();
       this.cb.onConnectionState(this.peerId, this.pc.connectionState);
     };
     this.pc.ontrack = (ev) => this.onTrack(ev);
@@ -165,7 +155,7 @@ class PeerLink {
   // ---- negotiation -------------------------------------------------------
 
   private async negotiate(): Promise<void> {
-    if (this.pc.signalingState === "closed") return;
+    if (this.isClosed()) return;
     if (this.attachingCount > 0) {
       this.offerPending = true;
       return;
@@ -185,6 +175,7 @@ class PeerLink {
       // because Chrome does not reliably re-fire negotiationneeded for what our
       // dropped offer carried. Without the retry a sharer's video to that peer was
       // simply never negotiated.
+      if (this.isClosed()) return;
       if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") {
         this.retryOffer();
         return;
@@ -192,9 +183,10 @@ class PeerLink {
       offer.sdp = mungeSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
-      if (sdp) this.send({ k: "offer", sdp });
+      if (sdp && !this.isClosed()) this.send({ k: "offer", sdp });
     } catch (err) {
       // The same race, lost a step later.
+      if (this.isClosed()) return;
       if (seen !== this.remoteOffers || this.pc.signalingState === "have-remote-offer") this.retryOffer();
       else console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
@@ -212,7 +204,7 @@ class PeerLink {
   }
 
   private flushPendingOffer(): void {
-    if (!this.offerPending || this.attachingCount > 0 || this.pc.signalingState === "closed") return;
+    if (!this.offerPending || this.attachingCount > 0 || this.isClosed()) return;
     this.offerPending = false;
     void this.negotiate();
   }
@@ -283,7 +275,9 @@ class PeerLink {
     tuneReceiverLatency(ev.receiver, this.opts.jitterBufferTargetMs);
 
     const stream = ev.streams[0] ?? new MediaStream([ev.track]);
-    this.remoteStream = stream;
+    if (ev.track.kind !== "audio" || this.remoteStream === null) {
+      this.remoteStream = stream;
+    }
     this.cb.onRemoteStream(this.peerId, stream);
 
     ev.track.addEventListener("ended", () => {
@@ -293,6 +287,11 @@ class PeerLink {
         this.cb.onRemoteStreamGone(this.peerId);
       }
     });
+  }
+
+  reemitRemoteStream(): void {
+    if (this.isClosed() || this.remoteStream === null) return;
+    this.cb.onRemoteStream(this.peerId, this.remoteStream);
   }
 
   get connectionState(): RTCPeerConnectionState {
@@ -306,16 +305,20 @@ class PeerLink {
   /**
    * Re-apply encoder settings after a live quality change.
    */
-  async reapplyEncoding(): Promise<void> {
-    if (!this.videoSender) return;
-    await applyVideoEncoding(
-      this.videoSender,
-      this.opts.preset,
-      this.opts.degradation ?? DEFAULT_DEGRADATION_MODE,
-    );
-    // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
-    // in both directions rather than only pausing.
-    await this.setSenderActive(this.remoteWantsVideo);
+  reapplyEncoding(): Promise<void> {
+    const gen = this.captureGeneration;
+    return this.enqueueMedia(async () => {
+      const sender = this.videoTransceiver?.sender;
+      if (this.isStale(gen) || !this.isSending || !sender) return;
+      try {
+        await applyVideoEncoding(sender, this.opts.preset, this.opts.degradation ?? DEFAULT_DEGRADATION_MODE);
+        // applyVideoEncoding deliberately leaves `active` alone, so set it explicitly
+        // in both directions rather than only pausing.
+        if (!this.isStale(gen)) await this.setSenderActive(this.remoteWantsVideo);
+      } catch (err) {
+        if (!this.isStale(gen)) throw err;
+      }
+    });
   }
 
   /**
@@ -323,46 +326,78 @@ class PeerLink {
    * effect immediately without stopping the share.
    */
   reapplyCodec(codec: CodecName): void {
-    if (!this.videoSender) return;
-    const tx = this.pc.getTransceivers().find((transceiver) => transceiver.sender === this.videoSender);
-    if (tx) preferCodec(tx, codec);
+    if (!this.isSending || !this.videoTransceiver || this.isClosed()) return;
+    preferCodec(this.videoTransceiver, codec);
+    this.lastNegotiatedCodec = codec;
     this.retryOffer();
   }
 
-  async attachCapture(capture: CaptureResult): Promise<void> {
-    this.detachCapture();
+  private enqueueMedia(op: () => Promise<void>): Promise<void> {
+    const run = this.mediaQueue.then(op);
+    this.mediaQueue = run.catch(() => {});
+    return run;
+  }
 
-    // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
-    // addTrack reuses the receive-only transceiver its offer created, and that
-    // sender has no send encodings yet: setting ours is "Read-only field modified",
-    // which stopped the whole share. So a viewer could not share back to a sharer.
-    const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
-    const videoTx = this.pc.addTransceiver(capture.video, send);
-    this.videoSender = videoTx.sender;
-    preferCodec(videoTx, this.opts.codec);
+  attachCapture(capture: CaptureResult): Promise<void> {
+    const gen = ++this.captureGeneration;
+    return this.enqueueMedia(() => this.runAttachCapture(capture, gen));
+  }
 
-    // Always open an audio sender, even when capture.audio is null, so attaching or
-    // replacing an audio track later never requires SDP renegotiation. Tagging it
-    // with the video's stream keeps the two in one MediaStream on the far end, so
-    // they play in sync.
-    this.audioSender = this.pc.addTransceiver(capture.audio ?? "audio", send).sender;
+  private async ensureSendTransceivers(capture: CaptureResult): Promise<void> {
+    if (!this.videoTransceiver || !this.audioTransceiver) {
+      // Fresh sendonly transceivers, not addTrack. When the far end is sharing too,
+      // addTrack reuses the receive-only transceiver its offer created, and that
+      // sender has no send encodings yet: setting ours is "Read-only field modified",
+      // which stopped the whole share. So a viewer could not share back to a sharer.
+      const send: RTCRtpTransceiverInit = { direction: "sendonly", streams: [capture.stream] };
+      this.videoTransceiver = this.pc.addTransceiver(capture.video, send);
+      preferCodec(this.videoTransceiver, this.opts.codec);
+      this.lastNegotiatedCodec = this.opts.codec;
+      // Always open an audio sender, even when capture.audio is null, so attaching or
+      // replacing an audio track later never requires SDP renegotiation. Tagging it
+      // with the video's stream keeps the two in one MediaStream on the far end, so
+      // they play in sync.
+      this.audioTransceiver = this.pc.addTransceiver(capture.audio ?? "audio", send);
+      return;
+    }
+    await Promise.all([
+      this.videoTransceiver.sender.replaceTrack(capture.video),
+      this.audioTransceiver.sender.replaceTrack(capture.audio),
+    ]);
+  }
 
+  private async applyInitialEncodings(video: RTCRtpSender, audio: RTCRtpSender): Promise<void> {
+    const mode = this.opts.degradation ?? DEFAULT_DEGRADATION_MODE;
+    const results = await Promise.allSettled([
+      applyAudioEncoding(audio),
+      applyVideoEncoding(video, this.opts.preset, mode),
+    ]);
+    const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (rejected) throw rejected.reason;
+  }
+
+  private syncCodecIfChanged(): void {
+    if (!this.videoTransceiver || this.lastNegotiatedCodec === this.opts.codec) return;
+    preferCodec(this.videoTransceiver, this.opts.codec);
+    this.lastNegotiatedCodec = this.opts.codec;
+    this.offerPending = true;
+  }
+
+  private async runAttachCapture(capture: CaptureResult, gen: number): Promise<void> {
+    if (this.isStale(gen)) return;
     this.attachingCount++;
     try {
-      const results = await Promise.allSettled([
-        applyAudioEncoding(this.audioSender),
-        applyVideoEncoding(
-          this.videoSender,
-          this.opts.preset,
-          this.opts.degradation ?? DEFAULT_DEGRADATION_MODE,
-        ),
-      ]);
-      const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
-      if (rejected) throw rejected.reason;
+      await this.ensureSendTransceivers(capture);
+      if (this.isStale(gen) || !this.videoTransceiver || !this.audioTransceiver) return;
+      await this.applyInitialEncodings(this.videoTransceiver.sender, this.audioTransceiver.sender);
+      if (this.isStale(gen)) return;
+      this.isSending = true;
       await this.setSenderActive(this.remoteWantsVideo);
+      if (this.isStale(gen)) return;
+      this.syncCodecIfChanged();
     } catch (err) {
-      // A link closed during setup can reject the pending setParameters calls.
-      if (this.pc.signalingState !== "closed") throw err;
+      // A link closed or superseded during setup can reject pending replaceTrack / setParameters calls.
+      if (!this.isStale(gen)) throw err;
     } finally {
       this.attachingCount--;
       if (this.attachingCount === 0 && !this.applyingOffer && this.pc.signalingState === "stable") {
@@ -371,31 +406,46 @@ class PeerLink {
     }
   }
 
+  private replaceTrackQueued(
+    getSender: () => RTCRtpSender | null,
+    track: MediaStreamTrack | null,
+  ): Promise<void> {
+    const gen = this.captureGeneration;
+    return this.enqueueMedia(async () => {
+      if (this.isStale(gen) || !this.isSending) return;
+      try {
+        await getSender()?.replaceTrack(track);
+      } catch (err) {
+        if (!this.isStale(gen)) throw err;
+      }
+    });
+  }
+
   /** Swap the audio being sent without renegotiating. Null sends silence. */
-  async replaceAudio(track: MediaStreamTrack | null): Promise<void> {
-    await this.audioSender?.replaceTrack(track);
+  replaceAudio(track: MediaStreamTrack | null): Promise<void> {
+    return this.replaceTrackQueued(() => this.audioTransceiver?.sender ?? null, track);
   }
 
   /**
    * Swap the video being sent without renegotiating. The encoder settings stay
    * attached to the sender, so they carry over to the new track.
    */
-  async replaceVideo(track: MediaStreamTrack): Promise<void> {
-    await this.videoSender?.replaceTrack(track);
+  replaceVideo(track: MediaStreamTrack): Promise<void> {
+    return this.replaceTrackQueued(() => this.videoTransceiver?.sender ?? null, track);
   }
 
-  detachCapture(): void {
-    for (const s of [this.videoSender, this.audioSender]) {
-      if (s) {
-        try {
-          this.pc.removeTrack(s);
-        } catch {
-          /* connection may already be closing */
-        }
-      }
-    }
-    this.videoSender = null;
-    this.audioSender = null;
+  detachCapture(): Promise<void> {
+    const gen = ++this.captureGeneration;
+    this.isSending = false;
+    return this.enqueueMedia(() => this.runDetachCapture(gen));
+  }
+
+  private async runDetachCapture(gen: number): Promise<void> {
+    if (this.isStale(gen)) return;
+    const ops = [this.videoTransceiver, this.audioTransceiver]
+      .filter((tx): tx is RTCRtpTransceiver => tx !== null)
+      .map((tx) => tx.sender.replaceTrack(null).catch(() => {}));
+    await Promise.allSettled(ops);
   }
 
   /**
@@ -442,19 +492,25 @@ class PeerLink {
    * sizes it is what keeps the mesh viable on an ordinary home uplink.
    */
   private async setSenderActive(active: boolean): Promise<void> {
-    if (!this.videoSender) return;
-    const params = this.videoSender.getParameters();
+    const sender = this.videoTransceiver?.sender;
+    if (!this.isSending || !sender || this.isClosed()) return;
+    const params = sender.getParameters();
     const e = params.encodings?.[0];
     if (!e || e.active === active) return;
     e.active = active;
     try {
-      await this.videoSender.setParameters(params);
+      await sender.setParameters(params);
     } catch (err) {
       console.warn(`[mesh] setSenderActive ${this.peerId}`, err);
     }
   }
 
   close(): void {
+    this.closed = true;
+    this.offerPending = false;
+    this.captureGeneration++;
+    this.isSending = false;
+    this.remoteStream = null;
     if (this.control) {
       this.control.onopen = null;
       this.control.onmessage = null;
@@ -486,12 +542,7 @@ export class Mesh {
   private readonly sendSignal: (to: PeerId, data: SignalData) => void;
   private readonly cb: MeshCallbacks;
 
-  constructor(
-    selfId: PeerId,
-    opts: MeshOptions,
-    sendSignal: (to: PeerId, data: SignalData) => void,
-    cb: MeshCallbacks,
-  ) {
+  constructor(selfId: PeerId, opts: MeshOptions, sendSignal: (to: PeerId, data: SignalData) => void, cb: MeshCallbacks) {
     this.selfId = selfId;
     this.opts = opts;
     this.sendSignal = sendSignal;
@@ -511,16 +562,8 @@ export class Mesh {
     if (peerId === this.selfId || this.links.has(peerId)) return;
     // The initiator opens the control channel, unless the other side is sharing
     // too and may be initiating as well; then the id order picks one of us.
-    const createsControl =
-      !answering && (this.members.get(peerId)?.sharing !== true || this.selfId >= peerId);
-    const link = new PeerLink(
-      this.selfId,
-      peerId,
-      this.opts,
-      (data) => this.sendSignal(peerId, data),
-      this.cb,
-      createsControl,
-    );
+    const createsControl = !answering && (this.members.get(peerId)?.sharing !== true || this.selfId >= peerId);
+    const link = new PeerLink(this.selfId, peerId, this.opts, (data) => this.sendSignal(peerId, data), this.cb, createsControl);
     this.links.set(peerId, link);
     if (this.capture) void link.attachCapture(this.capture);
   }
@@ -549,9 +592,16 @@ export class Mesh {
   setMemberSharing(peerId: PeerId, sharing: boolean): void {
     const m = this.members.get(peerId);
     if (!m) return;
+    const wasSharing = m.sharing;
     m.sharing = sharing;
     // Starting to share is not a reason to connect from here: their offer does that.
-    if (!this.wantsLink(peerId)) this.removePeer(peerId);
+    if (!this.wantsLink(peerId)) {
+      this.removePeer(peerId);
+    } else if (!wasSharing && sharing) {
+      // If the link stayed open while they stopped and resumed via replaceTrack,
+      // ontrack will not fire again — re-emit the retained stream so the UI remounts the tile.
+      this.links.get(peerId)?.reemitRemoteStream();
+    }
   }
 
   private wantsLink(peerId: PeerId): boolean {
@@ -592,7 +642,7 @@ export class Mesh {
     } else {
       this.capture = null;
       for (const [id, m] of this.members) if (!m.sharing) this.removePeer(id);
-      for (const l of this.links.values()) l.detachCapture();
+      await Promise.all([...this.links.values()].map((l) => l.detachCapture()));
     }
   }
 

@@ -1954,6 +1954,7 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
         isHost = room.host;
         roomLocked = room.locked;
 
+        const wiredStreams = new WeakSet<MediaStream>();
         mesh = new Mesh(
           selfIdFromServer,
           {
@@ -1970,6 +1971,9 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
               const video = tileFor(peerId);
               if (video.srcObject !== stream) {
                 video.srcObject = stream;
+              }
+              if (!wiredStreams.has(stream)) {
+                wiredStreams.add(stream);
                 stream.addEventListener("addtrack", () => applyAudio(peerId));
                 stream.addEventListener("removetrack", () => applyAudio(peerId));
               }

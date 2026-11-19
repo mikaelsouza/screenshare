@@ -245,9 +245,13 @@ describe("Mesh and PeerLink", () => {
 
     await mesh.setCapture(capture);
     expect(pc.senders.length).toBe(2);
+    expect(pc.senders[0]?.track).toBe(videoTrack);
+    expect(pc.senders[1]?.track).toBe(audioTrack);
 
     await mesh.setCapture(null);
-    expect(pc.senders.length).toBe(0);
+    expect(pc.senders.length).toBe(2);
+    expect(pc.senders[0]?.track).toBeNull();
+    expect(pc.senders[1]?.track).toBeNull();
   });
 
   it("opens a silent audio sender and swaps audio in without renegotiating", async () => {
@@ -1117,5 +1121,771 @@ describe("negotiation recovery", () => {
   it.todo("tears down active loopback audio capture deterministically if leaveRoom races an in-flight startShare");
 });
 
+describe("persistent sendonly transceivers", () => {
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+  };
+  const cb = (): MeshCallbacks => ({
+    onRemoteStream: vi.fn(),
+    onRemoteStreamGone: vi.fn(),
+    onConnectionState: vi.fn(),
+  });
+  const makeCapture = (withAudio: boolean): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    const audio = withAudio ? ({ kind: "audio" } as unknown as MediaStreamTrack) : null;
+    return {
+      stream: { getTracks: () => (audio ? [video, audio] : [video]) } as unknown as MediaStream,
+      video,
+      audio,
+    };
+  };
 
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }, { mimeType: "video/AV1" }] }),
+    };
+  });
 
+  it("reuses persistent sendonly transceivers across share/unshare cycles without calling removeTrack or renegotiating", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const addTxSpy = vi.spyOn(pc, "addTransceiver");
+    const removeTrackSpy = vi.spyOn(pc, "removeTrack");
+
+    const c1 = makeCapture(true);
+    await mesh.setCapture(c1);
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(c1.video);
+    expect(pc.senders[1]?.track).toBe(c1.audio);
+
+    // Clear initial signals before testing cycle 2
+    signals.length = 0;
+    await mesh.setCapture(null);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(pc.closed).toBe(false);
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBeNull();
+    expect(pc.senders[1]?.track).toBeNull();
+
+    // After stopping share on a mutual link, failed connection must NOT restartIce and reapplyEncoding is a no-op
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(0);
+    await mesh.setPreset({ label: "1080p60", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 });
+    expect(pc.senders[0]?.getParameters().encodings?.[0]?.maxBitrate).toBe(6_000_000);
+
+    // Cycle 2: video+audio -> video-only clears audio track to null without adding transceivers or sending offers
+    const c2 = makeCapture(false);
+    await mesh.setCapture(c2);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(c2.video);
+    expect(pc.senders[1]?.track).toBeNull();
+    expect(pc.senders[0]?.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+
+    // Once active again, failed connection DOES restartIce
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(1);
+  });
+
+  it("defers codec renegotiation while idle and renegotiates when resuming with a different codec", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    await mesh.setCapture(makeCapture(false));
+    const setCodecSpy = vi.spyOn(pc.transceivers[0]!, "setCodecPreferences");
+    setCodecSpy.mockClear();
+    await mesh.setCapture(null);
+    signals.length = 0;
+
+    // Changing codec while not sharing must not trigger a spurious offer
+    mesh.setCodec("av1");
+    await new Promise((r) => setTimeout(r, 10));
+    expect(setCodecSpy).not.toHaveBeenCalled();
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+
+    // Resuming capture detects codec drift, updates preferences, and sends a renegotiation offer
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(setCodecSpy).toHaveBeenCalledTimes(1);
+    expect(Array.from(setCodecSpy.mock.calls[0]?.[0] ?? [])[0]?.mimeType).toBe("video/AV1");
+    expect(signals.some((s) => s.data.k === "offer")).toBe(true);
+  });
+
+  it("re-emits retained remoteStream on false -> true setMemberSharing without duplicating true -> true", async () => {
+    const callbacks = cb();
+    const mesh = new Mesh("me", { ...opts }, () => {}, callbacks);
+    mesh.addMember("bob", true);
+    await mesh.setCapture(makeCapture(false));
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const videoTrack = { kind: "video", addEventListener: vi.fn() } as unknown as MediaStreamTrack;
+    const remoteStream = { id: "bob-stream", getTracks: () => [videoTrack] } as unknown as MediaStream;
+    pc.ontrack?.({
+      track: videoTrack,
+      receiver: {} as unknown as RTCRtpReceiver,
+      streams: [remoteStream],
+    } as unknown as RTCTrackEvent);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(1);
+
+    // Duplicate true -> true must not re-emit
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(1);
+
+    // Bob stops sharing while we still share -> link stays open, stream retained
+    mesh.setMemberSharing("bob", false);
+    expect(pc.closed).toBe(false);
+    expect(mesh.peers()).toEqual(["bob"]);
+
+    // Bob resumes sharing via replaceTrack (no new ontrack) -> retained stream is re-emitted
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
+    expect(callbacks.onRemoteStream).toHaveBeenLastCalledWith("bob", remoteStream);
+
+    // When both stop sharing, link is closed
+    await mesh.setCapture(null);
+    mesh.setMemberSharing("bob", false);
+    expect(pc.closed).toBe(true);
+    expect(mesh.peers()).toEqual([]);
+  });
+
+  it("serializes rapid unawaited setCapture(s1) -> setCapture(null) -> setCapture(s2) cleanly", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const s1 = makeCapture(true);
+    const s2 = makeCapture(false);
+
+    const p1 = mesh.setCapture(s1);
+    const p2 = mesh.setCapture(null);
+    const p3 = mesh.setCapture(s2);
+    await Promise.all([p1, p2, p3]);
+
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(s2.video);
+    expect(pc.senders[1]?.track).toBeNull();
+  });
+
+  it("suppresses replaceTrack rejection when link closes mid-operation", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    await mesh.setCapture(makeCapture(true));
+
+    let rejectReplace!: (err: Error) => void;
+    pc.senders[0]!.replaceTrack = () =>
+      new Promise<void>((_res, rej) => {
+        rejectReplace = rej;
+      });
+
+    const swapPromise = mesh.setVideoTrack({ kind: "video" } as unknown as MediaStreamTrack);
+    await Promise.resolve();
+    mesh.removePeer("bob");
+    rejectReplace(new Error("InvalidStateError: closed"));
+    await expect(swapPromise).resolves.toBeUndefined();
+    expect(pc.closed).toBe(true);
+  });
+});
+
+describe("adversarial persistent-transceiver & race probes", () => {
+  const opts: MeshOptions = {
+    iceServers: [],
+    preset: { label: "720p60", width: 1280, height: 720, frameRate: 60, maxBitrate: 6_000_000 },
+    codec: "h264",
+    jitterBufferTargetMs: 0,
+  };
+  const cb = (): MeshCallbacks => ({
+    onRemoteStream: vi.fn(),
+    onRemoteStreamGone: vi.fn(),
+    onConnectionState: vi.fn(),
+  });
+  const makeCapture = (withAudio: boolean): CaptureResult => {
+    const video = { kind: "video" } as unknown as MediaStreamTrack;
+    const audio = withAudio ? ({ kind: "audio" } as unknown as MediaStreamTrack) : null;
+    return {
+      stream: { getTracks: () => (audio ? [video, audio] : [video]) } as unknown as MediaStream,
+      video,
+      audio,
+    };
+  };
+  const deferred = <T = void>(): {
+    promise: Promise<T>;
+    resolve: (v: T) => void;
+    reject: (err: unknown) => void;
+  } => {
+    let resolve!: (v: T) => void;
+    let reject!: (err: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  };
+
+  beforeEach(() => {
+    FakeRTCPeerConnection.instances = [];
+    vi.stubGlobal("RTCPeerConnection", FakeRTCPeerConnection);
+    (globalThis as unknown as { RTCRtpSender: { getCapabilities: unknown } }).RTCRtpSender = {
+      getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }, { mimeType: "video/AV1" }] }),
+    };
+  });
+
+  it("serializes rapid unawaited setCapture(s1) -> setVideoTrack(v2) -> setCapture(null) cleanly", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    mesh.addMember("carol", false);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const bobPc = FakeRTCPeerConnection.instances[0]!;
+    const removeTrackSpy = vi.spyOn(bobPc, "removeTrack");
+
+    const s1 = makeCapture(true);
+    const v2 = { kind: "video" } as unknown as MediaStreamTrack;
+
+    const p1 = mesh.setCapture(s1);
+    const p2 = mesh.setVideoTrack(v2);
+    const p3 = mesh.setCapture(null);
+    await Promise.all([p1, p2, p3]);
+
+    // Viewer-only peer carol must be closed; mutual peer bob stays open with null tracks.
+    expect(mesh.peers()).toEqual(["bob"]);
+    expect(FakeRTCPeerConnection.instances[1]?.closed).toBe(true);
+    expect(bobPc.closed).toBe(false);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(bobPc.senders[0]?.track ?? null).toBeNull();
+    expect(bobPc.senders[1]?.track ?? null).toBeNull();
+  });
+
+  it("handles direct setCapture(s1) -> setCapture(s2) without null both unawaited and awaited", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const addTxSpy = vi.spyOn(pc, "addTransceiver");
+    const removeTrackSpy = vi.spyOn(pc, "removeTrack");
+
+    // Unawaited s1 -> s2 directly without null
+    const s1 = makeCapture(true);
+    const s2 = makeCapture(true);
+    await Promise.all([mesh.setCapture(s1), mesh.setCapture(s2)]);
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(s2.video);
+    expect(pc.senders[1]?.track).toBe(s2.audio);
+
+    // Awaited direct s2 (V+A) -> s3 (V-only) -> s4 (V+A) without null
+    signals.length = 0;
+    const s3 = makeCapture(false);
+    await mesh.setCapture(s3);
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(pc.senders[0]?.track).toBe(s3.video);
+    expect(pc.senders[1]?.track).toBeNull();
+
+    const s4 = makeCapture(true);
+    await mesh.setCapture(s4);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(pc.senders[0]?.track).toBe(s4.video);
+    expect(pc.senders[1]?.track).toBe(s4.audio);
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+  });
+
+  it("transitions video+audio -> video-only -> video+audio and video-only -> video+audio on an open mutual link", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const addTxSpy = vi.spyOn(pc, "addTransceiver");
+    const removeTrackSpy = vi.spyOn(pc, "removeTrack");
+
+    // Start video-only, stop, then resume with video+audio, stop, video-only, stop, video+audio
+    const c1 = makeCapture(false);
+    await mesh.setCapture(c1);
+    expect(pc.senders[0]?.track).toBe(c1.video);
+    expect(pc.senders[1]?.track).toBeNull();
+    signals.length = 0;
+
+    await mesh.setCapture(null);
+    const c2 = makeCapture(true);
+    await mesh.setCapture(c2);
+    expect(pc.senders[0]?.track).toBe(c2.video);
+    expect(pc.senders[1]?.track).toBe(c2.audio);
+
+    await mesh.setCapture(null);
+    const c3 = makeCapture(false);
+    await mesh.setCapture(c3);
+    expect(pc.senders[0]?.track).toBe(c3.video);
+    expect(pc.senders[1]?.track).toBeNull();
+
+    await mesh.setCapture(null);
+    const c4 = makeCapture(true);
+    await mesh.setCapture(c4);
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(addTxSpy).toHaveBeenCalledTimes(2);
+    expect(removeTrackSpy).not.toHaveBeenCalled();
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(c4.video);
+    expect(pc.senders[1]?.track).toBe(c4.audio);
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+  });
+
+  it("suppresses rejections when removeMember / removePeer / close races mid-replaceTrack and mid-detachCapture", async () => {
+    // Case 1: removeMember mid-replaceTrack during cycle-2 attachCapture
+    const mesh1 = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh1.addMember("bob", true);
+    await mesh1.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc1 = FakeRTCPeerConnection.instances[0]!;
+    await mesh1.setCapture(makeCapture(true));
+    await mesh1.setCapture(null);
+
+    const replaceGate = deferred();
+    pc1.senders[0]!.replaceTrack = () => replaceGate.promise;
+    const attachPromise = mesh1.setCapture(makeCapture(true));
+    await Promise.resolve();
+    mesh1.removeMember("bob");
+    replaceGate.reject(new Error("InvalidStateError: closed during reattach"));
+    await expect(attachPromise).resolves.toBeUndefined();
+    expect(pc1.closed).toBe(true);
+
+    // Case 2: mesh.close() mid-setAudioTrack
+    const mesh2 = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh2.addMember("bob", true);
+    await mesh2.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc2 = FakeRTCPeerConnection.instances[1]!;
+    await mesh2.setCapture(makeCapture(true));
+
+    const audioGate = deferred();
+    pc2.senders[1]!.replaceTrack = () => audioGate.promise;
+    const audioPromise = mesh2.setAudioTrack({ kind: "audio" } as unknown as MediaStreamTrack);
+    await Promise.resolve();
+    mesh2.close();
+    audioGate.reject(new Error("InvalidStateError: closed during audio swap"));
+    await expect(audioPromise).resolves.toBeUndefined();
+    expect(pc2.closed).toBe(true);
+
+    // Case 3: setMemberSharing(false) closing link mid-detachCapture
+    const mesh3 = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh3.addMember("bob", true);
+    await mesh3.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc3 = FakeRTCPeerConnection.instances[2]!;
+    await mesh3.setCapture(makeCapture(true));
+
+    const detachGate = deferred();
+    pc3.senders[0]!.replaceTrack = () => detachGate.promise;
+    const detachPromise = mesh3.setCapture(null);
+    await Promise.resolve();
+    mesh3.setMemberSharing("bob", false);
+    detachGate.reject(new Error("InvalidStateError: closed during detach"));
+    await expect(detachPromise).resolves.toBeUndefined();
+    expect(pc3.closed).toBe(true);
+    expect(mesh3.peers()).toEqual([]);
+  });
+
+  it("suppresses setParameters rejection when link closes mid-applyVideoEncoding during setPreset", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    await mesh.setCapture(makeCapture(false));
+
+    const setParamsGate = deferred();
+    pc.senders[0]!.setParameters = () => setParamsGate.promise;
+
+    const presetPromise = mesh.setPreset({
+      label: "1080p60",
+      width: 1920,
+      height: 1080,
+      frameRate: 60,
+      maxBitrate: 8_000_000,
+    });
+    await Promise.resolve();
+    mesh.removeMember("bob");
+    setParamsGate.reject(new Error("InvalidStateError: PeerConnection is closed"));
+
+    await expect(presetPromise).resolves.toBeUndefined();
+    expect(pc.closed).toBe(true);
+  });
+
+  it("applies setPreset and setDegradation called while attachCapture is mid-applyInitialEncodings", async () => {
+    const setParamsGate = deferred();
+    let intercepted = false;
+    const addTxSpy = vi
+      .spyOn(FakeRTCPeerConnection.prototype, "addTransceiver")
+      .mockImplementation(function (
+        this: FakeRTCPeerConnection,
+        trackOrKind: MediaStreamTrack | string,
+      ): RTCRtpTransceiver {
+        const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
+        const tx = this.transceivers.find((t) => t.sender === sender)!;
+        if (typeof trackOrKind !== "string" && !intercepted) {
+          intercepted = true;
+          const origSetParams = tx.sender.setParameters.bind(tx.sender);
+          let first = true;
+          tx.sender.setParameters = async (p: RTCRtpSendParameters) => {
+            if (first) {
+              first = false;
+              await setParamsGate.promise;
+            }
+            return origSetParams(p);
+          };
+        }
+        return tx;
+      });
+
+    try {
+      const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+      mesh.addMember("bob", false);
+
+      const attachPromise = mesh.setCapture(makeCapture(false));
+      // Let runAttachCapture enter applyInitialEncodings and pause at video setParameters
+      await new Promise((r) => setTimeout(r, 0));
+
+      const presetPromise = mesh.setPreset({
+        label: "1080p60",
+        width: 1920,
+        height: 1080,
+        frameRate: 60,
+        maxBitrate: 8_000_000,
+      });
+      const degradationPromise = mesh.setDegradation("clarity");
+
+      setParamsGate.resolve();
+      await Promise.all([attachPromise, presetPromise, degradationPromise]);
+
+      const sender = FakeRTCPeerConnection.instances[0]!.senders[0]!;
+      expect(sender.getParameters().encodings?.[0]?.maxBitrate).toBe(8_000_000);
+      expect(sender.getParameters().degradationPreference).toBe("maintain-framerate-and-resolution");
+    } finally {
+      addTxSpy.mockRestore();
+    }
+  });
+
+  it("handles setCodec before first share, mid-attachCapture, on idle round-trip, and while signaling is non-stable", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    // 1. Change codec while idle before first share -> first addTransceiver uses AV1 directly
+    mesh.setCodec("av1");
+    await mesh.setCapture(makeCapture(false));
+    const setCodecSpy = vi.spyOn(pc.transceivers[0]!, "setCodecPreferences");
+    expect(setCodecSpy).toHaveBeenCalledTimes(1);
+    expect(Array.from(setCodecSpy.mock.calls[0]?.[0] ?? [])[0]?.mimeType).toBe("video/AV1");
+    setCodecSpy.mockClear();
+
+    // 2. Idle round-trip av1 -> h264 -> av1 must NOT trigger spurious renegotiation on resume
+    await mesh.setCapture(null);
+    signals.length = 0;
+    mesh.setCodec("h264");
+    mesh.setCodec("av1");
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(setCodecSpy).not.toHaveBeenCalled();
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+
+    // 3. Mid-attachCapture codec change is detected by syncCodecIfChanged and triggers renegotiation
+    await mesh.setCapture(null);
+    const paramsGate = deferred();
+    const origSetParams = pc.senders[0]!.setParameters.bind(pc.senders[0]!);
+    let blockOnce = true;
+    pc.senders[0]!.setParameters = async (p: RTCRtpSendParameters) => {
+      if (blockOnce) {
+        blockOnce = false;
+        await paramsGate.promise;
+      }
+      return origSetParams(p);
+    };
+
+    signals.length = 0;
+    const attachPromise = mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 0));
+    mesh.setCodec("h264");
+    paramsGate.resolve();
+    await attachPromise;
+    await new Promise((r) => setTimeout(r, 10));
+    expect(setCodecSpy).toHaveBeenCalledTimes(1);
+    expect(Array.from(setCodecSpy.mock.calls[0]?.[0] ?? [])[0]?.mimeType).toBe("video/H264");
+    expect(signals.some((s) => s.data.k === "offer")).toBe(true);
+
+    // 4. Idle codec drift resumed while signalingState === "have-local-offer" flushes offer after remote answer
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    await mesh.setCapture(null);
+    setCodecSpy.mockClear();
+    signals.length = 0;
+    mesh.setCodec("av1");
+    pc.signalingState = "have-local-offer";
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(setCodecSpy).toHaveBeenCalledTimes(1);
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(signals.some((s) => s.data.k === "offer")).toBe(true);
+  });
+
+  it("does not emit a deferred renegotiation offer after removePeer races a live setCodec", async () => {
+    const signals: Array<{ to: string; data: SignalData }> = [];
+    const mesh = new Mesh("me", { ...opts }, (to, data) => signals.push({ to, data }), cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    await mesh.setCapture(makeCapture(false));
+    signals.length = 0;
+
+    mesh.setCodec("av1");
+    mesh.removePeer("bob");
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(signals.some((s) => s.data.k === "offer")).toBe(false);
+  });
+
+  it("enforces setMemberSharing transitions, video/audio ended retention, and zero open PCs when nobody shares", async () => {
+    const callbacks = cb();
+    const mesh = new Mesh("me", { ...opts }, () => {}, callbacks);
+    mesh.addMember("bob", true);
+    await mesh.setCapture(makeCapture(false));
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const videoListeners: Record<string, () => void> = {};
+    const audioListeners: Record<string, () => void> = {};
+    const videoTrack = {
+      kind: "video",
+      addEventListener: (ev: string, fn: () => void) => { videoListeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+    const audioTrack = {
+      kind: "audio",
+      addEventListener: (ev: string, fn: () => void) => { audioListeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+    const remoteStream = { id: "bob-stream", getTracks: () => [videoTrack, audioTrack] } as unknown as MediaStream;
+
+    pc.ontrack?.({ track: videoTrack, receiver: {} as unknown as RTCRtpReceiver, streams: [remoteStream] } as unknown as RTCTrackEvent);
+    pc.ontrack?.({ track: audioTrack, receiver: {} as unknown as RTCRtpReceiver, streams: [remoteStream] } as unknown as RTCTrackEvent);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
+
+    // Audio ended must NOT clear retained remoteStream
+    audioListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).not.toHaveBeenCalled();
+
+    // false -> false is a no-op; false -> true re-emits retained stream once
+    mesh.setMemberSharing("bob", false);
+    mesh.setMemberSharing("bob", false);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(2);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(3);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(3);
+
+    // Video ended clears remoteStream -> subsequent false -> true must NOT re-emit dead stream
+    videoListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).toHaveBeenCalledTimes(1);
+    mesh.setMemberSharing("bob", false);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(3);
+
+    // When both stop sharing, zero open RTCPeerConnections remain and late ended does not double-fire
+    await mesh.setCapture(null);
+    mesh.setMemberSharing("bob", false);
+    expect(mesh.peers()).toEqual([]);
+    expect(FakeRTCPeerConnection.instances.every((inst) => inst.closed)).toBe(true);
+    videoListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves video remoteStream teardown when audio arrives on a separate MediaStream", async () => {
+    const callbacks = cb();
+    const mesh = new Mesh("me", { ...opts }, () => {}, callbacks);
+    mesh.addMember("bob", true);
+    await mesh.setCapture(makeCapture(false));
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const videoListeners: Record<string, () => void> = {};
+    const videoTrack = {
+      kind: "video",
+      addEventListener: (ev: string, fn: () => void) => { videoListeners[ev] = fn; },
+    } as unknown as MediaStreamTrack;
+    const audioTrack = {
+      kind: "audio",
+      addEventListener: vi.fn(),
+    } as unknown as MediaStreamTrack;
+    const videoStream = { id: "video-only", getTracks: () => [videoTrack] } as unknown as MediaStream;
+    const audioStream = { id: "audio-only", getTracks: () => [audioTrack] } as unknown as MediaStream;
+
+    pc.ontrack?.({ track: videoTrack, receiver: {} as unknown as RTCRtpReceiver, streams: [videoStream] } as unknown as RTCTrackEvent);
+    pc.ontrack?.({ track: audioTrack, receiver: {} as unknown as RTCRtpReceiver, streams: [audioStream] } as unknown as RTCTrackEvent);
+
+    // Video ended must still tear down the remote stream and prevent re-emitting an audio-only stream
+    videoListeners["ended"]?.();
+    expect(callbacks.onRemoteStreamGone).toHaveBeenCalledWith("bob");
+
+    const callsBefore = vi.mocked(callbacks.onRemoteStream).mock.calls.length;
+    mesh.setMemberSharing("bob", false);
+    mesh.setMemberSharing("bob", true);
+    expect(callbacks.onRemoteStream).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it("restricts ICE restart on connectionState failed strictly to active sending phases on a mutual link", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    // 1. Viewer-only before sharing: no restart
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(0);
+
+    // 2. Mid-attachCapture (before isSending flips): no restart
+    const paramsGate = deferred();
+    const addTxSpy = vi
+      .spyOn(pc, "addTransceiver")
+      .mockImplementation(function (
+        this: FakeRTCPeerConnection,
+        trackOrKind: MediaStreamTrack | string,
+      ): RTCRtpTransceiver {
+        const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
+        const tx = this.transceivers.find((t) => t.sender === sender)!;
+        if (typeof trackOrKind !== "string") {
+          const origSetParams = tx.sender.setParameters.bind(tx.sender);
+          let once = true;
+          tx.sender.setParameters = async (p: RTCRtpSendParameters) => {
+            if (once) {
+              once = false;
+              await paramsGate.promise;
+            }
+            return origSetParams(p);
+          };
+        }
+        return tx;
+      });
+
+    const attachPromise = mesh.setCapture(makeCapture(true));
+    await new Promise((r) => setTimeout(r, 0));
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(0);
+
+    paramsGate.resolve();
+    await attachPromise;
+    addTxSpy.mockRestore();
+
+    // 3. Actively sharing: restarts ICE
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(1);
+
+    // 4. Immediately upon setCapture(null) even while detachCapture is still pending: no restart
+    const detachGate = deferred();
+    const origReplace = pc.senders[0]!.replaceTrack.bind(pc.senders[0]!);
+    pc.senders[0]!.replaceTrack = async (t: MediaStreamTrack | null) => {
+      await detachGate.promise;
+      return origReplace(t);
+    };
+    const detachPromise = mesh.setCapture(null);
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(1);
+
+    detachGate.resolve();
+    await detachPromise;
+
+    // 5. Resumed share (cycle 2): restarts ICE again
+    pc.senders[0]!.replaceTrack = origReplace;
+    await mesh.setCapture(makeCapture(false));
+    pc.connectionState = "failed";
+    pc.onconnectionstatechange?.();
+    expect(pc.restartIceCalls).toBe(2);
+  });
+
+  it("does not poison mediaQueue after open-link rejections in attachCapture, replaceVideo, or replaceAudio", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const origAddTx = pc.addTransceiver.bind(pc);
+    const addTxSpy = vi.spyOn(pc, "addTransceiver");
+
+    // 1. Fail initial attachCapture via setParameters on an open link -> must reject, not poison queue
+    let failFirstParams = true;
+    addTxSpy.mockImplementation((trackOrKind: MediaStreamTrack | string, init?: RTCRtpTransceiverInit) => {
+      const tx = origAddTx(trackOrKind, init);
+      if (typeof trackOrKind !== "string") {
+        const origSetParams = tx.sender.setParameters.bind(tx.sender);
+        tx.sender.setParameters = async (p: RTCRtpSendParameters) => {
+          if (failFirstParams) {
+            failFirstParams = false;
+            throw new Error("Transient setParameters failure");
+          }
+          return origSetParams(p);
+        };
+      }
+      return tx;
+    });
+
+    await expect(mesh.setCapture(makeCapture(true))).rejects.toThrow("Transient setParameters failure");
+
+    // Subsequent attachCapture must succeed and reuse the 2 transceivers already created
+    const c1 = makeCapture(true);
+    await expect(mesh.setCapture(c1)).resolves.toBeUndefined();
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.senders[0]?.track).toBe(c1.video);
+    expect(pc.senders[1]?.track).toBe(c1.audio);
+
+    // 2. Fail replaceVideo on an open link -> must reject, not poison queue
+    const origVideoReplace = pc.senders[0]!.replaceTrack.bind(pc.senders[0]!);
+    pc.senders[0]!.replaceTrack = async () => {
+      throw new Error("Video replaceTrack boom");
+    };
+    await expect(mesh.setVideoTrack({ kind: "video" } as unknown as MediaStreamTrack)).rejects.toThrow(
+      "Video replaceTrack boom",
+    );
+
+    pc.senders[0]!.replaceTrack = origVideoReplace;
+    const v2 = { kind: "video" } as unknown as MediaStreamTrack;
+    await expect(mesh.setVideoTrack(v2)).resolves.toBeUndefined();
+    expect(pc.senders[0]?.track).toBe(v2);
+
+    // 3. Fail replaceAudio on an open link -> must reject, not poison queue
+    const origAudioReplace = pc.senders[1]!.replaceTrack.bind(pc.senders[1]!);
+    pc.senders[1]!.replaceTrack = async () => {
+      throw new Error("Audio replaceTrack boom");
+    };
+    await expect(mesh.setAudioTrack({ kind: "audio" } as unknown as MediaStreamTrack)).rejects.toThrow(
+      "Audio replaceTrack boom",
+    );
+
+    pc.senders[1]!.replaceTrack = origAudioReplace;
+    const a2 = { kind: "audio" } as unknown as MediaStreamTrack;
+    await expect(mesh.setAudioTrack(a2)).resolves.toBeUndefined();
+    expect(pc.senders[1]?.track).toBe(a2);
+
+    // 4. Subsequent detachCapture still runs cleanly
+    await expect(mesh.setCapture(null)).resolves.toBeUndefined();
+    expect(pc.senders[0]?.track).toBeNull();
+    expect(pc.senders[1]?.track).toBeNull();
+  });
+});
