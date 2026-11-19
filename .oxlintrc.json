@@ -94,24 +94,6 @@
       }
     },
     {
-      "files": ["src/main.ts"],
-      "rules": {
-        "max-lines": "allow",
-        "complexity": "allow"
-      }
-    },
-    {
-      "files": [
-        "src/signaling.ts",
-        "shared/protocol.ts",
-        "src/ui-model.ts",
-        "scripts/smoke-test.ts"
-      ],
-      "rules": {
-        "complexity": "allow"
-      }
-    },
-    {
       "files": ["worker/room.ts"],
       "rules": {
         "max-lines": "allow",

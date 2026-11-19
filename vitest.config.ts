@@ -24,7 +24,7 @@ const config: ViteUserConfig = defineConfig({
         "scripts/check-guardrails-diff.ts",
         "worker/ratelimit.ts",
       ],
-      exclude: ["src/main.ts", "src/platform/types.ts"],
+      exclude: ["src/main.ts", "src/views/**/*.ts", "src/platform/types.ts"],
       reporter: ["text", "json", "html", "lcov"],
       thresholds: {
         statements: 93,

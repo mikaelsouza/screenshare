@@ -17,7 +17,7 @@ import {
 } from "@shared/protocol";
 
 /** Room control state carried by the welcome. */
-interface RoomInfo {
+export interface RoomInfo {
   /** Whether we are the room's host. */
   host: boolean;
   /** Present when room is unlocked (or always for host) so Invite ▾ can share CODE-SECRET. */
@@ -29,7 +29,7 @@ interface RoomInfo {
   locked: boolean;
 }
 
-interface SignalingHandlers {
+export interface SignalingHandlers {
   onWelcome(selfId: PeerId, peers: PeerInfo[], room: RoomInfo): void;
   onPeerJoined(peer: PeerInfo, replaces?: PeerId): void;
   onPeerLeft(id: PeerId, kicked?: boolean): void;
@@ -254,31 +254,43 @@ export class SignalingClient {
     };
   }
 
+  private handleWelcome(msg: Extract<ServerMessage, { t: "welcome" }>): void {
+    // Proof the connection actually worked, which is what clears the counters.
+    const sameSelf = this.currentSelfId === null || this.currentSelfId === msg.selfId;
+    this.currentSelfId = msg.selfId;
+    this.attempts = 0;
+    this.capacityRefusals = 0;
+    this.welcomed = true;
+    this.socketWelcomed = true;
+    const queued = this.pendingMessages;
+    this.pendingMessages = [];
+    for (const m of queued) {
+      if (!sameSelf && m.t === "signal") continue;
+      this.send(m);
+    }
+    this.handlers.onWelcome(msg.selfId, msg.peers, {
+      host: msg.host === true,
+      ...(typeof msg.password === "string" ? { password: msg.password } : {}),
+      ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
+      ...(typeof msg.rejoinToken === "string" ? { rejoinToken: msg.rejoinToken } : {}),
+      locked: msg.locked === true,
+    });
+  }
+
+  private handleError(msg: Extract<ServerMessage, { t: "error" }>): void {
+    this.receivedError = true;
+    this.lastError = { code: msg.code, message: msg.message };
+    if (FATAL_ERROR_CODES.has(msg.code)) {
+      this.markFatal();
+    }
+    this.handlers.onError(msg.code, msg.message);
+  }
+
   private dispatch(msg: ServerMessage): void {
     switch (msg.t) {
-      case "welcome": {
-        // Proof the connection actually worked, which is what clears the counters.
-        const sameSelf = this.currentSelfId === null || this.currentSelfId === msg.selfId;
-        this.currentSelfId = msg.selfId;
-        this.attempts = 0;
-        this.capacityRefusals = 0;
-        this.welcomed = true;
-        this.socketWelcomed = true;
-        const queued = this.pendingMessages;
-        this.pendingMessages = [];
-        for (const m of queued) {
-          if (!sameSelf && m.t === "signal") continue;
-          this.send(m);
-        }
-        this.handlers.onWelcome(msg.selfId, msg.peers, {
-          host: msg.host === true,
-          ...(typeof msg.password === "string" ? { password: msg.password } : {}),
-          ...(typeof msg.hostToken === "string" ? { hostToken: msg.hostToken } : {}),
-          ...(typeof msg.rejoinToken === "string" ? { rejoinToken: msg.rejoinToken } : {}),
-          locked: msg.locked === true,
-        });
+      case "welcome":
+        this.handleWelcome(msg);
         break;
-      }
       case "peer-joined":
         this.handlers.onPeerJoined(msg.peer, msg.replaces);
         break;
@@ -304,12 +316,7 @@ export class SignalingClient {
         this.handlers.onHostPromoted?.(msg.hostId, msg.hostToken, msg.password);
         break;
       case "error":
-        this.receivedError = true;
-        this.lastError = { code: msg.code, message: msg.message };
-        if (FATAL_ERROR_CODES.has(msg.code)) {
-          this.markFatal();
-        }
-        this.handlers.onError(msg.code, msg.message);
+        this.handleError(msg);
         break;
     }
   }

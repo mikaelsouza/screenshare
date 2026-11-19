@@ -459,11 +459,17 @@ export function formatInviteCode(code: string, password: string): string {
  * Inspects URL fragments BEFORE uppercasing so hostnames or paths containing dots/hyphens
  * are never confused with invite separators.
  */
-export function parseInviteInput(raw: string): InviteParseResult {
-  const trimmed = raw.trim();
-  if (!trimmed) return { ok: false, reason: "empty" };
+function decodeFragment(raw: string): string {
+  try {
+    return decodeURIComponent(raw).trim();
+  } catch {
+    return raw;
+  }
+}
 
-  let candidate = trimmed;
+function extractInviteCandidate(
+  trimmed: string,
+): { ok: true; candidate: string } | { ok: false; reason: InviteParseFailureReason } {
   if (/^https?:\/\//i.test(trimmed)) {
     let parsedUrl: URL;
     try {
@@ -473,32 +479,28 @@ export function parseInviteInput(raw: string): InviteParseResult {
     }
     const fragment = parsedUrl.hash.replace(/^#+/, "").trim();
     if (!fragment) return { ok: false, reason: "url-missing-invite" };
-    try {
-      candidate = decodeURIComponent(fragment).trim();
-    } catch {
-      candidate = fragment;
-    }
-  } else {
-    const hashIdx = trimmed.indexOf("#");
-    if (hashIdx !== -1) {
-      const beforeHash = trimmed.slice(0, hashIdx);
-      const afterHash = trimmed.slice(hashIdx + 1).replace(/^#+/, "").trim();
-      if (!afterHash) {
-        return beforeHash.trim().length > 0
-          ? { ok: false, reason: "url-missing-invite" }
-          : { ok: false, reason: "empty" };
-      }
-      try {
-        candidate = decodeURIComponent(afterHash).trim();
-      } catch {
-        candidate = afterHash;
-      }
-    } else if (/^(?:\/|[a-z0-9.-]+\.[a-z]{2,}\/)/i.test(trimmed)) {
-      return { ok: false, reason: "url-missing-invite" };
-    }
+    return { ok: true, candidate: decodeFragment(fragment) };
   }
 
-  const upper = candidate.toUpperCase();
+  const hashIdx = trimmed.indexOf("#");
+  if (hashIdx !== -1) {
+    const beforeHash = trimmed.slice(0, hashIdx);
+    const afterHash = trimmed.slice(hashIdx + 1).replace(/^#+/, "").trim();
+    if (!afterHash) {
+      return beforeHash.trim().length > 0
+        ? { ok: false, reason: "url-missing-invite" }
+        : { ok: false, reason: "empty" };
+    }
+    return { ok: true, candidate: decodeFragment(afterHash) };
+  }
+
+  if (/^(?:\/|[a-z0-9.-]+\.[a-z]{2,}\/)/i.test(trimmed)) {
+    return { ok: false, reason: "url-missing-invite" };
+  }
+  return { ok: true, candidate: trimmed };
+}
+
+function parseInviteTokens(upper: string): InviteParseResult {
   const sepMatch = /^([A-Z0-9]+)[-.]([A-Z0-9]*)$/.exec(upper);
   if (sepMatch) {
     const codePart = sepMatch[1] ?? "";
@@ -506,26 +508,28 @@ export function parseInviteInput(raw: string): InviteParseResult {
     if (passPart.length === 0) {
       return isValidRoomCode(codePart) ? { ok: false, reason: "missing-secret" } : { ok: false, reason: "invalid" };
     }
-    if (isValidRoomCode(codePart) && isValidRoomPassword(passPart)) {
-      return { ok: true, code: codePart, password: passPart };
-    }
-    return { ok: false, reason: "invalid" };
+    return isValidRoomCode(codePart) && isValidRoomPassword(passPart)
+      ? { ok: true, code: codePart, password: passPart }
+      : { ok: false, reason: "invalid" };
   }
 
   if (upper.length === ROOM_CODE_LENGTH + ROOM_PASSWORD_LENGTH) {
     const codePart = upper.slice(0, ROOM_CODE_LENGTH);
     const passPart = upper.slice(ROOM_CODE_LENGTH);
-    if (isValidRoomCode(codePart) && isValidRoomPassword(passPart)) {
-      return { ok: true, code: codePart, password: passPart };
-    }
-    return { ok: false, reason: "invalid" };
+    return isValidRoomCode(codePart) && isValidRoomPassword(passPart)
+      ? { ok: true, code: codePart, password: passPart }
+      : { ok: false, reason: "invalid" };
   }
 
-  if (isValidRoomCode(upper)) {
-    return { ok: false, reason: "missing-secret" };
-  }
+  return isValidRoomCode(upper) ? { ok: false, reason: "missing-secret" } : { ok: false, reason: "invalid" };
+}
 
-  return { ok: false, reason: "invalid" };
+export function parseInviteInput(raw: string): InviteParseResult {
+  const trimmed = raw.trim();
+  if (!trimmed) return { ok: false, reason: "empty" };
+  const extracted = extractInviteCandidate(trimmed);
+  if (!extracted.ok) return extracted;
+  return parseInviteTokens(extracted.candidate.toUpperCase());
 }
 
 /**

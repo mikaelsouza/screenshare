@@ -1,0 +1,533 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { parseInviteInput } from "@shared/protocol";
+import { SessionController } from "@src/controllers/session-controller";
+import { readPersistedHostToken, writePersistedHostToken } from "@src/host-tokens";
+
+function createMemoryStorage(): Storage {
+  const data = new Map<string, string>();
+  return {
+    get length() {
+      return data.size;
+    },
+    clear() {
+      data.clear();
+    },
+    getItem(key: string) {
+      return data.get(key) ?? null;
+    },
+    key(index: number) {
+      return [...data.keys()][index] ?? null;
+    },
+    removeItem(key: string) {
+      data.delete(key);
+    },
+    setItem(key: string, value: string) {
+      data.set(key, value);
+    },
+  };
+}
+
+function makeController(overrides?: {
+  local?: Storage | null;
+  session?: Storage | null;
+  onForgetHostUiChange?: () => void;
+}) {
+  const local = overrides?.local !== undefined ? overrides.local : createMemoryStorage();
+  const sess = overrides?.session !== undefined ? overrides.session : createMemoryStorage();
+  const tasks: Promise<unknown>[] = [];
+  const onForgetHostUiChange = overrides?.onForgetHostUiChange ?? vi.fn();
+  const ctrl = new SessionController({
+    getLocalStorage: () => local,
+    getSessionStorage: () => sess,
+    getLocks: () => null,
+    runBackground: (t) => {
+      tasks.push(t);
+    },
+    onForgetHostUiChange,
+  });
+  return { ctrl, local, sess, tasks, onForgetHostUiChange };
+}
+
+describe("SessionController", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("persists creator host tokens separately from ephemeral session host tokens", async () => {
+    const { ctrl, local, sess, tasks } = makeController();
+    ctrl.saveCreatorHostToken("ABCD1234", "creator-tok");
+    await Promise.all(tasks);
+
+    expect(ctrl.hasSavedCreatorHostFor("ABCD1234")).toBe(true);
+    expect(ctrl.hasAnySavedCreatorHosts()).toBe(true);
+    expect(ctrl.hostTokenFor("ABCD1234")).toBe("creator-tok");
+
+    // Promoted session host token takes precedence in-memory without overwriting localStorage creator token
+    ctrl.saveSessionHostToken("ABCD1234", "promoted-tok");
+    expect(ctrl.hostTokenFor("ABCD1234")).toBe("promoted-tok");
+
+    // Clearing room session drops promoted session token + rejoin token but keeps creator provenance
+    ctrl.lastJoinCode = "ABCD1234";
+    ctrl.saveActiveRoom("ABCD1234");
+    ctrl.saveRejoinToken("ABCD1234", "rejoin-1");
+    ctrl.clearRoomSession();
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("ABCD1234")).toBeUndefined();
+    expect(ctrl.hostTokenFor("ABCD1234")).toBe("creator-tok");
+
+    // Legacy sessionStorage host:CODE migration
+    sess?.setItem("host:WXYZ5678", "legacy-tok");
+    expect(ctrl.hostTokenFor("WXYZ5678")).toBe("legacy-tok");
+    await Promise.all(tasks);
+    expect(sess?.getItem("host:WXYZ5678")).toBeNull();
+    expect(ctrl.hasSavedCreatorHostFor("WXYZ5678")).toBe(true);
+
+    // Cross-tab storage sync removes deleted creator tokens and updates rotated ones
+    writePersistedHostToken(local, "ABCD1234", undefined);
+    writePersistedHostToken(local, "WXYZ5678", "updated-tok");
+    ctrl.syncCreatorTokensFromStorage();
+    expect(ctrl.hasSavedCreatorHostFor("ABCD1234")).toBe(false);
+    expect(ctrl.hostTokenFor("WXYZ5678")).toBe("updated-tok");
+
+    // Forget all clears both maps and storage
+    ctrl.forgetAllHostTokens();
+    await Promise.all(tasks);
+    expect(ctrl.hasAnySavedCreatorHosts()).toBe(false);
+    expect(ctrl.hostTokenFor("WXYZ5678")).toBeUndefined();
+  });
+
+  it("handles welcome credentials, room state, room password, and host promotion", async () => {
+    const { ctrl, tasks } = makeController();
+    ctrl.selfId = "self1";
+    ctrl.members.set("peer2", { name: "Bob", sharing: false, host: true });
+
+    ctrl.saveCreatorHostToken("ABCD1234", "creator-tok");
+    await Promise.all(tasks);
+
+    // Non-host welcome in locked room clears roomPassword and requests invite hide
+    const res1 = ctrl.applyWelcomeCredentials(
+      "ABCD1234",
+      { host: false, locked: true, rejoinToken: "rj-1" },
+      "creator-tok",
+    );
+    expect(res1.hideInvite).toBe(true);
+    expect(ctrl.roomPassword).toBeNull();
+    expect(ctrl.rejoinTokenFor("ABCD1234")).toBe("rj-1");
+
+    // Host welcome with hostToken stores in sessionHostTokens
+    const res2 = ctrl.applyWelcomeCredentials(
+      "ABCD1234",
+      { host: true, locked: false, hostToken: "promo-1", password: "PASSWORD12345678", rejoinToken: "rj-2" },
+      undefined,
+    );
+    expect(res2.hideInvite).toBe(false);
+    expect(ctrl.roomPassword).toBe("PASSWORD12345678");
+    expect(ctrl.hostTokenFor("ABCD1234")).toBe("promo-1");
+
+    // Creator welcome without new hostToken refreshes creator token
+    ctrl.deleteSessionHostToken("ABCD1234");
+    const res3 = ctrl.applyWelcomeCredentials("ABCD1234", { host: true, locked: false }, "creator-tok");
+    expect(res3.hideInvite).toBe(false);
+    await Promise.all(tasks);
+
+    // Room lock clears password for non-host, unlock restores it
+    ctrl.isHost = false;
+    ctrl.applyRoomState(true);
+    expect(ctrl.roomLocked).toBe(true);
+    expect(ctrl.roomPassword).toBeNull();
+    ctrl.applyRoomState(false, "UNLOCKED12345678");
+    expect(ctrl.roomPassword).toBe("UNLOCKED12345678");
+
+    // Room password update while locked as non-host without password clears password
+    ctrl.roomLocked = true;
+    ctrl.applyRoomPassword("ABCD1234", undefined, "rj-3");
+    expect(ctrl.roomPassword).toBeNull();
+    expect(ctrl.rejoinTokenFor("ABCD1234")).toBe("rj-3");
+
+    // Host promotion to self updates isHost, member flags, session host token, and password
+    ctrl.applyHostPromoted("ABCD1234", "self1", "promo-2", "SECRET1234567890");
+    expect(ctrl.isHost).toBe(true);
+    expect(ctrl.members.get("peer2")?.host).toBe(false);
+    expect(ctrl.hostTokenFor("ABCD1234")).toBe("promo-2");
+    expect(ctrl.roomPassword).toBe("SECRET1234567890");
+  });
+
+  it("classifies errors and cleans up session vs creator tokens on fatal errors", async () => {
+    const { ctrl, tasks } = makeController();
+    ctrl.saveCreatorHostToken("ABCD1234", "creator-tok");
+    ctrl.saveSessionHostToken("ABCD1234", "sess-tok");
+    ctrl.saveRejoinToken("ABCD1234", "rj-1");
+    ctrl.saveActiveRoom("ABCD1234");
+    ctrl.lastJoinCode = "ABCD1234";
+    await Promise.all(tasks);
+
+    expect(ctrl.classifyError("ABCD1234", "kicked", "raw", true)).toEqual({
+      friendly: "You were removed from this room by its host.",
+      severity: "fatal",
+      clearPendingKicks: true,
+    });
+    expect(ctrl.classifyError("ABCD1234", "not-host", "Only host", false)).toEqual({
+      friendly: "Only host",
+      severity: "warn",
+      clearPendingKicks: true,
+    });
+    expect(ctrl.classifyError("ABCD1234", "unknown-peer", "nope", false)).toEqual({
+      friendly: "nope",
+      severity: "ignore",
+      clearPendingKicks: true,
+    });
+    expect(ctrl.classifyError("ABCD1234", "not-sharing", "nope", false)).toEqual({
+      friendly: "nope",
+      severity: "ignore",
+      clearPendingKicks: false,
+    });
+    expect(ctrl.classifyError("ABCD1234", "rate-limited", "Slow down", false)).toEqual({
+      friendly: "Slow down",
+      severity: "error",
+      clearPendingKicks: true,
+    });
+    expect(ctrl.classifyError("ABCD1234", "room-full", "Full", false)).toEqual({
+      friendly: "room-full: Full",
+      severity: "error",
+      clearPendingKicks: true,
+    });
+
+    // Kicked wipes session AND matching creator token
+    ctrl.applyFatalErrorCleanup("ABCD1234", "kicked", true, "creator-tok");
+    await Promise.all(tasks);
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("ABCD1234")).toBeUndefined();
+    expect(ctrl.hasSavedCreatorHostFor("ABCD1234")).toBe(false);
+    expect(ctrl.lastJoinCode).toBeNull();
+
+    // Non-session-wiping fatal error before welcome clears activeRoom only
+    ctrl.saveActiveRoom("WXYZ5678");
+    ctrl.saveRejoinToken("WXYZ5678", "rj-keep");
+    ctrl.applyFatalErrorCleanup("WXYZ5678", "connection-failed", false, undefined);
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("WXYZ5678")).toBe("rj-keep");
+  });
+
+  it("manages transient room notices, pending kicks, and boot/hash resolution", () => {
+    const { ctrl } = makeController();
+    ctrl.selfId = "self1";
+    ctrl.lastJoinCode = "ABCD1234";
+
+    const shown: string[] = [];
+    const expired: string[] = [];
+    const restored: string[] = [];
+    ctrl.showTransientNotice("Notice!", (m) => shown.push(m), (m) => expired.push(m), 3000);
+    expect(shown).toEqual(["Notice!"]);
+    expect(ctrl.currentTransientNotice).toBe("Notice!");
+
+    ctrl.dismissTransientNotice("Notice!", true, (t) => restored.push(t));
+    expect(restored).toEqual(["In room ABCD1234 \u2014 1/20 connected"]);
+    expect(ctrl.currentTransientNotice).toBeNull();
+
+    ctrl.showTransientNotice("Notice 2", (m) => shown.push(m), (m) => expired.push(m), 3000);
+    vi.advanceTimersByTime(3000);
+    expect(expired).toEqual(["Notice 2"]);
+
+    // Pending kicks
+    const onTimeout = vi.fn();
+    expect(ctrl.startPendingKick("p1", "Bob", onTimeout, 5000)).toBe(true);
+    expect(ctrl.startPendingKick("p1", "Bob", onTimeout, 5000)).toBe(false);
+    expect(ctrl.hasPendingKick("p1")).toBe(true);
+    expect(ctrl.consumePendingKick("p1")).toBe("Bob");
+    expect(ctrl.consumePendingKick("p1")).toBeNull();
+
+    ctrl.startPendingKick("p2", "Cara", onTimeout, 5000);
+    vi.advanceTimersByTime(5000);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(ctrl.hasPendingKick("p2")).toBe(false);
+
+    // Boot / hash resolution
+    expect(ctrl.resolveBootAction("#bad", false, { active: false, fatal: false, ready: false }).kind).toBe("error");
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-ABCDEFGH23456789", false, { active: false, fatal: false, ready: false }),
+    ).toEqual({ kind: "enter-invite", code: "ABCD2345", password: "ABCDEFGH23456789" });
+
+    ctrl.lastJoinCode = "ABCD2345";
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-ABCDEFGH23456789", true, { active: true, fatal: false, ready: false }),
+    ).toEqual({ kind: "reconnect-current", password: "ABCDEFGH23456789" });
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-ABCDEFGH23456789", true, { active: true, fatal: false, ready: true }),
+    ).toEqual({ kind: "none" });
+    expect(ctrl.resolveBootAction("", true, { active: false, fatal: false, ready: false })).toEqual({ kind: "none" });
+
+    // Resume saved room on F5 reload
+    ctrl.saveActiveRoom("ABCD2345");
+    ctrl.saveRejoinToken("ABCD2345", "rj-f5");
+    expect(ctrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({
+      kind: "resume-saved",
+      code: "ABCD2345",
+    });
+
+    // Invalid or tokenless saved room is cleared
+    ctrl.saveRejoinToken("ABCD2345", undefined);
+    expect(ctrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({ kind: "none" });
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+
+    ctrl.resetRoomState();
+    expect(ctrl.selfId).toBeNull();
+    expect(ctrl.isHost).toBe(false);
+    expect(ctrl.roomLocked).toBe(false);
+  });
+
+  it("handles unavailable storage gracefully", () => {
+    const throwingStorage = {
+      get length() {
+        return 0;
+      },
+      clear() {
+        throw new Error("denied");
+      },
+      getItem() {
+        throw new Error("denied");
+      },
+      key() {
+        throw new Error("denied");
+      },
+      removeItem() {
+        throw new Error("denied");
+      },
+      setItem() {
+        throw new Error("denied");
+      },
+    } as Storage;
+
+    const { ctrl } = makeController({ local: null, session: throwingStorage });
+    expect(ctrl.readSession("missing")).toBeUndefined();
+    ctrl.writeSession("k", "v");
+    expect(ctrl.readSession("k")).toBe("v");
+    ctrl.writeSession("k", undefined);
+    expect(ctrl.readSession("k")).toBeUndefined();
+    ctrl.clearRoomSession();
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+  });
+
+  it("enforces creator vs mid-session promoted guest hostToken provenance without overwriting localStorage", async () => {
+    const { ctrl, local, sess, tasks } = makeController();
+    ctrl.selfId = "guest1";
+
+    // Promoted mid-session guest gets an in-memory sessionHostToken ONLY, never localStorage
+    ctrl.applyHostPromoted("ABCD2345", "guest1", "promoted-guest-tok", "PASS123456789012");
+    await Promise.all(tasks);
+    expect(ctrl.isHost).toBe(true);
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("promoted-guest-tok");
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(false);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBeUndefined();
+
+    // Creator token in localStorage is NOT overwritten by mid-session promotion or welcome hostToken
+    ctrl.saveCreatorHostToken("ABCD2345", "creator-orig");
+    await Promise.all(tasks);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-orig");
+
+    ctrl.applyWelcomeCredentials(
+      "ABCD2345",
+      { host: true, locked: false, hostToken: "ephemeral-host-tok", password: "PASS123456789012" },
+      "creator-orig",
+    );
+    await Promise.all(tasks);
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("ephemeral-host-tok");
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-orig");
+
+    // Non-host welcome drops ephemeral session token while preserving creator provenance
+    ctrl.applyWelcomeCredentials("ABCD2345", { host: false, locked: false }, "creator-orig");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-orig");
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-orig");
+
+    // forgetCreatorHostToken with non-matching token preserves both creator and session tokens
+    ctrl.saveSessionHostToken("ABCD2345", "ephemeral-2");
+    ctrl.forgetCreatorHostToken("ABCD2345", "wrong-token");
+    await Promise.all(tasks);
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("ephemeral-2");
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-orig");
+
+    // forgetCreatorHostToken without onlyIfMatching removes creator, session, legacy sessionStorage, and localStorage
+    sess?.setItem("host:ABCD2345", "legacy-should-clear");
+    ctrl.forgetCreatorHostToken("ABCD2345");
+    await Promise.all(tasks);
+    expect(ctrl.hostTokenFor("ABCD2345")).toBeUndefined();
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(false);
+    expect(sess?.getItem("host:ABCD2345")).toBeNull();
+    expect(readPersistedHostToken(local, "ABCD2345")).toBeUndefined();
+
+    // forgetAllHostTokens clears host:* keys from memorySession/sessionStorage/localStorage but keeps activeRoom & rejoin
+    ctrl.saveActiveRoom("WXYZ2345");
+    ctrl.saveRejoinToken("WXYZ2345", "rj-keep");
+    ctrl.writeSession("host:WXYZ2345", "legacy-mem");
+    ctrl.saveCreatorHostToken("WXYZ2345", "creator-2");
+    await Promise.all(tasks);
+    ctrl.forgetAllHostTokens();
+    await Promise.all(tasks);
+    expect(ctrl.hasAnySavedCreatorHosts()).toBe(false);
+    expect(ctrl.readSession("host:WXYZ2345")).toBeUndefined();
+    expect(ctrl.activeRoomFor()).toBe("WXYZ2345");
+    expect(ctrl.rejoinTokenFor("WXYZ2345")).toBe("rj-keep");
+  });
+
+  it("clears sessionStorage on fatal wiping errors vs retains for F5 reload on transient fatal errors", async () => {
+    const { ctrl, local, tasks } = makeController();
+
+    // bad-password wipes session + sessionHostTokens but preserves creator token in localStorage
+    ctrl.saveCreatorHostToken("ABCD2345", "creator-tok");
+    ctrl.saveSessionHostToken("ABCD2345", "promo-tok");
+    ctrl.saveActiveRoom("ABCD2345");
+    ctrl.saveRejoinToken("ABCD2345", "rj-1");
+    ctrl.lastJoinCode = "ABCD2345";
+    await Promise.all(tasks);
+
+    ctrl.applyFatalErrorCleanup("ABCD2345", "bad-password", false, "creator-tok");
+    await Promise.all(tasks);
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("ABCD2345")).toBeUndefined();
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-tok");
+
+    // kicked with undefined lastPresentedHostToken does NOT wipe creator token
+    ctrl.saveActiveRoom("ABCD2345");
+    ctrl.saveRejoinToken("ABCD2345", "rj-2");
+    ctrl.applyFatalErrorCleanup("ABCD2345", "kicked", true, undefined);
+    await Promise.all(tasks);
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("ABCD2345")).toBeUndefined();
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-tok");
+
+    // kicked with mismatched (promoted) token does NOT wipe creator token
+    ctrl.applyFatalErrorCleanup("ABCD2345", "kicked", true, "other-promoted-tok");
+    await Promise.all(tasks);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-tok");
+
+    // bad-room-code with matching creator token wipes creator token
+    ctrl.applyFatalErrorCleanup("ABCD2345", "bad-room-code", false, "creator-tok");
+    await Promise.all(tasks);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBeUndefined();
+
+    // Non-session-wiping fatal error AFTER welcome retains activeRoom + rejoinToken for F5 reload
+    ctrl.saveActiveRoom("WXYZ2345");
+    ctrl.saveRejoinToken("WXYZ2345", "rj-f5");
+    ctrl.applyFatalErrorCleanup("WXYZ2345", "connection-failed", true, undefined);
+    expect(ctrl.activeRoomFor()).toBe("WXYZ2345");
+    expect(ctrl.rejoinTokenFor("WXYZ2345")).toBe("rj-f5");
+    expect(ctrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({
+      kind: "resume-saved",
+      code: "WXYZ2345",
+    });
+  });
+
+  it("handles resolveBootAction edge cases across connected/fatal/disconnected states and malformed fragments", async () => {
+    const { ctrl, tasks } = makeController();
+    ctrl.selfId = "self1";
+    ctrl.lastJoinCode = "ABCD2345";
+    ctrl.roomPassword = "OLDPASS23456789A";
+
+    // hashchange to SAME room when connected & ready -> none, does not overwrite roomPassword
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-NEWPASS23456789A", true, { active: true, fatal: false, ready: true }),
+    ).toEqual({ kind: "none" });
+    expect(ctrl.roomPassword).toBe("OLDPASS23456789A");
+
+    // hashchange to SAME room when active & fatal -> enter-invite (fresh join)
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-NEWPASS23456789A", true, { active: true, fatal: true, ready: false }),
+    ).toEqual({ kind: "enter-invite", code: "ABCD2345", password: "NEWPASS23456789A" });
+
+    // hashchange to DIFFERENT room when connected & ready -> enter-invite
+    expect(
+      ctrl.resolveBootAction("#WXYZ2345-NEWPASS23456789A", true, { active: true, fatal: false, ready: true }),
+    ).toEqual({ kind: "enter-invite", code: "WXYZ2345", password: "NEWPASS23456789A" });
+
+    // hashchange to SAME room while not yet welcomed (selfId === null) -> enter-invite
+    ctrl.selfId = null;
+    expect(
+      ctrl.resolveBootAction("#ABCD2345-NEWPASS23456789A", true, { active: true, fatal: false, ready: false }),
+    ).toEqual({ kind: "enter-invite", code: "ABCD2345", password: "NEWPASS23456789A" });
+
+    // Boot with empty hash resumes saved room via creator hostToken even without rejoinToken
+    ctrl.saveActiveRoom("WXYZ2345");
+    ctrl.saveCreatorHostToken("WXYZ2345", "creator-tok");
+    await Promise.all(tasks);
+    expect(ctrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({
+      kind: "resume-saved",
+      code: "WXYZ2345",
+    });
+
+    // Boot with invalid saved activeRoom clears it and returns none
+    ctrl.saveActiveRoom("NOT-A-VALID-CODE");
+    expect(ctrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({ kind: "none" });
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+
+    // Malformed fragments return error
+    for (const bad of ["#", "#   ", "#ABCD2345", "#ABCD2345-", "#%E0%A4%A"]) {
+      expect(ctrl.resolveBootAction(bad, true, { active: false, fatal: false, ready: false }).kind).toBe("error");
+    }
+
+    // Direct parseInviteInput edge cases (URL, malformed URI encoding, host/path, concatenated tokens)
+    expect(parseInviteInput("")).toEqual({ ok: false, reason: "empty" });
+    expect(parseInviteInput("#")).toEqual({ ok: false, reason: "empty" });
+    expect(parseInviteInput("https://example.com/")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("https://example.com/#")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("example.com/room")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("/room")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("example.com/#")).toEqual({ ok: false, reason: "url-missing-invite" });
+    expect(parseInviteInput("https://[bad-url")).toEqual({ ok: false, reason: "invalid" });
+    expect(parseInviteInput("https://example.com/#%E0%A4%A")).toEqual({ ok: false, reason: "invalid" });
+    expect(parseInviteInput("ABCD2345-")).toEqual({ ok: false, reason: "missing-secret" });
+    expect(parseInviteInput("BAD-")).toEqual({ ok: false, reason: "invalid" });
+    expect(parseInviteInput("https://example.com/##abcd2345.abcdefgh23456789")).toEqual({
+      ok: true,
+      code: "ABCD2345",
+      password: "ABCDEFGH23456789",
+    });
+    expect(parseInviteInput("ABCD2345ABCDEFGH23456789")).toEqual({
+      ok: true,
+      code: "ABCD2345",
+      password: "ABCDEFGH23456789",
+    });
+  });
+
+  it("handles applyRoomPassword, clearPendingKicks, and transient notice dismissal edge cases", () => {
+    const { ctrl } = makeController();
+    ctrl.selfId = "self1";
+    ctrl.lastJoinCode = "ABCD2345";
+    ctrl.isHost = true;
+    ctrl.roomLocked = true;
+
+    // applyRoomPassword with explicit password updates roomPassword
+    ctrl.applyRoomPassword("ABCD2345", "ROTATED123456789", "rj-rot");
+    expect(ctrl.roomPassword).toBe("ROTATED123456789");
+    expect(ctrl.rejoinTokenFor("ABCD2345")).toBe("rj-rot");
+
+    // clearPendingKicks cancels all pending kick timers without firing callbacks
+    const onTimeout = vi.fn();
+    ctrl.startPendingKick("p1", "Alice", onTimeout, 2000);
+    ctrl.startPendingKick("p2", "Bob", onTimeout, 2000);
+    ctrl.clearPendingKicks();
+    expect(ctrl.hasPendingKick("p1")).toBe(false);
+    expect(ctrl.hasPendingKick("p2")).toBe(false);
+    vi.advanceTimersByTime(5000);
+    expect(onTimeout).not.toHaveBeenCalled();
+
+    // dismissTransientNotice does NOT restore if status text was overwritten by another message
+    const onRestore = vi.fn();
+    const onExpire = vi.fn();
+    ctrl.showTransientNotice("Notice A", vi.fn(), onExpire, 3000);
+    ctrl.dismissTransientNotice("Different status text", true, onRestore);
+    expect(onRestore).not.toHaveBeenCalled();
+    expect(ctrl.currentTransientNotice).toBeNull();
+    vi.advanceTimersByTime(5000);
+    expect(onExpire).not.toHaveBeenCalled();
+
+    // clearTransientNoticeState prevents expiration callback
+    ctrl.showTransientNotice("Notice B", vi.fn(), onExpire, 3000);
+    ctrl.clearTransientNoticeState();
+    vi.advanceTimersByTime(5000);
+    expect(onExpire).not.toHaveBeenCalled();
+  });
+});
