@@ -184,16 +184,22 @@ export async function createPcmAudioTrack(
     return handle.track;
   }
 
-  unsubscribe = bridge.onAudioPcm((bytes) => {
-    if (stopped) return;
-    const { left, right } = deinterleavePcm16Stereo(bytes);
-    if (left.length === 0) return;
-    try {
-      sink.postPcm(left, right);
-    } catch {
-      /* worklet port may already be closed */
-    }
-  });
+  try {
+    unsubscribe = bridge.onAudioPcm((bytes) => {
+      if (stopped) return;
+      const { left, right } = deinterleavePcm16Stereo(bytes);
+      if (left.length === 0) return;
+      try {
+        sink.postPcm(left, right);
+      } catch {
+        /* worklet port may already be closed */
+      }
+    });
+  } catch (err) {
+    teardown();
+    handle.track.stop();
+    throw err;
+  }
 
   return handle.track;
 }

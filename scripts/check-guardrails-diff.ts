@@ -126,6 +126,26 @@ export function formatGuardrailSummary(
   return `${lines.join("\n")}\n`;
 }
 
+/** Parse NUL-delimited `git diff --name-only -z` output into literal relative paths. */
+export function parseNullDelimitedPaths(raw: string): string[] {
+  return raw.split("\0").filter((entry) => entry.length > 0);
+}
+
+const ZERO_SHA = /^0+$/;
+
+/** Build a two-dot/three-dot git diff range from base/head SHAs, ignoring empty or all-zero SHAs. */
+export function buildDiffRange(
+  baseSha: string | undefined,
+  headSha: string | undefined,
+  eventName: string,
+): string | null {
+  const base = baseSha?.trim() ?? "";
+  const head = headSha?.trim() ?? "";
+  if (base.length === 0 || head.length === 0) return null;
+  if (ZERO_SHA.test(base) || ZERO_SHA.test(head)) return null;
+  return eventName === "push" ? `${base}..${head}` : `${base}...${head}`;
+}
+
 /* v8 ignore start */
 function runGit(args: readonly string[]): string {
   return execFileSync("git", args, {
@@ -135,9 +155,8 @@ function runGit(args: readonly string[]): string {
 }
 
 function resolveDiffRange(env: NodeJS.ProcessEnv): string | null {
-  const baseSha = env["BASE_SHA"]?.trim();
-  const headSha = env["HEAD_SHA"]?.trim();
-  if (baseSha && headSha) return `${baseSha}...${headSha}`;
+  const explicit = buildDiffRange(env["BASE_SHA"], env["HEAD_SHA"], env["GITHUB_EVENT_NAME"] ?? "");
+  if (explicit) return explicit;
   try {
     runGit(["rev-parse", "--verify", "origin/main"]);
     return "origin/main...HEAD";
@@ -151,15 +170,13 @@ function runCli(): void {
   const prLabels = parsePrLabelsJson(process.env["PR_LABELS_JSON"]);
   const range = resolveDiffRange(process.env);
   const changedFiles = range
-    ? runGit(["diff", "--name-only", range])
-        .split(/\r?\n/)
-        .filter((line) => line.trim().length > 0)
+    ? parseNullDelimitedPaths(runGit(["diff", "--name-only", "--no-renames", "-z", range]))
     : [];
 
   const result = evaluateGuardrailChanges({ eventName, changedFiles, prLabels });
   const diffText =
     range && result.touchedGuardrails.length > 0
-      ? runGit(["diff", range, "--", ...result.touchedGuardrails])
+      ? runGit(["diff", "--no-renames", range, "--", ...result.touchedGuardrails])
       : "";
 
   const summary = formatGuardrailSummary(result, diffText);

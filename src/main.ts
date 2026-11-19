@@ -1652,27 +1652,34 @@ async function startSharingInner(): Promise<void> {
   renderRoster();
 }
 
-let stoppingShare = false;
+let stopSharingPromise: Promise<void> | null = null;
 
 async function stopSharing(): Promise<void> {
-  if (!capture || stoppingShare) return;
-  stoppingShare = true;
+  if (stopSharingPromise) return stopSharingPromise;
+  if (!capture) return;
+  const run = (async () => {
+    try {
+      await mesh?.setCapture(null);
+    } finally {
+      captureController.stop();
+      capture = null;
+    }
+    outboundMonitors.clear();
+    peerOutboundText.clear();
+    totalOutboundMbps = 0;
+    activeViewerCount = 0;
+    renderSelfPreview(null);
+    client?.setSharing(false);
+    syncMuteAudioButton();
+    syncViewState();
+    renderRoster();
+  })();
+  stopSharingPromise = run;
   try {
-    await mesh?.setCapture(null);
+    await run;
   } finally {
-    captureController.stop();
-    capture = null;
-    stoppingShare = false;
+    if (stopSharingPromise === run) stopSharingPromise = null;
   }
-  outboundMonitors.clear();
-  peerOutboundText.clear();
-  totalOutboundMbps = 0;
-  activeViewerCount = 0;
-  renderSelfPreview(null);
-  client?.setSharing(false);
-  syncMuteAudioButton();
-  syncViewState();
-  renderRoster();
 }
 
 // ---- room ----------------------------------------------------------------
@@ -2264,6 +2271,7 @@ function leaveRoom(): void {
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   stopHealthPolling();
+  if (sharingPending && !capture) captureController.stop();
   if (capture) client?.setSharing(false);
   client?.close();
   client = null;

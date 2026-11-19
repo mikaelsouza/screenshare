@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   APPROVED_GUARDRAIL_LABEL,
+  buildDiffRange,
   evaluateGuardrailChanges,
   formatGuardrailSummary,
   isGuardrailFile,
+  parseNullDelimitedPaths,
   parsePrLabelsJson,
 } from "../../scripts/check-guardrails-diff";
 
@@ -57,6 +59,29 @@ describe("check-guardrails-diff", () => {
       expect(parsePrLabelsJson("   ")).toEqual([]);
       expect(parsePrLabelsJson('{"label": true}')).toEqual([]);
       expect(parsePrLabelsJson("{not-json")).toEqual([]);
+    });
+  });
+
+  describe("parseNullDelimitedPaths", () => {
+    it("parses NUL-delimited literal paths including non-ASCII filenames", () => {
+      expect(
+        parseNullDelimitedPaths(".github/workflows/café.yml\0test/formal/a.test.ts\0\0src/mesh.ts\0"),
+      ).toEqual([".github/workflows/café.yml", "test/formal/a.test.ts", "src/mesh.ts"]);
+      expect(parseNullDelimitedPaths("")).toEqual([]);
+    });
+  });
+
+  describe("buildDiffRange", () => {
+    it("uses three-dot range for pull_request and two-dot range for push", () => {
+      expect(buildDiffRange("abc123", "def456", "pull_request")).toBe("abc123...def456");
+      expect(buildDiffRange("abc123", "def456", "push")).toBe("abc123..def456");
+    });
+
+    it("returns null for missing, blank, or all-zero SHAs", () => {
+      expect(buildDiffRange(undefined, "def456", "pull_request")).toBeNull();
+      expect(buildDiffRange("abc123", "   ", "pull_request")).toBeNull();
+      expect(buildDiffRange("0000000000000000000000000000000000000000", "def456", "push")).toBeNull();
+      expect(buildDiffRange("abc123", "0000000000000000000000000000000000000000", "push")).toBeNull();
     });
   });
 

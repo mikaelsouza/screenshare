@@ -1184,6 +1184,7 @@ describe("persistent sendonly transceivers", () => {
     expect(pc.senders[0]?.getParameters().encodings?.[0]?.maxBitrate).toBe(6_000_000);
 
     // Cycle 2: video+audio -> video-only clears audio track to null without adding transceivers or sending offers
+    pc.connectionState = "connected";
     const c2 = makeCapture(false);
     await mesh.setCapture(c2);
     await new Promise((r) => setTimeout(r, 10));
@@ -1789,14 +1790,16 @@ describe("adversarial persistent-transceiver & race probes", () => {
     pc.onconnectionstatechange?.();
     expect(pc.restartIceCalls).toBe(0);
 
+    // Completing attachCapture while connectionState is already failed immediately recovers via restartIce
     paramsGate.resolve();
     await attachPromise;
     addTxSpy.mockRestore();
+    expect(pc.restartIceCalls).toBe(1);
 
-    // 3. Actively sharing: restarts ICE
+    // 3. Actively sharing: restarts ICE on subsequent failures
     pc.connectionState = "failed";
     pc.onconnectionstatechange?.();
-    expect(pc.restartIceCalls).toBe(1);
+    expect(pc.restartIceCalls).toBe(2);
 
     // 4. Immediately upon setCapture(null) even while detachCapture is still pending: no restart
     const detachGate = deferred();
@@ -1808,17 +1811,18 @@ describe("adversarial persistent-transceiver & race probes", () => {
     const detachPromise = mesh.setCapture(null);
     pc.connectionState = "failed";
     pc.onconnectionstatechange?.();
-    expect(pc.restartIceCalls).toBe(1);
+    expect(pc.restartIceCalls).toBe(2);
 
     detachGate.resolve();
     await detachPromise;
 
     // 5. Resumed share (cycle 2): restarts ICE again
     pc.senders[0]!.replaceTrack = origReplace;
+    pc.connectionState = "connected";
     await mesh.setCapture(makeCapture(false));
     pc.connectionState = "failed";
     pc.onconnectionstatechange?.();
-    expect(pc.restartIceCalls).toBe(2);
+    expect(pc.restartIceCalls).toBe(3);
   });
 
   it("does not poison mediaQueue after open-link rejections in attachCapture, replaceVideo, or replaceAudio", async () => {
@@ -1887,5 +1891,58 @@ describe("adversarial persistent-transceiver & race probes", () => {
     await expect(mesh.setCapture(null)).resolves.toBeUndefined();
     expect(pc.senders[0]?.track).toBeNull();
     expect(pc.senders[1]?.track).toBeNull();
+  });
+
+  it("still executes queued detachCapture before a replacement attach even if the replacement fails", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    const capA = makeCapture(true);
+    await mesh.setCapture(capA);
+    expect(pc.senders[0]?.track).toBe(capA.video);
+
+    // Hold mediaQueue with an in-flight replaceVideo so setCapture(null) and setCapture(B) queue behind it
+    const gate = deferred();
+    const origReplace = pc.senders[0]!.replaceTrack.bind(pc.senders[0]!);
+    const capB = makeCapture(true);
+    pc.senders[0]!.replaceTrack = async (t: MediaStreamTrack | null) => {
+      if (t === capB.video) throw new Error("Replacement track incompatible");
+      if (t !== null) await gate.promise;
+      return origReplace(t);
+    };
+
+    const pSwap = mesh.setVideoTrack({ kind: "video" } as unknown as MediaStreamTrack);
+    const pDetach = mesh.setCapture(null);
+    const pReplace = mesh.setCapture(capB);
+
+    gate.resolve();
+    await pSwap;
+    await pDetach;
+    await expect(pReplace).rejects.toThrow("Replacement track incompatible");
+
+    // Capture A must NOT still be attached on the sender after setCapture(null)
+    expect(pc.senders[0]?.track).toBeNull();
+  });
+
+  it("resolves setCapture(null) even if a closed link's pending replaceTrack(null) never settles", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    await mesh.setCapture(makeCapture(true));
+
+    // Simulate WebRTC aborting replaceTrack(null) on close without ever settling its promise
+    pc.senders[0]!.replaceTrack = () => new Promise<void>(() => {});
+    pc.senders[1]!.replaceTrack = () => new Promise<void>(() => {});
+
+    const detachPromise = mesh.setCapture(null);
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Peer disconnects while detachCapture is awaiting the never-settling replaceTrack(null)
+    mesh.removeMember("bob");
+    await expect(detachPromise).resolves.toBeUndefined();
   });
 });

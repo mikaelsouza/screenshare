@@ -81,6 +81,11 @@ function hasAudioBridge(
   return Boolean(api.startWindowAudio && api.startSystemAudio && api.stopAudio && api.onAudioPcm);
 }
 
+interface AudioProviderHooks {
+  isCanceled: () => boolean;
+  onNativeAudioStarted: () => void;
+}
+
 /**
  * Default Electron audio provider: uses per-window WASAPI capture when a window was
  * picked, and system audio (excluding our own app) when a screen was picked. Falls
@@ -90,15 +95,26 @@ function hasAudioBridge(
 function buildDefaultAudioProvider(
   api: FollowAPI,
   deps: ElectronCaptureDeps,
+  hooks: AudioProviderHooks,
 ): AudioSourceProvider {
   return async (capture) => {
     if (!hasAudioBridge(api)) return capture.audio;
     const useWindow = capture.surface === "window";
     const ok = useWindow ? await api.startWindowAudio() : await api.startSystemAudio();
     if (!ok) return capture.audio;
+    hooks.onNativeAudioStarted();
+    if (hooks.isCanceled()) return null;
     capture.audio?.stop();
     return await deps.createPcmTrack({ onAudioPcm: api.onAudioPcm, stopAudio: api.stopAudio });
   };
+}
+
+interface PendingStart {
+  readonly gen: number;
+  canceled: boolean;
+  result: CaptureResult | null;
+  cancel: () => void;
+  unsub: () => void;
 }
 
 /** Create the Electron desktop capture controller with game-client following and WASAPI audio. */
@@ -107,7 +123,6 @@ export function createElectronCaptureController(
   cb: CaptureCallbacks,
   deps: ElectronCaptureDeps = defaultDeps,
 ): CaptureController {
-  const audioProvider = deps.audioSource ?? buildDefaultAudioProvider(api, deps);
   let capture: CaptureResult | null = null;
   let preset: QualityPreset | null = null;
   /** An update that arrived while the picker result was still on its way. */
@@ -118,6 +133,15 @@ export function createElectronCaptureController(
   /** Bumped on stop and on every swap, so a slow capture that lost the race is dropped. */
   let generation = 0;
   let unsubscribe: (() => void) | null = null;
+  let pendingStart: PendingStart | null = null;
+  /** Generation that currently owns the main-process native WASAPI audio session. */
+  let activeNativeAudioGen: number | null = null;
+
+  function stopOwnedNativeAudio(gen: number): void {
+    if (activeNativeAudioGen !== gen) return;
+    activeNativeAudioGen = null;
+    api.stopAudio?.();
+  }
 
   function watchEnded(track: MediaStreamTrack): void {
     track.addEventListener("ended", () => {
@@ -182,6 +206,70 @@ export function createElectronCaptureController(
     pending = null;
   }
 
+  function beginPendingStart(gen: number): PendingStart {
+    pendingStart?.cancel();
+    release();
+    // Subscribe first: the main process starts following as soon as the window is
+    // picked, which can be before getDisplayMedia resolves here.
+    const rawUnsub = api.onFollowUpdate(handle);
+    let unsubscribed = false;
+    const unsub = (): void => {
+      if (unsubscribed) return;
+      unsubscribed = true;
+      rawUnsub();
+      if (unsubscribe === unsub) unsubscribe = null;
+    };
+    unsubscribe = unsub;
+
+    const state: PendingStart = {
+      gen,
+      canceled: false,
+      result: null,
+      unsub,
+      cancel() {
+        if (state.canceled) return;
+        state.canceled = true;
+        unsub();
+        if (state.result) {
+          stopCapture(state.result);
+          state.result = null;
+        }
+        stopOwnedNativeAudio(gen);
+        if (pendingStart === state) {
+          pendingStart = null;
+          pending = null;
+        }
+      },
+    };
+    pendingStart = state;
+    return state;
+  }
+
+  function provideAudioForStart(state: PendingStart, result: CaptureResult): Promise<MediaStreamTrack | null> {
+    if (deps.audioSource) return deps.audioSource(result);
+    const provider = buildDefaultAudioProvider(api, deps, {
+      isCanceled: () => state.canceled || state.gen !== generation,
+      onNativeAudioStarted: () => {
+        if (state.canceled || state.gen !== generation) {
+          if (activeNativeAudioGen === null) api.stopAudio?.();
+          return;
+        }
+        activeNativeAudioGen = state.gen;
+      },
+    });
+    return provider(result);
+  }
+
+  function assertStartActive(state: PendingStart): void {
+    if (state.canceled || state.gen !== generation) {
+      throw new Error("Capture stopped before starting");
+    }
+  }
+
+  function isDeadNonFollowedVideo(video: MediaStreamTrack): boolean {
+    return video.readyState === "ended" && (!pending || pending.role === "ended");
+  }
+
   return {
     kind: "electron",
     async start(p) {
@@ -189,27 +277,36 @@ export function createElectronCaptureController(
       // stop() (or a failed start) clears them again.
       const gen = ++generation;
       preset = p;
-      // Subscribe first: the main process starts following as soon as the window is
-      // picked, which can be before getDisplayMedia resolves here.
-      unsubscribe = api.onFollowUpdate(handle);
+      const state = beginPendingStart(gen);
       let result: CaptureResult | null = null;
       let chosenAudio: MediaStreamTrack | null = null;
       try {
         result = await deps.captureScreen(p);
-        if (gen !== generation) throw new Error("Capture stopped before starting");
-        chosenAudio = await audioProvider(result);
-        if (gen !== generation) throw new Error("Capture stopped before starting");
+        state.result = result;
+        assertStartActive(state);
+        chosenAudio = await provideAudioForStart(state, result);
+        assertStartActive(state);
+        if (isDeadNonFollowedVideo(result.video)) {
+          throw new Error("Capture ended before starting");
+        }
         if (chosenAudio !== result.audio) {
+          const nextStream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
           result.audio = chosenAudio;
-          result.stream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
+          result.stream = nextStream;
         }
       } catch (err) {
         if (chosenAudio && chosenAudio !== result?.audio) chosenAudio.stop();
         if (result) stopCapture(result);
-        api.stopAudio?.();
-        if (gen === generation) release();
+        state.result = null;
+        stopOwnedNativeAudio(gen);
+        state.unsub();
+        if (pendingStart === state) {
+          pendingStart = null;
+          pending = null;
+        }
         throw err;
       }
+      pendingStart = null;
       capture = result;
       watchEnded(result.video);
       const early = pending;
@@ -222,11 +319,13 @@ export function createElectronCaptureController(
     },
     stop() {
       generation++;
+      pendingStart?.cancel();
       release();
       api.stopFollow();
       if (following) cb.onFollowState(null);
       following = false;
       sourceId = null;
+      activeNativeAudioGen = null;
       if (capture) stopCapture(capture);
       capture = null;
     },

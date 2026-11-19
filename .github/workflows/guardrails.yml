@@ -1,0 +1,55 @@
+name: Guardrails
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guardrails-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  guardrails-diff:
+    name: Guardrail & Spec Diff Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Check protected guardrail modifications
+        shell: bash
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event_name == 'push' && github.event.after || github.event.pull_request.head.sha }}
+          PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          CHECKER_PATH="scripts/check-guardrails-diff.ts"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ] && [ -n "$BASE_SHA" ] && git cat-file -e "${BASE_SHA}:scripts/check-guardrails-diff.ts" 2>/dev/null; then
+            CHECKER_PATH="$(mktemp "${RUNNER_TEMP:-/tmp}/check-guardrails-diff.XXXXXX.ts")"
+            git show "${BASE_SHA}:scripts/check-guardrails-diff.ts" > "$CHECKER_PATH"
+            trap 'rm -f "$CHECKER_PATH"' EXIT
+          fi
+          node --experimental-strip-types "$CHECKER_PATH"

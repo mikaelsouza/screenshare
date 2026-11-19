@@ -177,7 +177,9 @@ describe("PcmRingProcessor", () => {
     const processor = new PcmRingProcessor(16);
     processor.handleMessage({ type: "pcm", left: new Float32Array([1, 1]), right: new Float32Array([1, 1]) });
     processor.handleMessage({ type: "dispose" });
+    const framesAfterDispose = processor.bufferedFrames;
     processor.handleMessage({ type: "pcm", left: new Float32Array([2, 2]), right: new Float32Array([2, 2]) });
+    expect(processor.bufferedFrames).toBe(framesAfterDispose);
 
     const outL = new Float32Array([9, 9]);
     const outR = new Float32Array([9, 9]);
@@ -229,6 +231,8 @@ describe("createPcmAudioTrack", () => {
     expect(capturedUrl.length).toBeGreaterThan(0);
     expect(capturedUrl.startsWith("blob:")).toBe(false);
     expect(capturedUrl.startsWith("data:")).toBe(false);
+    const appOrigin = "https://screenshare.example";
+    expect(new URL(capturedUrl, `${appOrigin}/`).origin).toBe(appOrigin);
 
     // Sub-frame (< 4 bytes) packet is skipped
     pcmListener!(new Uint8Array([1, 2, 3]));
@@ -250,6 +254,34 @@ describe("createPcmAudioTrack", () => {
     // Post-teardown PCM packets are ignored
     pcmListener!(pcmBytesFromInt16([16384, -16384]));
     expect(processor.process([], [[outL, outR]])).toBe(false);
+  });
+
+  it("rolls back worklet sink and track when bridge.onAudioPcm throws synchronously", async () => {
+    const stopAudio = vi.fn();
+    const dispose = vi.fn();
+    const stopTrack = vi.fn();
+    const fakeTrack = { kind: "audio", stop: stopTrack } as unknown as MediaStreamTrack;
+
+    await expect(
+      createPcmAudioTrack(
+        {
+          onAudioPcm: () => {
+            throw new Error("IPC registration failed");
+          },
+          stopAudio,
+        },
+        {
+          createTrack: async () => ({
+            track: fakeTrack,
+            sink: { postPcm: vi.fn(), dispose },
+          }),
+        },
+      ),
+    ).rejects.toThrow("IPC registration failed");
+
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(stopTrack).toHaveBeenCalledTimes(1);
+    expect(stopAudio).toHaveBeenCalledTimes(1);
   });
 
   it("does not call stopAudio when an older replaced PCM track is stopped after a newer one is created", async () => {

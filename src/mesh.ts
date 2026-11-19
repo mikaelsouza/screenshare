@@ -92,6 +92,8 @@ class PeerLink {
   private audioTransceiver: RTCRtpTransceiver | null = null;
   private isSending = false;
   private closed = false;
+  private resolveClosed: (() => void) | null = null;
+  private readonly closedPromise: Promise<void> = new Promise((r) => { this.resolveClosed = r; });
   private lastNegotiatedCodec: CodecName | null = null;
   private mediaQueue: Promise<void> = Promise.resolve();
   private captureGeneration = 0;
@@ -392,6 +394,7 @@ class PeerLink {
       await this.applyInitialEncodings(this.videoTransceiver.sender, this.audioTransceiver.sender);
       if (this.isStale(gen)) return;
       this.isSending = true;
+      if (this.pc.connectionState === "failed") this.pc.restartIce();
       await this.setSenderActive(this.remoteWantsVideo);
       if (this.isStale(gen)) return;
       this.syncCodecIfChanged();
@@ -435,17 +438,17 @@ class PeerLink {
   }
 
   detachCapture(): Promise<void> {
-    const gen = ++this.captureGeneration;
+    this.captureGeneration++;
     this.isSending = false;
-    return this.enqueueMedia(() => this.runDetachCapture(gen));
+    return this.enqueueMedia(() => this.runDetachCapture());
   }
 
-  private async runDetachCapture(gen: number): Promise<void> {
-    if (this.isStale(gen)) return;
+  private async runDetachCapture(): Promise<void> {
+    if (this.isClosed()) return;
     const ops = [this.videoTransceiver, this.audioTransceiver]
       .filter((tx): tx is RTCRtpTransceiver => tx !== null)
       .map((tx) => tx.sender.replaceTrack(null).catch(() => {}));
-    await Promise.allSettled(ops);
+    await Promise.race([Promise.allSettled(ops), this.closedPromise]);
   }
 
   /**
@@ -521,6 +524,7 @@ class PeerLink {
     this.pc.ontrack = null;
     this.pc.onconnectionstatechange = null;
     this.pc.close();
+    this.resolveClosed?.();
   }
 }
 
