@@ -94,12 +94,6 @@
       }
     },
     {
-      "files": ["electron/main.ts"],
-      "rules": {
-        "node/no-process-env": "allow"
-      }
-    },
-    {
       "files": ["src/main.ts"],
       "rules": {
         "max-lines": "allow",

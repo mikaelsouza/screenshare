@@ -16,6 +16,7 @@ const config: ViteUserConfig = defineConfig({
       include: [
         "shared/**/*.ts",
         "src/**/*.ts",
+        "electron/config.ts",
         "electron/follow/**/*.ts",
         "electron/audio/**/*.ts",
         "electron/picker.ts",

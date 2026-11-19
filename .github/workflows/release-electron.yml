@@ -291,7 +291,7 @@ jobs:
           test -f "release/Screenshare-Setup-${RELEASE_VERSION}.exe"
           test -f "release/Screenshare-Setup-${RELEASE_VERSION}.exe.blockmap"
           test -f "release/latest.yml"
-          npm run electron:smoke:packaged
+          npm run electron:smoke
           (
             cd release
             sha256sum -b \

@@ -16,6 +16,7 @@ import { buildPickerTemplate } from "./picker.js";
 import { createPidResolver } from "./audio/pid.js";
 import { createAudioSessionController } from "./audio/capture.js";
 import { createAutoUpdateController } from "./updater.js";
+import { resolveProcessElectronConfig } from "./config.js";
 import koffi from "koffi";
 import loopback from "loopback-capture";
 import path from "node:path";
@@ -24,13 +25,10 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const isDev = process.env["ELECTRON_DEV"] === "1" || process.env["NODE_ENV"] === "development";
-const isSmokeTest = process.argv.includes("--smoke-test") || process.env["SMOKE_TEST"] === "1";
+const runtimeConfig = resolveProcessElectronConfig(app.isPackaged);
+const isDev = runtimeConfig.isDev;
+const isSmokeTest = runtimeConfig.isSmokeTest;
 const isWindowsStore = Boolean(process.windowsStore);
-
-// The app loads the hosted site so it shares rooms (signaling via the Cloudflare Worker /
-// Durable Object) with browser users.
-const REMOTE_APP_URL = process.env["SCREENSHARE_URL"] || "https://screenshare.webmikas.com";
 
 let mainWindow: BrowserWindow | null = null;
 // Origin of the page we load; capture permissions are only granted to it.
@@ -59,8 +57,7 @@ function isTrustedUrl(url: string | undefined): boolean {
 }
 
 function resolveTargetUrl(): string {
-  const devServerUrl = process.env["VITE_DEV_SERVER_URL"];
-  return isDev && devServerUrl ? devServerUrl : REMOTE_APP_URL;
+  return runtimeConfig.targetUrl;
 }
 
 function offlinePage(url: string, description: string): string {
@@ -288,7 +285,7 @@ function setupMediaHandlers(): void {
 
 async function initApplication(): Promise<void> {
   const targetUrl = resolveTargetUrl();
-  trustedOrigin = new URL(targetUrl).origin;
+  trustedOrigin = runtimeConfig.allowedAppOrigin;
   console.log(`[main] Loading ${targetUrl}`);
 
   const win = new BrowserWindow({
@@ -406,12 +403,10 @@ const autoUpdate = createAutoUpdateController(
 // Smoke tests use a throwaway profile so they neither collide with a running copy of the
 // app (single-instance lock) nor touch its data.
 if (isSmokeTest) {
-  const customSmokeDir = process.env["SMOKE_USER_DATA_DIR"];
+  const customSmokeDir = runtimeConfig.smokeUserDataDir;
   app.setPath(
     "userData",
-    customSmokeDir && customSmokeDir.length > 0
-      ? customSmokeDir
-      : path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`),
+    customSmokeDir ?? path.join(app.getPath("temp"), `screenshare-smoke-${process.pid}`),
   );
 }
 
