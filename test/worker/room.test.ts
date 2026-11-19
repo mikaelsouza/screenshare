@@ -2884,4 +2884,10 @@ describe("RoomDO security & PR 1 flows", () => {
     const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
     expect(remainingKeys).toBe(0);
   });
+
+  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
+  it.todo("rejects viewer-originated SDP offer signals when sender is not sharing even if recipient is sharing");
+  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
+  it.todo("enforces strict wss:// and same-origin Origin header on production WebSocket upgrades");
 });
+

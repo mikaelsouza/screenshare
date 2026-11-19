@@ -1652,27 +1652,32 @@ async function startSharingInner(): Promise<void> {
   renderRoster();
 }
 
-let stoppingShare = false;
+let stopSharingPromise: Promise<void> | null = null;
 
-async function stopSharing(): Promise<void> {
-  if (!capture || stoppingShare) return;
-  stoppingShare = true;
-  try {
-    await mesh?.setCapture(null);
-  } finally {
-    captureController.stop();
-    capture = null;
-    stoppingShare = false;
-  }
-  outboundMonitors.clear();
-  peerOutboundText.clear();
-  totalOutboundMbps = 0;
-  activeViewerCount = 0;
-  renderSelfPreview(null);
-  client?.setSharing(false);
-  syncMuteAudioButton();
-  syncViewState();
-  renderRoster();
+function stopSharing(): Promise<void> {
+  if (stopSharingPromise) return stopSharingPromise;
+  if (!capture) return Promise.resolve();
+  const run = (async () => {
+    try {
+      await mesh?.setCapture(null);
+    } finally {
+      captureController.stop();
+      capture = null;
+    }
+    outboundMonitors.clear();
+    peerOutboundText.clear();
+    totalOutboundMbps = 0;
+    activeViewerCount = 0;
+    renderSelfPreview(null);
+    client?.setSharing(false);
+    syncMuteAudioButton();
+    syncViewState();
+    renderRoster();
+  })().finally(() => {
+    stopSharingPromise = null;
+  });
+  stopSharingPromise = run;
+  return run;
 }
 
 // ---- room ----------------------------------------------------------------
@@ -1954,6 +1959,7 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
         isHost = room.host;
         roomLocked = room.locked;
 
+        const wiredStreams = new WeakSet<MediaStream>();
         mesh = new Mesh(
           selfIdFromServer,
           {
@@ -1970,6 +1976,9 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
               const video = tileFor(peerId);
               if (video.srcObject !== stream) {
                 video.srcObject = stream;
+              }
+              if (!wiredStreams.has(stream)) {
+                wiredStreams.add(stream);
                 stream.addEventListener("addtrack", () => applyAudio(peerId));
                 stream.addEventListener("removetrack", () => applyAudio(peerId));
               }
@@ -2260,6 +2269,7 @@ function leaveRoom(): void {
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   stopHealthPolling();
+  if (sharingPending && !capture) captureController.stop();
   if (capture) client?.setSharing(false);
   client?.close();
   client = null;

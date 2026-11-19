@@ -16,10 +16,12 @@ const config: ViteUserConfig = defineConfig({
       include: [
         "shared/**/*.ts",
         "src/**/*.ts",
+        "electron/config.ts",
         "electron/follow/**/*.ts",
         "electron/audio/**/*.ts",
         "electron/picker.ts",
         "electron/updater.ts",
+        "scripts/check-guardrails-diff.ts",
         "worker/ratelimit.ts",
       ],
       exclude: ["src/main.ts", "src/platform/types.ts"],

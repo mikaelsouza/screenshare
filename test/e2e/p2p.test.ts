@@ -884,6 +884,119 @@ await describe("peer-to-peer screen sharing", { concurrency: 1 }, async () => {
     );
   });
 
+  await it("reuses persistent transceivers across 5 mutual share/unshare cycles without SDP bloat", async () => {
+    // Keep the link open from viewer -> sharer while sharer toggles sharing 5 times.
+    await viewer.click("#share");
+    await waitFor(
+      sharer,
+      () => {
+        const remote = document.querySelector<HTMLVideoElement>(".tile:has(.tile-pause) video");
+        return Boolean(
+          remote?.srcObject instanceof MediaStream &&
+            window.__pcs.some((pc) => pc.connectionState === "connected"),
+        );
+      },
+      { label: "sharer connected to viewer's stream", timeout: 30_000 },
+    );
+
+    // Pin the mutual PeerConnection on sharer before sharer starts cycling.
+    const pinned = await sharer.evaluate(() => {
+      const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
+      const [pc] = live;
+      if (live.length !== 1 || !pc) return false;
+      (window as unknown as { __mutualPc?: RTCPeerConnection }).__mutualPc = pc;
+      return true;
+    });
+    assert.equal(pinned, true, "expected exactly one live mutual PeerConnection on sharer");
+
+    const readMutualMetrics = (): {
+      connectionState: RTCPeerConnectionState;
+      mLines: number;
+      transceivers: number;
+    } => {
+      const pc = (window as unknown as { __mutualPc?: RTCPeerConnection }).__mutualPc;
+      if (!pc) throw new Error("Missing pinned mutual PeerConnection");
+      const sdp = pc.localDescription?.sdp ?? "";
+      return {
+        connectionState: pc.connectionState,
+        mLines: (sdp.match(/^m=/gm) ?? []).length,
+        transceivers: pc.getTransceivers().length,
+      };
+    };
+
+    let cycle1Metrics: { mLines: number; transceivers: number } | null = null;
+    let cycle5Metrics: { mLines: number; transceivers: number } | null = null;
+
+    for (let cycle = 1; cycle <= 5; cycle++) {
+      await sharer.click("#share");
+      await waitFor(
+        viewer,
+        () => {
+          const remote = document.querySelector<HTMLVideoElement>(".tile:has(.tile-pause) video");
+          return Boolean(remote?.srcObject instanceof MediaStream && remote.readyState >= 2);
+        },
+        { label: `viewer remote tile live on cycle ${String(cycle)}`, timeout: 30_000 },
+      );
+
+      if (cycle === 1 || cycle === 5) {
+        const beforeFrames = await viewer.evaluate(decodedFrames);
+        const deadline = Date.now() + 20_000;
+        let afterFrames = beforeFrames;
+        while (Date.now() < deadline && afterFrames <= beforeFrames + 3) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+          afterFrames = await viewer.evaluate(decodedFrames);
+        }
+        assert.ok(
+          afterFrames > beforeFrames + 3,
+          `viewer did not decode live frames on cycle ${String(cycle)}: ${String(beforeFrames)} -> ${String(afterFrames)}`,
+        );
+
+        const metrics = await sharer.evaluate(readMutualMetrics);
+        assert.equal(metrics.connectionState, "connected", `mutual link dropped on cycle ${String(cycle)}`);
+        assert.ok(metrics.mLines <= 5, `expected <= 5 SDP m-lines on cycle ${String(cycle)}, got ${String(metrics.mLines)}`);
+        assert.ok(
+          metrics.transceivers <= 4,
+          `expected <= 4 transceivers on cycle ${String(cycle)}, got ${String(metrics.transceivers)}`,
+        );
+        if (cycle === 1) cycle1Metrics = { mLines: metrics.mLines, transceivers: metrics.transceivers };
+        if (cycle === 5) cycle5Metrics = { mLines: metrics.mLines, transceivers: metrics.transceivers };
+      }
+
+      await sharer.click("#share");
+      await waitFor(
+        viewer,
+        () => document.querySelector(".tile:has(.tile-pause)") === null,
+        { label: `viewer remote tile removed after cycle ${String(cycle)}`, timeout: 20_000 },
+      );
+    }
+
+    assert.ok(cycle1Metrics && cycle5Metrics, "expected metrics from cycle 1 and cycle 5");
+    assert.equal(
+      cycle5Metrics.mLines,
+      cycle1Metrics.mLines,
+      `SDP m-line count grew across cycles: ${String(cycle1Metrics.mLines)} -> ${String(cycle5Metrics.mLines)}`,
+    );
+    assert.equal(
+      cycle5Metrics.transceivers,
+      cycle1Metrics.transceivers,
+      `transceiver count grew across cycles: ${String(cycle1Metrics.transceivers)} -> ${String(cycle5Metrics.transceivers)}`,
+    );
+
+    // Stop viewer's share too: all links across the room must close cleanly.
+    await viewer.click("#share");
+    for (const [name, page] of [
+      ["sharer", sharer],
+      ["viewer", viewer],
+      ["viewer2", viewer2],
+    ] as const) {
+      await waitFor(
+        page,
+        () => window.__pcs.every((pc) => pc.connectionState === "closed"),
+        { label: `${name} links to close when both stop sharing`, timeout: 15_000 },
+      );
+    }
+  });
+
   await it("lets only the room's creator remove people and lock the room", async () => {
     for (const p of [sharer, viewer]) {
       if (await p.evaluate(() => document.getElementById("roster")?.hidden ?? true)) {

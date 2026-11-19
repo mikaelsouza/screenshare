@@ -542,7 +542,7 @@ describe("desktop capture defaults", () => {
 describe("desktop WASAPI audio integration", () => {
   function makeAudioBridge() {
     return {
-      onFollowUpdate: vi.fn(() => () => {}),
+      onFollowUpdate: vi.fn((_cb: (u: FollowUpdate) => void) => () => {}),
       stopFollow: vi.fn(),
       startWindowAudio: vi.fn(async () => true),
       startSystemAudio: vi.fn(async () => true),
@@ -639,4 +639,239 @@ describe("desktop WASAPI audio integration", () => {
     expect(displayAudio!.stopped).toBe(true);
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
   });
+
+  it("immediately releases video and native audio on stop() during pending createPcmTrack, disposes late track, and rejects", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, displayAudio, pcmTrack } = makeDeps("window", true);
+    const cb = callbacks();
+    let resolvePcm!: (t: MediaStreamTrack) => void;
+    deps.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm = resolve;
+        }),
+    );
+
+    const c = createElectronCaptureController(bridge, cb, deps);
+    const startPromise = c.start(preset);
+
+    // Wait until captureScreen + startWindowAudio have resolved and createPcmTrack is pending
+    await flush();
+    expect(deps.createPcmTrack).toHaveBeenCalledTimes(1);
+    expect(displayAudio!.stopped).toBe(true);
+
+    // Caller stops the controller mid-addModule -> already acquired resources release immediately
+    c.stop();
+    expect(video.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+
+    // Now the pending createPcmTrack resolves late
+    resolvePcm(pcmTrack);
+    await expect(startPromise).rejects.toThrow("Capture stopped before starting");
+
+    expect(pcmTrack.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+
+    // No zombie ended listener should remain attached after stop()
+    video.end();
+    expect(cb.onEnded).not.toHaveBeenCalled();
+  });
+
+  it("skips createPcmTrack and stops native audio when controller.stop() runs while startWindowAudio is pending", async () => {
+    const bridge = makeAudioBridge();
+    let resolveStartAudio!: (ok: boolean) => void;
+    bridge.startWindowAudio.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveStartAudio = resolve;
+        }),
+    );
+    const { deps, video, displayAudio } = makeDeps("window", true);
+    const cb = callbacks();
+    const c = createElectronCaptureController(bridge, cb, deps);
+    const startPromise = c.start(preset);
+
+    await flush();
+    expect(bridge.startWindowAudio).toHaveBeenCalledTimes(1);
+
+    c.stop();
+    expect(video.stopped).toBe(true);
+    expect(displayAudio!.stopped).toBe(true);
+
+    resolveStartAudio(true);
+    await expect(startPromise).rejects.toThrow("Capture stopped before starting");
+
+    expect(deps.createPcmTrack).not.toHaveBeenCalled();
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+    video.end();
+    expect(cb.onEnded).not.toHaveBeenCalled();
+  });
+
+  it("does not let stale startup cleanup stop a replacement start's native audio or leak follow listeners", async () => {
+    const unsubs = [vi.fn(), vi.fn()];
+    let subIdx = 0;
+    const bridge = makeAudioBridge();
+    bridge.onFollowUpdate = vi.fn(() => unsubs[subIdx++] ?? vi.fn());
+
+    let resolvePcmA!: (t: MediaStreamTrack) => void;
+    const trackA = track("audio", "pcmA");
+    const trackB = track("audio", "pcmB");
+    const videoA = track("video", "vidA");
+    const videoB = track("video", "vidB");
+    const deps: ElectronCaptureDeps = {
+      captureScreen: vi
+        .fn()
+        .mockResolvedValueOnce({ stream: stream([videoA]), video: videoA, audio: null, surface: "window" })
+        .mockResolvedValueOnce({ stream: stream([videoB]), video: videoB, audio: null, surface: "window" }),
+      captureSource: vi.fn(),
+      makeStream: vi.fn((tracks: MediaStreamTrack[]) => stream(tracks)),
+      createPcmTrack: vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<MediaStreamTrack>((resolve) => { resolvePcmA = resolve; }))
+        .mockResolvedValueOnce(trackB),
+    };
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const startA = c.start(preset);
+    await flush();
+    expect(deps.createPcmTrack).toHaveBeenCalledTimes(1);
+
+    // Supersede start A directly with start B (without intervening stop)
+    const startB = c.start(preset);
+    await expect(startB).resolves.toMatchObject({ video: videoB, audio: trackB });
+    expect(unsubs[0]).toHaveBeenCalledTimes(1);
+    expect(videoA.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+
+    // Now stale start A settles late — must stop its own trackA but MUST NOT stop start B's native audio
+    resolvePcmA(trackA);
+    await expect(startA).rejects.toThrow("Capture stopped before starting");
+    expect(trackA.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+
+    c.stop();
+    expect(unsubs[1]).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects and cleans up if a non-followed video track ends during audio setup, while preserving followed windows", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, pcmTrack } = makeDeps("window", false);
+    let resolvePcm!: (t: MediaStreamTrack) => void;
+    deps.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm = resolve;
+        }),
+    );
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const startPromise = c.start(preset);
+    await flush();
+
+    // Non-followed window closes while worklet is loading
+    video.end();
+    resolvePcm(pcmTrack);
+    await expect(startPromise).rejects.toThrow("Capture ended before starting");
+    expect(pcmTrack.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+
+    // Followed window that closed during setup acquires the replacement before resolving
+    let emitFollow!: (u: FollowUpdate) => void;
+    const bridge2 = makeAudioBridge();
+    bridge2.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow = cbFn;
+      return () => {};
+    });
+    const { deps: deps2, video: video2, pcmTrack: pcm2 } = makeDeps("window", false);
+    const swapTrack = track("video", "swapped");
+    (deps2.captureSource as ReturnType<typeof vi.fn>).mockResolvedValueOnce(swapTrack);
+    let resolvePcm2!: (t: MediaStreamTrack) => void;
+    deps2.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm2 = resolve;
+        }),
+    );
+    const cb2 = callbacks();
+    const c2 = createElectronCaptureController(bridge2, cb2, deps2);
+    const startPromise2 = c2.start(preset);
+    await flush();
+    emitFollow({ role: "game", profile: "League", title: "Match", sourceId: "win:2" });
+    video2.end();
+    resolvePcm2(pcm2);
+    await expect(startPromise2).resolves.toMatchObject({ video: swapTrack, audio: pcm2 });
+    expect(cb2.onFollowState).toHaveBeenCalledWith({ role: "game", profile: "League", title: "Match" });
+    expect(bridge2.stopFollow).not.toHaveBeenCalled();
+
+    // If acquiring the replacement track fails, start() rejects cleanly instead of publishing a dead track
+    let emitFollow3!: (u: FollowUpdate) => void;
+    const bridge3 = makeAudioBridge();
+    bridge3.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow3 = cbFn;
+      return () => {};
+    });
+    const { deps: deps3, video: video3, pcmTrack: pcm3 } = makeDeps("window", false);
+    (deps3.captureSource as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("source vanished"));
+    let resolvePcm3!: (t: MediaStreamTrack) => void;
+    deps3.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm3 = resolve;
+        }),
+    );
+    const c3 = createElectronCaptureController(bridge3, callbacks(), deps3);
+    const startPromise3 = c3.start(preset);
+    await flush();
+    emitFollow3({ role: "game", profile: "League", title: "Match", sourceId: "win:3" });
+    video3.end();
+    resolvePcm3(pcm3);
+    await expect(startPromise3).rejects.toThrow("source vanished");
+    expect(pcm3.stopped).toBe(true);
+    expect(bridge3.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge3.stopFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects startup if a terminal follow-ended update arrives even while the video track is still live", async () => {
+    let emitFollow!: (u: FollowUpdate) => void;
+    const bridge = makeAudioBridge();
+    bridge.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow = cbFn;
+      return () => {};
+    });
+    const { deps, video, pcmTrack } = makeDeps("window", false);
+    let resolvePcm!: (t: MediaStreamTrack) => void;
+    deps.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm = resolve;
+        }),
+    );
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const startPromise = c.start(preset);
+    await flush();
+    emitFollow({ role: "ended", profile: "League", title: null, sourceId: null });
+    resolvePcm(pcmTrack);
+    await expect(startPromise).rejects.toThrow("Capture ended before starting");
+    expect(video.stopped).toBe(true);
+    expect(pcmTrack.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.stopFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops chosenAudio and main-process follower if deps.makeStream throws when rebuilding the capture stream", async () => {
+    const bridge = makeAudioBridge();
+    const { deps, video, pcmTrack } = makeDeps("window", false);
+    deps.makeStream = vi.fn(() => {
+      throw new Error("makeStream boom");
+    });
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    await expect(c.start(preset)).rejects.toThrow("makeStream boom");
+    expect(pcmTrack.stopped).toBe(true);
+    expect(video.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.stopFollow).toHaveBeenCalledTimes(1);
+  });
 });
+

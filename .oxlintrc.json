@@ -20,6 +20,27 @@
     "no-unreachable": "error",
     "no-unused-vars": "error",
     "no-constant-condition": "error",
+    "max-lines": [
+      "error",
+      {
+        "max": 500,
+        "skipBlankLines": true,
+        "skipComments": true
+      }
+    ],
+    "complexity": ["error", 15],
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "zod",
+            "message": "Import validated schemas and parsers from shared/protocol.ts instead of importing zod directly."
+          }
+        ]
+      }
+    ],
+    "node/no-process-env": "error",
     "typescript/ban-ts-comment": "error",
     "typescript/no-explicit-any": "error",
     "typescript/no-non-null-asserted-optional-chain": "error",
@@ -53,7 +74,54 @@
     {
       "files": ["test/**/*.ts"],
       "rules": {
+        "max-lines": "allow",
+        "complexity": "allow",
+        "no-restricted-imports": "allow",
+        "node/no-process-env": "allow",
         "typescript/no-unsafe-type-assertion": "allow"
+      }
+    },
+    {
+      "files": ["shared/protocol.ts"],
+      "rules": {
+        "no-restricted-imports": "allow"
+      }
+    },
+    {
+      "files": ["electron/config.ts", "scripts/**/*.ts", "*.config.ts"],
+      "rules": {
+        "node/no-process-env": "allow"
+      }
+    },
+    {
+      "files": ["src/main.ts"],
+      "rules": {
+        "max-lines": "allow",
+        "complexity": "allow"
+      }
+    },
+    {
+      "files": [
+        "src/signaling.ts",
+        "shared/protocol.ts",
+        "src/ui-model.ts",
+        "scripts/smoke-test.ts"
+      ],
+      "rules": {
+        "complexity": "allow"
+      }
+    },
+    {
+      "files": ["worker/room.ts"],
+      "rules": {
+        "max-lines": "allow",
+        "complexity": "allow"
+      }
+    },
+    {
+      "files": ["worker/index.ts"],
+      "rules": {
+        "complexity": "allow"
       }
     }
   ]

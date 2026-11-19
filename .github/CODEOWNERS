@@ -1,0 +1,12 @@
+# Protected verification guardrails, security boundaries, and CI workflows
+/AGENTS.md @mikaelsouza
+/.oxlintrc.json @mikaelsouza
+/stryker.config.json @mikaelsouza
+/vitest.config.ts @mikaelsouza
+/vitest.workers.config.ts @mikaelsouza
+/electron-builder.json @mikaelsouza
+/shared/protocol.ts @mikaelsouza
+/worker/index.ts @mikaelsouza
+/test/formal/ @mikaelsouza
+/.github/ @mikaelsouza
+/scripts/check-guardrails-diff.ts @mikaelsouza

@@ -2,10 +2,18 @@
  * Turns raw 48 kHz 16-bit signed little-endian stereo PCM from the Electron main
  * process (loopback-capture) into a live MediaStreamTrack for WebRTC.
  *
+ * Audio buffering and playback run off the renderer main thread inside a same-origin
+ * AudioWorkletNode (`pcm-ring-worklet.ts?worker&url`) so UI jank never starves audio
+ * output and strict CSP (`script-src 'self'`, `trusted-types 'none'`) stays intact.
+ *
  * When a followed game swaps from its lobby window to its match window, the main
  * process switches the PID feeding this stream while the MediaStreamTrack here stays
  * the same object — so peers keep hearing uninterrupted audio with no renegotiation.
  */
+
+import { PCM_WORKLET_PROCESSOR_NAME, type PcmWorkletMessage } from "./pcm-ring-worklet";
+// oxlint-disable-next-line import/default -- Vite ?worker&url virtual module default-exports the compiled asset URL
+import pcmRingWorkletUrl from "./pcm-ring-worklet.ts?worker&url";
 
 const SAMPLE_RATE = 48_000;
 const PCM16_SCALE = 1 / 32768;
@@ -27,95 +35,94 @@ export function deinterleavePcm16Stereo(bytes: Uint8Array): { left: Float32Array
   return { left, right };
 }
 
-/**
- * Fixed-capacity stereo ring buffer. On overflow, the oldest samples are dropped so
- * latency never builds up; on underrun, remaining output samples are filled with 0.
- */
-export class StereoRingBuffer {
-  private readonly left: Float32Array;
-  private readonly right: Float32Array;
-  private readPos = 0;
-  private writePos = 0;
-  private available = 0;
-
-  readonly capacity: number;
-  constructor(capacity: number) {
-    this.capacity = capacity;
-    this.left = new Float32Array(capacity);
-    this.right = new Float32Array(capacity);
-  }
-
-  /** Write interleaved planar left and right channel samples into the ring buffer. */
-  write(leftIn: Float32Array, rightIn: Float32Array): void {
-    const n = leftIn.length;
-    for (let i = 0; i < n; i++) {
-      this.left[this.writePos] = leftIn[i]!;
-      this.right[this.writePos] = rightIn[i]!;
-      this.writePos = (this.writePos + 1) % this.capacity;
-      if (this.available < this.capacity) {
-        this.available++;
-      } else {
-        this.readPos = (this.readPos + 1) % this.capacity;
-      }
-    }
-  }
-
-  /** Read up to `outLeft.length` stereo frames from the ring buffer, zero-filling on underrun. */
-  read(outLeft: Float32Array, outRight: Float32Array): void {
-    const len = outLeft.length;
-    for (let i = 0; i < len; i++) {
-      if (this.available > 0) {
-        outLeft[i] = this.left[this.readPos]!;
-        outRight[i] = this.right[this.readPos]!;
-        this.readPos = (this.readPos + 1) % this.capacity;
-        this.available--;
-      } else {
-        outLeft[i] = 0;
-        outRight[i] = 0;
-      }
-    }
-  }
-}
-
 export interface PcmAudioBridge {
   onAudioPcm: (cb: (pcm: Uint8Array) => void) => () => void;
   stopAudio: () => void;
 }
 
+interface PcmWorkletSink {
+  postPcm: (left: Float32Array, right: Float32Array) => void;
+  dispose: () => void;
+}
+
+export interface PcmWorkletTrackHandle {
+  track: MediaStreamTrack;
+  sink: PcmWorkletSink;
+}
+
 export interface PcmTrackDeps {
-  createTrack: (ring: StereoRingBuffer, onTeardown: () => void) => MediaStreamTrack;
+  createTrack: (workletUrl: string, onTeardown: () => void) => Promise<PcmWorkletTrackHandle>;
 }
 
 /**
- * Default Web Audio pipeline: pulls from the StereoRingBuffer into a
- * MediaStreamAudioDestinationNode and returns its audio MediaStreamTrack.
+ * Default Web Audio pipeline: loads the same-origin AudioWorklet module, feeds
+ * stereo PCM frames via transferable MessagePort buffers into an AudioWorkletNode
+ * connected to a MediaStreamAudioDestinationNode, and returns its MediaStreamTrack.
  */
 // Stryker disable all: Web Audio API DOM plumbing requires a real browser AudioContext
 /* v8 ignore start */
-function createWebAudioTrack(ring: StereoRingBuffer, onTeardown: () => void): MediaStreamTrack {
+async function createWebAudioTrack(
+  workletUrl: string,
+  onTeardown: () => void,
+): Promise<PcmWorkletTrackHandle> {
   const ctx = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
-  const processor = ctx.createScriptProcessor(512, 0, 2);
-  const destination = ctx.createMediaStreamDestination();
-  processor.onaudioprocess = (ev) => {
-    const outL = ev.outputBuffer.getChannelData(0);
-    const outR = ev.outputBuffer.getChannelData(1);
-    ring.read(outL, outR);
-  };
-  processor.connect(destination);
-  if (ctx.state === "suspended") void ctx.resume().catch(() => {});
+  try {
+    await ctx.audioWorklet.addModule(workletUrl);
+    const worklet = new AudioWorkletNode(ctx, PCM_WORKLET_PROCESSOR_NAME, {
+      numberOfInputs: 0,
+      numberOfOutputs: 1,
+      outputChannelCount: [2],
+    });
+    const destination = ctx.createMediaStreamDestination();
+    worklet.connect(destination);
+    if (ctx.state === "suspended") void ctx.resume().catch(() => {});
 
-  const track = destination.stream.getAudioTracks()[0]!;
-  track.contentHint = "music";
-  const origStop = track.stop.bind(track);
-  track.stop = () => {
-    onTeardown();
-    try {
-      processor.disconnect();
+    const track = destination.stream.getAudioTracks()[0];
+    if (!track) {
+      worklet.disconnect();
+      throw new Error("MediaStreamAudioDestinationNode returned no audio track");
+    }
+    track.contentHint = "music";
+
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      try {
+        const msg: PcmWorkletMessage = { type: "dispose" };
+        worklet.port.postMessage(msg);
+      } catch {
+        /* port may already be closed */
+      }
+      try {
+        worklet.disconnect();
+      } catch {
+        /* node may already be disconnected */
+      }
       void ctx.close().catch(() => {});
-    } catch {}
-    origStop();
-  };
-  return track;
+    };
+
+    const origStop = track.stop.bind(track);
+    track.stop = () => {
+      onTeardown();
+      dispose();
+      origStop();
+    };
+
+    return {
+      track,
+      sink: {
+        postPcm: (left, right) => {
+          const msg: PcmWorkletMessage = { type: "pcm", left, right };
+          worklet.port.postMessage(msg, [left.buffer, right.buffer]);
+        },
+        dispose,
+      },
+    };
+  } catch (err) {
+    void ctx.close().catch(() => {});
+    throw err;
+  }
 }
 
 const defaultPcmDeps: PcmTrackDeps = {
@@ -124,35 +131,75 @@ const defaultPcmDeps: PcmTrackDeps = {
 /* v8 ignore stop */
 // Stryker restore all
 
-/** ~150 ms of 48 kHz stereo buffer. */
-const RING_CAPACITY_FRAMES = 7_200;
-
 let latestPcmTrackToken: symbol | null = null;
 
 /**
- * Create a live MediaStreamTrack fed by `bridge.onAudioPcm`. Calling `track.stop()`
- * unsubscribes from PCM updates and tells the main process to stop capturing audio
- * if no newer PCM track has replaced this one.
+ * Create a live MediaStreamTrack fed by `bridge.onAudioPcm` through an off-main-thread
+ * AudioWorkletNode. Calling `track.stop()` unsubscribes from PCM updates, disposes the
+ * worklet, and tells the main process to stop capturing audio if no newer PCM track has
+ * replaced this one.
  */
-export function createPcmAudioTrack(
+export async function createPcmAudioTrack(
   bridge: PcmAudioBridge,
   deps: PcmTrackDeps = defaultPcmDeps,
-): MediaStreamTrack {
-  const ring = new StereoRingBuffer(RING_CAPACITY_FRAMES);
+): Promise<MediaStreamTrack> {
   let stopped = false;
+  let sink: PcmWorkletSink | null = null;
+  let unsubscribe: (() => void) | null = null;
   const token = Symbol();
   latestPcmTrackToken = token;
-  const unsubscribe = bridge.onAudioPcm((bytes) => {
-    const { left, right } = deinterleavePcm16Stereo(bytes);
-    ring.write(left, right);
-  });
 
-  const teardown = () => {
+  const teardown = (): void => {
     if (stopped) return;
     stopped = true;
-    unsubscribe();
+    unsubscribe?.();
+    unsubscribe = null;
+    try {
+      sink?.dispose();
+    } catch {
+      /* worklet port may already be closed */
+    }
     if (latestPcmTrackToken === token) bridge.stopAudio();
   };
 
-  return deps.createTrack(ring, teardown);
+  let handle: PcmWorkletTrackHandle;
+  try {
+    handle = await deps.createTrack(pcmRingWorkletUrl, teardown);
+  } catch (err) {
+    teardown();
+    throw err;
+  }
+
+  sink = handle.sink;
+
+  // If teardown ran or a newer track superseded this one while awaiting addModule, dispose immediately.
+  if (stopped || latestPcmTrackToken !== token) {
+    stopped = true;
+    try {
+      sink.dispose();
+    } catch {
+      /* worklet port may already be closed */
+    }
+    handle.track.stop();
+    return handle.track;
+  }
+
+  try {
+    unsubscribe = bridge.onAudioPcm((bytes) => {
+      if (stopped) return;
+      const { left, right } = deinterleavePcm16Stereo(bytes);
+      if (left.length === 0) return;
+      try {
+        sink.postPcm(left, right);
+      } catch {
+        /* worklet port may already be closed */
+      }
+    });
+  } catch (err) {
+    teardown();
+    handle.track.stop();
+    throw err;
+  }
+
+  return handle.track;
 }
