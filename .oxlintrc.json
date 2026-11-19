@@ -92,19 +92,6 @@
       "rules": {
         "node/no-process-env": "allow"
       }
-    },
-    {
-      "files": ["worker/room.ts"],
-      "rules": {
-        "max-lines": "allow",
-        "complexity": "allow"
-      }
-    },
-    {
-      "files": ["worker/index.ts"],
-      "rules": {
-        "complexity": "allow"
-      }
     }
   ]
 }

@@ -42,4 +42,20 @@ describe("ipKey", () => {
   it("rejects addresses with invalid characters in the tail", () => {
     expect(ipKey("2001:db8::zzzz")).toBe("2001:db8::zzzz");
   });
+
+  it("handles trimming, zone IDs, exact 8-group validation, and invalid compression lengths", () => {
+    expect(ipKey("  203.0.113.7  ")).toBe("203.0.113.7");
+    expect(ipKey("fe80::1%eth0")).toBe("fe80:0:0:0::/64");
+    // 7 groups without :: is invalid -> pass through
+    expect(ipKey("1:2:3:4:5:6:7")).toBe("1:2:3:4:5:6:7");
+    // 9 groups without :: is invalid -> pass through
+    expect(ipKey("1:2:3:4:5:6:7:8:9")).toBe("1:2:3:4:5:6:7:8:9");
+    // 8 groups WITH :: (missing === 0) is invalid -> pass through
+    expect(ipKey("1:2:3:4::5:6:7:8")).toBe("1:2:3:4::5:6:7:8");
+    // Hextet > 4 chars -> pass through
+    expect(ipKey("2001:db8::12345")).toBe("2001:db8::12345");
+    // Non-IPv4-mapped ffff prefix does not match IPv4-mapped regex
+    expect(ipKey("1:0:0:0:0:ffff:198.51.100.4")).toBe("1:0:0:0:0:ffff:198.51.100.4");
+  });
 });
+

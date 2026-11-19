@@ -125,136 +125,113 @@ export default {
   },
 };
 
-async function route(request: Request, env: Env, url: URL): Promise<Response> {
-  // GET /ws/:code -> validate with isValidRoomCode(); 400 if bad.
-  // Forward the request unchanged to the Durable Object stub.
-  const wsPrefix = "/ws/";
-  if (request.method === "GET" && (url.pathname.startsWith(wsPrefix) || url.pathname === "/ws")) {
-    const code = url.pathname.startsWith(wsPrefix) ? url.pathname.slice(wsPrefix.length) : "";
-    // A JSON body is unreadable by a WebSocket client: a non-101 answer reaches the
-    // page as a bare 1006, which it retries forever. Speak the refusal over the
-    // socket when one was asked for, and keep JSON only for a plain HTTP probe.
-    if (!isValidRoomCode(code)) {
-      return isUpgrade(request)
-        ? rejectUpgrade("bad-room-code", "That room code is not valid")
-        : new Response(JSON.stringify({ error: "Invalid room code" }), {
-            status: 400,
-            headers: { "Content-Type": "application/json" },
-          });
-    }
-    // Reject non-WebSocket probes and cross-origin handshake attempts at the edge before
-    // charging the per-IP limiter or routing to a Durable Object.
-    if (!isUpgrade(request)) {
-      return new Response("Expected Upgrade: websocket", { status: 426 });
-    }
-    const secFetchSite = request.headers.get("Sec-Fetch-Site");
-    if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
-      return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
-    }
-    const origin = request.headers.get("Origin");
-    if (origin !== null) {
-      let parsedOrigin: string;
-      try {
-        parsedOrigin = new URL(origin).origin;
-      } catch {
-        return rejectUpgrade("forbidden-origin", "Malformed Origin header");
-      }
-      if (parsedOrigin !== url.origin) {
-        return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
-      }
-    }
-    const clientIp = request.headers.get("CF-Connecting-IP");
-    const rateKey = ipKey(clientIp ?? "unknown");
-    if (!(await allowed(env.WS_LIMITER, wsUpgradeLimit, rateKey))) {
-      return rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER);
-    }
-    const id = env.ROOMS.idFromName(code);
-    const stub = env.ROOMS.get(id);
-    try {
-      return await stub.fetch(request);
-    } catch {
-      return rejectUpgrade("rate-limited", "Room temporarily unavailable", TRY_AGAIN_LATER);
-    }
+function checkSameOriginHeaders(request: Request, url: URL): "ok" | "cross-origin" | "malformed-origin" {
+  const secFetchSite = request.headers.get("Sec-Fetch-Site");
+  if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+    return "cross-origin";
   }
+  const origin = request.headers.get("Origin");
+  if (origin === null) return "ok";
+  try {
+    return new URL(origin).origin === url.origin ? "ok" : "cross-origin";
+  } catch {
+    return "malformed-origin";
+  }
+}
 
-  // POST /api/room -> initialize DO room state and return { code, password, hostToken }.
-  if (url.pathname === "/api/room") {
-    if (request.method !== "POST") {
-      return new Response(
-        JSON.stringify({ error: "Method not allowed — reload the page to update Screenshare." }),
-        {
-          status: 405,
-          headers: { "Content-Type": "application/json", Allow: "POST" },
-        },
-      );
-    }
-
-    const secFetchSite = request.headers.get("Sec-Fetch-Site");
-    if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
-      return new Response(JSON.stringify({ error: "Cross-origin room creation is not allowed" }), {
-        status: 403,
-        headers: { "Content-Type": "application/json" },
-      });
-    }
-    const origin = request.headers.get("Origin");
-    if (origin !== null) {
-      let originSame = false;
-      try {
-        originSame = new URL(origin).origin === url.origin;
-      } catch {
-        originSame = false;
-      }
-      if (!originSame) {
-        return new Response(JSON.stringify({ error: "Cross-origin room creation is not allowed" }), {
-          status: 403,
+async function handleWebSocketRoute(request: Request, env: Env, url: URL): Promise<Response> {
+  const wsPrefix = "/ws/";
+  const code = url.pathname.startsWith(wsPrefix) ? url.pathname.slice(wsPrefix.length) : "";
+  // A JSON body is unreadable by a WebSocket client: speak the refusal over the socket when upgraded.
+  if (!isValidRoomCode(code)) {
+    return isUpgrade(request)
+      ? rejectUpgrade("bad-room-code", "That room code is not valid")
+      : new Response(JSON.stringify({ error: "Invalid room code" }), {
+          status: 400,
           headers: { "Content-Type": "application/json" },
         });
-      }
-    }
+  }
+  if (!isUpgrade(request)) {
+    return new Response("Expected Upgrade: websocket", { status: 426 });
+  }
+  const originVerdict = checkSameOriginHeaders(request, url);
+  if (originVerdict !== "ok") {
+    return rejectUpgrade(
+      "forbidden-origin",
+      originVerdict === "malformed-origin" ? "Malformed Origin header" : "Connections from this origin are not allowed",
+    );
+  }
+  const rateKey = ipKey(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  if (!(await allowed(env.WS_LIMITER, wsUpgradeLimit, rateKey))) {
+    return rejectUpgrade("rate-limited", "Too many connection attempts", TRY_AGAIN_LATER);
+  }
+  const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+  try {
+    return await stub.fetch(request);
+  } catch {
+    return rejectUpgrade("rate-limited", "Room temporarily unavailable", TRY_AGAIN_LATER);
+  }
+}
 
-    const clientIp = request.headers.get("CF-Connecting-IP");
-    const rateKey = ipKey(clientIp ?? "unknown");
-    if (!(await allowed(env.ROOM_LIMITER, roomCreationLimit, rateKey))) {
-      return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
-        status: 429,
-        headers: { "Content-Type": "application/json", "Retry-After": "60" },
-      });
-    }
-
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const code = generateRoomCode();
-      const id = env.ROOMS.idFromName(code);
-      const stub = env.ROOMS.get(id);
-      let initRes: Response;
-      try {
-        initRes = await stub.fetch("https://internal/init", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ code }),
-        });
-      } catch {
-        continue;
-      }
-      if (initRes.status === 200) {
-        return new Response(initRes.body, {
-          status: 200,
-          headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-        });
-      }
-      await initRes.body?.cancel();
-      if (initRes.status !== 409) {
-        return new Response(JSON.stringify({ error: "Could not initialize room" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        });
-      }
-    }
-
-    return new Response(JSON.stringify({ error: "Could not allocate room" }), {
-      status: 503,
+async function handleCreateRoomRoute(request: Request, env: Env, url: URL): Promise<Response> {
+  if (request.method !== "POST") {
+    return new Response(
+      JSON.stringify({ error: "Method not allowed — reload the page to update Screenshare." }),
+      { status: 405, headers: { "Content-Type": "application/json", Allow: "POST" } },
+    );
+  }
+  if (checkSameOriginHeaders(request, url) !== "ok") {
+    return new Response(JSON.stringify({ error: "Cross-origin room creation is not allowed" }), {
+      status: 403,
       headers: { "Content-Type": "application/json" },
     });
   }
+  const rateKey = ipKey(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  if (!(await allowed(env.ROOM_LIMITER, roomCreationLimit, rateKey))) {
+    return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+      status: 429,
+      headers: { "Content-Type": "application/json", "Retry-After": "60" },
+    });
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const code = generateRoomCode();
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+    let initRes: Response;
+    try {
+      initRes = await stub.fetch("https://internal/init", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+      });
+    } catch {
+      continue;
+    }
+    if (initRes.status === 200) {
+      return new Response(initRes.body, {
+        status: 200,
+        headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+      });
+    }
+    await initRes.body?.cancel();
+    if (initRes.status !== 409) {
+      return new Response(JSON.stringify({ error: "Could not initialize room" }), {
+        status: 503,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+  }
+  return new Response(JSON.stringify({ error: "Could not allocate room" }), {
+    status: 503,
+    headers: { "Content-Type": "application/json" },
+  });
+}
 
+async function route(request: Request, env: Env, url: URL): Promise<Response> {
+  if (request.method === "GET" && (url.pathname.startsWith("/ws/") || url.pathname === "/ws")) {
+    return handleWebSocketRoute(request, env, url);
+  }
+  if (url.pathname === "/api/room") {
+    return handleCreateRoomRoute(request, env, url);
+  }
   return env.ASSETS.fetch(request);
 }

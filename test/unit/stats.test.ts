@@ -179,4 +179,78 @@ describe("summarize", () => {
       }),
     ).toBe("connecting…");
   });
+
+  it("uses includeResolution=true by default, requires both dimensions, and enforces > 0.1% loss threshold", () => {
+    expect(summarize(base)).toBe("19ms · 8.0 Mbps · 60fps · 1920x1080");
+    expect(summarize({ ...base, frameWidth: null })).toBe("19ms · 8.0 Mbps · 60fps");
+    expect(summarize({ ...base, frameHeight: null })).toBe("19ms · 8.0 Mbps · 60fps");
+    // Exactly 0.001 (0.1%) must NOT be shown; > 0.001 must be shown
+    expect(summarize({ ...base, packetLossRatio: 0.001 }, false)).toBe("19ms · 8.0 Mbps · 60fps");
+    expect(summarize({ ...base, packetLossRatio: 0.0011 }, false)).toBe("19ms · 8.0 Mbps · 60fps · 0.1% loss");
+  });
 });
+
+describe("LinkMonitor edge cases", () => {
+  it("ignores non-video RTP stats, non-nominated/unsuccessful candidate pairs, and missing transport pairs", async () => {
+    const report = {
+      T: { type: "transport", selectedCandidatePairId: "MISSING" },
+      BAD1: { type: "candidate-pair", state: "in-progress", nominated: true, currentRoundTripTime: 0.5 },
+      BAD2: { type: "candidate-pair", state: "succeeded", nominated: false, currentRoundTripTime: 0.4 },
+      GOOD: { type: "candidate-pair", state: "succeeded", nominated: true, currentRoundTripTime: 0.03 },
+      AUDIO_OUT: { type: "outbound-rtp", kind: "audio", bytesSent: 999, framesPerSecond: 120 },
+      AUDIO_RI: { type: "remote-inbound-rtp", kind: "audio", packetsLost: 99 },
+      VIDEO_OUT: { type: "outbound-rtp", kind: "video", bytesSent: 100, packetsSent: 10, framesPerSecond: 30 },
+      VIDEO_RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 1 },
+      INVALID: { notAType: true },
+    };
+    const health = await new LinkMonitor(fakePc([report])).read();
+    expect(health?.rttMs).toBeCloseTo(30);
+    expect(health?.framesPerSecond).toBe(30);
+  });
+
+  it("handles zero/negative byte and packet deltas, missing counters, and zero-denominator loss cleanly", async () => {
+    const s1 = {
+      O: { type: "outbound-rtp", kind: "video", bytesSent: 1000, packetsSent: 100 },
+      RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 5 },
+    };
+    // Counter reset (lower bytes/packets/lost) -> bitrate clamped to 0, zero/negative denom -> null loss
+    const s2 = {
+      O: { type: "outbound-rtp", kind: "video", bytesSent: 500, packetsSent: 100 },
+      RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 2 },
+    };
+    // Missing bytesSent / packetsLost
+    const s3 = {
+      O: { type: "outbound-rtp", kind: "video", packetsSent: 150 },
+      RI: { type: "remote-inbound-rtp", kind: "video" },
+    };
+    const monitor = new LinkMonitor(fakePc([s1, s2, s3]), "outbound");
+    await monitor.read();
+    await new Promise((r) => setTimeout(r, 15));
+    const h2 = await monitor.read();
+    expect(h2?.bitrate).toBe(0);
+    expect(h2?.packetLossRatio).toBeNull();
+
+    await new Promise((r) => setTimeout(r, 15));
+    const h3 = await monitor.read();
+    expect(h3?.bitrate).toBeNull();
+    expect(h3?.packetLossRatio).toBeNull();
+  });
+
+  it("clamps negative packet loss delta to 0 when packets increased", async () => {
+    const s1 = {
+      O: { type: "outbound-rtp", kind: "video", bytesSent: 1000, packetsSent: 100 },
+      RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 10 },
+    };
+    const s2 = {
+      O: { type: "outbound-rtp", kind: "video", bytesSent: 2000, packetsSent: 200 },
+      RI: { type: "remote-inbound-rtp", kind: "video", packetsLost: 5 },
+    };
+    const monitor = new LinkMonitor(fakePc([s1, s2]), "outbound");
+    await monitor.read();
+    await new Promise((r) => setTimeout(r, 15));
+    const h2 = await monitor.read();
+    expect(h2?.packetLossRatio).toBe(0);
+    expect(h2?.bitrate).toBeGreaterThan(0);
+  });
+});
+

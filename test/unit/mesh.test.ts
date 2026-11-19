@@ -1965,4 +1965,41 @@ describe("adversarial persistent-transceiver & race probes", () => {
     mesh.removeMember("bob");
     await expect(detachPromise).resolves.toBeUndefined();
   });
+
+  it("enforces defensive Mesh guards for selfId, unknown peers, non-offer signals, and non-control channels", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+
+    // addMember(selfId) is a no-op
+    mesh.addMember("me", true);
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+
+    // handleSignal from unknown member is ignored
+    await mesh.handleSignal("ghost", { k: "offer", sdp: "v=0\r\n" });
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+
+    // Non-offer signal (answer/ice) from a known sharing member with no open link is ignored
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "answer", sdp: "v=0\r\n" });
+    await mesh.handleSignal("bob", { k: "ice", candidate: { candidate: "cand", sdpMid: "0", sdpMLineIndex: 0 } });
+    expect(FakeRTCPeerConnection.instances).toHaveLength(0);
+
+    // Unknown peer queries and setViewing/setAudioTrack without capture do not throw
+    expect(mesh.getConnection("ghost")).toBeUndefined();
+    expect(mesh.hasConnectedLink("ghost")).toBe(false);
+    expect(() => mesh.setViewing("ghost", true)).not.toThrow();
+    await expect(mesh.setAudioTrack({ kind: "audio" } as unknown as MediaStreamTrack)).resolves.toBeUndefined();
+
+    // Non-control data channel is ignored when received on an open link
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const otherChannel = new FakeDataChannel("other");
+    pc.ondatachannel?.({ channel: otherChannel });
+    mesh.setViewing("bob", false);
+    expect(otherChannel.sent).toHaveLength(0);
+
+    // Non-matching setMemberSharing(true) on a member without a link does not throw
+    mesh.addMember("carol", false);
+    expect(() => mesh.setMemberSharing("carol", true)).not.toThrow();
+  });
 });
+

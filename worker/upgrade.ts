@@ -11,22 +11,83 @@ import type { ErrorCode, ServerMessage } from "@shared/protocol";
  */
 export const TRY_AGAIN_LATER = 1013;
 
+export interface UpgradeServerSocket {
+  accept(): void;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+}
+
+export interface UpgradeRuntime<TClient = unknown, TResponse = Response> {
+  createPair(): readonly [TClient, UpgradeServerSocket];
+  createUpgradeResponse(client: TClient): TResponse;
+}
+
+function isServerSocket(value: unknown): value is UpgradeServerSocket {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "accept" in value &&
+    typeof value.accept === "function" &&
+    "send" in value &&
+    typeof value.send === "function" &&
+    "close" in value &&
+    typeof value.close === "function"
+  );
+}
+
+function createGlobalPair(): readonly [unknown, UpgradeServerSocket] {
+  const ctor: unknown = Reflect.get(globalThis, "WebSocketPair");
+  if (typeof ctor !== "function") {
+    throw new Error("WebSocketPair is not available in this runtime");
+  }
+  const pair: unknown = Reflect.construct(ctor, []);
+  if (typeof pair !== "object" || pair === null) {
+    throw new Error("Invalid WebSocketPair instance");
+  }
+  const client: unknown = Reflect.get(pair, 0);
+  const server: unknown = Reflect.get(pair, 1);
+  if (!isServerSocket(server)) {
+    throw new Error("Invalid WebSocketPair server socket");
+  }
+  return [client, server];
+}
+
+function createGlobalUpgradeResponse(client: unknown): Response {
+  const res: unknown = Reflect.construct(Response, [null, { status: 101, webSocket: client }]);
+  if (res instanceof Response) return res;
+  throw new Error("Failed to construct WebSocket upgrade response");
+}
+
+function defaultRuntime(): UpgradeRuntime<unknown, Response> {
+  return {
+    createPair: createGlobalPair,
+    createUpgradeResponse: createGlobalUpgradeResponse,
+  };
+}
+
 /**
  * Refuse a WebSocket connection in a way the browser can actually report.
  *
- * Answering the upgrade with a non-101 status makes the handshake fail, and all the
- * page sees is close code 1006 with no body — no status, no JSON body, no Retry-After,
- * nothing. SignalingClient cannot tell that from a network blip, so it reconnects
- * forever. Completing the handshake lets us say what happened and pick a close code
- * that says whether coming back is worth trying.
- *
- * The server side is taken with `accept()`, not `ctx.acceptWebSocket()`, so a rejection
- * never enters getWebSockets() and cannot itself consume room capacity.
+ * Completing the handshake lets us say what happened and pick a close code
+ * that says whether coming back is worth trying. The server side is taken with
+ * `accept()`, not `ctx.acceptWebSocket()`, so a rejection never enters
+ * `getWebSockets()` and cannot itself consume room capacity.
  */
-export function rejectUpgrade(code: ErrorCode, message: string, closeCode = 1008): Response {
-  const pair = new WebSocketPair();
-  const client = pair[0];
-  const server = pair[1];
+export function rejectUpgrade(code: ErrorCode, message: string, closeCode?: number): Response;
+export function rejectUpgrade<TClient, TResponse>(
+  code: ErrorCode,
+  message: string,
+  closeCode: number,
+  runtime: UpgradeRuntime<TClient, TResponse>,
+): TResponse;
+export function rejectUpgrade(
+  code: ErrorCode,
+  message: string,
+  closeCode = 1008,
+  runtime?: UpgradeRuntime<unknown, unknown>,
+): unknown {
+  const rt = runtime ?? defaultRuntime();
+  const [client, server] = rt.createPair();
   server.accept();
   const msg: ServerMessage = { t: "error", code, message };
   try {
@@ -39,7 +100,7 @@ export function rejectUpgrade(code: ErrorCode, message: string, closeCode = 1008
   } catch {
     // Already gone.
   }
-  return new Response(null, { status: 101, webSocket: client });
+  return rt.createUpgradeResponse(client);
 }
 
 /** True when this request is a WebSocket upgrade, so a refusal can be spoken over one. */

@@ -530,4 +530,127 @@ describe("SessionController", () => {
     vi.advanceTimersByTime(5000);
     expect(onExpire).not.toHaveBeenCalled();
   });
+
+  it("formats all fatal error codes accurately and invokes onForgetHostUiChange on every host-token mutation", async () => {
+    const onForgetHostUiChange = vi.fn();
+    const { ctrl, local, sess, tasks } = makeController({ onForgetHostUiChange });
+    expect(ctrl.isHost).toBe(false);
+    expect(ctrl.roomLocked).toBe(false);
+
+    expect(ctrl.classifyError("ABCD2345", "room-locked", "fallback", true).friendly).toContain("Room ABCD2345 is locked");
+    expect(ctrl.classifyError("ABCD2345", "session-replaced", "fallback", true).friendly).toContain("another tab");
+    expect(ctrl.classifyError("ABCD2345", "bad-password", "fallback", true).friendly).toBe("Invalid or expired room invite.");
+    expect(ctrl.classifyError("ABCD2345", "join-timeout", "fallback", true).friendly).toContain("timed out");
+    expect(ctrl.classifyError("ABCD2345", "connection-failed", "fallback", true).friendly).toContain("Could not connect");
+    expect(ctrl.classifyError("ABCD2345", "bad-message", "fallback", true).friendly).toContain("protocol error");
+
+    onForgetHostUiChange.mockClear();
+    ctrl.saveCreatorHostToken("ABCD2345", "creator-1");
+    await Promise.all(tasks);
+    expect(onForgetHostUiChange).toHaveBeenCalledTimes(2);
+
+    // Persisted-only creator token still reports hasSavedCreatorHostFor and syncs
+    onForgetHostUiChange.mockClear();
+    ctrl.syncCreatorTokensFromStorage();
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(true);
+    expect(onForgetHostUiChange).toHaveBeenCalledTimes(1);
+
+    // saveSessionHostToken and deleteSessionHostToken trigger UI update
+    onForgetHostUiChange.mockClear();
+    ctrl.saveSessionHostToken("ABCD2345", "sess-1");
+    expect(onForgetHostUiChange).toHaveBeenCalledTimes(1);
+    ctrl.deleteSessionHostToken("ABCD2345");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-1");
+
+    // forgetCreatorHostToken with matching token clears both maps and fires UI update
+    onForgetHostUiChange.mockClear();
+    ctrl.saveSessionHostToken("ABCD2345", "creator-1");
+    ctrl.forgetCreatorHostToken("ABCD2345", "creator-1");
+    await Promise.all(tasks);
+    expect(ctrl.hostTokenFor("ABCD2345")).toBeUndefined();
+    expect(onForgetHostUiChange).toHaveBeenCalled();
+
+    // clearRoomSession falls back to lastJoinCode and activeRoomFor, and handles no target
+    ctrl.lastJoinCode = null;
+    ctrl.clearRoomSession();
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    ctrl.saveActiveRoom("WXYZ2345");
+    ctrl.saveRejoinToken("WXYZ2345", "rj-wxyz");
+    ctrl.clearRoomSession();
+    expect(ctrl.activeRoomFor()).toBeUndefined();
+    expect(ctrl.rejoinTokenFor("WXYZ2345")).toBeUndefined();
+
+    // forgetAllHostTokens removes legacy sessionStorage host:* keys
+    sess?.setItem("host:ZZZZ2345", "legacy-val");
+    ctrl.saveSessionHostToken("ZZZZ2345", "mem-val");
+    onForgetHostUiChange.mockClear();
+    ctrl.forgetAllHostTokens();
+    await Promise.all(tasks);
+    expect(sess?.getItem("host:ZZZZ2345")).toBeNull();
+    expect(ctrl.hostTokenFor("ZZZZ2345")).toBeUndefined();
+    expect(onForgetHostUiChange).toHaveBeenCalled();
+
+    // Re-presenting a creator token on welcome refreshes its persisted timestamp
+    ctrl.saveCreatorHostToken("ABCD2345", "creator-refresh");
+    await Promise.all(tasks);
+    local?.removeItem("host-rooms");
+    // Creator token is in memory; presenting it as lastPresentedHostToken re-persists it
+    ctrl.applyWelcomeCredentials("ABCD2345", { host: true, locked: false }, "creator-refresh");
+    await Promise.all(tasks);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-refresh");
+
+    // Locked room welcome for non-host clears roomPassword
+    ctrl.roomPassword = "OLDSECRET1234567";
+    ctrl.applyWelcomeCredentials("ABCD2345", { host: false, locked: true }, undefined);
+    expect(ctrl.roomPassword).toBeNull();
+
+    // applyRoomState when locked as non-host clears roomPassword; when unlocked updates password
+    ctrl.isHost = false;
+    ctrl.roomPassword = "STILLHERE1234567";
+    ctrl.applyRoomState(true);
+    expect(ctrl.roomPassword).toBeNull();
+    ctrl.applyRoomState(false, "NEWPASS123456789");
+    expect(ctrl.roomPassword).toBe("NEWPASS123456789");
+
+    // applyRoomPassword when locked as non-host clears roomPassword
+    ctrl.roomLocked = true;
+    ctrl.isHost = false;
+    ctrl.applyRoomPassword("ABCD2345", undefined, "rj-locked");
+    expect(ctrl.roomPassword).toBeNull();
+    expect(ctrl.rejoinTokenFor("ABCD2345")).toBe("rj-locked");
+
+    // applyHostPromoted updates member host flags for both self and others
+    ctrl.selfId = "p1";
+    ctrl.members.set("p1", { name: "Me", sharing: false, host: false });
+    ctrl.members.set("p2", { name: "Peer", sharing: false, host: true });
+    ctrl.applyHostPromoted("ABCD2345", "p2");
+    expect(ctrl.isHost).toBe(false);
+    expect(ctrl.members.get("p1")?.host).toBe(false);
+    expect(ctrl.members.get("p2")?.host).toBe(true);
+    ctrl.applyHostPromoted("ABCD2345", "p1", "promo-tok", "PROMOPASS1234567");
+    expect(ctrl.isHost).toBe(true);
+    expect(ctrl.members.get("p1")?.host).toBe(true);
+    expect(ctrl.members.get("p2")?.host).toBe(false);
+    expect(ctrl.roomPassword).toBe("PROMOPASS1234567");
+
+    // dismissTransientNotice restores status when message matches, joined, and room active
+    const onShow = vi.fn();
+    const onRestore = vi.fn();
+    ctrl.lastJoinCode = "ABCD2345";
+    ctrl.showTransientNotice("Host left", onShow, vi.fn(), 3000);
+    expect(onShow).toHaveBeenCalledWith("Host left");
+    ctrl.dismissTransientNotice("Host left", true, onRestore);
+    expect(onRestore).toHaveBeenCalledTimes(1);
+
+    // resetRoomState clears pending kicks, transient notice, and members
+    const kickTimeout = vi.fn();
+    ctrl.startPendingKick("p2", "Peer", kickTimeout, 2000);
+    ctrl.showTransientNotice("Temp", vi.fn(), vi.fn(), 2000);
+    ctrl.resetRoomState();
+    expect(ctrl.members.size).toBe(0);
+    expect(ctrl.currentTransientNotice).toBeNull();
+    vi.advanceTimersByTime(5000);
+    expect(kickTimeout).not.toHaveBeenCalled();
+  });
 });
+

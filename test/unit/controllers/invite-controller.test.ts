@@ -303,4 +303,71 @@ describe("InviteController", () => {
     ctrl.cancelRotate();
     expect(ctrl.getFeedback().rotateText).toBe("Rotated!");
   });
+
+  it("starts with clean default feedback and fires onChange on every state transition and timer expiry", () => {
+    const onChange = vi.fn();
+    const ctrl = new InviteController({ onChange });
+
+    expect(ctrl.getFeedback()).toEqual({
+      linkText: "",
+      linkOk: false,
+      codeText: "Copy",
+      codeOk: false,
+      rotateText: "Rotate",
+      rotateOk: false,
+    });
+
+    // Re-triggering code copy feedback resets its timer cleanly
+    ctrl.showCopyFeedback("code");
+    expect(onChange).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(INVITE_COPY_FEEDBACK_MS / 2);
+    ctrl.showCopyFeedback("code");
+    expect(onChange).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(INVITE_COPY_FEEDBACK_MS / 2);
+    expect(ctrl.getFeedback()).toMatchObject({ codeText: "Copied!", codeOk: true });
+    vi.advanceTimersByTime(INVITE_COPY_FEEDBACK_MS / 2);
+    expect(ctrl.getFeedback()).toMatchObject({ codeText: "Copy", codeOk: false });
+    expect(onChange).toHaveBeenCalledTimes(3);
+
+    // beginRotate cancels active copy timers + fires onChange; rotate timeout fires onChange
+    ctrl.showCopyFeedback("link");
+    ctrl.showCopyFeedback("code");
+    onChange.mockClear();
+    expect(ctrl.beginRotate()).toBe(true);
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(ctrl.getFeedback()).toMatchObject({
+      linkText: "",
+      linkOk: false,
+      codeText: "Copy",
+      codeOk: false,
+      rotateText: "Rotating\u2026",
+      rotateOk: false,
+    });
+    vi.advanceTimersByTime(INVITE_COPY_FEEDBACK_MS * 2);
+    // Copy timers must have been cancelled (no extra onChange)
+    expect(onChange).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(INVITE_ROTATE_TIMEOUT_MS);
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(ctrl.getFeedback()).toMatchObject({ rotateText: "Rotate", rotateOk: false });
+
+    // cancelRotate while rotating cancels pending timeout and fires onChange
+    onChange.mockClear();
+    ctrl.beginRotate();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    ctrl.cancelRotate();
+    expect(onChange).toHaveBeenCalledTimes(2);
+    expect(ctrl.getFeedback()).toMatchObject({ rotateText: "Rotate", rotateOk: false });
+    vi.advanceTimersByTime(INVITE_ROTATE_TIMEOUT_MS * 2);
+    expect(onChange).toHaveBeenCalledTimes(2);
+
+    // completeRotate fires onChange and its feedback timer fires onChange on expiry
+    onChange.mockClear();
+    ctrl.beginRotate();
+    ctrl.completeRotate();
+    expect(onChange).toHaveBeenCalledTimes(2);
+    vi.advanceTimersByTime(INVITE_ROTATE_FEEDBACK_MS);
+    expect(onChange).toHaveBeenCalledTimes(3);
+    expect(ctrl.getFeedback()).toMatchObject({ rotateText: "Rotate", rotateOk: false });
+  });
 });
+
