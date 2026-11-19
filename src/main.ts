@@ -1654,9 +1654,9 @@ async function startSharingInner(): Promise<void> {
 
 let stopSharingPromise: Promise<void> | null = null;
 
-async function stopSharing(): Promise<void> {
+function stopSharing(): Promise<void> {
   if (stopSharingPromise) return stopSharingPromise;
-  if (!capture) return;
+  if (!capture) return Promise.resolve();
   const run = (async () => {
     try {
       await mesh?.setCapture(null);
@@ -1673,13 +1673,11 @@ async function stopSharing(): Promise<void> {
     syncMuteAudioButton();
     syncViewState();
     renderRoster();
-  })();
+  })().finally(() => {
+    stopSharingPromise = null;
+  });
   stopSharingPromise = run;
-  try {
-    await run;
-  } finally {
-    if (stopSharingPromise === run) stopSharingPromise = null;
-  }
+  return run;
 }
 
 // ---- room ----------------------------------------------------------------
