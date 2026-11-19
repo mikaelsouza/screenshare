@@ -1110,6 +1110,11 @@ describe("negotiation recovery", () => {
       addTransceiverSpy.mockRestore();
     }
   });
+
+  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
+  it.todo("rate-limits inbound DataChannel view control messages per peer to drop high-frequency floods");
+  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
+  it.todo("tears down active loopback audio capture deterministically if leaveRoom races an in-flight startShare");
 });
 
 
