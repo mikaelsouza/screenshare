@@ -85,6 +85,9 @@ const LAST_HOST_ACTIVE_KEY = "lastHostActiveAt";
 /** Storage key: host promotion credential waiting to be delivered on half-open resume. */
 const PROMOTED_HOST_KEY = "promotedHost";
 
+/** Storage key: durable marker set whenever a mid-session host promotion occurs or is claimed, cleared on 15m reset. */
+const HOST_PROMOTED_KEY = "hostPromoted";
+
 /** How long an occupied room waits for its host to return before promoting the earliest member. */
 const HOST_GRACE_MS = 5 * 60 * 1000;
 
@@ -340,11 +343,27 @@ interface MessageBudget {
   updatedAt: number;
 }
 
+/**
+ * Compute empty-room credential expiry:
+ * - Already-joined pre-deploy rooms lacking `CREATOR_HOST_KEY` explicitly keep their
+ *   pre-deploy 12-hour TTL (capped non-sliding by `lastHostActiveAt` once anchored) rather
+ *   than upgrading to 90-day reusable retention.
+ * - Never-joined rooms expire 12 hours after creation (`UNUSED_ROOM_TTL_MS`).
+ * - Joined rooms with verified `CREATOR_HOST_KEY` expire 90 days after the earlier of
+ *   `emptySince` and `lastHostActiveAt`.
+ */
 function computeCredentialExpiry(
   emptySince: number,
   everJoined: boolean,
   lastHostActiveAt: number | undefined,
+  hasCreatorHost: boolean,
 ): number {
+  if (!hasCreatorHost) {
+    const legacyIdle = emptySince + UNUSED_ROOM_TTL_MS;
+    return lastHostActiveAt !== undefined
+      ? Math.min(legacyIdle, lastHostActiveAt + UNUSED_ROOM_TTL_MS)
+      : legacyIdle;
+  }
   if (!everJoined) return emptySince + UNUSED_ROOM_TTL_MS;
   const idleExpiry = emptySince + EMPTY_ROOM_TTL_MS;
   const hostExpiry = lastHostActiveAt !== undefined ? lastHostActiveAt + EMPTY_ROOM_TTL_MS : idleExpiry;
@@ -570,22 +589,32 @@ export class RoomDO extends DurableObject<Env> {
   /**
    * Clear ephemeral session/IP maps, restore original creator host hash, and reset room lock
    * once empty past 15 minutes — rotating the invite secret if the room was locked when emptied.
+   *
+   * For already-joined pre-deploy rooms without `CREATOR_HOST_KEY`, revoke `HOST_KEY` whenever
+   * durable promotion evidence (`PROMOTED_HOST_KEY` or `HOST_PROMOTED_KEY`) is present; otherwise
+   * leave `HOST_KEY` intact solely within the room's non-sliding 12-hour pre-deploy TTL without
+   * ever copying it to `CREATOR_HOST_KEY` or upgrading the room to 90-day retention.
    */
   private async resetEmptySessionState(
     now: number,
     preRotated: { password: string; passwordHash: string },
   ): Promise<void> {
     this.closeStaleUnjoined(now);
-    const [wasLocked, creatorHostHash] = await Promise.all([
+    const [wasLocked, creatorHostHash, promoted, hostPromoted] = await Promise.all([
       this.ctx.storage.get<boolean>(LOCKED_KEY),
       this.ctx.storage.get<string>(CREATOR_HOST_KEY),
+      this.ctx.storage.get<unknown>(PROMOTED_HOST_KEY),
+      this.ctx.storage.get<boolean>(HOST_PROMOTED_KEY),
     ]);
+    const revokeLegacyPromotedHost =
+      creatorHostHash === undefined && (promoted !== undefined || hostPromoted === true);
     await this.ctx.storage.delete([
       MEMBERS_KEY,
       DENY_KEY,
       PROMOTED_HOST_KEY,
       HOST_GONE_KEY,
-      ...(creatorHostHash === undefined ? [HOST_KEY] : []),
+      HOST_PROMOTED_KEY,
+      ...(revokeLegacyPromotedHost ? [HOST_KEY] : []),
     ]);
     await this.ctx.storage.put({
       [LOCKED_KEY]: false,
@@ -598,18 +627,32 @@ export class RoomDO extends DurableObject<Env> {
   }
 
   /**
-   * Backfill `CREATOR_HOST_KEY` from `HOST_KEY` only for pre-deploy rooms that have never been
-   * joined (`!everJoined && !sessionCleaned && members === undefined && promotedHost === undefined`).
+   * Backfill `CREATOR_HOST_KEY` and an initial `LAST_HOST_ACTIVE_KEY` baseline from `HOST_KEY`
+   * only for pre-deploy rooms that have never been joined
+   * (`!everJoined && !sessionCleaned && members === undefined && promotedHost === undefined && !hostPromoted`).
    */
-  private async backfillUnjoinedLegacyCreatorHash(): Promise<void> {
-    if (this.joinedPeers().length > 0) return;
-    const [creatorHash, hostHash, everJoined, sessionCleaned, members, promoted] = await Promise.all([
+  private async backfillUnjoinedLegacyCreatorHash(now: number): Promise<boolean> {
+    if (this.joinedPeers().length > 0) return false;
+    const [
+      creatorHash,
+      hostHash,
+      everJoined,
+      sessionCleaned,
+      members,
+      promoted,
+      hostPromoted,
+      emptySince,
+      lastHostActiveAt,
+    ] = await Promise.all([
       this.ctx.storage.get<string>(CREATOR_HOST_KEY),
       this.ctx.storage.get<string>(HOST_KEY),
       this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
       this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
       this.ctx.storage.get<unknown>(MEMBERS_KEY),
       this.ctx.storage.get<unknown>(PROMOTED_HOST_KEY),
+      this.ctx.storage.get<boolean>(HOST_PROMOTED_KEY),
+      this.ctx.storage.get<number>(EMPTY_SINCE_KEY),
+      this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
     ]);
     if (
       creatorHash === undefined &&
@@ -617,15 +660,38 @@ export class RoomDO extends DurableObject<Env> {
       everJoined !== true &&
       sessionCleaned !== true &&
       members === undefined &&
-      promoted === undefined
+      promoted === undefined &&
+      hostPromoted !== true
     ) {
-      await this.ctx.storage.put(CREATOR_HOST_KEY, hostHash);
+      await this.ctx.storage.put({
+        [CREATOR_HOST_KEY]: hostHash,
+        ...(lastHostActiveAt === undefined ? { [LAST_HOST_ACTIVE_KEY]: emptySince ?? now } : {}),
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * For rooms lacking `CREATOR_HOST_KEY`, either migrate an unjoined pre-deploy room by
+   * backfilling `CREATOR_HOST_KEY` + `LAST_HOST_ACTIVE_KEY`, or anchor an already-joined
+   * pre-deploy room's `LAST_HOST_ACTIVE_KEY` so its 12-hour legacy TTL cannot slide.
+   */
+  private async reconcileLegacyCreatorState(
+    now: number,
+    emptySince: number,
+    lastHostActiveAt: number | undefined,
+  ): Promise<void> {
+    const backfilled = await this.backfillUnjoinedLegacyCreatorHash(now);
+    if (!backfilled && lastHostActiveAt === undefined) {
+      await this.ctx.storage.put(LAST_HOST_ACTIVE_KEY, emptySince);
     }
   }
 
   /**
-   * Return the creator-anchored 90-day credential cap for an occupied room, refreshing
-   * `LAST_HOST_ACTIVE_KEY` whenever the room creator is currently connected.
+   * Return the creator-anchored credential cap for an occupied room (90d for rooms with verified
+   * `CREATOR_HOST_KEY`, or non-sliding 12h for already-joined pre-deploy rooms without one),
+   * refreshing `LAST_HOST_ACTIVE_KEY` whenever the room creator is currently connected.
    */
   private async creatorActivityCap(
     peers: Array<{ ws: WebSocket; att: PeerAttachment }>,
@@ -635,12 +701,24 @@ export class RoomDO extends DurableObject<Env> {
       await this.ctx.storage.put(LAST_HOST_ACTIVE_KEY, now);
       return now + EMPTY_ROOM_TTL_MS;
     }
-    const [everJoinedRaw, lastHostActiveAt] = await Promise.all([
+    const [everJoinedRaw, lastHostActiveAt, creatorHostHash] = await Promise.all([
       this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
       this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
+      this.ctx.storage.get<string>(CREATOR_HOST_KEY),
     ]);
-    if (everJoinedRaw === true && lastHostActiveAt !== undefined) {
-      return lastHostActiveAt + EMPTY_ROOM_TTL_MS;
+    if (creatorHostHash === undefined) {
+      const baseline = lastHostActiveAt ?? now;
+      if (lastHostActiveAt === undefined) {
+        await this.ctx.storage.put(LAST_HOST_ACTIVE_KEY, baseline);
+      }
+      return baseline + UNUSED_ROOM_TTL_MS;
+    }
+    if (everJoinedRaw === true) {
+      const baseline = lastHostActiveAt ?? now;
+      if (lastHostActiveAt === undefined) {
+        await this.ctx.storage.put(LAST_HOST_ACTIVE_KEY, baseline);
+      }
+      return baseline + EMPTY_ROOM_TTL_MS;
     }
     return Number.POSITIVE_INFINITY;
   }
@@ -658,14 +736,20 @@ export class RoomDO extends DurableObject<Env> {
         emptySince = now;
         await this.ctx.storage.put(EMPTY_SINCE_KEY, emptySince);
       }
-      const [sessionCleanedRaw, everJoinedRaw, lastHostActiveAt] = await Promise.all([
+      const [sessionCleanedRaw, everJoinedRaw, lastHostActiveAt, creatorHostHash] = await Promise.all([
         this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
         this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
         this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
+        this.ctx.storage.get<string>(CREATOR_HOST_KEY),
       ]);
       const sessionCleaned = sessionCleanedRaw === true;
       const everJoined = everJoinedRaw === true;
-      const credentialExpiry = computeCredentialExpiry(emptySince, everJoined, lastHostActiveAt);
+      const credentialExpiry = computeCredentialExpiry(
+        emptySince,
+        everJoined,
+        lastHostActiveAt,
+        creatorHostHash !== undefined,
+      );
       const lifecycleDeadline = sessionCleaned
         ? credentialExpiry
         : Math.min(credentialExpiry, emptySince + EMPTY_SESSION_CLEANUP_MS);
@@ -715,16 +799,22 @@ export class RoomDO extends DurableObject<Env> {
       this.closeStaleUnjoined(now);
       const peers = this.joinedPeers();
       if (peers.length === 0) {
-        let [emptySince, sessionCleanedRaw, everJoinedRaw, lastHostActiveAt] = await Promise.all([
+        let [emptySince, sessionCleanedRaw, everJoinedRaw, lastHostActiveAt, creatorHostHash] = await Promise.all([
           this.ctx.storage.get<number>(EMPTY_SINCE_KEY),
           this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
           this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
           this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
+          this.ctx.storage.get<string>(CREATOR_HOST_KEY),
         ]);
         const sessionCleaned = sessionCleanedRaw === true;
         const everJoined = everJoinedRaw === true;
         if (emptySince === undefined) {
-          if (everJoined && lastHostActiveAt !== undefined && now >= lastHostActiveAt + EMPTY_ROOM_TTL_MS) {
+          const capTtl = creatorHostHash !== undefined ? EMPTY_ROOM_TTL_MS : UNUSED_ROOM_TTL_MS;
+          if (
+            lastHostActiveAt !== undefined &&
+            now >= lastHostActiveAt + capTtl &&
+            (creatorHostHash === undefined || everJoined)
+          ) {
             await this.expireRoom();
             return;
           }
@@ -733,12 +823,19 @@ export class RoomDO extends DurableObject<Env> {
           emptySince = now;
           await this.ctx.storage.put(EMPTY_SINCE_KEY, emptySince);
         }
-        const credentialExpiry = computeCredentialExpiry(emptySince, everJoined, lastHostActiveAt);
+        const credentialExpiry = computeCredentialExpiry(
+          emptySince,
+          everJoined,
+          lastHostActiveAt,
+          creatorHostHash !== undefined,
+        );
         if (now >= credentialExpiry) {
           await this.expireRoom();
           return;
         }
-        await this.backfillUnjoinedLegacyCreatorHash();
+        if (creatorHostHash === undefined) {
+          await this.reconcileLegacyCreatorState(now, emptySince, lastHostActiveAt);
+        }
         if (!sessionCleaned) {
           if (now - emptySince < EMPTY_SESSION_CLEANUP_MS) {
             await this.scheduleAlarmWithUnjoined(
@@ -789,6 +886,7 @@ export class RoomDO extends DurableObject<Env> {
       await this.ctx.storage.put({
         [HOST_KEY]: newHostHash,
         [PROMOTED_HOST_KEY]: promotedRecord,
+        [HOST_PROMOTED_KEY]: true,
       });
       await this.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
       await this.scheduleAlarmWithUnjoined(now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
@@ -1482,29 +1580,44 @@ export class RoomDO extends DurableObject<Env> {
       }
       return "ok";
     }
-    const [emptySince, sessionCleanedRaw, everJoinedRaw, lastHostActiveAt] = await Promise.all([
+    const [emptySince, sessionCleanedRaw, everJoinedRaw, lastHostActiveAt, creatorHostHash] = await Promise.all([
       this.ctx.storage.get<number>(EMPTY_SINCE_KEY),
       this.ctx.storage.get<boolean>(SESSION_CLEANED_KEY),
       this.ctx.storage.get<boolean>(EVER_JOINED_KEY),
       this.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
+      this.ctx.storage.get<string>(CREATOR_HOST_KEY),
     ]);
     const sessionCleaned = sessionCleanedRaw === true;
     const everJoined = everJoinedRaw === true;
     if (emptySince === undefined) {
-      if (everJoined && lastHostActiveAt !== undefined && now >= lastHostActiveAt + EMPTY_ROOM_TTL_MS) {
+      const capTtl = creatorHostHash !== undefined ? EMPTY_ROOM_TTL_MS : UNUSED_ROOM_TTL_MS;
+      if (
+        lastHostActiveAt !== undefined &&
+        now >= lastHostActiveAt + capTtl &&
+        (creatorHostHash === undefined || everJoined)
+      ) {
         await this.expireRoom(ws);
         return "expired";
       }
-      await this.backfillUnjoinedLegacyCreatorHash();
+      if (creatorHostHash === undefined) {
+        await this.reconcileLegacyCreatorState(now, now, lastHostActiveAt);
+      }
       await this.ctx.storage.put(EMPTY_SINCE_KEY, now);
       return "ok";
     }
-    const credentialExpiry = computeCredentialExpiry(emptySince, everJoined, lastHostActiveAt);
+    const credentialExpiry = computeCredentialExpiry(
+      emptySince,
+      everJoined,
+      lastHostActiveAt,
+      creatorHostHash !== undefined,
+    );
     if (now >= credentialExpiry) {
       await this.expireRoom(ws);
       return "expired";
     }
-    await this.backfillUnjoinedLegacyCreatorHash();
+    if (creatorHostHash === undefined) {
+      await this.reconcileLegacyCreatorState(now, emptySince, lastHostActiveAt);
+    }
     if (!sessionCleaned && now - emptySince >= EMPTY_SESSION_CLEANUP_MS) {
       await this.resetEmptySessionState(now, preRotated);
     }
@@ -1586,11 +1699,15 @@ export class RoomDO extends DurableObject<Env> {
       let effectiveIsHost = admission.isHost || supersededSocket?.att.host === true;
       let reissuedHostToken: string | undefined;
       if (admission.isHost) {
-        if (promoted) await this.ctx.storage.delete(PROMOTED_HOST_KEY);
+        if (rawPromoted !== undefined) {
+          await this.ctx.storage.delete(PROMOTED_HOST_KEY);
+          await this.ctx.storage.put(HOST_PROMOTED_KEY, true);
+        }
       } else if (admission.returning && promoted && replacesId === promoted.id) {
         effectiveIsHost = true;
         reissuedHostToken = promoted.token;
         await this.ctx.storage.delete(PROMOTED_HOST_KEY);
+        await this.ctx.storage.put(HOST_PROMOTED_KEY, true);
       }
 
       const prevPeerState = supersededSocket
