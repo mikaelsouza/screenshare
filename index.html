@@ -578,6 +578,14 @@
         height: 1px;
         background-color: var(--border-color);
       }
+      .forget-host-btn {
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+      .forget-host-btn:hover:not(:disabled) {
+        color: #fca5a5;
+        border-color: rgba(220, 38, 38, 0.45);
+      }
 
       /* Stage & Video Tiles */
       #stage {
@@ -958,6 +966,9 @@
                 <button type="button" id="invite-copy-code" class="ui-btn invite-inline-btn">Copy</button>
               </div>
             </div>
+            <button type="button" id="invite-forget-host" class="popover-item forget-host-btn" hidden title="Remove saved host access for this room from this device">
+              <span>Forget host on this device</span>
+            </button>
           </section>
         </div>
         <div class="roster-anchor popover-anchor">
@@ -999,6 +1010,9 @@
           </div>
           <p id="lobby-error" class="lobby-error" role="alert" hidden></p>
         </div>
+        <button type="button" id="lobby-forget-hosts" class="ui-btn forget-host-btn" hidden title="Remove saved host tokens for all rooms from this device">
+          Forget saved host rooms on this device
+        </button>
       </div>
     </div>
 
