@@ -6,6 +6,7 @@ import {
   formatGuardrailSummary,
   isGuardrailFile,
   parseNullDelimitedPaths,
+  parsePrFilesApiJson,
   parsePrLabelsJson,
 } from "../../scripts/check-guardrails-diff";
 
@@ -68,6 +69,34 @@ describe("check-guardrails-diff", () => {
         parseNullDelimitedPaths(".github/workflows/café.yml\0test/formal/a.test.ts\0\0src/mesh.ts\0"),
       ).toEqual([".github/workflows/café.yml", "test/formal/a.test.ts", "src/mesh.ts"]);
       expect(parseNullDelimitedPaths("")).toEqual([]);
+    });
+  });
+
+  describe("parsePrFilesApiJson", () => {
+    it("extracts filename and previous_filename from single-page and slurped multi-page responses", () => {
+      const slurped = JSON.stringify([
+        [
+          { filename: "src/mesh.ts" },
+          { filename: "test/unit/encoding.test.ts", previous_filename: "test/formal/encoding-invariants.test.ts" },
+        ],
+        [
+          { filename: ".github/workflows/café.yml" },
+          null,
+          { filename: "" },
+        ],
+      ]);
+      expect(parsePrFilesApiJson(slurped)).toEqual([
+        "src/mesh.ts",
+        "test/unit/encoding.test.ts",
+        "test/formal/encoding-invariants.test.ts",
+        ".github/workflows/café.yml",
+      ]);
+      expect(parsePrFilesApiJson(JSON.stringify([{ filename: "AGENTS.md" }]))).toEqual(["AGENTS.md"]);
+    });
+
+    it("returns an empty array for malformed or non-array JSON", () => {
+      expect(parsePrFilesApiJson("{bad")).toEqual([]);
+      expect(parsePrFilesApiJson('{"filename":"AGENTS.md"}')).toEqual([]);
     });
   });
 

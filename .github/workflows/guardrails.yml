@@ -16,6 +16,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: guardrails-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -27,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Always checks out the trusted base branch (default for pull_request_target).
-      # PR commits are fetched below solely as read-only diff input and never executed.
+      # PR file metadata is queried read-only via the GitHub API; untrusted PR commits are never fetched or executed.
       - name: Checkout trusted base repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -39,22 +40,23 @@ jobs:
         with:
           node-version: 22
 
-      - name: Fetch PR commits for diff comparison only
-        if: ${{ github.event_name == 'pull_request_target' }}
-        shell: bash
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
-
       - name: Check protected guardrail modifications
         shell: bash
         env:
+          GH_TOKEN: ${{ github.token }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event_name == 'push' && github.event.after || github.event.pull_request.head.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event_name == 'push' && github.event.before || '' }}
+          HEAD_SHA: ${{ github.event_name == 'push' && github.event.after || '' }}
           PR_LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
           set -euo pipefail
-          node --experimental-strip-types scripts/check-guardrails-diff.ts
+          if [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
+            FILES_JSON="$(mktemp "${RUNNER_TEMP:-/tmp}/pr-files.XXXXXX.json")"
+            trap 'rm -f "$FILES_JSON"' EXIT
+            gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" > "$FILES_JSON"
+            CHANGED_FILES_PATH="$FILES_JSON" node --experimental-strip-types scripts/check-guardrails-diff.ts
+          else
+            node --experimental-strip-types scripts/check-guardrails-diff.ts
+          fi

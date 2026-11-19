@@ -154,6 +154,43 @@ export function buildDiffRange(
   return eventName === "push" ? `${base}..${head}` : `${base}...${head}`;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * Extract `filename` and `previous_filename` entries from a GitHub REST API
+ * `pulls/{number}/files` response (either a single array or a `--slurp` array of page arrays).
+ */
+export function parsePrFilesApiJson(raw: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const entries: unknown[] = [];
+  for (const item of parsed as unknown[]) {
+    if (Array.isArray(item)) {
+      for (const sub of item as unknown[]) entries.push(sub);
+    } else {
+      entries.push(item);
+    }
+  }
+  const files: string[] = [];
+  for (const entry of entries) {
+    if (!isRecord(entry)) continue;
+    if (typeof entry["filename"] === "string" && entry["filename"].length > 0) {
+      files.push(entry["filename"]);
+    }
+    if (typeof entry["previous_filename"] === "string" && entry["previous_filename"].length > 0) {
+      files.push(entry["previous_filename"]);
+    }
+  }
+  return files;
+}
+
 /* v8 ignore start */
 function runGit(args: readonly string[]): string {
   return execFileSync("git", args, {
@@ -176,10 +213,13 @@ function resolveDiffRange(env: NodeJS.ProcessEnv): string | null {
 function runCli(): void {
   const eventName = process.env["GITHUB_EVENT_NAME"] ?? "";
   const prLabels = parsePrLabelsJson(process.env["PR_LABELS_JSON"]);
-  const range = resolveDiffRange(process.env);
-  const changedFiles = range
-    ? parseNullDelimitedPaths(runGit(["diff", "--name-only", "--no-renames", "-z", range]))
-    : [];
+  const changedFilesPath = process.env["CHANGED_FILES_PATH"]?.trim();
+  const range = changedFilesPath ? null : resolveDiffRange(process.env);
+  const changedFiles = changedFilesPath
+    ? parsePrFilesApiJson(fs.readFileSync(changedFilesPath, "utf8"))
+    : range
+      ? parseNullDelimitedPaths(runGit(["diff", "--name-only", "--no-renames", "-z", range]))
+      : [];
 
   const result = evaluateGuardrailChanges({ eventName, changedFiles, prLabels });
   const diffText =
