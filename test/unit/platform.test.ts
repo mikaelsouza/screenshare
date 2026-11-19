@@ -775,7 +775,7 @@ describe("desktop WASAPI audio integration", () => {
     expect(pcmTrack.stopped).toBe(true);
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
 
-    // Followed window that closed during setup still publishes and swaps via early follow update
+    // Followed window that closed during setup acquires the replacement before resolving
     let emitFollow!: (u: FollowUpdate) => void;
     const bridge2 = makeAudioBridge();
     bridge2.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
@@ -799,12 +799,67 @@ describe("desktop WASAPI audio integration", () => {
     emitFollow({ role: "game", profile: "League", title: "Match", sourceId: "win:2" });
     video2.end();
     resolvePcm2(pcm2);
-    await expect(startPromise2).resolves.toMatchObject({ audio: pcm2 });
+    await expect(startPromise2).resolves.toMatchObject({ video: swapTrack, audio: pcm2 });
+    expect(cb2.onFollowState).toHaveBeenCalledWith({ role: "game", profile: "League", title: "Match" });
+    expect(bridge2.stopFollow).not.toHaveBeenCalled();
+
+    // If acquiring the replacement track fails, start() rejects cleanly instead of publishing a dead track
+    let emitFollow3!: (u: FollowUpdate) => void;
+    const bridge3 = makeAudioBridge();
+    bridge3.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow3 = cbFn;
+      return () => {};
+    });
+    const { deps: deps3, video: video3, pcmTrack: pcm3 } = makeDeps("window", false);
+    (deps3.captureSource as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("source vanished"));
+    let resolvePcm3!: (t: MediaStreamTrack) => void;
+    deps3.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm3 = resolve;
+        }),
+    );
+    const c3 = createElectronCaptureController(bridge3, callbacks(), deps3);
+    const startPromise3 = c3.start(preset);
     await flush();
-    expect(cb2.onVideoTrackSwapped).toHaveBeenCalledWith(swapTrack, expect.anything());
+    emitFollow3({ role: "game", profile: "League", title: "Match", sourceId: "win:3" });
+    video3.end();
+    resolvePcm3(pcm3);
+    await expect(startPromise3).rejects.toThrow("source vanished");
+    expect(pcm3.stopped).toBe(true);
+    expect(bridge3.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge3.stopFollow).toHaveBeenCalledTimes(1);
   });
 
-  it("stops chosenAudio if deps.makeStream throws when rebuilding the capture stream", async () => {
+  it("rejects startup if a terminal follow-ended update arrives even while the video track is still live", async () => {
+    let emitFollow!: (u: FollowUpdate) => void;
+    const bridge = makeAudioBridge();
+    bridge.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow = cbFn;
+      return () => {};
+    });
+    const { deps, video, pcmTrack } = makeDeps("window", false);
+    let resolvePcm!: (t: MediaStreamTrack) => void;
+    deps.createPcmTrack = vi.fn(
+      () =>
+        new Promise<MediaStreamTrack>((resolve) => {
+          resolvePcm = resolve;
+        }),
+    );
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    const startPromise = c.start(preset);
+    await flush();
+    emitFollow({ role: "ended", profile: "League", title: null, sourceId: null });
+    resolvePcm(pcmTrack);
+    await expect(startPromise).rejects.toThrow("Capture ended before starting");
+    expect(video.stopped).toBe(true);
+    expect(pcmTrack.stopped).toBe(true);
+    expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.stopFollow).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops chosenAudio and main-process follower if deps.makeStream throws when rebuilding the capture stream", async () => {
     const bridge = makeAudioBridge();
     const { deps, video, pcmTrack } = makeDeps("window", false);
     deps.makeStream = vi.fn(() => {
@@ -816,6 +871,7 @@ describe("desktop WASAPI audio integration", () => {
     expect(pcmTrack.stopped).toBe(true);
     expect(video.stopped).toBe(true);
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
+    expect(bridge.stopFollow).toHaveBeenCalledTimes(1);
   });
 });
 

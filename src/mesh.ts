@@ -440,7 +440,10 @@ class PeerLink {
   detachCapture(): Promise<void> {
     this.captureGeneration++;
     this.isSending = false;
-    return this.enqueueMedia(() => this.runDetachCapture());
+    return Promise.race([
+      this.enqueueMedia(() => this.runDetachCapture()),
+      this.closedPromise,
+    ]);
   }
 
   private async runDetachCapture(): Promise<void> {

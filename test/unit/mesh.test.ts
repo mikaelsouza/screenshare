@@ -1945,4 +1945,24 @@ describe("adversarial persistent-transceiver & race probes", () => {
     mesh.removeMember("bob");
     await expect(detachPromise).resolves.toBeUndefined();
   });
+
+  it("resolves setCapture(null) on peer removal even when queued behind a stalled setVideoTrack replacement", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", true);
+    await mesh.handleSignal("bob", { k: "offer", sdp: "v=0\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+
+    await mesh.setCapture(makeCapture(true));
+
+    // Simulate a stalled video swap whose replaceTrack never settles when the peer closes
+    pc.senders[0]!.replaceTrack = () => new Promise<void>(() => {});
+    const swapPromise = mesh.setVideoTrack({ kind: "video" } as unknown as MediaStreamTrack);
+    void swapPromise.catch(() => {});
+
+    const detachPromise = mesh.setCapture(null);
+    await new Promise((r) => setTimeout(r, 0));
+
+    mesh.removeMember("bob");
+    await expect(detachPromise).resolves.toBeUndefined();
+  });
 });

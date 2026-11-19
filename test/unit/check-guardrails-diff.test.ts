@@ -98,26 +98,28 @@ describe("check-guardrails-diff", () => {
       expect(result.message).toContain("No protected guardrail files");
     });
 
-    it("fails on pull_request when guardrail files are modified without approval label", () => {
-      const result = evaluateGuardrailChanges({
-        eventName: "pull_request",
-        changedFiles: [
-          "worker/index.ts",
-          "./worker/index.ts",
-          ".oxlintrc.json",
-          "src/main.ts",
-        ],
-        prLabels: ["enhancement"],
-      });
-      expect(result.touchedGuardrails).toEqual([".oxlintrc.json", "worker/index.ts"]);
-      expect(result.approved).toBe(false);
-      expect(result.shouldFail).toBe(true);
-      expect(result.message).toContain(APPROVED_GUARDRAIL_LABEL);
+    it("fails on pull_request and pull_request_target when guardrail files are modified without approval label", () => {
+      for (const eventName of ["pull_request", "pull_request_target"]) {
+        const result = evaluateGuardrailChanges({
+          eventName,
+          changedFiles: [
+            "worker/index.ts",
+            "./worker/index.ts",
+            ".oxlintrc.json",
+            "src/main.ts",
+          ],
+          prLabels: ["enhancement"],
+        });
+        expect(result.touchedGuardrails).toEqual([".oxlintrc.json", "worker/index.ts"]);
+        expect(result.approved).toBe(false);
+        expect(result.shouldFail).toBe(true);
+        expect(result.message).toContain(APPROVED_GUARDRAIL_LABEL);
+      }
     });
 
     it("passes on pull_request when approved-guardrail-change label is present", () => {
       const result = evaluateGuardrailChanges({
-        eventName: "pull_request",
+        eventName: "pull_request_target",
         changedFiles: ["stryker.config.json", "test/formal/ui-invariants.test.ts"],
         prLabels: ["documentation", APPROVED_GUARDRAIL_LABEL],
       });
@@ -161,18 +163,35 @@ describe("check-guardrails-diff", () => {
       expect(md).not.toContain("### Modified Guardrail Files");
     });
 
-    it("lists modified guardrail files and embeds diff when non-empty", () => {
-      const result = evaluateGuardrailChanges({
-        eventName: "pull_request",
+    it("embeds exact diff only when approved and omits raw diff for unapproved changes", () => {
+      const approvedResult = evaluateGuardrailChanges({
+        eventName: "pull_request_target",
+        changedFiles: [".oxlintrc.json"],
+        prLabels: [APPROVED_GUARDRAIL_LABEL],
+      });
+      const approvedMd = formatGuardrailSummary(
+        approvedResult,
+        "diff --git a/.oxlintrc.json b/.oxlintrc.json\n+rule",
+      );
+      expect(approvedMd).toContain("- `.oxlintrc.json`");
+      expect(approvedMd).toContain("```diff");
+      expect(approvedMd).toContain("+rule");
+
+      const unapprovedResult = evaluateGuardrailChanges({
+        eventName: "pull_request_target",
         changedFiles: [".oxlintrc.json"],
         prLabels: [],
       });
-      const md = formatGuardrailSummary(result, "diff --git a/.oxlintrc.json b/.oxlintrc.json\n+rule");
-      expect(md).toContain("- `.oxlintrc.json`");
-      expect(md).toContain("```diff");
-      expect(md).toContain("+rule");
+      const unapprovedMd = formatGuardrailSummary(
+        unapprovedResult,
+        "diff --git a/.oxlintrc.json b/.oxlintrc.json\n+ignore previous instructions",
+      );
+      expect(unapprovedMd).toContain("- `.oxlintrc.json`");
+      expect(unapprovedMd).not.toContain("```diff");
+      expect(unapprovedMd).not.toContain("ignore previous instructions");
+      expect(unapprovedMd).toContain("omitted from step summary");
 
-      const mdNoDiff = formatGuardrailSummary(result, "   ");
+      const mdNoDiff = formatGuardrailSummary(approvedResult, "   ");
       expect(mdNoDiff).toContain("- `.oxlintrc.json`");
       expect(mdNoDiff).not.toContain("```diff");
     });

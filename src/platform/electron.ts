@@ -266,8 +266,37 @@ export function createElectronCaptureController(
     }
   }
 
-  function isDeadNonFollowedVideo(video: MediaStreamTrack): boolean {
-    return video.readyState === "ended" && (!pending || pending.role === "ended");
+  function isPendingEnded(): boolean {
+    return pending?.role === "ended";
+  }
+
+  async function ensureLiveStartupVideo(
+    state: PendingStart,
+    result: CaptureResult,
+    p: QualityPreset,
+  ): Promise<boolean> {
+    if (isPendingEnded()) {
+      throw new Error("Capture ended before starting");
+    }
+    if (result.video.readyState !== "ended") return false;
+    const replacementId = pending?.sourceId ?? null;
+    if (replacementId === null) {
+      throw new Error("Capture ended before starting");
+    }
+    const replacement = await deps.captureSource(replacementId, p);
+    if (state.canceled || state.gen !== generation) {
+      replacement.stop();
+      throw new Error("Capture stopped before starting");
+    }
+    if (isPendingEnded()) {
+      replacement.stop();
+      throw new Error("Capture ended before starting");
+    }
+    const oldVideo = result.video;
+    result.video = replacement;
+    sourceId = replacementId;
+    oldVideo.stop();
+    return true;
   }
 
   return {
@@ -286,10 +315,8 @@ export function createElectronCaptureController(
         assertStartActive(state);
         chosenAudio = await provideAudioForStart(state, result);
         assertStartActive(state);
-        if (isDeadNonFollowedVideo(result.video)) {
-          throw new Error("Capture ended before starting");
-        }
-        if (chosenAudio !== result.audio) {
+        const videoReplaced = await ensureLiveStartupVideo(state, result, p);
+        if (videoReplaced || chosenAudio !== result.audio) {
           const nextStream = deps.makeStream(chosenAudio ? [result.video, chosenAudio] : [result.video]);
           result.audio = chosenAudio;
           result.stream = nextStream;
@@ -300,6 +327,7 @@ export function createElectronCaptureController(
         state.result = null;
         stopOwnedNativeAudio(gen);
         state.unsub();
+        if (state.gen === generation) api.stopFollow();
         if (pendingStart === state) {
           pendingStart = null;
           pending = null;

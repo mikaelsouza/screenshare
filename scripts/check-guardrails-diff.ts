@@ -77,7 +77,8 @@ export function evaluateGuardrailChanges(
   touchedGuardrails.sort();
 
   const approved = input.prLabels.includes(APPROVED_GUARDRAIL_LABEL);
-  const isPullRequest = input.eventName === "pull_request";
+  const isPullRequest =
+    input.eventName === "pull_request" || input.eventName === "pull_request_target";
   const shouldFail = isPullRequest && touchedGuardrails.length > 0 && !approved;
 
   if (touchedGuardrails.length === 0) {
@@ -121,7 +122,14 @@ export function formatGuardrailSummary(
   }
   const trimmedDiff = diffText.trim();
   if (trimmedDiff.length > 0) {
-    lines.push("", "### Exact Guardrail Diff", "", "```diff", trimmedDiff, "```");
+    if (result.approved) {
+      lines.push("", "### Exact Guardrail Diff", "", "```diff", trimmedDiff, "```");
+    } else {
+      lines.push(
+        "",
+        `Exact guardrail diff omitted from step summary for unapproved changes; inspect the PR diff directly before applying \`${APPROVED_GUARDRAIL_LABEL}\`.`,
+      );
+    }
   }
   return `${lines.join("\n")}\n`;
 }
