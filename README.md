@@ -186,7 +186,7 @@ npm run check           # typecheck client, worker, and electron (TypeScript 7)
 npm run lint:all        # dead-code & cycle check (knip) + type-aware lint (oxlint)
 npm run test:unit       # unit tests (protocol, mesh, quality, capture, audio, follow, UI)
 npm run test:worker     # RoomDO in real workerd (@cloudflare/vitest-plugin)
-npm run test:formal     # formal state-machine & rate-limit invariant tests
+npm run test:formal     # exhaustive & stateful model-based invariant suites
 npm run test:fuzz       # fast-check property and fuzz tests
 npm run test:mutate     # Stryker mutation testing
 npm run test:e2e        # Playwright Chromium peers: P2P media and edge cases

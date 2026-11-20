@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   check-and-test:
-    name: Check, Lint & Test (Unit, Worker, Formal, Fuzz)
+    name: Check, Lint & Test (Unit, Worker, Model Invariants, Fuzz)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -49,7 +49,7 @@ jobs:
       - name: Durable Object workerd tests
         run: npm run test:worker
 
-      - name: Formal invariant & fuzz tests
+      - name: Exhaustive, stateful model & fuzz invariant tests
         run: |
           npm run test:formal
           npm run test:fuzz

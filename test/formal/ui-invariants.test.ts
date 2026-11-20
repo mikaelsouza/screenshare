@@ -9,7 +9,7 @@ import {
   type PopoverKind,
 } from "@src/ui-model";
 
-describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
+describe("Exhaustive Model Invariants: UI View & Bandwidth", () => {
   it("exhaustively verifies view-state mutual exclusion and button invariants across all boolean & tile-count states", () => {
     const bools = [false, true];
     const tileCounts = [0, 1, 2, 3, 8, 20];
@@ -165,7 +165,7 @@ describe("Formal State-Machine Proofs: UI View & Bandwidth Invariants", () => {
     }
   });
 
-  it("proves deriveInviteMenuState invariants exhaustively across readiness, rotation, lock, and credentials", () => {
+  it("exhaustively verifies deriveInviteMenuState invariants across readiness, rotation, lock, and credentials", () => {
     const codes: Array<string | null> = [null, "", "ABCDEFGH"];
     const passwords: Array<string | null> = [null, "", "JKMNPQRSTUVWXYZ2"];
     const bools = [false, true];
