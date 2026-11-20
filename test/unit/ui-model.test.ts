@@ -517,6 +517,8 @@ describe("describeInviteParseFailure", () => {
   it("maps every invite failure reason to user-facing lobby copy", () => {
     expect(describeInviteParseFailure("empty")).toContain("Paste an invite link or code");
     expect(describeInviteParseFailure("url-missing-invite")).toContain("#CODE-SECRET");
+    expect(describeInviteParseFailure("url-missing-invite")).toContain("Copy invite link");
+    expect(describeInviteParseFailure("url-missing-invite")).not.toContain("Invite \u25BE");
     expect(describeInviteParseFailure("missing-secret")).toContain("CODE-SECRET");
     expect(describeInviteParseFailure("invalid")).toContain("Invalid invite");
   });

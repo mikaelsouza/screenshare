@@ -138,6 +138,60 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     assert.equal(await host.evaluate(() => window.location.hash), "", "URL hash must stay empty after Create");
     assert.equal(await host.inputValue("#room-code"), "", "#room-code input should clear on join");
 
+    // 1-click Copy invite link in the split button: menu stays closed, 0px horizontal shift.
+    await host.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: BASE_URL });
+    const beforeCopyWidth = await host.evaluate(
+      () => document.getElementById("invite-copy-link")?.getBoundingClientRect().width ?? 0,
+    );
+    assert.ok(beforeCopyWidth > 0, "#invite-copy-link should have non-zero width");
+    assert.equal(
+      await host.evaluate(() => document.getElementById("invite-menu")?.hidden),
+      true,
+      "#invite-menu should start hidden",
+    );
+    await host.click("#invite-copy-link");
+    await waitFor(
+      host,
+      () =>
+        document.getElementById("invite-link-feedback")?.textContent === "Copied!" &&
+        Boolean(document.getElementById("invite-copy-link")?.classList.contains("invite-feedback-ok")),
+      { label: "#invite-copy-link shows Copied! feedback" },
+    );
+    const afterCopy = await host.evaluate(() => ({
+      menuHidden: document.getElementById("invite-menu")?.hidden ?? false,
+      afterWidth: document.getElementById("invite-copy-link")?.getBoundingClientRect().width ?? 0,
+    }));
+    assert.equal(afterCopy.menuHidden, true, "#invite-menu must remain hidden after 1-click copy");
+    assert.ok(
+      Math.abs(afterCopy.afterWidth - beforeCopyWidth) < 0.5,
+      `#invite-copy-link width shifted during Copied! flash: ${String(beforeCopyWidth)} -> ${String(afterCopy.afterWidth)}`,
+    );
+
+    // Clipboard failure on #invite-copy-link must auto-open #invite-menu so Show is immediately visible.
+    try {
+      await host.evaluate(() => {
+        Object.defineProperty(navigator, "clipboard", {
+          configurable: true,
+          value: { writeText: () => Promise.reject(new Error("clipboard denied")) },
+        });
+        Object.defineProperty(document, "execCommand", {
+          configurable: true,
+          value: () => false,
+        });
+      });
+      await host.click("#invite-copy-link");
+      await waitFor(host, () => document.getElementById("invite-menu")?.hidden === false, {
+        label: "#invite-menu auto-opens on clipboard failure",
+      });
+      assert.equal(await host.isVisible("#invite-show-btn"), true, "#invite-show-btn must be visible on copy failure");
+      await host.click("#invite-btn"); // close popover before continuing
+    } finally {
+      await host.evaluate(() => {
+        Reflect.deleteProperty(navigator, "clipboard");
+        Reflect.deleteProperty(document, "execCommand");
+      });
+    }
+
     await openInvite(host);
     const masked = ((await host.textContent("#invite-code-value")) ?? "").trim();
     assert.match(masked, /^[A-Z2-9]{8}-\u2022{16}$/, "invite code must be masked by default");
@@ -381,6 +435,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       () =>
         !document.getElementById("invite-locked-note")?.hidden &&
         (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.disabled === true &&
+        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.title ===
+          "Room is locked \u2014 unlock to invite" &&
         (document.getElementById("invite-show-btn") as HTMLButtonElement | null)?.disabled === true,
       { label: "other sees invite disabled while room locked" },
     );
@@ -427,7 +483,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       other,
       () =>
         Boolean(document.getElementById("invite-locked-note")?.hidden) &&
-        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.disabled === false,
+        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.disabled === false &&
+        (document.getElementById("invite-copy-link") as HTMLButtonElement | null)?.title === "Copy invite link",
       { label: "other regains invite controls after unlock" },
     );
     await other.click("#invite-btn");
@@ -482,29 +539,57 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       [1440, 900],
       [1024, 768],
       [800, 600],
+      [390, 844],
     ];
-    for (const [width, height] of viewports) {
-      await host.setViewportSize({ width, height });
-      const metrics = await host.evaluate(() => {
-        const headerRect = document.querySelector("header.app-bar")?.getBoundingClientRect();
-        const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
-        const inviteBtnRect = document.getElementById("invite-btn")?.getBoundingClientRect();
-        const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
-        return {
-          headerHeight: Math.round(headerRect?.height ?? 0),
-          controlsHeight: Math.round(controlsRect?.height ?? 0),
-          inviteLeftOfRoster: Boolean(inviteBtnRect && rosterBtnRect && inviteBtnRect.right <= rosterBtnRect.left),
-          scrollWidth: document.documentElement.scrollWidth,
-          innerWidth: window.innerWidth,
-        };
-      });
-      assert.equal(metrics.headerHeight, 52, `header height at ${String(width)}x${String(height)}`);
-      assert.equal(metrics.controlsHeight, 52, `controls height at ${String(width)}x${String(height)}`);
-      assert.equal(metrics.inviteLeftOfRoster, true, `header button order at ${String(width)}x${String(height)}`);
-      assert.ok(
-        metrics.scrollWidth <= metrics.innerWidth,
-        `horizontal overflow at ${String(width)}x${String(height)}: ${String(metrics.scrollWidth)} > ${String(metrics.innerWidth)}`,
-      );
+    try {
+      for (const [width, height] of viewports) {
+        await host.setViewportSize({ width, height });
+        const metrics = await host.evaluate(() => {
+          const headerRect = document.querySelector("header.app-bar")?.getBoundingClientRect();
+          const controlsRect = document.getElementById("controls")?.getBoundingClientRect();
+          const inviteCopyEl = document.getElementById("invite-copy-link");
+          const inviteCopyRect = inviteCopyEl?.getBoundingClientRect();
+          const inviteCopyLabel = inviteCopyEl?.querySelector<HTMLElement>(".invite-copy-label");
+          const inviteBtnRect = document.getElementById("invite-btn")?.getBoundingClientRect();
+          const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
+          return {
+            headerHeight: Math.round(headerRect?.height ?? 0),
+            controlsHeight: Math.round(controlsRect?.height ?? 0),
+            inviteLeftOfRoster: Boolean(inviteBtnRect && rosterBtnRect && inviteBtnRect.right <= rosterBtnRect.left),
+            inviteCopyWidth: Math.round(inviteCopyRect?.width ?? 0),
+            inviteCopyHeight: Math.round(inviteCopyRect?.height ?? 0),
+            inviteCopyLabelDisplay: inviteCopyLabel ? getComputedStyle(inviteCopyLabel).display : "",
+            scrollWidth: document.documentElement.scrollWidth,
+            innerWidth: window.innerWidth,
+          };
+        });
+        assert.equal(metrics.headerHeight, 52, `header height at ${String(width)}x${String(height)}`);
+        assert.equal(metrics.controlsHeight, 52, `controls height at ${String(width)}x${String(height)}`);
+        assert.equal(metrics.inviteLeftOfRoster, true, `header button order at ${String(width)}x${String(height)}`);
+        assert.ok(
+          metrics.scrollWidth <= metrics.innerWidth,
+          `horizontal overflow at ${String(width)}x${String(height)}: ${String(metrics.scrollWidth)} > ${String(metrics.innerWidth)}`,
+        );
+        if (width <= 680) {
+          assert.equal(
+            metrics.inviteCopyWidth,
+            32,
+            `#invite-copy-link width at ${String(width)}x${String(height)} should collapse to 32px`,
+          );
+          assert.equal(
+            metrics.inviteCopyHeight,
+            32,
+            `#invite-copy-link height at ${String(width)}x${String(height)} should be 32px`,
+          );
+          assert.equal(
+            metrics.inviteCopyLabelDisplay,
+            "none",
+            `.invite-copy-label must be display: none at ${String(width)}x${String(height)}`,
+          );
+        }
+      }
+    } finally {
+      await host.setViewportSize({ width: 1280, height: 720 });
     }
   });
 

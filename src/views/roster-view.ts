@@ -62,6 +62,9 @@ export function renderInviteMenuView(
 
   ui.inviteLockedNote.hidden = !state.showLockedBanner;
   ui.inviteCopyLinkBtn.disabled = !state.canCopy;
+  ui.inviteCopyLinkBtn.title = state.showLockedBanner
+    ? "Room is locked \u2014 unlock to invite"
+    : "Copy invite link";
   ui.inviteLinkFeedback.textContent = fb.linkText;
   ui.inviteLinkFeedback.classList.toggle("invite-feedback-ok", fb.linkOk);
   ui.inviteCopyLinkBtn.classList.toggle("invite-feedback-ok", fb.linkOk);

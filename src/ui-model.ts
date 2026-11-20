@@ -217,7 +217,7 @@ export function describeInviteParseFailure(reason: InviteParseFailureReason): st
     case "empty":
       return "Paste an invite link or code to join.";
     case "url-missing-invite":
-      return "That link is missing its #CODE-SECRET invite part. Ask someone in the room to use Invite \u25BE \u2192 Copy invite link.";
+      return "That link is missing its #CODE-SECRET invite part. Ask someone in the room to click Copy invite link.";
     case "missing-secret":
       return "Room codes now include a secret (CODE-SECRET). Paste the full invite link or code.";
     case "invalid":
