@@ -164,20 +164,18 @@ Picture-in-Picture, live stats, and fullscreen controls.
 1. Add a comma after `ratelimits`, uncomment `routes` in `wrangler.jsonc`, replace the
    `<tld>` placeholder with your custom domain, and configure `CLOUDFLARE_API_TOKEN` and
    `CLOUDFLARE_ACCOUNT_ID` in GitHub Actions repository secrets.
-2. Push to `main`.
-   - **Frontend & Worker:** `.github/workflows/deploy.yml` verifies that both `CI` and
-     `CodeQL` succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`.
-     Existing desktop app installs pick up web/UI updates immediately because they load
-     the hosted site.
-   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs after `CI`
-     succeeds on `main`, verifies `CodeQL` passed, checks Electron-relevant changes since
-     the latest tag (`electron/`, `electron-builder.json`, `tsconfig.electron.json`,
-     `assets/icon.*`, `.github/workflows/release-electron.yml`, or runtime/Electron entries
-     in `package.json` and `package-lock.json`), builds and smoke-tests the NSIS installer
-     in a read-only job, and publishes the GitHub Release (`latest.yml`, `.blockmap`, and
-     `SHA256SUMS.txt`) in an isolated release job (or via `workflow_dispatch` with an
-     optional `force` flag).
+2. Push to `main` to deploy the web frontend and Worker.
+   - `.github/workflows/deploy.yml` verifies that both `CI` and `CodeQL` succeeded for the
+     `main` commit and deploys with `cloudflare/wrangler-action`. Existing desktop app installs
+     pick up web/UI updates immediately because they load the hosted site.
    - `npm run deploy` builds and deploys the Worker locally without running any checks.
+3. Release the Windows desktop app by pushing a `vMAJOR.MINOR.PATCH` tag on the target `main`
+   commit (or manually dispatching `.github/workflows/release-electron.yml` for that commit).
+   - The workflow verifies `CI` and `CodeQL` passed on `main` for that commit, builds the
+     Windows installer with all 6 `@electron/fuses` burned, runs both unpackaged
+     (`electron:smoke`) and packaged fuse/ASAR (`electron:smoke:packaged`) checks, attaches
+     SLSA build provenance via `actions/attest-build-provenance`, and publishes the GitHub
+     Release (`latest.yml`, `.blockmap`, and `SHA256SUMS.txt`).
 
 ## Development
 
@@ -186,7 +184,7 @@ npm run check           # typecheck client, worker, and electron (TypeScript 7)
 npm run lint:all        # dead-code & cycle check (knip) + type-aware lint (oxlint)
 npm run test:unit       # unit tests (protocol, mesh, quality, capture, audio, follow, UI)
 npm run test:worker     # RoomDO in real workerd (@cloudflare/vitest-plugin)
-npm run test:formal     # formal state-machine & rate-limit invariant tests
+npm run test:formal     # exhaustive & stateful model-based invariant suites
 npm run test:fuzz       # fast-check property and fuzz tests
 npm run test:mutate     # Stryker mutation testing
 npm run test:e2e        # Playwright Chromium peers: P2P media and edge cases

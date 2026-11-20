@@ -2001,5 +2001,136 @@ describe("adversarial persistent-transceiver & race probes", () => {
     mesh.addMember("carol", false);
     expect(() => mesh.setMemberSharing("carol", true)).not.toThrow();
   });
+
+  it("defers local offers during applyingOffer and avoids calling setLocalDescription on stale colliding offers", async () => {
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("alice", { ...opts }, (_to, data) => sent.push(data), cb());
+    mesh.addMember("zoe", true);
+    // zoe > alice so alice is polite
+    let resolveRemoteDesc!: () => void;
+    const remoteDescGate = new Promise<void>((resolve) => {
+      resolveRemoteDesc = resolve;
+    });
+
+    await mesh.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    sent.length = 0;
+
+    // Simulate attachCapture while a new remote offer is in-flight in setRemoteDescription
+    const origSetRemote = pc.setRemoteDescription.bind(pc);
+    let gatedOnce = false;
+    pc.setRemoteDescription = async (desc: RTCSessionDescriptionInit) => {
+      if (!gatedOnce) {
+        gatedOnce = true;
+        await remoteDescGate;
+      }
+      await origSetRemote(desc);
+    };
+
+    let setLocalCalls = 0;
+    const origSetLocal = pc.setLocalDescription.bind(pc);
+    pc.setLocalDescription = async (desc?: RTCSessionDescriptionInit) => {
+      if (desc?.type === "offer") setLocalCalls++;
+      return desc ? origSetLocal(desc) : Promise.resolve();
+    };
+
+    const incomingOffer = mesh.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    // Trigger onnegotiationneeded while applyingOffer is true
+    pc.onnegotiationneeded?.();
+    await mesh.setCapture(makeCapture(false));
+    expect(setLocalCalls).toBe(0);
+
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      resolveRemoteDesc();
+      await incomingOffer;
+      await new Promise((r) => setTimeout(r, 15));
+      expect(setLocalCalls).toBeGreaterThanOrEqual(1);
+      expect(sent.some((m) => m.k === "offer")).toBe(true);
+      expect(errSpy).not.toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it("defers non-stable negotiate calls and retries cleanly when a remote offer supersedes createOffer or setLocalDescription", async () => {
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("alice", { ...opts }, (_to, data) => sent.push(data), cb());
+    mesh.addMember("zoe", true);
+    await mesh.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    sent.length = 0;
+
+    // 1. Non-stable signalingState defers negotiate without invoking createOffer
+    let createCalls = 0;
+    const origCreate = pc.createOffer.bind(pc);
+    pc.createOffer = async () => {
+      createCalls++;
+      return origCreate();
+    };
+    pc.signalingState = "have-remote-offer";
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(createCalls).toBe(0);
+    pc.signalingState = "stable";
+
+    // 2. Remote offer lands mid-createOffer -> local offer aborted before setLocalDescription, answer sent, then fresh local offer retried
+    let resolveCreate!: (d: RTCSessionDescriptionInit) => void;
+    const createGate = new Promise<RTCSessionDescriptionInit>((r) => { resolveCreate = r; });
+    pc.createOffer = () => {
+      createCalls++;
+      return createCalls === 1 ? createGate : origCreate();
+    };
+    const origSetLocal = pc.setLocalDescription.bind(pc);
+    const appliedLocalSdps: string[] = [];
+    pc.setLocalDescription = async (desc?: RTCSessionDescriptionInit) => {
+      if (desc?.sdp) appliedLocalSdps.push(desc.sdp);
+      return desc ? origSetLocal(desc) : Promise.resolve();
+    };
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      pc.onnegotiationneeded?.();
+      await new Promise((r) => setTimeout(r, 0));
+      const raceOffer = mesh.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+      resolveCreate({ type: "offer", sdp: "v=0\r\nm=stale 9\r\n" });
+      await raceOffer;
+      await new Promise((r) => setTimeout(r, 15));
+      expect(appliedLocalSdps.every((sdp) => !sdp.includes("m=stale"))).toBe(true);
+      expect(sent.some((m) => m.k === "answer")).toBe(true);
+      expect(sent.some((m) => m.k === "offer")).toBe(true);
+      expect(errSpy).not.toHaveBeenCalled();
+
+      // Acknowledge the outgoing offer so FakeRTCPeerConnection returns to stable
+      await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+
+      // 3. Reject setLocalDescription after signalingState transiently flips, then return to stable WITHOUT
+      // delivering a colliding remote offer -> fresh offer MUST originate solely from catch-recorded retryOffer()
+      sent.length = 0;
+      let failOnce = true;
+      pc.setLocalDescription = async (desc?: RTCSessionDescriptionInit) => {
+        if (failOnce && desc?.type === "offer") {
+          failOnce = false;
+          // Simulate browser flipping signalingState while rejecting stale setLocalDescription,
+          // then restoring stable once remote answer settles (no colliding remote offer).
+          pc.signalingState = "have-remote-offer";
+          throw new DOMException("m-line order mismatch", "InvalidAccessError");
+        }
+        return desc ? origSetLocal(desc) : Promise.resolve();
+      };
+      pc.onnegotiationneeded?.();
+      await new Promise((r) => setTimeout(r, 10));
+      expect(errSpy).not.toHaveBeenCalled();
+      expect(failOnce).toBe(false);
+      expect(sent.some((m) => m.k === "offer")).toBe(false);
+      // Delivering an answer (never sets offerPending) brings signalingState back to stable and flushes
+      // the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
+      pc.signalingState = "stable";
+      await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+      await new Promise((r) => setTimeout(r, 15));
+      expect(sent.some((m) => m.k === "offer")).toBe(true);
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
 });
 

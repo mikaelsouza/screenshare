@@ -1,0 +1,333 @@
+/**
+ * Packaged Electron Fuse & ASAR Integrity Startup Verifier.
+ *
+ * Unlike `scripts/smoke-test.ts` (unpackaged Playwright DOM/IPC test), packaged
+ * binaries ignore all env/CLI overrides and burn all 6 `@electron/fuses`. This
+ * verifier inspects the built `Screenshare.exe` directly:
+ * 1. Verifies all 6 required security fuses via `getCurrentFuseWire(execPath)`.
+ * 2. Verifies `ELECTRON_RUN_AS_NODE=1` cannot execute inline Node code (`-e`).
+ * 3. Verifies `--inspect=127.0.0.1:<port>` does not expose a V8 inspector socket.
+ * 4. Verifies clean native startup for 4s without ASAR integrity crash (`exitCode === null`),
+ *    then cleanly terminates the binary.
+ */
+
+import { spawn, spawnSync } from "node:child_process";
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+/** Byte values stored in the Electron binary's SENTINEL fuse wire (`@electron/fuses/dist/constants`). */
+export const FUSE_STATE_DISABLE = 48; // '0'
+export const FUSE_STATE_ENABLE = 49; // '1'
+export const FUSE_STATE_REMOVED = 114; // 'r'
+export const FUSE_STATE_INHERIT = 144;
+
+/** Fuse wire indices matching `@electron/fuses` `FuseV1Options`. */
+export const FUSE_V1_VERSION = "1";
+export const FUSE_V1_RUN_AS_NODE = 0;
+export const FUSE_V1_ENABLE_COOKIE_ENCRYPTION = 1;
+export const FUSE_V1_ENABLE_NODE_OPTIONS_ENV = 2;
+export const FUSE_V1_ENABLE_NODE_CLI_INSPECT = 3;
+export const FUSE_V1_ENABLE_ASAR_INTEGRITY = 4;
+export const FUSE_V1_ONLY_LOAD_APP_FROM_ASAR = 5;
+
+export interface RequiredFuseExpectation {
+  option: number;
+  name: string;
+  expected: boolean;
+}
+
+export const REQUIRED_ELECTRON_FUSES: readonly RequiredFuseExpectation[] = [
+  { option: FUSE_V1_RUN_AS_NODE, name: "runAsNode", expected: false },
+  { option: FUSE_V1_ENABLE_COOKIE_ENCRYPTION, name: "enableCookieEncryption", expected: true },
+  {
+    option: FUSE_V1_ENABLE_NODE_OPTIONS_ENV,
+    name: "enableNodeOptionsEnvironmentVariable",
+    expected: false,
+  },
+  { option: FUSE_V1_ENABLE_NODE_CLI_INSPECT, name: "enableNodeCliInspectArguments", expected: false },
+  {
+    option: FUSE_V1_ENABLE_ASAR_INTEGRITY,
+    name: "enableEmbeddedAsarIntegrityValidation",
+    expected: true,
+  },
+  { option: FUSE_V1_ONLY_LOAD_APP_FROM_ASAR, name: "onlyLoadAppFromAsar", expected: true },
+] as const;
+
+export interface FuseVerificationResult {
+  ok: boolean;
+  failures: string[];
+}
+
+export function verifyFuseWire(
+  wire: Partial<Record<number, number>> & { version?: string },
+): FuseVerificationResult {
+  const failures: string[] = [];
+  if (wire.version !== FUSE_V1_VERSION) {
+    failures.push(`Expected fuse wire version ${FUSE_V1_VERSION}, got ${String(wire.version)}`);
+  }
+  for (const spec of REQUIRED_ELECTRON_FUSES) {
+    const expectedState = spec.expected ? FUSE_STATE_ENABLE : FUSE_STATE_DISABLE;
+    const actualState = wire[spec.option];
+    if (actualState !== expectedState) {
+      failures.push(
+        `Fuse ${spec.name} mismatch: expected ${String(expectedState)} (${spec.expected ? "ENABLE" : "DISABLE"}), got ${String(actualState)}`,
+      );
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+export function verifyElectronBuilderFuseConfig(rawConfig: unknown): FuseVerificationResult {
+  if (typeof rawConfig !== "object" || rawConfig === null) {
+    return { ok: false, failures: ["electron-builder.json root must be an object"] };
+  }
+  const fuses: unknown = Reflect.get(rawConfig, "electronFuses");
+  if (typeof fuses !== "object" || fuses === null) {
+    return { ok: false, failures: ["electron-builder.json is missing electronFuses"] };
+  }
+  const failures: string[] = [];
+  if (Reflect.get(rawConfig, "asar") !== true) {
+    failures.push("electron-builder.json must keep asar: true for ASAR integrity fuses");
+  }
+  for (const spec of REQUIRED_ELECTRON_FUSES) {
+    const actual: unknown = Reflect.get(fuses, spec.name);
+    if (actual !== spec.expected) {
+      failures.push(`electronFuses.${spec.name} must be ${String(spec.expected)}, got ${String(actual)}`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+export function verifyPackagedResourceEntries(entries: readonly string[]): FuseVerificationResult {
+  const failures: string[] = [];
+  if (!entries.includes("app.asar")) {
+    failures.push("resources/app.asar must exist when onlyLoadAppFromAsar and ASAR integrity fuses are enabled");
+  }
+  if (entries.includes("app")) {
+    failures.push("Unexpected loose resources/app directory found alongside app.asar");
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+/* v8 ignore start */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const projectRoot = path.resolve(__dirname, "..");
+
+function resolvePackagedExecutable(): string {
+  const custom = process.env["ELECTRON_EXEC_PATH"]?.trim();
+  const target = custom
+    ? path.resolve(projectRoot, custom)
+    : path.join(projectRoot, "release", "win-unpacked", "Screenshare.exe");
+  if (!fs.existsSync(target)) {
+    throw new Error(`Packaged Electron executable not found: ${target}`);
+  }
+  return target;
+}
+
+function getUnusedLocalPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const addr = srv.address();
+      if (!addr || typeof addr === "string") {
+        srv.close(() => reject(new Error("Failed to allocate local probe port")));
+        return;
+      }
+      const { port } = addr;
+      srv.close((err) => (err ? reject(err) : resolve(port)));
+    });
+  });
+}
+
+function canConnectTcp(port: number, timeoutMs = 400): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.createConnection({ host: "127.0.0.1", port });
+    const done = (connected: boolean): void => {
+      sock.removeAllListeners();
+      sock.destroy();
+      resolve(connected);
+    };
+    sock.setTimeout(timeoutMs, () => done(false));
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+  });
+}
+
+function hasProcessExited(proc: ReturnType<typeof spawn>): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
+
+function formatExitStatus(proc: ReturnType<typeof spawn>): string {
+  return `code=${String(proc.exitCode)}, signal=${String(proc.signalCode)}`;
+}
+
+async function terminateProcessTree(pid: number | undefined, proc: ReturnType<typeof spawn>): Promise<void> {
+  if (pid === undefined || hasProcessExited(proc)) return;
+  let killErr: string | null = null;
+  if (process.platform === "win32") {
+    const res = spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { encoding: "utf8" });
+    if (res.error) killErr = res.error.message;
+    else if (res.status !== 0 && !hasProcessExited(proc)) {
+      killErr = `taskkill exited with status ${String(res.status)}: ${(res.stderr || res.stdout || "").trim()}`;
+    }
+  } else {
+    try {
+      proc.kill("SIGKILL");
+    } catch (err) {
+      if (!hasProcessExited(proc)) killErr = err instanceof Error ? err.message : String(err);
+    }
+  }
+  await new Promise<void>((resolve) => {
+    if (hasProcessExited(proc)) {
+      resolve();
+      return;
+    }
+    const timer = setTimeout(resolve, 2_000);
+    timer.unref();
+    proc.once("exit", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+  if (!hasProcessExited(proc)) {
+    throw new Error(
+      `Failed to terminate smoke child process (pid=${String(pid)})${killErr ? `: ${killErr}` : ""}`,
+    );
+  }
+}
+
+async function runWithChildCleanup(
+  child: ReturnType<typeof spawn>,
+  probe: () => Promise<void>,
+): Promise<void> {
+  let primaryErr: Error | undefined;
+  let cleanupErr: Error | undefined;
+  try {
+    await probe();
+  } catch (err) {
+    primaryErr = err instanceof Error ? err : new Error(String(err));
+  } finally {
+    try {
+      await terminateProcessTree(child.pid, child);
+    } catch (err) {
+      cleanupErr = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  if (primaryErr !== undefined) {
+    if (cleanupErr !== undefined) {
+      console.error("[smoke-packaged] cleanup failed after primary probe error:", cleanupErr);
+    }
+    throw primaryErr;
+  }
+  if (cleanupErr !== undefined) throw cleanupErr;
+}
+
+async function checkRunAsNodeBlocked(execPath: string): Promise<void> {
+  const marker = "PACKAGED_FUSE_RUN_AS_NODE_BYPASSED";
+  const env: NodeJS.ProcessEnv = { ...process.env, ELECTRON_RUN_AS_NODE: "1" };
+  const child = spawn(
+    execPath,
+    ["-e", `process.stdout.write(${JSON.stringify(marker)}); process.exit(42);`],
+    { env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.on("data", (d: Buffer) => {
+    stdout += d.toString();
+  });
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+  await runWithChildCleanup(child, async () => {
+    await new Promise((r) => setTimeout(r, 2500));
+    if (stdout.includes(marker) || child.exitCode === 42) {
+      throw new Error("ELECTRON_RUN_AS_NODE=1 executed arbitrary -e script despite RunAsNode=DISABLE fuse");
+    }
+    if (hasProcessExited(child) && /asar|integrity|corrupt/i.test(stderr)) {
+      throw new Error(
+        `ASAR integrity error during ELECTRON_RUN_AS_NODE probe (${formatExitStatus(child)}):\n${stderr}`,
+      );
+    }
+  });
+}
+
+async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
+  const inspectPort = await getUnusedLocalPort();
+  // Wait briefly so Chromium's single-instance lock from prior launch is released cleanly
+  await new Promise((r) => setTimeout(r, 500));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_OPTIONS: "--require=nonexistent-smoke-fuse-probe",
+  };
+  const child = spawn(execPath, [`--inspect=127.0.0.1:${String(inspectPort)}`], {
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stderr = "";
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+
+  await runWithChildCleanup(child, async () => {
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline) {
+      if (hasProcessExited(child)) {
+        throw new Error(
+          `Packaged executable exited prematurely (${formatExitStatus(child)}):\n${stderr}`,
+        );
+      }
+      if (await canConnectTcp(inspectPort, 250)) {
+        throw new Error(`V8 inspector port 127.0.0.1:${String(inspectPort)} opened despite EnableNodeCliInspectArguments=DISABLE`);
+      }
+      await new Promise((r) => setTimeout(r, 350));
+    }
+    if (hasProcessExited(child)) {
+      throw new Error(`Packaged executable exited within 4s window (${formatExitStatus(child)}):\n${stderr}`);
+    }
+    if (/debugger listening/i.test(stderr)) {
+      throw new Error(`Packaged executable printed inspector listener banner:\n${stderr}`);
+    }
+    if (/nonexistent-smoke-fuse-probe/i.test(stderr)) {
+      throw new Error(`NODE_OPTIONS was evaluated despite EnableNodeOptionsEnvironmentVariable=DISABLE:\n${stderr}`);
+    }
+  });
+}
+
+async function runPackagedSmokeVerifier(): Promise<void> {
+  const execPath = resolvePackagedExecutable();
+  console.log(`[smoke-packaged] Inspecting binary fuses: ${execPath}`);
+
+  const resourcesDir = path.join(path.dirname(execPath), "resources");
+  const resourceEntries = fs.existsSync(resourcesDir) ? fs.readdirSync(resourcesDir) : [];
+  const layoutVerdict = verifyPackagedResourceEntries(resourceEntries);
+  if (!layoutVerdict.ok) {
+    throw new Error(`Packaged resource layout invalid:\n${layoutVerdict.failures.join("\n")}`);
+  }
+
+  const { getCurrentFuseWire } = await import("@electron/fuses");
+  const wire: Partial<Record<number, number>> & { version?: string } = await getCurrentFuseWire(execPath);
+  const verdict = verifyFuseWire(wire);
+  if (!verdict.ok) {
+    throw new Error(`Packaged fuse verification failed:\n${verdict.failures.join("\n")}`);
+  }
+  console.log("[smoke-packaged] All 6 Electron security fuses and app.asar layout verified.");
+
+  await checkRunAsNodeBlocked(execPath);
+  console.log("[smoke-packaged] Verified ELECTRON_RUN_AS_NODE=1 is disabled.");
+
+  await checkInspectAndNativeStartup(execPath);
+  console.log("[smoke-packaged] Verified NODE_OPTIONS/--inspect disabled and binary survived 4s native ASAR integrity startup.");
+}
+
+const isEntrypoint =
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isEntrypoint) {
+  await runPackagedSmokeVerifier();
+}
+/* v8 ignore stop */

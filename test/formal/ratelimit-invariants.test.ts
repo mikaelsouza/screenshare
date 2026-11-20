@@ -2,15 +2,15 @@ import { describe, it, expect } from "vitest";
 import fc from "fast-check";
 import { RateLimiter } from "@worker/ratelimit";
 
-describe("Formal Invariants: Rate Limiting (Feature 38)", () => {
+describe("Property-Based Invariants: Rate Limiting (Feature 38)", () => {
   /**
-   * Feature 38: Formal Invariant: Rate Limits & Token Monotonicity
+   * Feature 38: Property-Based Invariant Checks: Rate Limits & Token Monotonicity
    * - Monotonic budget bounds: for any key, check() returns true at most `max` times within windowMs.
    * - Bounded capacity: limiter.size never exceeds maxEntries.
    * - Window progression: after windowMs elapses, quota is completely restored.
    */
   describe("Budget Ceiling & Window Expiration Invariants", () => {
-    it("proves strict budget ceiling: check() allows at most `max` requests per window", () => {
+    it("verifies strict budget ceiling: check() allows at most `max` requests per window", () => {
       fc.assert(
         fc.property(
           fc.integer({ min: 1, max: 50 }), // max
@@ -39,7 +39,7 @@ describe("Formal Invariants: Rate Limiting (Feature 38)", () => {
       );
     });
 
-    it("proves window reset: full budget restores when now >= resetAt", () => {
+    it("verifies window reset: full budget restores when now >= resetAt", () => {
       fc.assert(
         fc.property(
           fc.integer({ min: 1, max: 20 }),
@@ -55,8 +55,8 @@ describe("Formal Invariants: Rate Limiting (Feature 38)", () => {
             }
             expect(limiter.check(key, time)).toBe(false);
 
-            // Advance time past the window
-            time += windowMs + 1;
+            // Advance time to exact resetAt boundary (now === resetAt)
+            time += windowMs;
 
             // Invariant: Next request must be allowed and start a fresh window
             expect(limiter.check(key, time)).toBe(true);
@@ -76,7 +76,7 @@ describe("Formal Invariants: Rate Limiting (Feature 38)", () => {
   });
 
   describe("Memory Boundedness & Eviction Invariants", () => {
-    it("proves footprint invariance: limiter.size never exceeds maxEntries under arbitrary loads", () => {
+    it("verifies footprint invariance: limiter.size never exceeds maxEntries under arbitrary loads", () => {
       fc.assert(
         fc.property(
           fc.integer({ min: 5, max: 30 }), // maxEntries

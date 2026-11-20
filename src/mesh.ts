@@ -156,57 +156,43 @@ class PeerLink {
 
   // ---- negotiation -------------------------------------------------------
 
+  private isOfferBlocked(): boolean {
+    if (this.attachingCount > 0 || this.applyingOffer || this.makingOffer) { this.offerPending = true; return true; }
+    if (this.pc.signalingState !== "stable") { this.retryOffer(); return true; }
+    return false;
+  }
+
   private async negotiate(): Promise<void> {
-    if (this.isClosed()) return;
-    if (this.attachingCount > 0) {
-      this.offerPending = true;
-      return;
-    }
-    // Counted when their offer arrives, not once it is applied: RTCPeerConnection
-    // queues its operations, so our createOffer can resolve, and our
-    // setLocalDescription be queued, while their offer is still being applied.
+    if (this.isClosed() || this.isOfferBlocked()) return;
     const seen = this.remoteOffers;
     try {
       this.makingOffer = true;
-      // Explicit createOffer (rather than the arg-less setLocalDescription) because
-      // the Opus fmtp line has to be munged before the description is applied.
       const offer = await this.pc.createOffer();
-      // Their offer landed while ours was being built. As the polite side we answer
-      // theirs, and ours, built on the old state, no longer applies: Chrome rejects it
-      // ("wrong state", or m-lines out of order). Nothing else will offer again,
-      // because Chrome does not reliably re-fire negotiationneeded for what our
-      // dropped offer carried. Without the retry a sharer's video to that peer was
-      // simply never negotiated.
       if (this.isClosed()) return;
-      if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") {
-        this.retryOffer();
-        return;
-      }
+      if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") return this.retryOffer();
       offer.sdp = mungeSdp(offer.sdp ?? "");
       await this.pc.setLocalDescription(offer);
       const sdp = this.pc.localDescription?.sdp;
       if (sdp && !this.isClosed()) this.send({ k: "offer", sdp });
     } catch (err) {
-      // The same race, lost a step later.
       if (this.isClosed()) return;
-      if (seen !== this.remoteOffers || this.pc.signalingState === "have-remote-offer") this.retryOffer();
+      if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") this.retryOffer();
       else console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
       this.makingOffer = false;
+      if (this.offerPending) this.retryOffer();
     }
   }
 
   /** Offer again once their offer has been answered (see negotiate). */
   private retryOffer(): void {
     this.offerPending = true;
-    // Mid-answer: applyDescription picks the flag up when it is done. Otherwise the
-    // answer is already out, so go now (after negotiate's finally has run).
     if (this.applyingOffer || this.pc.signalingState !== "stable") return;
     setTimeout(() => this.flushPendingOffer(), 0);
   }
 
   private flushPendingOffer(): void {
-    if (!this.offerPending || this.attachingCount > 0 || this.isClosed()) return;
+    if (!this.offerPending || this.attachingCount > 0 || this.applyingOffer || this.makingOffer || this.isClosed() || this.pc.signalingState !== "stable") return;
     this.offerPending = false;
     void this.negotiate();
   }
@@ -342,6 +328,7 @@ class PeerLink {
 
   attachCapture(capture: CaptureResult): Promise<void> {
     const gen = ++this.captureGeneration;
+    this.attachingCount++;
     return this.enqueueMedia(() => this.runAttachCapture(capture, gen));
   }
 
@@ -386,9 +373,8 @@ class PeerLink {
   }
 
   private async runAttachCapture(capture: CaptureResult, gen: number): Promise<void> {
-    if (this.isStale(gen)) return;
-    this.attachingCount++;
     try {
+      if (this.isStale(gen)) return;
       await this.ensureSendTransceivers(capture);
       if (this.isStale(gen) || !this.videoTransceiver || !this.audioTransceiver) return;
       await this.applyInitialEncodings(this.videoTransceiver.sender, this.audioTransceiver.sender);
@@ -403,9 +389,7 @@ class PeerLink {
       if (!this.isStale(gen)) throw err;
     } finally {
       this.attachingCount--;
-      if (this.attachingCount === 0 && !this.applyingOffer && this.pc.signalingState === "stable") {
-        this.flushPendingOffer();
-      }
+      this.flushPendingOffer();
     }
   }
 

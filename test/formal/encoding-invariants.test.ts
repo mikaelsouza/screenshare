@@ -13,12 +13,12 @@ import {
   applyVideoEncoding,
 } from "@src/quality";
 
-describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () => {
+describe("Exhaustive & Property-Based Invariants: Video Encoding & Quality", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("proves partial-order monotonicity and bitrate bounds across all QUALITY_PRESETS", () => {
+  it("verifies partial-order monotonicity and bitrate bounds across all QUALITY_PRESETS", () => {
     const entries = Object.entries(QUALITY_PRESETS) as Array<[QualityPresetName, (typeof QUALITY_PRESETS)[QualityPresetName]]>;
     expect(entries.length).toBeGreaterThanOrEqual(4);
     expect(QUALITY_PRESETS[DEFAULT_PRESET]).toBeDefined();
@@ -56,7 +56,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves applyVideoEncoding ceiling projection, send-side pause invariance, degradation mode mapping, and idempotence", async () => {
+  it("exhaustively verifies applyVideoEncoding ceiling projection, send-side pause invariance, degradation mode mapping, and idempotence", async () => {
     const presets = Object.values(QUALITY_PRESETS);
     const activeStates: Array<boolean | undefined> = [undefined, false, true];
     const degradationStates: Array<
@@ -123,7 +123,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves applyAudioEncoding idempotence and 256 kbps ceiling across all initial sender states", async () => {
+  it("exhaustively verifies applyAudioEncoding idempotence and 256 kbps ceiling across all initial sender states", async () => {
     const activeStates: Array<boolean | undefined> = [undefined, false, true];
     const shapes = ["populated", "empty", "missing"] as const;
 
@@ -156,7 +156,7 @@ describe("Formal Mathematical Proofs: Video Encoding & Quality Invariants", () =
     }
   });
 
-  it("exhaustively proves initial and followed capture tracks set video contentHint ('motion') and audio contentHint ('music') across all presets and surfaces", async () => {
+  it("exhaustively verifies initial and followed capture tracks set video contentHint ('motion') and audio contentHint ('music') across all presets and surfaces", async () => {
     const presets = Object.values(QUALITY_PRESETS);
     const hasAudioStates = [false, true];
     const surfaces = ["monitor", "window", "browser", "other", undefined] as const;

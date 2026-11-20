@@ -49,7 +49,7 @@ jobs:
       - name: Durable Object workerd tests
         run: npm run test:worker
 
-      - name: Formal invariant & fuzz tests
+      - name: Exhaustive, stateful model & fuzz invariant tests
         run: |
           npm run test:formal
           npm run test:fuzz
@@ -98,6 +98,30 @@ jobs:
           CHROMIUM_BIN: /usr/bin/google-chrome
         run: npm run test:e2e
 
+  e2e-impaired:
+    name: Network-Impaired E2E Suite (tc netem + Playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build static assets & run network-impaired E2E suite
+        env:
+          CHROMIUM_BIN: /usr/bin/google-chrome
+          REQUIRE_NETEM: "1"
+        run: npm run test:e2e:impaired
+
   electron-smoke:
     name: Electron Packaged Smoke Test (Windows)
     runs-on: windows-latest
@@ -121,7 +145,7 @@ jobs:
         shell: bash
         run: npm run electron:build
 
-      - name: Verify release metadata and run unpackaged Electron smoke test
+      - name: Verify release metadata and run unpackaged & packaged Electron smoke checks
         shell: bash
         run: |
           set -euo pipefail
@@ -131,3 +155,4 @@ jobs:
           test -f "release/Screenshare-Setup-${PKG_VERSION}.exe.blockmap"
           test -f "release/latest.yml"
           npm run electron:smoke
+          npm run electron:smoke:packaged
