@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import fc from "fast-check";
 import { MAX_ROOM_SIZE, generateRoomCode, generateRoomPassword, type SignalData } from "@shared/protocol";
@@ -35,11 +34,31 @@ import {
 } from "@worker/room-policy";
 
 // ---------------------------------------------------------------------------
-// Deterministic Crypto + Virtual Room Simulator (faithful to worker/room*.ts)
+// Deterministic Model Digest + Virtual Room Simulator (faithful to worker/room*.ts)
 // ---------------------------------------------------------------------------
 
+/**
+ * Deterministic 64-hex-char fingerprint for the synchronous virtual model.
+ * Real production hashing uses WebCrypto SHA-256 on 96-bit CSPRNG room secrets
+ * in `worker/room-crypto.ts`; the model only requires an injective 64-hex digest
+ * for constant-time comparison in `evaluateAdmission`.
+ */
 function syncHashSecret(roomId: string, secret: string, kind: "host" | "rejoin" | "password"): string {
-  return createHash("sha256").update(`${roomId}:${kind}:${secret}`).digest("hex");
+  const input = `${roomId}:${kind}:${secret}`;
+  let out = "";
+  for (let lane = 0; lane < 8; lane++) {
+    let h = (0x811c9dc5 ^ (lane * 0x9e3779b9)) >>> 0;
+    for (let i = 0; i < input.length; i++) {
+      h ^= input.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    h ^= input.length;
+    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
+    h = (h ^ (h >>> 16)) >>> 0;
+    out += h.toString(16).padStart(8, "0");
+  }
+  return out;
 }
 
 interface SimClientPeer {
