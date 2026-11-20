@@ -315,7 +315,7 @@ export function buildSignalingHandlers(
         const kickedName = pendingKickRotationName;
         pendingKickRotationName = null;
         ctx.showTransientRoomNotice(
-          `Removed ${kickedName} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
+          `Removed ${kickedName} \u2014 invite link rotated. Share the new link with Copy invite link.`,
         );
       }
       ctx.renderInviteMenu();

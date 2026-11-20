@@ -56,11 +56,12 @@ async function copyInvite(ctx: DomEventsContext, mode: "link" | "code"): Promise
   if (!copied) {
     session.clearTransientNoticeState();
     ctx.setStatus("Could not copy automatically. Use Show to view and copy manually.", "warn");
+    if (mode === "link" && ctx.popovers.activePopover !== "invite") ctx.togglePopover("invite");
     return;
   }
   if (session.roomLocked || invite.isRotatePending) return;
   if (session.roomPassword !== password) {
-    ctx.showTransientRoomNotice("Invite link rotated while copying \u2014 copy the new link from Invite \u25BE.");
+    ctx.showTransientRoomNotice("Invite link rotated while copying \u2014 click Copy invite link again.");
     return;
   }
   ctx.dismissTransientRoomNotice();

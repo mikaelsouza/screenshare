@@ -209,6 +209,7 @@
         overflow: hidden;
         text-overflow: ellipsis;
         max-width: 480px;
+        min-width: 0;
       }
       #status[data-kind="warn"] {
         color: #fbbf24;
@@ -222,6 +223,7 @@
         align-items: center;
         gap: 8px;
         margin-left: auto;
+        flex-shrink: 0;
       }
 
       /* Shared Popover Anchors & Menus (Invite, Roster, Stream Quality, Video Codec, Stream Priority) */
@@ -230,6 +232,58 @@
       .roster-anchor {
         position: relative;
         display: inline-flex;
+      }
+      .invite-split {
+        display: inline-flex;
+        align-items: stretch;
+      }
+      .invite-split > .ui-btn:first-child {
+        border-top-right-radius: 0;
+        border-bottom-right-radius: 0;
+      }
+      .invite-split > .ui-btn:last-child {
+        border-top-left-radius: 0;
+        border-bottom-left-radius: 0;
+        margin-left: -1px;
+        padding: 0 9px;
+      }
+      .invite-split > .ui-btn:hover:not(:disabled),
+      .invite-split > .ui-btn:active:not(:disabled),
+      .invite-split > .ui-btn[aria-expanded="true"],
+      .invite-split > .ui-btn.invite-feedback-ok {
+        position: relative;
+        z-index: 1;
+      }
+      .invite-split > .ui-btn:focus-visible {
+        position: relative;
+        z-index: 2;
+      }
+      .invite-copy-label {
+        display: inline-grid;
+        align-items: center;
+        justify-items: center;
+      }
+      .invite-copy-default,
+      .invite-copy-feedback {
+        grid-area: 1 / 1;
+      }
+      .invite-copy-feedback {
+        visibility: hidden;
+      }
+      .invite-check-icon {
+        display: none;
+      }
+      #invite-copy-link.invite-feedback-ok .invite-copy-default {
+        visibility: hidden;
+      }
+      #invite-copy-link.invite-feedback-ok .invite-copy-feedback {
+        visibility: visible;
+      }
+      #invite-copy-link.invite-feedback-ok .invite-copy-icon {
+        display: none;
+      }
+      #invite-copy-link.invite-feedback-ok .invite-check-icon {
+        display: inline-block;
       }
       #invite-menu,
       #roster {
@@ -250,6 +304,23 @@
         width: 380px;
       }
       @media (max-width: 680px) {
+        #invite-copy-link {
+          position: relative;
+          width: 32px;
+          padding: 0;
+          gap: 0;
+        }
+        .invite-copy-label {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip-path: inset(50%);
+          white-space: nowrap;
+          border: 0;
+        }
         #room-bar,
         .invite-anchor,
         .roster-anchor {
@@ -944,9 +1015,24 @@
 
       <div id="room-bar" hidden>
         <div class="invite-anchor popover-anchor">
-          <button type="button" id="invite-btn" class="ui-btn" aria-expanded="false" aria-controls="invite-menu">
-            Invite &#9662;
-          </button>
+          <div class="invite-split">
+            <button type="button" id="invite-copy-link" class="ui-btn" title="Copy invite link" aria-label="Copy invite link">
+              <svg class="invite-copy-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+              </svg>
+              <svg class="invite-check-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+              <span class="invite-copy-label">
+                <span class="invite-copy-default">Copy invite link</span>
+                <span id="invite-link-feedback" class="invite-copy-feedback" aria-live="polite"></span>
+              </span>
+            </button>
+            <button type="button" id="invite-btn" class="ui-btn" aria-expanded="false" aria-controls="invite-menu" aria-label="Invite options" title="Invite code and options">
+              &#9662;
+            </button>
+          </div>
           <section id="invite-menu" class="app-card" hidden aria-labelledby="invite-menu-title">
             <div class="popover-head">
               <span id="invite-menu-title">Room invite</span>
@@ -955,10 +1041,6 @@
               </button>
             </div>
             <p id="invite-locked-note" class="invite-locked-note" hidden>Room is locked — unlock to invite</p>
-            <button type="button" id="invite-copy-link" class="popover-item">
-              <span>Copy invite link</span>
-              <span id="invite-link-feedback" class="popover-item-right"></span>
-            </button>
             <div id="invite-code-row" class="invite-code-row">
               <code id="invite-code-value" class="invite-code-value"></code>
               <div class="invite-code-actions">
