@@ -449,13 +449,18 @@ export class TileView {
     }
     this.cb.runBackground(
       video.play().catch(() => {
+        if (this.videos.get(peerId) !== video || this.ctrl.isPaused(peerId)) return;
         video.muted = true;
         return video.play().then(
           () => {
-            if (this.videos.get(peerId) === video) this.showUnmutePrompt(video, peerId, false);
+            if (this.videos.get(peerId) === video && !this.ctrl.isPaused(peerId)) {
+              this.showUnmutePrompt(video, peerId, false);
+            }
           },
           () => {
-            if (this.videos.get(peerId) === video) this.showUnmutePrompt(video, peerId, true);
+            if (this.videos.get(peerId) === video && !this.ctrl.isPaused(peerId)) {
+              this.showUnmutePrompt(video, peerId, true);
+            }
           },
         );
       }),

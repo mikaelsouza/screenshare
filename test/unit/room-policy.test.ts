@@ -145,6 +145,13 @@ describe("worker/room-policy", () => {
       message: "Too many wrong invite codes. Wait a minute before trying again.",
     });
 
+    // Over-budget IP is refused even with a matching password
+    expect(evaluateAdmission(baseAdmission({ passwordFailureRateLimited: true }))).toEqual({
+      ok: false,
+      code: "rate-limited",
+      message: "Too many wrong invite codes. Wait a minute before trying again.",
+    });
+
     expect(evaluateAdmission(baseAdmission({ msgRoom: "OTHER123" }))).toEqual({
       ok: false,
       code: "bad-room-code",

@@ -38,6 +38,7 @@ describe("worker/room-crypto", () => {
     const hOtherRoom = await hashRoomSecret("room-2", "SECRET", "password");
 
     expect(h1).toMatch(/^[0-9a-f]{64}$/);
+    expect(h1).toBe("1b35e1cebb921de06e007abad3225c1f8b19db83fb83b090f904dc76b36066a9");
     expect(h1).toBe(h2);
     expect(h1).not.toBe(hHost);
     expect(h1).not.toBe(hRejoin);

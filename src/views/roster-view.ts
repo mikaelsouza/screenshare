@@ -167,6 +167,7 @@ function buildRosterListItem(
     kick.type = "button";
     kick.className = "ui-btn kick-btn";
     kick.textContent = "Remove";
+    kick.dataset["peer"] = entry.id;
     kick.disabled = session.hasPendingKick(entry.id);
     kick.title = `Remove ${entry.name} from the room and rotate the invite link (blocks their network for 15 minutes).`;
     kick.addEventListener("click", () => onKick(entry, kick));
@@ -213,8 +214,22 @@ export function renderRosterView(
   ui.lockBtn.hidden = !session.isHost;
   ui.lockBtn.textContent = session.roomLocked ? "Unlock room" : "Lock room";
 
+  const activeEl = document.activeElement;
+  const focusedKickPeer =
+    activeEl instanceof HTMLButtonElement && ui.rosterList.contains(activeEl)
+      ? activeEl.dataset["peer"]
+      : undefined;
+
   const items = summary.entries.map((entry) => buildRosterListItem(entry, isSharing, tileCtrl, session, onKick));
   ui.rosterList.replaceChildren(...items);
+
+  if (focusedKickPeer && !ui.roster.hidden) {
+    const replacement = [...ui.rosterList.querySelectorAll<HTMLButtonElement>("button")].find(
+      (btn) => btn.dataset["peer"] === focusedKickPeer && !btn.disabled,
+    );
+    if (replacement) replacement.focus();
+    else ui.rosterBtn.focus();
+  }
 }
 
 export function updateRosterStatsInPlaceView(

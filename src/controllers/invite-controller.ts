@@ -13,10 +13,10 @@ export interface InviteControllerCallbacks {
   onChange: () => void;
 }
 
-export const INVITE_REVEAL_MS = 10_000;
-export const INVITE_COPY_FEEDBACK_MS = 2_000;
-export const INVITE_ROTATE_FEEDBACK_MS = 1_600;
-export const INVITE_ROTATE_TIMEOUT_MS = 10_000;
+export const INVITE_REVEAL_MS: number = 10_000;
+export const INVITE_COPY_FEEDBACK_MS: number = 2_000;
+export const INVITE_ROTATE_FEEDBACK_MS: number = 1_600;
+export const INVITE_ROTATE_TIMEOUT_MS: number = 10_000;
 
 /**
  * Pure, DOM-free controller for the room invite menu: secret reveal/mask,

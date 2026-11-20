@@ -32,6 +32,12 @@ export class RateLimiter {
     return this.entries.size;
   }
 
+  /** True if the key has already exhausted its budget for the current window (without consuming a token). */
+  isLimited(key: string, now: number = Date.now()): boolean {
+    const entry = this.entries.get(key);
+    return entry !== undefined && entry.resetAt > now && entry.count >= this.max;
+  }
+
   /** True if the request is allowed; false if the key is over its budget. */
   check(key: string, now: number = Date.now()): boolean {
     if (this.entries.size >= this.maxEntries) {

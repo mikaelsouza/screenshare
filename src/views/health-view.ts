@@ -16,8 +16,8 @@ export interface HealthPollerContext {
 
 export class HealthPoller {
   private readonly ctx: HealthPollerContext;
-  private readonly inbound = new Map<PeerId, LinkMonitor>();
-  private readonly outbound = new Map<PeerId, LinkMonitor>();
+  private readonly inbound = new Map<PeerId, { pc: RTCPeerConnection; monitor: LinkMonitor }>();
+  private readonly outbound = new Map<PeerId, { pc: RTCPeerConnection; monitor: LinkMonitor }>();
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(ctx: HealthPollerContext) {
@@ -73,13 +73,13 @@ export class HealthPoller {
         target.textContent = "paused";
         continue;
       }
-      let monitor = this.inbound.get(peerId);
-      if (!monitor) {
-        monitor = new LinkMonitor(pc, "inbound");
-        this.inbound.set(peerId, monitor);
+      let entry = this.inbound.get(peerId);
+      if (!entry || entry.pc !== pc) {
+        entry = { pc, monitor: new LinkMonitor(pc, "inbound") };
+        this.inbound.set(peerId, entry);
       }
       this.ctx.runBackground(
-        monitor.read().then((health) => {
+        entry.monitor.read().then((health) => {
           if (!health || this.ctx.tileCtrl.isPaused(peerId)) return;
           target.textContent = summarize(health, true);
         }),
@@ -110,12 +110,12 @@ export class HealthPoller {
       this.ctx.tileCtrl.setPeerOutboundText(peerId, "↑ paused");
       return { viewing: false, bps: 0 };
     }
-    let outMon = this.outbound.get(peerId);
-    if (!outMon) {
-      outMon = new LinkMonitor(pc, "outbound");
-      this.outbound.set(peerId, outMon);
+    let entry = this.outbound.get(peerId);
+    if (!entry || entry.pc !== pc) {
+      entry = { pc, monitor: new LinkMonitor(pc, "outbound") };
+      this.outbound.set(peerId, entry);
     }
-    const health = await outMon.read();
+    const health = await entry.monitor.read();
     if (!health) {
       this.ctx.tileCtrl.setPeerOutboundText(peerId, "↑ connecting…");
       return { viewing: true, bps: 0 };

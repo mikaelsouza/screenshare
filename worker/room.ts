@@ -373,6 +373,7 @@ export class RoomDO extends DurableObject<Env> {
         this.refuse(ws, "bad-password", "Invalid or expired room invite.");
         return;
       }
+      if (this.refused.has(ws)) return;
       const hasActiveSocketMatch =
         offeredRejoinHash !== null &&
         this.joinedPeers(ws).some(
@@ -449,7 +450,12 @@ export class RoomDO extends DurableObject<Env> {
     newRejoinToken: string,
     newRejoinHash: string,
   ): Promise<void> {
-    const superseded = findSupersededPeers(this.joinedPeers(ws), offeredRejoinHash, admission.isHost, admission.memberTicket?.id);
+    const activeOthers = this.joinedPeers(ws);
+    const superseded = findSupersededPeers(activeOthers, offeredRejoinHash, admission.isHost, admission.memberTicket?.id);
+    if (activeOthers.length - superseded.length >= MAX_ROOM_SIZE) {
+      this.refuse(ws, "room-full", "Room is full");
+      return;
+    }
     const isResume = clientMsg.resume === true && admission.returning;
     const supersededSocket = superseded[0];
     const replacesId = supersededSocket?.att.id ?? admission.memberTicket?.id;

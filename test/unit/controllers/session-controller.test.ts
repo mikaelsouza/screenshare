@@ -59,25 +59,26 @@ describe("SessionController", () => {
 
   it("persists creator host tokens separately from ephemeral session host tokens", async () => {
     const { ctrl, local, sess, tasks } = makeController();
-    ctrl.saveCreatorHostToken("ABCD1234", "creator-tok");
+    ctrl.saveCreatorHostToken("ABCD2345", "creator-tok");
     await Promise.all(tasks);
 
-    expect(ctrl.hasSavedCreatorHostFor("ABCD1234")).toBe(true);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-tok");
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(true);
     expect(ctrl.hasAnySavedCreatorHosts()).toBe(true);
-    expect(ctrl.hostTokenFor("ABCD1234")).toBe("creator-tok");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
 
     // Promoted session host token takes precedence in-memory without overwriting localStorage creator token
-    ctrl.saveSessionHostToken("ABCD1234", "promoted-tok");
-    expect(ctrl.hostTokenFor("ABCD1234")).toBe("promoted-tok");
+    ctrl.saveSessionHostToken("ABCD2345", "promoted-tok");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("promoted-tok");
 
     // Clearing room session drops promoted session token + rejoin token but keeps creator provenance
-    ctrl.lastJoinCode = "ABCD1234";
-    ctrl.saveActiveRoom("ABCD1234");
-    ctrl.saveRejoinToken("ABCD1234", "rejoin-1");
+    ctrl.lastJoinCode = "ABCD2345";
+    ctrl.saveActiveRoom("ABCD2345");
+    ctrl.saveRejoinToken("ABCD2345", "rejoin-1");
     ctrl.clearRoomSession();
     expect(ctrl.activeRoomFor()).toBeUndefined();
-    expect(ctrl.rejoinTokenFor("ABCD1234")).toBeUndefined();
-    expect(ctrl.hostTokenFor("ABCD1234")).toBe("creator-tok");
+    expect(ctrl.rejoinTokenFor("ABCD2345")).toBeUndefined();
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
 
     // Legacy sessionStorage host:CODE migration
     sess?.setItem("host:WXYZ5678", "legacy-tok");
@@ -87,10 +88,10 @@ describe("SessionController", () => {
     expect(ctrl.hasSavedCreatorHostFor("WXYZ5678")).toBe(true);
 
     // Cross-tab storage sync removes deleted creator tokens and updates rotated ones
-    writePersistedHostToken(local, "ABCD1234", undefined);
+    writePersistedHostToken(local, "ABCD2345", undefined);
     writePersistedHostToken(local, "WXYZ5678", "updated-tok");
     ctrl.syncCreatorTokensFromStorage();
-    expect(ctrl.hasSavedCreatorHostFor("ABCD1234")).toBe(false);
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(false);
     expect(ctrl.hostTokenFor("WXYZ5678")).toBe("updated-tok");
 
     // Forget all clears both maps and storage
@@ -98,6 +99,40 @@ describe("SessionController", () => {
     await Promise.all(tasks);
     expect(ctrl.hasAnySavedCreatorHosts()).toBe(false);
     expect(ctrl.hostTokenFor("WXYZ5678")).toBeUndefined();
+  });
+
+  it("keeps a forgotten creator token out of memory while persisted removal awaits the lock", async () => {
+    const local = createMemoryStorage();
+    const sess = createMemoryStorage();
+    const tasks: Promise<unknown>[] = [];
+    const pendingReleases: Array<() => void> = [];
+    const locks = {
+      request: vi.fn((_name: string, cb: () => unknown) => {
+        return new Promise<unknown>((resolve) => {
+          pendingReleases.push(() => resolve(cb()));
+        });
+      }),
+    } as unknown as LockManager;
+    const ctrl = new SessionController({
+      getLocalStorage: () => local,
+      getSessionStorage: () => sess,
+      getLocks: () => locks,
+      runBackground: (p) => { tasks.push(p); },
+      onForgetHostUiChange: vi.fn(),
+    });
+    writePersistedHostToken(local, "ABCD2345", "creator-tok");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
+
+    ctrl.forgetCreatorHostToken("ABCD2345");
+    // Before the lock resolves, storage still has the token, but lookups must NOT return or re-cache it
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("creator-tok");
+    expect(ctrl.hostTokenFor("ABCD2345")).toBeUndefined();
+    expect(ctrl.hasSavedCreatorHostFor("ABCD2345")).toBe(false);
+
+    for (const release of pendingReleases) release();
+    await Promise.all(tasks);
+    expect(readPersistedHostToken(local, "ABCD2345")).toBeUndefined();
+    expect(ctrl.hostTokenFor("ABCD2345")).toBeUndefined();
   });
 
   it("handles welcome credentials, room state, room password, and host promotion", async () => {

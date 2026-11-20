@@ -46,9 +46,10 @@ export interface DomEventsContext {
 async function copyInvite(ctx: DomEventsContext, mode: "link" | "code"): Promise<void> {
   const { session, invite } = ctx;
   const code = session.lastJoinCode;
-  if (!code || !session.roomPassword || session.roomLocked) return;
+  const password = session.roomPassword;
+  if (!code || !password || session.roomLocked) return;
   const gen = session.joinGeneration;
-  const inviteCode = formatInviteCode(code, session.roomPassword);
+  const inviteCode = formatInviteCode(code, password);
   const text = mode === "link" ? `${location.origin}/#${inviteCode}` : inviteCode;
   const copied = await copyTextToClipboard(text);
   if (gen !== session.joinGeneration || session.lastJoinCode !== code) return;
@@ -58,6 +59,10 @@ async function copyInvite(ctx: DomEventsContext, mode: "link" | "code"): Promise
     return;
   }
   if (session.roomLocked || invite.isRotatePending) return;
+  if (session.roomPassword !== password) {
+    ctx.showTransientRoomNotice("Invite link rotated while copying \u2014 copy the new link from Invite \u25BE.");
+    return;
+  }
   ctx.dismissTransientRoomNotice();
   invite.showCopyFeedback(mode);
 }

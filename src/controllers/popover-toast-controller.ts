@@ -7,8 +7,8 @@ import {
   type PopoverVisibility,
 } from "../ui-model";
 
-export const RECENT_DEPARTURE_MS = 8_000;
-export const JOIN_CHIP_DURATION_MS = 2_800;
+export const RECENT_DEPARTURE_MS: number = 8_000;
+export const JOIN_CHIP_DURATION_MS: number = 2_800;
 
 export interface PopoverTransition {
   previous: PopoverKind | null;

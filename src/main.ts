@@ -99,8 +99,9 @@ const captureController = createCaptureController({
     );
   },
   onVideoTrackSwapped: async (track, stream) => {
-    if (!share.capture) return;
+    if (share.capture?.stream !== stream) return;
     await mesh?.setVideoTrack(track);
+    if (share.capture?.stream !== stream) return;
     tileView.renderSelfPreview(stream);
   },
   onFollowState: (state) => renderFollowChip(ui, state),

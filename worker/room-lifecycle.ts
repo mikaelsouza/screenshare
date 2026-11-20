@@ -15,7 +15,6 @@ import {
   LAST_HOST_ACTIVE_KEY,
   LOCKED_KEY,
   MEMBERS_KEY,
-  OCCUPIED_FALLBACK_ALARM_MS,
   PASSWORD_KEY,
   PROMOTED_HOST_KEY,
   PeerAttachmentSchema,
@@ -29,7 +28,12 @@ import {
   type PreMintedEmptyReset,
   type PromotedHostRecord,
 } from "./room-models";
-import { computeCredentialExpiry, selectHostPromotionCandidate } from "./room-policy";
+import {
+  computeCredentialExpiry,
+  computeNextAlarmDeadline,
+  selectHostPromotionCandidate,
+  type AlarmDeadlineInput,
+} from "./room-policy";
 
 export interface JoinedSocket {
   ws: WebSocket;
@@ -88,14 +92,34 @@ function earliestUnjoinedDeadline(host: RoomLifecycleHost, now: number): number 
   return earliest;
 }
 
-async function scheduleAlarmWithUnjoined(
+async function scheduleAlarm(
   host: RoomLifecycleHost,
-  now: number,
-  lifecycleDeadline: number,
+  input: Omit<AlarmDeadlineInput, "earliestUnjoinedDeadline">,
 ): Promise<void> {
-  const unjoinedDeadline = earliestUnjoinedDeadline(host, now);
-  const next = unjoinedDeadline !== null ? Math.min(lifecycleDeadline, unjoinedDeadline) : lifecycleDeadline;
-  await host.ctx.storage.setAlarm(Math.max(now + 1000, next));
+  const next = computeNextAlarmDeadline({
+    ...input,
+    earliestUnjoinedDeadline: earliestUnjoinedDeadline(host, input.now),
+  });
+  await host.ctx.storage.setAlarm(next);
+}
+
+function occupiedAlarmInput(
+  now: number, hasHost: boolean, hostGoneAt: number | undefined, creatorCap: number,
+): Omit<AlarmDeadlineInput, "earliestUnjoinedDeadline"> {
+  return {
+    now, occupied: true, hasHost, hostGoneAt, emptySince: now,
+    sessionCleaned: false, everJoined: true, lastHostActiveAt: undefined, hasCreatorHost: true, creatorCap,
+  };
+}
+
+function emptyAlarmInput(
+  now: number, emptySince: number, sessionCleaned: boolean, everJoined: boolean,
+  lastHostActiveAt: number | undefined, hasCreatorHost: boolean,
+): Omit<AlarmDeadlineInput, "earliestUnjoinedDeadline"> {
+  return {
+    now, occupied: false, hasHost: false, hostGoneAt: undefined, emptySince,
+    sessionCleaned, everJoined, lastHostActiveAt, hasCreatorHost, creatorCap: null,
+  };
 }
 
 export async function getMembers(
@@ -264,22 +288,24 @@ export async function syncAlarm(host: RoomLifecycleHost, now: number): Promise<v
       host.ctx.storage.get<number>(LAST_HOST_ACTIVE_KEY),
       host.ctx.storage.get<string>(CREATOR_HOST_KEY),
     ]);
-    const credentialExpiry = computeCredentialExpiry(
-      emptySince,
-      everJoinedRaw === true,
-      lastHostActiveAt,
-      creatorHostHash !== undefined,
+    await scheduleAlarm(
+      host,
+      emptyAlarmInput(
+        now,
+        emptySince,
+        sessionCleanedRaw === true,
+        everJoinedRaw === true,
+        lastHostActiveAt,
+        creatorHostHash !== undefined,
+      ),
     );
-    const lifecycleDeadline =
-      sessionCleanedRaw === true ? credentialExpiry : Math.min(credentialExpiry, emptySince + EMPTY_SESSION_CLEANUP_MS);
-    await scheduleAlarmWithUnjoined(host, now, lifecycleDeadline);
     return;
   }
 
   const creatorCap = await creatorActivityCap(host, peers, now);
   if (peers.some(({ att }) => att.host)) {
     await host.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-    await scheduleAlarmWithUnjoined(host, now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
+    await scheduleAlarm(host, occupiedAlarmInput(now, true, undefined, creatorCap));
     return;
   }
 
@@ -289,7 +315,7 @@ export async function syncAlarm(host: RoomLifecycleHost, now: number): Promise<v
     goneAt = now;
     await host.ctx.storage.put(HOST_GONE_KEY, goneAt);
   }
-  await scheduleAlarmWithUnjoined(host, now, Math.min(goneAt + HOST_GRACE_MS, creatorCap));
+  await scheduleAlarm(host, occupiedAlarmInput(now, false, goneAt, creatorCap));
 }
 
 interface EmptyRoomState {
@@ -354,14 +380,22 @@ async function runEmptyAlarm(
   if (state.creatorHostHash === undefined) {
     await reconcileLegacyCreatorState(host, now, emptySince, state.lastHostActiveAt);
   }
-  if (!state.sessionCleaned) {
-    if (now - emptySince < EMPTY_SESSION_CLEANUP_MS) {
-      await scheduleAlarmWithUnjoined(host, now, Math.min(credentialExpiry, emptySince + EMPTY_SESSION_CLEANUP_MS));
-      return;
-    }
+  let sessionCleaned = state.sessionCleaned;
+  if (!sessionCleaned && now - emptySince >= EMPTY_SESSION_CLEANUP_MS) {
     await resetEmptySessionState(host, now, preRotated);
+    sessionCleaned = true;
   }
-  await scheduleAlarmWithUnjoined(host, now, credentialExpiry);
+  await scheduleAlarm(
+    host,
+    emptyAlarmInput(
+      now,
+      emptySince,
+      sessionCleaned,
+      state.everJoined,
+      state.lastHostActiveAt,
+      state.creatorHostHash !== undefined,
+    ),
+  );
 }
 
 async function promoteCandidateOnAlarm(
@@ -382,7 +416,7 @@ async function promoteCandidateOnAlarm(
     [HOST_PROMOTED_KEY]: true,
   });
   await host.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-  await scheduleAlarmWithUnjoined(host, now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
+  await scheduleAlarm(host, occupiedAlarmInput(now, true, undefined, creatorCap));
 
   candidate.att.host = true;
   try {
@@ -427,17 +461,17 @@ export async function runAlarmInTransaction(
   }
   if (peers.some(({ att }) => att.host)) {
     await host.ctx.storage.delete([EMPTY_SINCE_KEY, HOST_GONE_KEY, SESSION_CLEANED_KEY]);
-    await scheduleAlarmWithUnjoined(host, now, Math.min(now + OCCUPIED_FALLBACK_ALARM_MS, creatorCap));
+    await scheduleAlarm(host, occupiedAlarmInput(now, true, undefined, creatorCap));
     return;
   }
   const goneAt = await host.ctx.storage.get<number>(HOST_GONE_KEY);
   if (goneAt === undefined) {
     await host.ctx.storage.put(HOST_GONE_KEY, now);
-    await scheduleAlarmWithUnjoined(host, now, Math.min(now + HOST_GRACE_MS, creatorCap));
+    await scheduleAlarm(host, occupiedAlarmInput(now, false, now, creatorCap));
     return;
   }
   if (now - goneAt < HOST_GRACE_MS) {
-    await scheduleAlarmWithUnjoined(host, now, Math.min(goneAt + HOST_GRACE_MS, creatorCap));
+    await scheduleAlarm(host, occupiedAlarmInput(now, false, goneAt, creatorCap));
     return;
   }
   await promoteCandidateOnAlarm(host, peers, now, creatorCap, newHostToken, newHostHash);

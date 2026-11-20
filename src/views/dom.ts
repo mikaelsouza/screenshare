@@ -137,13 +137,33 @@ export function scrubRoomUrlDom(): void {
   if (location.hash.length > 0) history.replaceState(null, "", location.pathname + location.search);
 }
 
+let memoryName: string | null = null;
+
+function readStoredName(): string | null {
+  if (memoryName !== null) return memoryName;
+  try {
+    return localStorage.getItem("name");
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredName(name: string): void {
+  memoryName = name;
+  try {
+    localStorage.setItem("name", name);
+  } catch {
+    /* localStorage unavailable */
+  }
+}
+
 export function currentNameDom(ui: UiElements): string {
   const typed = ui.nameInput.value.trim().slice(0, 32);
   if (typed) return typed;
-  let stored = localStorage.getItem("name");
+  let stored = readStoredName();
   if (!stored) {
     stored = `guest-${Math.random().toString(36).slice(2, 6)}`;
-    localStorage.setItem("name", stored);
+    writeStoredName(stored);
   }
   return stored;
 }
@@ -152,7 +172,7 @@ export function syncNameInputsDom(ui: UiElements, value: string): string {
   const clean = value.trim().slice(0, 32);
   ui.nameInput.value = clean;
   ui.roomNameInput.value = clean;
-  if (clean) localStorage.setItem("name", clean);
+  if (clean) writeStoredName(clean);
   return clean;
 }
 

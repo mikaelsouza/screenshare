@@ -4,11 +4,16 @@ import { RateLimiter } from "../../worker/ratelimit";
 describe("RateLimiter", () => {
   it("allows up to the limit and then refuses, per key", () => {
     const rl = new RateLimiter(3, 60_000, 100);
+    expect(rl.isLimited("a", 0)).toBe(false);
     expect(rl.check("a", 0)).toBe(true);
     expect(rl.check("a", 0)).toBe(true);
+    expect(rl.isLimited("a", 0)).toBe(false);
     expect(rl.check("a", 0)).toBe(true);
+    expect(rl.isLimited("a", 0)).toBe(true);
+    expect(rl.isLimited("a", 60_000)).toBe(false);
     expect(rl.check("a", 0)).toBe(false);
     // A different key has its own budget.
+    expect(rl.isLimited("b", 0)).toBe(false);
     expect(rl.check("b", 0)).toBe(true);
   });
 

@@ -28,12 +28,42 @@ const DEGRADATION_META: Record<DegradationMode, { title: string; hint: string }>
   clarity: { title: "Focus Clarity", hint: "Sharp Resolution" },
 };
 
+const memoryPrefs = new Map<string, string>();
+
+function readPref(key: string): string | null {
+  const mem = memoryPrefs.get(key);
+  if (mem !== undefined) return mem;
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writePref(key: string, value: string): void {
+  memoryPrefs.set(key, value);
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    /* localStorage unavailable or full */
+  }
+}
+
+function removePref(key: string): void {
+  memoryPrefs.delete(key);
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    /* localStorage unavailable */
+  }
+}
+
 function isQualityPresetName(val: string | null): val is QualityPresetName {
   return val !== null && Object.hasOwn(QUALITY_PRESETS, val);
 }
 
 export function currentPreset(): QualityPresetName {
-  const stored = localStorage.getItem("preset");
+  const stored = readPref("preset");
   return isQualityPresetName(stored) ? stored : DEFAULT_PRESET;
 }
 
@@ -42,7 +72,7 @@ function isCodecName(val: string | null): val is CodecName {
 }
 
 export function currentCodec(): CodecName {
-  const stored = localStorage.getItem("codec");
+  const stored = readPref("codec");
   return isCodecName(stored) ? stored : DEFAULT_CODEC;
 }
 
@@ -51,7 +81,7 @@ function isDegradationMode(val: string | null): val is DegradationMode {
 }
 
 export function currentDegradation(): DegradationMode {
-  const stored = localStorage.getItem("stream-degradation");
+  const stored = readPref("stream-degradation");
   return isDegradationMode(stored) ? stored : DEFAULT_DEGRADATION_MODE;
 }
 
@@ -147,7 +177,7 @@ export interface QualityControlCallbacks {
 }
 
 export function initQualityControls(ui: UiElements, cb: QualityControlCallbacks): void {
-  localStorage.removeItem("audio_mode");
+  removePref("audio_mode");
 
   const syncPreset = (selected: QualityPresetName): void => {
     ui.presetBtnLabel.textContent = QUALITY_PRESETS[selected].label;
@@ -157,7 +187,7 @@ export function initQualityControls(ui: UiElements, cb: QualityControlCallbacks)
     ui.presetList.append(
       buildMenuOption("preset", name, preset.label, `${(preset.maxBitrate / 1e6).toFixed(0)} Mbps`, () => {
         if (!isQualityPresetName(name)) return;
-        localStorage.setItem("preset", name);
+        writePref("preset", name);
         syncPreset(name);
         cb.onClosePopovers();
         cb.onPresetChange(name);
@@ -174,7 +204,7 @@ export function initQualityControls(ui: UiElements, cb: QualityControlCallbacks)
     ui.codecList.append(
       buildMenuOption("codec", name, meta.title, meta.hint, () => {
         if (!isCodecName(name)) return;
-        localStorage.setItem("codec", name);
+        writePref("codec", name);
         syncCodec(name);
         cb.onClosePopovers();
         cb.onCodecChange(name);
@@ -191,7 +221,7 @@ export function initQualityControls(ui: UiElements, cb: QualityControlCallbacks)
     ui.degradationList.append(
       buildMenuOption("degradation", name, meta.title, meta.hint, () => {
         if (!isDegradationMode(name)) return;
-        localStorage.setItem("stream-degradation", name);
+        writePref("stream-degradation", name);
         syncDeg(name);
         cb.onClosePopovers();
         cb.onDegradationChange(name);

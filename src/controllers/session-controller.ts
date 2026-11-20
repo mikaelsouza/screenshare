@@ -75,15 +75,18 @@ export class SessionController {
   private readonly memorySession = new Map<string, string>();
   private readonly creatorHostTokens = new Map<string, string>();
   private readonly sessionHostTokens = new Map<string, string>();
+  private readonly pendingForgets = new Map<string, { match: string | null; gen: number }>();
   readonly members: Map<PeerId, MemberRecord> = new Map<PeerId, MemberRecord>();
   private readonly pendingKicks = new Map<PeerId, { name: string; timer: ReturnType<typeof setTimeout> }>();
 
   selfId: PeerId | null = null;
-  isHost = false;
-  roomLocked = false;
+  isHost: boolean = false;
+  roomLocked: boolean = false;
   roomPassword: string | null = null;
   lastJoinCode: string | null = null;
-  joinGeneration = 0;
+  joinGeneration: number = 0;
+  private forgetGen = 0;
+  private pendingForgetAll = 0;
   private transientNoticeTimer: ReturnType<typeof setTimeout> | null = null;
   private activeTransientNotice: string | null = null;
 
@@ -134,18 +137,28 @@ export class SessionController {
     this.writeSession(`rejoin:${code}`, token);
   }
 
+  private readAllowedPersistedHostToken(code: string): string | undefined {
+    if (this.pendingForgetAll > 0) return undefined;
+    const persisted = readPersistedHostToken(this.env.getLocalStorage(), code);
+    if (persisted === undefined) return undefined;
+    const pending = this.pendingForgets.get(code);
+    if (pending && (pending.match === null || pending.match === persisted)) return undefined;
+    return persisted;
+  }
+
   hasSavedCreatorHostFor(code: string): boolean {
-    return (
-      this.creatorHostTokens.has(code) ||
-      readPersistedHostToken(this.env.getLocalStorage(), code) !== undefined
-    );
+    return this.creatorHostTokens.has(code) || this.readAllowedPersistedHostToken(code) !== undefined;
   }
 
   hasAnySavedCreatorHosts(): boolean {
-    return this.creatorHostTokens.size > 0 || hasAnyPersistedHostTokens(this.env.getLocalStorage());
+    return (
+      this.creatorHostTokens.size > 0 ||
+      (this.pendingForgetAll === 0 && hasAnyPersistedHostTokens(this.env.getLocalStorage()))
+    );
   }
 
   saveCreatorHostToken(code: string, token: string): void {
+    this.pendingForgets.delete(code);
     this.creatorHostTokens.set(code, token);
     this.env.onForgetHostUiChange();
     this.env.runBackground(
@@ -172,16 +185,22 @@ export class SessionController {
     if (onlyIfMatching === undefined || this.creatorHostTokens.get(code) === onlyIfMatching) {
       this.creatorHostTokens.delete(code);
     }
-    if (onlyIfMatching === undefined) {
-      this.writeSession(`host:${code}`, undefined);
-    }
+    if (onlyIfMatching === undefined) this.writeSession(`host:${code}`, undefined);
+    const gen = ++this.forgetGen;
+    const prev = this.pendingForgets.get(code);
+    const match = prev?.match === null || onlyIfMatching === undefined ? null : onlyIfMatching;
+    this.pendingForgets.set(code, { match, gen });
     this.env.onForgetHostUiChange();
     this.env.runBackground(
       runWithHostRoomsLock(this.env.getLocks(), () => {
-        if (onlyIfMatching !== undefined) {
-          removePersistedHostTokenIfMatching(this.env.getLocalStorage(), code, onlyIfMatching);
-        } else {
-          writePersistedHostToken(this.env.getLocalStorage(), code, undefined);
+        try {
+          if (onlyIfMatching !== undefined) {
+            removePersistedHostTokenIfMatching(this.env.getLocalStorage(), code, onlyIfMatching);
+          } else {
+            writePersistedHostToken(this.env.getLocalStorage(), code, undefined);
+          }
+        } finally {
+          if (this.pendingForgets.get(code)?.gen === gen) this.pendingForgets.delete(code);
         }
         this.env.onForgetHostUiChange();
       }),
@@ -195,10 +214,15 @@ export class SessionController {
       if (key.startsWith("host:")) this.memorySession.delete(key);
     }
     clearLegacySessionHostTokens(this.env.getSessionStorage());
+    this.pendingForgetAll++;
     this.env.onForgetHostUiChange();
     this.env.runBackground(
       runWithHostRoomsLock(this.env.getLocks(), () => {
-        clearAllPersistedHostTokens(this.env.getLocalStorage());
+        try {
+          clearAllPersistedHostTokens(this.env.getLocalStorage());
+        } finally {
+          this.pendingForgetAll = Math.max(0, this.pendingForgetAll - 1);
+        }
         this.env.onForgetHostUiChange();
       }),
     );
@@ -209,7 +233,7 @@ export class SessionController {
     if (promoted !== undefined) return promoted;
     const inMemoryCreator = this.creatorHostTokens.get(code);
     if (inMemoryCreator !== undefined) return inMemoryCreator;
-    const persisted = readPersistedHostToken(this.env.getLocalStorage(), code);
+    const persisted = this.readAllowedPersistedHostToken(code);
     if (persisted !== undefined) {
       this.creatorHostTokens.set(code, persisted);
       return persisted;

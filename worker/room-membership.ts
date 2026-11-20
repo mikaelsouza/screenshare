@@ -212,6 +212,36 @@ export function applyResumeState(
   attachment.sharing = res.sharing;
 }
 
+function seedRotationGraceMembers(
+  now: number,
+  rawMembers: Record<string, MemberEntry>,
+  remainingActiveHashes: ReadonlySet<string>,
+  purgeDisconnected: boolean,
+): Record<string, MemberEntry> {
+  const nextMembers: Record<string, MemberEntry> = {};
+  for (const [hash, entry] of Object.entries(rawMembers)) {
+    if (purgeDisconnected && !remainingActiveHashes.has(hash)) continue;
+    nextMembers[hash] = {
+      ...entry,
+      until: Math.min(entry.until, now + ROTATION_REJOIN_GRACE_MS),
+      rotationGrace: true,
+    };
+  }
+  return nextMembers;
+}
+
+function buildConnectedMemberEntry(now: number, att: PeerAttachment): MemberEntry {
+  const joinedAt = att.joinedAt ?? att.openedAt;
+  return {
+    until: now + CONNECTED_TICKET_TTL_MS,
+    id: att.id,
+    ...(att.sharing ? { sharing: true } : {}),
+    ...(att.ip ? { ip: att.ip } : {}),
+    ...(joinedAt !== undefined ? { joinedAt } : {}),
+    ...(att.creatorHost ? { creatorHost: true } : {}),
+  };
+}
+
 export async function applyRotationInTransaction(
   host: RoomLifecycleHost,
   now: number,
@@ -219,40 +249,26 @@ export async function applyRotationInTransaction(
   peers: readonly JoinedSocket[],
   rawMembers: Record<string, MemberEntry>,
   creds: PreMintedRotation,
-  opts: { purgeDisconnected: boolean; extraWrites?: Record<string, unknown> },
-): Promise<void> {
-  const nextMembers: Record<string, MemberEntry> = {};
-  if (!opts.purgeDisconnected) {
-    for (const [hash, entry] of Object.entries(rawMembers)) {
-      nextMembers[hash] = {
-        ...entry,
-        until: Math.min(entry.until, now + ROTATION_REJOIN_GRACE_MS),
-        rotationGrace: true,
-      };
-    }
+  opts: { purgeDisconnected: boolean; extraWrites?: Record<string, unknown>; deferNotifications?: boolean },
+): Promise<() => void> {
+  const remainingActiveHashes = new Set<string>();
+  for (const { att } of peers) {
+    if (att.rejoinHash) remainingActiveHashes.add(att.rejoinHash);
   }
-  const pendingNotifications: Array<{ ws: WebSocket; msg: ServerMessage }> = [];
+  const nextMembers = seedRotationGraceMembers(now, rawMembers, remainingActiveHashes, opts.purgeDisconnected);
+  const pendingUpdates: Array<{ ws: WebSocket; att: PeerAttachment; hash: string; msg: ServerMessage }> = [];
+  const protectedHashes = new Set<string>(remainingActiveHashes);
   let ticketIdx = 0;
   for (const { ws: peerWs, att } of peers) {
     const minted = creds.tickets[ticketIdx++];
     if (!minted) continue;
-    nextMembers[minted.hash] = {
-      until: now + CONNECTED_TICKET_TTL_MS,
-      id: att.id,
-      ...(att.sharing ? { sharing: true } : {}),
-      ...(att.ip ? { ip: att.ip } : {}),
-      ...((att.joinedAt ?? att.openedAt) !== undefined ? { joinedAt: att.joinedAt ?? att.openedAt } : {}),
-      ...(att.creatorHost ? { creatorHost: true } : {}),
-    };
-    att.rejoinHash = minted.hash;
-    try {
-      peerWs.serializeAttachment(att);
-    } catch {
-      /* ignore */
-    }
+    nextMembers[minted.hash] = buildConnectedMemberEntry(now, att);
+    protectedHashes.add(minted.hash);
     const canSeeSecret = att.host === true || !locked;
-    pendingNotifications.push({
+    pendingUpdates.push({
       ws: peerWs,
+      att,
+      hash: minted.hash,
       msg: {
         t: "room-password",
         ...(canSeeSecret ? { password: creds.newPassword } : {}),
@@ -264,9 +280,17 @@ export async function applyRotationInTransaction(
     ...opts.extraWrites,
     [PASSWORD_KEY]: creds.newPasswordHash,
     [ROOM_PASSWORD_KEY]: creds.newPassword,
-    [MEMBERS_KEY]: capByExpiry(nextMembers, (m) => m.until, MAX_STORED_ENTRIES, host.activeRejoinHashes()),
+    [MEMBERS_KEY]: capByExpiry(nextMembers, (m) => m.until, MAX_STORED_ENTRIES, protectedHashes),
   });
-  for (const { ws: peerWs, msg } of pendingNotifications) sendSafe(peerWs, msg);
+  for (const { ws: peerWs, att, hash } of pendingUpdates) {
+    att.rejoinHash = hash;
+    try { peerWs.serializeAttachment(att); } catch { /* ignore */ }
+  }
+  const flushNotifications = (): void => {
+    for (const { ws: peerWs, msg } of pendingUpdates) sendSafe(peerWs, msg);
+  };
+  if (!opts.deferNotifications) flushNotifications();
+  return flushNotifications;
 }
 
 export async function persistMemberRecord(

@@ -1816,6 +1816,10 @@ describe("RoomDO security & PR 1 flows", () => {
     const throttled = await Client.connect(CODE, { "CF-Connecting-IP": guessIp });
     throttled.send({ t: "join", room: CODE, displayName: "guesser", password: "WRONG23456789ABC" });
     expect((await throttled.nextOf("error")).code).toBe("rate-limited");
+    // Even the correct password must be refused while the IP's failure budget is exhausted.
+    const throttledCorrect = await Client.connect(CODE, { "CF-Connecting-IP": guessIp });
+    throttledCorrect.send({ t: "join", room: CODE, displayName: "guesser", password: PASSWORD });
+    expect((await throttledCorrect.nextOf("error")).code).toBe("rate-limited");
     h.close();
   });
 
@@ -1871,7 +1875,7 @@ describe("RoomDO security & PR 1 flows", () => {
     );
     expect(membersAfterRotate).toBe(128);
 
-    // Kick triggers deny cap at 128 and purges all disconnected members (leaving only host h).
+    // Kick triggers deny cap at 128 and purges all disconnected members (leaving only host h's fresh + grace tickets).
     const c = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.222" });
     const wc = await c.join("carol", rot.password ? { password: rot.password } : undefined);
     await h.nextOf("peer-joined");
@@ -1883,7 +1887,7 @@ describe("RoomDO security & PR 1 flows", () => {
       members: Object.keys((await state.storage.get<Record<string, unknown>>("members")) ?? {}).length,
       deny: Object.keys((await state.storage.get<Record<string, unknown>>("deny")) ?? {}).length,
     }));
-    expect(counts.members).toBe(1);
+    expect(counts.members).toBe(2);
     expect(counts.deny).toBe(128);
     h.close();
   });
@@ -2943,10 +2947,12 @@ describe("RoomDO security & PR 1 flows", () => {
   });
 
   it("adversarial: kick in a locked room atomically bans IP, rotates password without leaking to guests, and purges disconnected tickets", async () => {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
     const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.80" });
     await h.joinAsHost("host");
     const stay = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.81" });
-    await stay.join("stay");
+    const wStay = await stay.join("stay");
+    expect(wStay.rejoinToken).toBeTruthy();
     await h.nextOf("peer-joined");
     const target = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.82" });
     const wTarget = await target.join("target");
@@ -2954,6 +2960,7 @@ describe("RoomDO security & PR 1 flows", () => {
     await stay.nextOf("peer-joined");
     const gone = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.83" });
     const wGone = await gone.join("gone");
+    expect(wGone.rejoinToken).toBeTruthy();
     await h.nextOf("peer-joined");
     await stay.nextOf("peer-joined");
     await target.nextOf("peer-joined");
@@ -2985,14 +2992,29 @@ describe("RoomDO security & PR 1 flows", () => {
     expect(stayRot.password).toBeUndefined();
     expect(stayRot.rejoinToken).toBeTruthy();
 
+    // Verify the kicked address was persisted in the deny list independently of room lock.
+    const denyEntry = await runInDurableObject(stub, async (_i, state) => {
+      const deny = await state.storage.get<Record<string, number>>("deny");
+      return deny?.["198.51.100.82"];
+    });
+    expect(denyEntry).toBeGreaterThan(Date.now());
+
     // Disconnected peer's old rejoin ticket was purged by kick.
     const goneRetry = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.83" });
     goneRetry.send({ t: "join", room: CODE, displayName: "gone", rejoinToken: wGone.rejoinToken });
     expect((await goneRetry.nextOf("error")).code).toBe("bad-password");
     goneRetry.close();
 
-    h.close();
+    // Remaining non-kicked peer retains a short grace window for their pre-kick ticket if they drop before receiving room-password.
     stay.close();
+    await h.nextOf("peer-left");
+    const stayReconnect = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.81" });
+    stayReconnect.send({ t: "join", room: CODE, displayName: "stay", rejoinToken: wStay.rejoinToken, resume: true });
+    const wStayRejoined = await stayReconnect.nextOf("welcome");
+    expect(wStayRejoined.selfId).toBe(wStay.selfId);
+    stayReconnect.close();
+
+    h.close();
   });
 
   // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)

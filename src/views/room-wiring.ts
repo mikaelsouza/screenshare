@@ -160,7 +160,12 @@ function handleFreshWelcome(
   if (cap) {
     ctx.getClient()?.setSharing(true);
     if (!tileView.getVideo(SELF_TILE)) tileView.renderSelfPreview(cap.stream);
-    void newMesh.setCapture(cap);
+    void newMesh.setCapture(cap).catch((err: unknown) => {
+      if (ctx.getMesh() !== newMesh || ctx.getCapture() !== cap) return;
+      console.error("[main] failed to reattach capture to peers", err);
+      ctx.setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
+      void ctx.stopSharing();
+    });
   }
 }
 
@@ -172,6 +177,7 @@ export function buildSignalingHandlers(
 ): SignalingHandlers {
   const { ui, session, invite, tileCtrl, popovers, tileView, health } = ctx;
   let hasWelcomed = false;
+  let pendingKickRotationName: string | null = null;
   const isStale = (): boolean => activeGen !== session.joinGeneration;
 
   return {
@@ -181,6 +187,7 @@ export function buildSignalingHandlers(
       if (status === "open") {
         ctx.setStatus(`In room ${code}`, "info");
       } else {
+        pendingKickRotationName = null;
         session.clearPendingKicks();
         ctx.setStatus(`Connection ${status}…`, "warn");
       }
@@ -191,6 +198,7 @@ export function buildSignalingHandlers(
       if (isStale()) return;
       const wasFirstWelcome = !hasWelcomed;
       hasWelcomed = true;
+      pendingKickRotationName = null;
       const rejectedStoredHostToken =
         !room.host && wasFirstWelcome && getLastPresentedHostToken() !== undefined;
       invite.cancelRotate();
@@ -234,7 +242,15 @@ export function buildSignalingHandlers(
       }
       tileCtrl.setName(peer.id, peer.name);
       session.members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
-      ctx.getMesh()?.addMember(peer.id, peer.sharing);
+      const activeMesh = ctx.getMesh();
+      if (activeMesh) {
+        if (activeMesh.memberIds().includes(peer.id)) {
+          if (!peer.sharing) tileView.removeTile(peer.id);
+          activeMesh.setMemberSharing(peer.id, peer.sharing);
+        } else {
+          activeMesh.addMember(peer.id, peer.sharing);
+        }
+      }
       popovers.recordArrival(
         { id: peer.id, name: peer.name },
         { replaces, isFocusedAndVisible: ctx.isFocusedAndVisible() },
@@ -247,9 +263,8 @@ export function buildSignalingHandlers(
       if (isStale()) return;
       const kickedName = session.consumePendingKick(id);
       if (kickedName !== null && kicked && session.isHost) {
-        ctx.showTransientRoomNotice(
-          `Removed ${kickedName} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
-        );
+        pendingKickRotationName = kickedName;
+        ctx.showTransientRoomNotice(`Removed ${kickedName}.`);
       }
       if (!kicked) popovers.recordDeparture(id);
       popovers.removeUnread(id);
@@ -296,6 +311,13 @@ export function buildSignalingHandlers(
       if (isStale()) return;
       session.applyRoomPassword(code, password, rejoinToken);
       invite.completeRotate();
+      if (password && pendingKickRotationName !== null && session.isHost) {
+        const kickedName = pendingKickRotationName;
+        pendingKickRotationName = null;
+        ctx.showTransientRoomNotice(
+          `Removed ${kickedName} \u2014 invite link rotated. Share the new link from Invite \u25BE.`,
+        );
+      }
       ctx.renderInviteMenu();
     },
 

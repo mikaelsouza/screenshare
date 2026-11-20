@@ -106,12 +106,12 @@ describe("worker/upgrade", () => {
     ];
 
     try {
-      // Malformed WebSocketPair returning a primitive
-      function PrimitivePair(): unknown {
-        return null;
+      // Constructor error propagates cleanly
+      function ThrowingPair(): unknown {
+        throw new Error("WebSocketPair unavailable");
       }
-      Object.defineProperty(globalThis, "WebSocketPair", { value: PrimitivePair, configurable: true, writable: true });
-      expect(() => rejectUpgrade("bad-room-code", "Bad")).toThrow("Invalid WebSocketPair server socket");
+      Object.defineProperty(globalThis, "WebSocketPair", { value: ThrowingPair, configurable: true, writable: true });
+      expect(() => rejectUpgrade("bad-room-code", "Bad")).toThrow("WebSocketPair unavailable");
 
       // Invalid server socket shapes
       for (const badServer of invalidServers) {

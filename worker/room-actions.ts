@@ -45,13 +45,15 @@ export async function admitConnection(
 ): Promise<AdmissionDecision> {
   const claimed = (await host.ctx.storage.get<boolean>(CLAIMED_KEY)) === true;
   const rateIp = tokens.ip ?? "unknown";
+  const passwordFailureRateLimited = passwordFailures.isLimited(rateIp);
   if (!claimed) {
     return evaluateAdmission({
       claimed: false, storedRoomCode: undefined, expectedPasswordHash: undefined, roomPassword: undefined,
       hostHash: null, creatorHostHash: null, locked: false, memberTicket: undefined, denied: false,
       msgRoom: tokens.msgRoom, pathRoomCode: tokens.pathRoomCode,
       offeredPasswordHash: tokens.offeredPasswordHash, offeredHostHash: tokens.offeredHostHash,
-      hasActiveSocketMatch: false, checkPasswordFailureRate: () => passwordFailures.check(rateIp),
+      hasActiveSocketMatch: false, passwordFailureRateLimited,
+      checkPasswordFailureRate: () => passwordFailures.check(rateIp),
     });
   }
   const now = Date.now();
@@ -73,7 +75,7 @@ export async function admitConnection(
     denied: tokens.ip !== undefined && deny[tokens.ip] !== undefined,
     msgRoom: tokens.msgRoom, pathRoomCode: tokens.pathRoomCode,
     offeredPasswordHash: tokens.offeredPasswordHash, offeredHostHash: tokens.offeredHostHash,
-    hasActiveSocketMatch: tokens.hasActiveSocketMatch,
+    hasActiveSocketMatch: tokens.hasActiveSocketMatch, passwordFailureRateLimited,
     checkPasswordFailureRate: () => passwordFailures.check(rateIp),
   });
 }
@@ -115,15 +117,25 @@ export async function handleKickAction(
       deny[target.att.ip] = now + KICK_BAN_MS;
       extraWrites[DENY_KEY] = capByExpiry(deny, (u) => u);
     }
+    const remainingPeers = host.joinedPeers(target.ws);
+    const [lockedRaw, members] = await Promise.all([
+      host.ctx.storage.get<boolean>(LOCKED_KEY),
+      getMembers(host, now),
+    ]);
+    const flushNotifications = await applyRotationInTransaction(
+      host,
+      now,
+      lockedRaw === true,
+      remainingPeers,
+      members,
+      creds,
+      { purgeDisconnected: true, extraWrites, deferNotifications: true },
+    );
     host.refused.add(target.ws);
     sendSafe(target.ws, { t: "error", code: "kicked", message: "You were removed from this room." });
     await handleKickedLeave(target.ws);
     try { target.ws.close(1008, "Kicked"); } catch { /* already closed */ }
-    const locked = (await host.ctx.storage.get<boolean>(LOCKED_KEY)) === true;
-    await applyRotationInTransaction(host, now, locked, host.joinedPeers(), {}, creds, {
-      purgeDisconnected: true,
-      extraWrites,
-    });
+    flushNotifications();
     await syncAlarm(host, now);
   });
 }

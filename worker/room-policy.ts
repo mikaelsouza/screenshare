@@ -53,6 +53,8 @@ export interface AdmissionInput {
   offeredPasswordHash: string | null;
   offeredHostHash: string | null;
   hasActiveSocketMatch: boolean;
+  /** True when the IP has already exhausted its password failure budget for the current window. */
+  passwordFailureRateLimited?: boolean;
   /** Called ONLY when auth fails (unclaimed or invalid credentials). Returns false when rate-limited. */
   checkPasswordFailureRate: () => boolean;
 }
@@ -69,14 +71,14 @@ export type AdmissionDecision =
     }
   | { ok: false; code: ErrorCode; message: string };
 
+const RATE_LIMITED_DECISION: AdmissionDecision = {
+  ok: false,
+  code: "rate-limited",
+  message: "Too many wrong invite codes. Wait a minute before trying again.",
+};
+
 function passwordFailureDecision(checkRate: () => boolean): AdmissionDecision {
-  if (!checkRate()) {
-    return {
-      ok: false,
-      code: "rate-limited",
-      message: "Too many wrong invite codes. Wait a minute before trying again.",
-    };
-  }
+  if (!checkRate()) return RATE_LIMITED_DECISION;
   return {
     ok: false,
     code: "bad-password",
@@ -120,6 +122,9 @@ export function evaluateAdmission(input: AdmissionInput): AdmissionDecision {
     input.expectedPasswordHash,
   );
 
+  if (input.passwordFailureRateLimited === true) {
+    return RATE_LIMITED_DECISION;
+  }
   if (!input.claimed) {
     return passwordFailureDecision(input.checkPasswordFailureRate);
   }
