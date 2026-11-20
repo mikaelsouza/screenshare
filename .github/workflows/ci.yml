@@ -144,7 +144,7 @@ jobs:
         shell: bash
         run: npm run electron:build
 
-      - name: Verify release metadata and run unpackaged Electron smoke test
+      - name: Verify release metadata and run unpackaged & packaged Electron smoke checks
         shell: bash
         run: |
           set -euo pipefail
@@ -154,3 +154,4 @@ jobs:
           test -f "release/Screenshare-Setup-${PKG_VERSION}.exe.blockmap"
           test -f "release/latest.yml"
           npm run electron:smoke
+          npm run electron:smoke:packaged

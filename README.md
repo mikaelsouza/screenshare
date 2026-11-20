@@ -169,14 +169,12 @@ Picture-in-Picture, live stats, and fullscreen controls.
      `CodeQL` succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`.
      Existing desktop app installs pick up web/UI updates immediately because they load
      the hosted site.
-   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs after `CI`
-     succeeds on `main`, verifies `CodeQL` passed, checks Electron-relevant changes since
-     the latest tag (`electron/`, `electron-builder.json`, `tsconfig.electron.json`,
-     `assets/icon.*`, `.github/workflows/release-electron.yml`, or runtime/Electron entries
-     in `package.json` and `package-lock.json`), builds and smoke-tests the NSIS installer
-     in a read-only job, and publishes the GitHub Release (`latest.yml`, `.blockmap`, and
-     `SHA256SUMS.txt`) in an isolated release job (or via `workflow_dispatch` with an
-     optional `force` flag).
+   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs on
+     `vMAJOR.MINOR.PATCH` tag pushes (or `workflow_dispatch`), verifies `CI` and `CodeQL`
+     passed for that commit, builds the Windows installer with all 6 `@electron/fuses` burned,
+     runs both unpackaged (`electron:smoke`) and packaged fuse/ASAR (`electron:smoke:packaged`)
+     checks, attaches SLSA build provenance via `actions/attest-build-provenance`, and publishes
+     the GitHub Release (`latest.yml`, `.blockmap`, and `SHA256SUMS.txt`).
    - `npm run deploy` builds and deploys the Worker locally without running any checks.
 
 ## Development

@@ -22,6 +22,7 @@ const config: ViteUserConfig = defineConfig({
         "electron/picker.ts",
         "electron/updater.ts",
         "scripts/check-guardrails-diff.ts",
+        "scripts/smoke-test-packaged.ts",
         "worker/ipkey.ts",
         "worker/ratelimit.ts",
         "worker/room-crypto.ts",
