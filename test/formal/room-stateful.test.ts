@@ -56,6 +56,11 @@ interface SimClientPeer {
   hostToken?: string;
 }
 
+interface UnjoinedSocketSpec {
+  id: string;
+  openedAt: number;
+}
+
 class VirtualRoomHarness {
   readonly roomId = "do-sim-room-1";
   readonly roomCode = generateRoomCode();
@@ -63,13 +68,15 @@ class VirtualRoomHarness {
 
   claimed = true;
   everJoined = false;
-  sessionCleaned = true;
+  sessionCleaned = false;
   locked = false;
   hostPromoted = false;
   promotedHost: PromotedHostRecord | null = null;
   emptySince: number | undefined;
   hostGoneAt: number | undefined;
   lastHostActiveAt: number | undefined;
+  readonly passwordFailures = new Map<string, number[]>();
+  readonly unjoinedSockets: UnjoinedSocketSpec[] = [];
 
   password: string;
   passwordHash: string;
@@ -84,7 +91,7 @@ class VirtualRoomHarness {
 
   private seq = 0;
 
-  constructor(opts: { legacy?: boolean } = {}) {
+  constructor(opts: { legacy?: boolean; legacyJoined?: boolean } = {}) {
     this.password = generateRoomPassword();
     this.passwordHash = syncHashSecret(this.roomId, this.password, "password");
     this.creatorHostToken = `host-tok-${this.nextSeq()}`;
@@ -93,6 +100,10 @@ class VirtualRoomHarness {
     this.creatorHostHash = opts.legacy ? null : cHash;
     this.emptySince = this.now;
     this.lastHostActiveAt = opts.legacy ? undefined : this.now;
+    if (opts.legacy && opts.legacyJoined) {
+      this.everJoined = true;
+      this.sessionCleaned = true;
+    }
     this.syncAlarm();
   }
 
@@ -123,6 +134,34 @@ class VirtualRoomHarness {
     return this.creatorHostHash !== null;
   }
 
+  private earliestUnjoinedDeadline(): number | null {
+    let earliest: number | null = null;
+    for (const s of this.unjoinedSockets) {
+      const d = s.openedAt + 10_000;
+      if (earliest === null || d < earliest) earliest = d;
+    }
+    return earliest;
+  }
+
+  private sweepStaleUnjoined(): void {
+    for (let i = this.unjoinedSockets.length - 1; i >= 0; i--) {
+      if (this.now - this.unjoinedSockets[i]!.openedAt >= 10_000) {
+        this.unjoinedSockets.splice(i, 1);
+      }
+    }
+  }
+
+  private checkPasswordFailureRate(ip: string, now: number): boolean {
+    const recent = (this.passwordFailures.get(ip) ?? []).filter((t) => now - t < 60_000);
+    if (recent.length >= 20) {
+      this.passwordFailures.set(ip, recent);
+      return false;
+    }
+    recent.push(now);
+    this.passwordFailures.set(ip, recent);
+    return true;
+  }
+
   private creatorActivityCap(): number {
     if ([...this.peers.values()].some((p) => p.creatorHost)) {
       this.lastHostActiveAt = this.now;
@@ -146,6 +185,7 @@ class VirtualRoomHarness {
       this.alarmDeadline = null;
       return;
     }
+    const earliestUnjoined = this.earliestUnjoinedDeadline();
     const occupied = this.peers.size > 0;
     if (!occupied) {
       this.hostGoneAt = undefined;
@@ -161,7 +201,7 @@ class VirtualRoomHarness {
         lastHostActiveAt: this.lastHostActiveAt,
         hasCreatorHost: this.hasCreatorHostKey(),
         creatorCap: null,
-        earliestUnjoinedDeadline: null,
+        earliestUnjoinedDeadline: earliestUnjoined,
       });
       return;
     }
@@ -182,7 +222,7 @@ class VirtualRoomHarness {
         lastHostActiveAt: undefined,
         hasCreatorHost: this.hasCreatorHostKey(),
         creatorCap,
-        earliestUnjoinedDeadline: null,
+        earliestUnjoinedDeadline: earliestUnjoined,
       });
       return;
     }
@@ -198,13 +238,14 @@ class VirtualRoomHarness {
       lastHostActiveAt: undefined,
       hasCreatorHost: this.hasCreatorHostKey(),
       creatorCap,
-      earliestUnjoinedDeadline: null,
+      earliestUnjoinedDeadline: earliestUnjoined,
     });
   }
 
   private expireRoom(): void {
     this.claimed = false;
     this.peers.clear();
+    this.unjoinedSockets.length = 0;
     this.members = {};
     this.deny = {};
     this.promotedHost = null;
@@ -219,6 +260,7 @@ class VirtualRoomHarness {
   private resetEmptySession(): void {
     const wasLocked = this.locked;
     const revokeLegacy = !this.hasCreatorHostKey() && (this.promotedHost !== null || this.hostPromoted);
+    this.sweepStaleUnjoined();
     this.members = {};
     this.deny = {};
     this.promotedHost = null;
@@ -234,8 +276,8 @@ class VirtualRoomHarness {
     }
   }
 
-  private backfillUnjoinedLegacyCreatorHash(): void {
-    if (this.peers.size > 0) return;
+  private backfillUnjoinedLegacyCreatorHash(): boolean {
+    if (this.peers.size > 0) return false;
     const canBackfill =
       this.creatorHostHash === null &&
       this.hostHash !== null &&
@@ -244,11 +286,12 @@ class VirtualRoomHarness {
       Object.keys(this.members).length === 0 &&
       this.promotedHost === null &&
       !this.hostPromoted;
-    if (!canBackfill || this.hostHash === null) return;
+    if (!canBackfill || this.hostHash === null) return false;
     this.creatorHostHash = this.hostHash;
     if (this.lastHostActiveAt === undefined) {
       this.lastHostActiveAt = this.emptySince ?? this.now;
     }
+    return true;
   }
 
   private reconcileBeforeAdmit(): "expired" | "ok" {
@@ -276,12 +319,20 @@ class VirtualRoomHarness {
       return "expired";
     }
     if (!this.hasCreatorHostKey()) {
-      this.backfillUnjoinedLegacyCreatorHash();
+      const backfilled = this.backfillUnjoinedLegacyCreatorHash();
+      if (!backfilled && this.lastHostActiveAt === undefined) {
+        this.lastHostActiveAt = this.emptySince;
+      }
     }
     if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
       this.resetEmptySession();
     }
     return "ok";
+  }
+
+  openUnjoinedSocket(): void {
+    this.unjoinedSockets.push({ id: this.nextUuid("unjoined"), openedAt: this.now });
+    this.syncAlarm();
   }
 
   admitAndJoin(req: {
@@ -320,7 +371,7 @@ class VirtualRoomHarness {
       offeredPasswordHash,
       offeredHostHash,
       hasActiveSocketMatch: activeMatch,
-      checkPasswordFailureRate: () => true,
+      checkPasswordFailureRate: () => this.checkPasswordFailureRate(req.ip, this.now),
     });
     if (!decision.ok) return { ok: false, code: decision.code };
 
@@ -530,6 +581,7 @@ class VirtualRoomHarness {
       this.alarmDeadline = null;
       return;
     }
+    this.sweepStaleUnjoined();
     if (this.peers.size === 0) {
       if (this.emptySince === undefined) this.emptySince = this.now;
       const expiry = computeCredentialExpiry(
@@ -543,7 +595,10 @@ class VirtualRoomHarness {
         return;
       }
       if (!this.hasCreatorHostKey()) {
-        this.backfillUnjoinedLegacyCreatorHash();
+        const backfilled = this.backfillUnjoinedLegacyCreatorHash();
+        if (!backfilled && this.lastHostActiveAt === undefined) {
+          this.lastHostActiveAt = this.emptySince;
+        }
       }
       if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
         this.resetEmptySession();
@@ -596,6 +651,8 @@ class VirtualRoomHarness {
 // Room Lifecycle Model + Commands (PR #52 12h / 15m / 90d + legacy + moderation)
 // ---------------------------------------------------------------------------
 
+type LegacyVariant = "modern" | "legacy-unjoined" | "legacy-joined";
+
 interface RoomModel {
   expired: boolean;
   everJoined: boolean;
@@ -606,7 +663,7 @@ interface RoomModel {
   kickedIps: Map<string, number>;
   leakedPreLockPasswords: string[];
   rotatedPasswords: string[];
-  legacyMode: boolean;
+  legacyVariant: LegacyVariant;
   promotedSinceLastReset: boolean;
 }
 
@@ -641,6 +698,8 @@ class JoinCreatorCommand implements RoomCommand {
   }
   check = (m: Readonly<RoomModel>): boolean => !m.expired && m.connectedIds.length < MAX_ROOM_SIZE;
   run(m: RoomModel, real: VirtualRoomHarness): void {
+    const prevFailureCount = real.passwordFailures.get("198.51.100.1")?.length ?? 0;
+    const prevLastActive = real.lastHostActiveAt;
     const res = real.admitAndJoin({
       name: "creator",
       ip: "198.51.100.1",
@@ -649,6 +708,7 @@ class JoinCreatorCommand implements RoomCommand {
     });
     if (!real.claimed) {
       assert.deepEqual(res, { ok: false, code: "bad-password" });
+      assert.equal(real.passwordFailures.get("198.51.100.1")?.length ?? 0, prevFailureCount);
       m.expired = true;
       m.connectedIds = [];
       m.hostIds = [];
@@ -669,9 +729,16 @@ class JoinCreatorCommand implements RoomCommand {
     if (!m.promotedSinceLastReset && real.creatorHostHash !== null) {
       assert.equal(res.peer.host, true);
       assert.equal(res.password, real.password);
-    } else if (m.promotedSinceLastReset) {
+    } else if (m.promotedSinceLastReset && real.creatorHostHash !== null) {
       assert.equal(res.peer.creatorHost, true);
       assert.equal(res.peer.host, false);
+    } else if (real.creatorHostHash === null) {
+      // Joined legacy room without CREATOR_HOST_KEY: creatorHost stays false and lastHostActiveAt
+      // anchors once without sliding on subsequent visits.
+      assert.equal(res.peer.creatorHost, false);
+      if (prevLastActive !== undefined) {
+        assert.equal(real.lastHostActiveAt, prevLastActive);
+      }
     }
     assertRoomInvariants(m, real);
   }
@@ -685,6 +752,7 @@ class JoinGuestCommand implements RoomCommand {
   }
   check = (m: Readonly<RoomModel>): boolean => !m.expired && m.connectedIds.length < MAX_ROOM_SIZE;
   run(m: RoomModel, real: VirtualRoomHarness): void {
+    const prevLastActive = real.lastHostActiveAt;
     const ip = IP_POOL[this.ipIdx % IP_POOL.length] ?? "198.51.100.2";
     const res = real.admitAndJoin({ name: `guest-${String(this.ipIdx)}`, ip, password: real.password });
     const banUntil = m.kickedIps.get(ip);
@@ -693,10 +761,19 @@ class JoinGuestCommand implements RoomCommand {
       assert.deepEqual(res, { ok: false, code: "room-locked" });
     } else if (isBanned) {
       assert.deepEqual(res, { ok: false, code: "kicked" });
+    } else if (!real.claimed) {
+      assert.deepEqual(res, { ok: false, code: "bad-password" });
+      m.expired = true;
+      m.connectedIds = [];
+      m.hostIds = [];
     } else {
       assert.equal(res.ok, true);
       if (res.ok) {
         assert.equal(res.peer.host, false);
+        // Guest admission must not advance creator's lastHostActiveAt once established
+        if (prevLastActive !== undefined) {
+          assert.equal(real.lastHostActiveAt, prevLastActive);
+        }
         m.everJoined = true;
         m.connectedIds = [...real.peers.keys()];
       }
@@ -704,6 +781,39 @@ class JoinGuestCommand implements RoomCommand {
     assertRoomInvariants(m, real);
   }
   toString = (): string => `JoinGuest(${String(this.ipIdx)})`;
+}
+
+class OpenUnjoinedPreemptCommand implements RoomCommand {
+  check = (m: Readonly<RoomModel>): boolean => !m.expired;
+  run(_m: RoomModel, real: VirtualRoomHarness): void {
+    real.openUnjoinedSocket();
+    assert.ok(real.alarmDeadline !== null && real.alarmDeadline <= real.now + 10_000);
+    real.advanceTimeAndRunAlarm(10_000);
+    assert.equal(real.unjoinedSockets.length, 0);
+  }
+  toString = (): string => "OpenUnjoinedPreempt()";
+}
+
+class FloodMembersCapCommand implements RoomCommand {
+  check = (m: Readonly<RoomModel>): boolean => !m.expired;
+  run(_m: RoomModel, real: VirtualRoomHarness): void {
+    const activeHashes = new Set([...real.peers.values()].map((p) => p.rejoinHash));
+    const injected: Record<string, MemberEntry> = { ...real.members };
+    for (let i = 0; i < MAX_STORED_ENTRIES + 24; i++) {
+      injected[`synth-${String(real.now)}-${String(i)}`] = {
+        until: real.now + 1000 + i,
+        id: `synth-${String(i)}`,
+        ip: "198.51.100.250",
+        joinedAt: real.now,
+      };
+    }
+    real.members = capByExpiry(injected, (e) => e.until, MAX_STORED_ENTRIES, activeHashes);
+    assert.ok(Object.keys(real.members).length <= MAX_STORED_ENTRIES);
+    for (const h of activeHashes) {
+      assert.ok(real.members[h] !== undefined);
+    }
+  }
+  toString = (): string => "FloodMembersCap()";
 }
 
 class JoinWithStaleSecretCommand implements RoomCommand {
@@ -1048,12 +1158,17 @@ class FakeWebSocket {
 interface MeshHarness {
   mesh: Mesh;
   signals: Array<{ to: string; data: SignalData }>;
+  reemitted: string[];
+  allPcs: FakeRtcPeerConnection[];
   peers: string[];
 }
 
 interface MeshModel {
   localSharing: boolean;
+  withAudio: boolean;
+  degradation: "framerate" | "clarity";
   peers: Map<string, boolean>;
+  remoteStreams: Set<string>;
 }
 
 function makeFakeCapture(tag: string, withAudio: boolean): CaptureResult {
@@ -1083,7 +1198,21 @@ function assertMeshInvariants(m: Readonly<MeshModel>, real: MeshHarness): void {
       assert.ok(pc.transceivers.length <= 2);
       const mLineCount = (pc.localDescription?.sdp?.match(/^m=/gm) ?? []).length;
       assert.ok(mLineCount <= 3);
+      if (m.localSharing && pc.transceivers.length > 0) {
+        assert.equal(pc.transceivers[0]?.sender.track?.contentHint, "motion");
+        const expectedDegrad =
+          m.degradation === "clarity" ? "maintain-framerate-and-resolution" : "maintain-framerate";
+        assert.equal(pc.transceivers[0]?.sender.getParameters().degradationPreference, expectedDegrad);
+      }
+      if (!m.localSharing && pc.transceivers.length > 0) {
+        assert.equal(pc.transceivers[0]?.sender.track, null);
+      }
     }
+  }
+  const activeSet = new Set(activeLinks);
+  for (const pc of real.allPcs) {
+    const stillActive = [...activeSet].some((id) => (real.mesh.getConnection(id) as unknown) === pc);
+    if (!stillActive) assert.equal(pc.connectionState, "closed");
   }
   if (!m.localSharing && [...m.peers.values()].every((s) => !s)) {
     assert.equal(activeLinks.length, 0);
@@ -1099,6 +1228,8 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
     const cmds = [
       fc.boolean().map((usePw) => new JoinCreatorCommand(usePw)),
       fc.integer({ min: 0, max: 4 }).map((i) => new JoinGuestCommand(i)),
+      fc.constant(new OpenUnjoinedPreemptCommand()),
+      fc.constant(new FloodMembersCapCommand()),
       fc.boolean().map((preLock) => new JoinWithStaleSecretCommand(preLock)),
       fc.integer({ min: 0, max: 9 }).map((i) => new DisconnectPeerCommand(i)),
       fc.integer({ min: 0, max: 9 }).map((i) => new ReconnectResumeCommand(i)),
@@ -1115,30 +1246,37 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
 
     let totalRuns = 0;
     fc.assert(
-      fc.property(fc.boolean(), fc.commands(cmds, { maxCommands: 50 }), (legacy, seq) => {
-        totalRuns += 1;
-        const real = new VirtualRoomHarness({ legacy });
-        const model: RoomModel = {
-          expired: false,
-          everJoined: false,
-          locked: false,
-          connectedIds: [],
-          hostIds: [],
-          disconnectedTokens: new Map(),
-          kickedIps: new Map(),
-          leakedPreLockPasswords: [],
-          rotatedPasswords: [],
-          legacyMode: legacy,
-          promotedSinceLastReset: false,
-        };
-        fc.modelRun(() => ({ model, real }), seq);
-      }),
+      fc.property(
+        fc.constantFrom<LegacyVariant>("modern", "legacy-unjoined", "legacy-joined"),
+        fc.commands(cmds, { maxCommands: 50 }),
+        (legacyVariant, seq) => {
+          totalRuns += 1;
+          const real = new VirtualRoomHarness({
+            legacy: legacyVariant !== "modern",
+            legacyJoined: legacyVariant === "legacy-joined",
+          });
+          const model: RoomModel = {
+            expired: false,
+            everJoined: legacyVariant === "legacy-joined",
+            locked: false,
+            connectedIds: [],
+            hostIds: [],
+            disconnectedTokens: new Map(),
+            kickedIps: new Map(),
+            leakedPreLockPasswords: [],
+            rotatedPasswords: [],
+            legacyVariant,
+            promotedSinceLastReset: false,
+          };
+          fc.modelRun(() => ({ model, real }), seq);
+        },
+      ),
       { numRuns: 150 },
     );
     expect(totalRuns).toBe(150);
   });
 
-  it("verifies partial-mesh zero-idle-link and bounded-transceiver invariants across randomized Mesh command sequences", async () => {
+  it("verifies partial-mesh zero-idle-link, bounded-transceiver, reemit, and degradation invariants across randomized Mesh command sequences", async () => {
     vi.stubGlobal("RTCPeerConnection", FakeRtcPeerConnection);
     (globalThis as unknown as { RTCRtpSender: { getCapabilities: () => { codecs: unknown[] } } }).RTCRtpSender = {
       getCapabilities: () => ({ codecs: [{ mimeType: "video/H264" }] }),
@@ -1150,7 +1288,14 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
         check: () => true,
         async run(m, real) {
           m.localSharing = true;
+          m.withAudio = withAudio;
           await real.mesh.setCapture(makeFakeCapture("local", withAudio));
+          const latestPcs = peerIds
+            .map((id) => real.mesh.getConnection(id) as unknown as FakeRtcPeerConnection | undefined)
+            .filter((pc): pc is FakeRtcPeerConnection => pc !== undefined);
+          for (const pc of latestPcs) {
+            if (!real.allPcs.includes(pc)) real.allPcs.push(pc);
+          }
           assertMeshInvariants(m, real);
         },
         toString: () => `StartLocalShare(audio=${String(withAudio)})`,
@@ -1164,19 +1309,46 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
         },
         toString: () => "StopLocalShare()",
       }),
+      fc.constantFrom("framerate" as const, "clarity" as const).map(
+        (mode): fc.AsyncCommand<MeshModel, MeshHarness> => ({
+          check: () => true,
+          async run(m, real) {
+            m.degradation = mode;
+            await real.mesh.setDegradation(mode);
+            assertMeshInvariants(m, real);
+          },
+          toString: () => `SetDegradation(${mode})`,
+        }),
+      ),
       fc.tuple(fc.integer({ min: 0, max: 2 }), fc.boolean()).map(
         ([idx, sharing]): fc.AsyncCommand<MeshModel, MeshHarness> => ({
           check: () => true,
           async run(m, real) {
             const peerId = peerIds[idx]!;
+            const prev = m.peers.get(peerId) === true;
             m.peers.set(peerId, sharing);
+            const preReemit = real.reemitted.length;
             real.mesh.setMemberSharing(peerId, sharing);
             if (sharing && !real.mesh.getConnection(peerId)) {
               await real.mesh.handleSignal(peerId, {
                 k: "offer",
                 sdp: "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n",
               });
+              const pc = real.mesh.getConnection(peerId) as unknown as FakeRtcPeerConnection | undefined;
+              if (pc && !real.allPcs.includes(pc)) real.allPcs.push(pc);
+              if (pc?.ontrack && !m.remoteStreams.has(peerId)) {
+                const track = { kind: "video", addEventListener: () => {} } as unknown as MediaStreamTrack;
+                pc.ontrack({
+                  track,
+                  streams: [{ id: `remote-${peerId}` } as unknown as MediaStream],
+                  receiver: {} as RTCRtpReceiver,
+                } as unknown as RTCTrackEvent);
+                m.remoteStreams.add(peerId);
+              }
+            } else if (!prev && sharing && m.remoteStreams.has(peerId) && real.mesh.getConnection(peerId)) {
+              assert.equal(real.reemitted.length, preReemit + 1);
             }
+            if (!sharing && !m.localSharing) m.remoteStreams.delete(peerId);
             assertMeshInvariants(m, real);
           },
           toString: () => `SetRemoteSharing(${peerIds[idx]},${String(sharing)})`,
@@ -1202,23 +1374,29 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       fc.asyncProperty(fc.commands(meshCmds, { maxCommands: 30 }), async (seq) => {
         totalRuns += 1;
         const signals: Array<{ to: string; data: SignalData }> = [];
+        const reemitted: string[] = [];
+        const allPcs: FakeRtcPeerConnection[] = [];
         const opts: MeshOptions = {
           iceServers: [{ urls: "stun:stun.example.com" }],
           preset: { label: "1080p60", width: 1920, height: 1080, frameRate: 60, maxBitrate: 12_000_000 },
           codec: "h264",
+          degradation: "framerate",
           jitterBufferTargetMs: 0,
         };
         const cb: MeshCallbacks = {
-          onRemoteStream: () => {},
+          onRemoteStream: (peerId) => reemitted.push(peerId),
           onRemoteStreamGone: () => {},
           onConnectionState: () => {},
         };
         const mesh = new Mesh("peer-0000", opts, (to, data) => signals.push({ to, data }), cb);
         for (const id of peerIds) mesh.addMember(id, false);
-        const real: MeshHarness = { mesh, signals, peers: peerIds };
+        const real: MeshHarness = { mesh, signals, reemitted, allPcs, peers: peerIds };
         const model: MeshModel = {
           localSharing: false,
+          withAudio: false,
+          degradation: "framerate",
           peers: new Map(peerIds.map((id) => [id, false])),
+          remoteStreams: new Set(),
         };
         try {
           await fc.asyncModelRun(() => ({ model, real }), seq);
@@ -1231,14 +1409,26 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
     expect(totalRuns).toBe(75);
   });
 
-  it("verifies SignalingClient fatal close codes, reconnect queueing, and resume invariants", () => {
+  it("verifies SignalingClient fatal close codes, retry caps, pending queue, and cross-selfId suppression", () => {
+    vi.useFakeTimers();
     vi.stubGlobal("WebSocket", FakeWebSocket);
     vi.stubGlobal("location", { protocol: "https:", host: "screenshare.example" });
     const events: string[] = [];
     const welcomes: RoomInfo[] = [];
 
+    interface SigModel {
+      fatal: boolean;
+      welcomed: boolean;
+      closed: boolean;
+      capRefusals: number;
+      initAttempts: number;
+      selfId: string | null;
+      pendingSignals: number;
+      pendingStates: number;
+    }
+
     const sigCmds = [
-      fc.constant<fc.Command<{ fatal: boolean; welcomed: boolean; closed: boolean }, SignalingClient>>({
+      fc.constantFrom("self-A", "self-B").map((nextSelfId): fc.Command<SigModel, SignalingClient> => ({
         check: (m) => !m.fatal && !m.closed,
         run(m, real) {
           const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
@@ -1247,23 +1437,38 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
             ws.readyState = FakeWebSocket.OPEN;
             ws.onopen?.();
           }
+          const sentBefore = ws.sent.length;
           ws.onmessage?.({
             data: JSON.stringify({
               t: "welcome",
-              selfId: "self-1",
+              selfId: nextSelfId,
               peers: [],
               host: true,
               locked: false,
               rejoinToken: "rej-1",
             }),
           });
+          const flushed = ws.sent.slice(sentBefore).map((s) => JSON.parse(s) as { t: string });
+          const sameSelf = m.selfId === null || m.selfId === nextSelfId;
+          const sigFlushed = flushed.filter((x) => x.t === "signal").length;
+          if (!sameSelf) {
+            assert.equal(sigFlushed, 0);
+          } else {
+            assert.equal(sigFlushed, m.pendingSignals);
+          }
+          assert.equal(flushed.filter((x) => x.t === "state").length, m.pendingStates);
+          m.selfId = nextSelfId;
           m.welcomed = true;
+          m.capRefusals = 0;
+          m.initAttempts = 0;
+          m.pendingSignals = 0;
+          m.pendingStates = 0;
           assert.equal(real.isReady, true);
         },
-        toString: () => "Welcome()",
-      }),
+        toString: () => `Welcome(${nextSelfId})`,
+      })),
       fc.constantFrom("bad-password", "kicked", "room-locked", "session-replaced").map(
-        (code): fc.Command<{ fatal: boolean; welcomed: boolean; closed: boolean }, SignalingClient> => ({
+        (code): fc.Command<SigModel, SignalingClient> => ({
           check: (m) => !m.fatal && !m.closed,
           run(m, real) {
             const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
@@ -1277,43 +1482,108 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
           toString: () => `FatalError(${code})`,
         }),
       ),
-      fc.boolean().map((sharing): fc.Command<{ fatal: boolean; welcomed: boolean; closed: boolean }, SignalingClient> => ({
+      fc.constant<fc.Command<SigModel, SignalingClient>>({
+        check: (m) => !m.fatal && !m.closed,
+        run(m, real) {
+          const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+          if (!ws || ws.readyState === FakeWebSocket.CLOSED) return;
+          ws.close(1013, "room-full");
+          m.capRefusals += 1;
+          if (m.capRefusals > 5) {
+            m.fatal = true;
+            assert.equal(real.isFatal, true);
+          } else {
+            assert.equal(real.isFatal, false);
+            vi.advanceTimersByTime(16_000);
+          }
+        },
+        toString: () => "Transient1013()",
+      }),
+      fc.constant<fc.Command<SigModel, SignalingClient>>({
+        check: (m) => !m.fatal && !m.closed && !m.welcomed,
+        run(m, real) {
+          const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+          if (!ws || ws.readyState === FakeWebSocket.CLOSED) return;
+          ws.close(1006, "abnormal");
+          m.initAttempts += 1;
+          if (m.initAttempts >= 8) {
+            m.fatal = true;
+            assert.equal(real.isFatal, true);
+          } else {
+            assert.equal(real.isFatal, false);
+            vi.advanceTimersByTime(16_000);
+          }
+        },
+        toString: () => "Transient1006()",
+      }),
+      fc.constant<fc.Command<SigModel, SignalingClient>>({
+        check: (m) => !m.fatal && !m.closed,
+        run(m, real) {
+          const wasReady = real.isReady;
+          real.signal("peer-x", { k: "ice", candidate: { candidate: "c", sdpMid: "0", sdpMLineIndex: 0 } });
+          if (!wasReady) m.pendingSignals = Math.min(64, m.pendingSignals + 1);
+        },
+        toString: () => "SendSignal()",
+      }),
+      fc.boolean().map((sharing): fc.Command<SigModel, SignalingClient> => ({
         check: (m) => !m.closed,
-        run(_m, real) {
+        run(m, real) {
+          const wasReady = real.isReady;
           real.setSharing(sharing);
+          if (!wasReady && !m.fatal) m.pendingStates = Math.min(64, m.pendingStates + 1);
         },
         toString: () => `SetSharing(${String(sharing)})`,
       })),
     ];
 
     let totalRuns = 0;
-    fc.assert(
-      fc.property(fc.commands(sigCmds, { maxCommands: 20 }), (seq) => {
-        totalRuns += 1;
-        FakeWebSocket.instances = [];
-        const client = new SignalingClient(
-          "ABCD2345",
-          "Alice",
-          {
-            onWelcome: (_id, _peers, room) => welcomes.push(room),
-            onPeerJoined: () => {},
-            onPeerLeft: () => {},
-            onSignal: () => {},
-            onPeerState: () => {},
-            onError: (code) => events.push(code),
-            onStatus: () => {},
-          },
-          () => ({ password: "SECRET23456789AB", rejoinToken: "rej-1" }),
-        );
-        client.connect();
-        try {
-          fc.modelRun(() => ({ model: { fatal: false, welcomed: false, closed: false }, real: client }), seq);
-        } finally {
-          client.close();
-        }
-      }),
-      { numRuns: 50 },
-    );
+    try {
+      fc.assert(
+        fc.property(fc.commands(sigCmds, { maxCommands: 20 }), (seq) => {
+          totalRuns += 1;
+          FakeWebSocket.instances = [];
+          const client = new SignalingClient(
+            "ABCD2345",
+            "Alice",
+            {
+              onWelcome: (_id, _peers, room) => welcomes.push(room),
+              onPeerJoined: () => {},
+              onPeerLeft: () => {},
+              onSignal: () => {},
+              onPeerState: () => {},
+              onError: (code) => events.push(code),
+              onStatus: () => {},
+            },
+            () => ({ password: "SECRET23456789AB", rejoinToken: "rej-1" }),
+          );
+          client.connect();
+          try {
+            fc.modelRun(
+              () => ({
+                model: {
+                  fatal: false,
+                  welcomed: false,
+                  closed: false,
+                  capRefusals: 0,
+                  initAttempts: 0,
+                  selfId: null,
+                  pendingSignals: 0,
+                  pendingStates: 0,
+                },
+                real: client,
+              }),
+              seq,
+            );
+          } finally {
+            client.close();
+          }
+        }),
+        { numRuns: 50 },
+      );
+    } finally {
+      vi.useRealTimers();
+    }
     expect(totalRuns).toBe(50);
   });
 });
+

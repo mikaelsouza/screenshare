@@ -64,8 +64,8 @@ export function verifyFuseWire(
   wire: Partial<Record<number, number>> & { version?: string },
 ): FuseVerificationResult {
   const failures: string[] = [];
-  if (wire.version !== undefined && wire.version !== FUSE_V1_VERSION) {
-    failures.push(`Expected fuse wire version ${FUSE_V1_VERSION}, got ${wire.version}`);
+  if (wire.version !== FUSE_V1_VERSION) {
+    failures.push(`Expected fuse wire version ${FUSE_V1_VERSION}, got ${String(wire.version)}`);
   }
   for (const spec of REQUIRED_ELECTRON_FUSES) {
     const expectedState = spec.expected ? FUSE_STATE_ENABLE : FUSE_STATE_DISABLE;
@@ -96,6 +96,17 @@ export function verifyElectronBuilderFuseConfig(rawConfig: unknown): FuseVerific
     if (actual !== spec.expected) {
       failures.push(`electronFuses.${spec.name} must be ${String(spec.expected)}, got ${String(actual)}`);
     }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+export function verifyPackagedResourceEntries(entries: readonly string[]): FuseVerificationResult {
+  const failures: string[] = [];
+  if (!entries.includes("app.asar")) {
+    failures.push("resources/app.asar must exist when onlyLoadAppFromAsar and ASAR integrity fuses are enabled");
+  }
+  if (entries.includes("app")) {
+    failures.push("Unexpected loose resources/app directory found alongside app.asar");
   }
   return { ok: failures.length === 0, failures };
 }
@@ -180,20 +191,34 @@ async function checkRunAsNodeBlocked(execPath: string): Promise<void> {
     { env, stdio: ["ignore", "pipe", "pipe"] },
   );
   let stdout = "";
+  let stderr = "";
   child.stdout?.on("data", (d: Buffer) => {
     stdout += d.toString();
   });
-  await new Promise((r) => setTimeout(r, 1500));
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString();
+  });
+  await new Promise((r) => setTimeout(r, 2500));
   if (stdout.includes(marker) || child.exitCode === 42) {
     await terminateProcessTree(child.pid, child);
     throw new Error("ELECTRON_RUN_AS_NODE=1 executed arbitrary -e script despite RunAsNode=DISABLE fuse");
+  }
+  if (child.exitCode !== null && /asar|integrity|corrupt/i.test(stderr)) {
+    throw new Error(`ASAR integrity error during ELECTRON_RUN_AS_NODE probe (code=${String(child.exitCode)}):\n${stderr}`);
   }
   await terminateProcessTree(child.pid, child);
 }
 
 async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
   const inspectPort = await getUnusedLocalPort();
+  // Wait briefly so Chromium's single-instance lock from prior launch is released cleanly
+  await new Promise((r) => setTimeout(r, 500));
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    NODE_OPTIONS: "--require=nonexistent-smoke-fuse-probe",
+  };
   const child = spawn(execPath, [`--inspect=127.0.0.1:${String(inspectPort)}`], {
+    env,
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stderr = "";
@@ -220,6 +245,9 @@ async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
     if (/debugger listening/i.test(stderr)) {
       throw new Error(`Packaged executable printed inspector listener banner:\n${stderr}`);
     }
+    if (/nonexistent-smoke-fuse-probe/i.test(stderr)) {
+      throw new Error(`NODE_OPTIONS was evaluated despite EnableNodeOptionsEnvironmentVariable=DISABLE:\n${stderr}`);
+    }
   } finally {
     await terminateProcessTree(child.pid, child);
   }
@@ -229,19 +257,26 @@ async function runPackagedSmokeVerifier(): Promise<void> {
   const execPath = resolvePackagedExecutable();
   console.log(`[smoke-packaged] Inspecting binary fuses: ${execPath}`);
 
+  const resourcesDir = path.join(path.dirname(execPath), "resources");
+  const resourceEntries = fs.existsSync(resourcesDir) ? fs.readdirSync(resourcesDir) : [];
+  const layoutVerdict = verifyPackagedResourceEntries(resourceEntries);
+  if (!layoutVerdict.ok) {
+    throw new Error(`Packaged resource layout invalid:\n${layoutVerdict.failures.join("\n")}`);
+  }
+
   const { getCurrentFuseWire } = await import("@electron/fuses");
   const wire: Partial<Record<number, number>> & { version?: string } = await getCurrentFuseWire(execPath);
   const verdict = verifyFuseWire(wire);
   if (!verdict.ok) {
     throw new Error(`Packaged fuse verification failed:\n${verdict.failures.join("\n")}`);
   }
-  console.log("[smoke-packaged] All 6 Electron security fuses verified.");
+  console.log("[smoke-packaged] All 6 Electron security fuses and app.asar layout verified.");
 
   await checkRunAsNodeBlocked(execPath);
   console.log("[smoke-packaged] Verified ELECTRON_RUN_AS_NODE=1 is disabled.");
 
   await checkInspectAndNativeStartup(execPath);
-  console.log("[smoke-packaged] Verified --inspect is disabled and binary survived 4s native ASAR integrity startup.");
+  console.log("[smoke-packaged] Verified NODE_OPTIONS/--inspect disabled and binary survived 4s native ASAR integrity startup.");
 }
 
 const isEntrypoint =

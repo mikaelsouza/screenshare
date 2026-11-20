@@ -290,9 +290,14 @@ jobs:
           fi
           if [ "$EXISTING_COUNT" -eq 1 ]; then
             IS_DRAFT="$(jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag)][0].draft' "$TMP_DIR/releases.json")"
+            EXISTING_COMMITISH="$(jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag)][0].target_commitish // ""' "$TMP_DIR/releases.json")"
             if [ "$IS_DRAFT" = "true" ]; then
+              if [ -n "$EXISTING_COMMITISH" ] && [ "$EXISTING_COMMITISH" != "$TARGET_SHA" ] && [ "$EXISTING_COMMITISH" != "main" ]; then
+                echo "::error::Draft release ${TAG} targets ${EXISTING_COMMITISH}, expected ${TARGET_SHA}; refusing to promote mismatched draft."
+                exit 1
+              fi
               gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$REPO"
-              gh release edit "$TAG" --draft=false --latest --repo "$REPO"
+              gh release edit "$TAG" --draft=false --latest --target "$TARGET_SHA" --repo "$REPO"
               exit 0
             fi
             echo "::error::Release ${TAG} already exists; refusing to overwrite published release."

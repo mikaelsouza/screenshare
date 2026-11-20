@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import type { Browser, BrowserContext, Page } from "playwright-core";
+import type { Browser, BrowserContext, CDPSession, Page } from "playwright-core";
 import {
   baseUrl,
   INSTRUMENT,
@@ -59,10 +59,10 @@ const encodedFrames = async (): Promise<number> => {
   return total;
 };
 
-async function attachImpairmentCdp(page: Page): Promise<void> {
+async function attachImpairmentCdp(page: Page): Promise<CDPSession | null> {
   if (process.env["NETEM_ACTIVE"] === "1") {
     // Kernel tc netem already shapes loopback TCP/UDP; skip duplicate CDP latency.
-    return;
+    return null;
   }
   const client = await page.context().newCDPSession(page);
   await client.send("Network.enable");
@@ -72,6 +72,7 @@ async function attachImpairmentCdp(page: Page): Promise<void> {
     downloadThroughput: (5 * 1024 * 1024) / 8,
     uploadThroughput: (5 * 1024 * 1024) / 8,
   });
+  return client;
 }
 
 async function waitForDecodedAdvance(
@@ -90,9 +91,29 @@ async function waitForDecodedAdvance(
   throw new Error(`${label}: decoded frames stalled at ${String(current)} (start=${String(start)})`);
 }
 
+interface LinkMetrics {
+  liveCount: number;
+  mLines: number;
+  transceivers: number;
+}
+
+async function readLiveLinkMetrics(page: Page): Promise<LinkMetrics | null> {
+  return page.evaluate(() => {
+    const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
+    const [pc] = live;
+    if (!pc) return null;
+    return {
+      liveCount: live.length,
+      mLines: (pc.localDescription?.sdp?.match(/^m=/gm) ?? []).length,
+      transceivers: pc.getTransceivers().length,
+    };
+  });
+}
+
 await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () => {
   let invite = "";
   const pageErrors: string[] = [];
+  const cdpSessions: CDPSession[] = [];
 
   before(async () => {
     server = await startServer(PORT);
@@ -120,11 +141,14 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
       });
     }
 
-    await attachImpairmentCdp(host);
-    await attachImpairmentCdp(viewer);
+    const hostCdp = await attachImpairmentCdp(host);
+    const viewerCdp = await attachImpairmentCdp(viewer);
+    if (hostCdp) cdpSessions.push(hostCdp);
+    if (viewerCdp) cdpSessions.push(viewerCdp);
   });
 
   after(async () => {
+    await Promise.allSettled(cdpSessions.map((c) => c.detach()));
     await Promise.allSettled(contexts.map((c) => c.close()));
     await browser?.close();
     await stopServer(server);
@@ -165,6 +189,14 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
       () => window.__pcs.some((pc) => pc.connectionState === "connected"),
       { label: "viewer ICE connected under impairment", timeout: 45_000 },
     );
+    await waitFor(
+      viewer,
+      () => {
+        const video = document.querySelector(".tile:has(.tile-pause) video");
+        return video instanceof HTMLVideoElement && video.readyState >= 2;
+      },
+      { label: "viewer remote video readyState >= 2", timeout: 30_000 },
+    );
 
     const decoded = await waitForDecodedAdvance(viewer, 5, "initial impaired stream");
     assert.ok(decoded >= 5);
@@ -175,11 +207,28 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
     await host.click("#degradation-btn");
     await host.click('#degradation-list button[data-degradation="clarity"]');
     assert.equal(await host.textContent("#degradation-btn-label"), "Focus Clarity");
+    await waitFor(
+      host,
+      () =>
+        Boolean(
+          window.__setParamsCalls?.some(
+            (call) =>
+              call.degradationPreference === "maintain-framerate-and-resolution" ||
+              call.degradationPreference === "maintain-resolution",
+          ),
+        ),
+      { label: "host applied Focus Clarity setParameters", timeout: 10_000 },
+    );
     await waitForDecodedAdvance(viewer, 3, "impaired Focus Clarity delivery");
 
     await host.click("#degradation-btn");
     await host.click('#degradation-list button[data-degradation="framerate"]');
     assert.equal(await host.textContent("#degradation-btn-label"), "Focus Framerate");
+    await waitFor(
+      host,
+      () => window.__setParamsCalls?.at(-1)?.degradationPreference === "maintain-framerate",
+      { label: "host restored Focus Framerate setParameters", timeout: 10_000 },
+    );
     await waitForDecodedAdvance(viewer, 3, "impaired Focus Framerate restore");
   });
 
@@ -212,16 +261,16 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
     await waitForDecodedAdvance(viewer, 3, "mutual share viewer decode");
     await waitForDecodedAdvance(host, 3, "mutual share host decode");
 
-    const cycle1 = await host.evaluate(() => {
-      const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
-      const [pc] = live;
-      if (!pc) return null;
-      return {
-        mLines: (pc.localDescription?.sdp?.match(/^m=/gm) ?? []).length,
-        transceivers: pc.getTransceivers().length,
-      };
-    });
-    assert.ok(cycle1 !== null && cycle1.mLines <= 5 && cycle1.transceivers <= 4, `unexpected glare SDP metrics: ${JSON.stringify(cycle1)}`);
+    const hostCycle1 = await readLiveLinkMetrics(host);
+    const viewerCycle1 = await readLiveLinkMetrics(viewer);
+    assert.ok(
+      hostCycle1 !== null && hostCycle1.liveCount === 1 && hostCycle1.mLines <= 5 && hostCycle1.transceivers <= 4,
+      `unexpected host glare metrics: ${JSON.stringify(hostCycle1)}`,
+    );
+    assert.ok(
+      viewerCycle1 !== null && viewerCycle1.liveCount === 1 && viewerCycle1.mLines <= 5 && viewerCycle1.transceivers <= 4,
+      `unexpected viewer glare metrics: ${JSON.stringify(viewerCycle1)}`,
+    );
 
     // Stop and restart host share while viewer remains sharing (reusing persistent transceivers)
     await host.click("#share");
@@ -233,16 +282,18 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
     await host.click("#share");
     await waitForDecodedAdvance(viewer, 4, "viewer decode after restart under impairment");
 
-    const cycle2 = await host.evaluate(() => {
-      const live = window.__pcs.filter((pc) => pc.connectionState !== "closed");
-      const [pc] = live;
-      if (!pc) return null;
-      return {
-        mLines: (pc.localDescription?.sdp?.match(/^m=/gm) ?? []).length,
-        transceivers: pc.getTransceivers().length,
-      };
-    });
-    assert.deepEqual(cycle2, cycle1, `SDP m=-lines/transceivers changed after restart: ${JSON.stringify(cycle1)} -> ${JSON.stringify(cycle2)}`);
+    const hostCycle2 = await readLiveLinkMetrics(host);
+    const viewerCycle2 = await readLiveLinkMetrics(viewer);
+    assert.deepEqual(
+      hostCycle2,
+      hostCycle1,
+      `host SDP m=-lines/transceivers changed after restart: ${JSON.stringify(hostCycle1)} -> ${JSON.stringify(hostCycle2)}`,
+    );
+    assert.deepEqual(
+      viewerCycle2,
+      viewerCycle1,
+      `viewer SDP m=-lines/transceivers changed after restart: ${JSON.stringify(viewerCycle1)} -> ${JSON.stringify(viewerCycle2)}`,
+    );
 
     // Stop both shares and verify clean teardown + zero CSP/page errors
     await Promise.all([host.click("#share"), viewer.click("#share")]);

@@ -119,6 +119,7 @@ jobs:
       - name: Build static assets & run network-impaired E2E suite
         env:
           CHROMIUM_BIN: /usr/bin/google-chrome
+          REQUIRE_NETEM: "1"
         run: npm run test:e2e:impaired
 
   electron-smoke:

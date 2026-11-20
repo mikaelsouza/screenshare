@@ -16,6 +16,7 @@ import {
   REQUIRED_ELECTRON_FUSES,
   verifyElectronBuilderFuseConfig,
   verifyFuseWire,
+  verifyPackagedResourceEntries,
 } from "../../scripts/smoke-test-packaged";
 
 describe("Electron packaged fuse & ASAR integrity verification", () => {
@@ -61,7 +62,18 @@ describe("Electron packaged fuse & ASAR integrity verification", () => {
     }
 
     expect(verifyFuseWire({ ...baseWire, version: "2" }).ok).toBe(false);
+    const { version: _omitted, ...withoutVersion } = baseWire;
+    expect(verifyFuseWire(withoutVersion).ok).toBe(false);
     expect(verifyFuseWire({}).ok).toBe(false);
+  });
+
+  it("validates packaged resources contain app.asar without loose app directory", () => {
+    expect(verifyPackagedResourceEntries(["app.asar", "app.asar.unpacked", "app-update.yml"])).toEqual({
+      ok: true,
+      failures: [],
+    });
+    expect(verifyPackagedResourceEntries(["app-update.yml"]).ok).toBe(false);
+    expect(verifyPackagedResourceEntries(["app.asar", "app"]).ok).toBe(false);
   });
 
   it("validates electron-builder.json enables asar and burns all 6 security fuses", () => {
