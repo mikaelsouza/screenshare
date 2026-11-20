@@ -28,7 +28,6 @@ const __dirname = path.dirname(__filename);
 const runtimeConfig = resolveProcessElectronConfig(app.isPackaged);
 const isDev = runtimeConfig.isDev;
 const isSmokeTest = runtimeConfig.isSmokeTest;
-const isWindowsStore = Boolean(process.windowsStore);
 
 let mainWindow: BrowserWindow | null = null;
 // Origin of the page we load; capture permissions are only granted to it.
@@ -365,7 +364,7 @@ async function initApplication(): Promise<void> {
   }
 }
 
-if (process.platform === "win32" && app.isPackaged && !isWindowsStore) {
+if (process.platform === "win32" && app.isPackaged) {
   app.setAppUserModelId("com.screenshare.app");
 }
 
@@ -375,7 +374,6 @@ const autoUpdate = createAutoUpdateController(
   {
     isPackaged: app.isPackaged,
     platform: process.platform,
-    isWindowsStore,
     isDev,
     isSmokeTest,
   },
