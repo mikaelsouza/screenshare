@@ -247,4 +247,48 @@ describe("host-tokens localStorage persistence", () => {
     };
     expect(() => clearLegacySessionHostTokens(throwingSession)).not.toThrow();
   });
+
+  it("validates null storage, invalid room codes, token length boundaries, and duplicate timestamp ordering", async () => {
+    expect(readPersistedHostToken(null, "ABCDEFGH")).toBeUndefined();
+    expect(hasAnyPersistedHostTokens(null)).toBe(false);
+    expect(removePersistedHostTokenIfMatching(null, "ABCDEFGH", "tok")).toBe(false);
+    expect(() => clearAllPersistedHostTokens(null)).not.toThrow();
+
+    const storage = makeMemoryStorage();
+    expect(readPersistedHostToken(storage, "bad")).toBeUndefined();
+    expect(removePersistedHostTokenIfMatching(storage, "ABCDEFGH", "")).toBe(false);
+    expect(removePersistedHostTokenIfMatching(storage, "bad", "tok")).toBe(false);
+
+    // Lowercase/trimmed room code is normalized; empty or >64-char tokens are ignored
+    writePersistedHostToken(storage, "  abcdefgh  ", "a".repeat(64), 1000);
+    expect(readPersistedHostToken(storage, " abcdefgh ", 1001)).toBe("a".repeat(64));
+    writePersistedHostToken(storage, "ABCDEFGH", "b".repeat(65), 1002);
+    expect(readPersistedHostToken(storage, "ABCDEFGH", 1003)).toBeUndefined();
+    writePersistedHostToken(storage, "ABCDEFGH", "", 1004);
+    expect(readPersistedHostToken(storage, "ABCDEFGH", 1005)).toBeUndefined();
+
+    // Duplicate entries: equal timestamp keeps later entry, older timestamp does not overwrite newer
+    const dupStorage = makeMemoryStorage({
+      [HOST_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: " abcdefgh ", token: "first", updatedAt: 2000 },
+        { code: "ABCDEFGH", token: "older", updatedAt: 1000 },
+        { code: "ABCDEFGH", token: "equal-newer", updatedAt: 2000 },
+      ]),
+    });
+    expect(readPersistedHostToken(dupStorage, "ABCDEFGH", 2500)).toBe("equal-newer");
+
+    // Lock callback throwing after fn() already ran must NOT run fn() a second time
+    let calls = 0;
+    const throwsAfterCallback: LockManagerLike = {
+      request: async (_name, cb) => {
+        await cb();
+        throw new Error("lock release error");
+      },
+    };
+    await runWithHostRoomsLock(throwsAfterCallback, () => {
+      calls++;
+    });
+    expect(calls).toBe(1);
+  });
 });
+

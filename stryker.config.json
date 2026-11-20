@@ -5,15 +5,29 @@
   "plugins": ["@stryker-mutator/vitest-runner"],
   "tsconfigFile": "",
   "mutate": [
+    "electron/config.ts",
     "electron/follow/**/*.ts",
     "electron/audio/**/*.ts",
     "electron/picker.ts",
     "electron/updater.ts",
+    "scripts/check-guardrails-diff.ts",
+    "shared/protocol.ts",
     "src/capture.ts",
-    "src/platform/**/*.ts",
+    "src/controllers/**/*.ts",
+    "src/host-tokens.ts",
     "src/mesh.ts",
+    "src/platform/**/*.ts",
+    "!src/platform/types.ts",
     "src/quality.ts",
-    "src/ui-model.ts"
+    "src/signaling.ts",
+    "src/stats.ts",
+    "src/ui-model.ts",
+    "worker/ipkey.ts",
+    "worker/ratelimit.ts",
+    "worker/room-crypto.ts",
+    "worker/room-models.ts",
+    "worker/room-policy.ts",
+    "worker/upgrade.ts"
   ],
   "ignorePatterns": ["release/**", "dist/**", "dist-electron/**", "reports/**", ".wrangler/**", ".stryker-tmp/**"],
   "vitest": {
@@ -24,10 +38,11 @@
     "fileName": "reports/mutation/mutation.html"
   },
   "thresholds": {
-    "high": 80,
-    "low": 60,
-    "break": 60
+    "high": 90,
+    "low": 80,
+    "break": 85
   },
+  "ignoreStatic": true,
   "concurrency": 4,
   "timeoutMS": 15000
 }

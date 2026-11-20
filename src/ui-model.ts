@@ -175,6 +175,19 @@ export interface InviteMenuParams {
   rotating?: boolean;
 }
 
+function formatInviteDisplayCode(
+  roomCode: string | null,
+  roomPassword: string | null,
+  canShow: boolean,
+  revealed: boolean,
+): string {
+  if (!roomCode) return "";
+  if (canShow && revealed && roomPassword !== null) {
+    return `${roomCode}-${roomPassword}`;
+  }
+  return maskInviteSecret(roomCode);
+}
+
 /**
  * Pure derivation of the 1C-2 invite menu's enabled actions, locked state, and displayed code string.
  */
@@ -182,23 +195,17 @@ export function deriveInviteMenuState(params: InviteMenuParams): InviteMenuState
   const { roomCode, roomPassword, roomLocked, isHost, revealed } = params;
   const signalingReady = params.signalingReady ?? true;
   const rotating = params.rotating ?? false;
-  const hasCode = roomCode !== null && roomCode.length > 0;
-  const hasSecret = roomPassword !== null && roomPassword.length > 0;
+  const hasCode = Boolean(roomCode);
+  const hasSecret = Boolean(roomPassword);
   const canRotate = isHost && hasCode && signalingReady && !rotating;
   const canCopy = !roomLocked && !rotating && hasCode && hasSecret;
   const canShow = canCopy;
-  const displayCode =
-    !hasCode || roomCode === null
-      ? ""
-      : canShow && revealed && roomPassword !== null
-        ? `${roomCode}-${roomPassword}`
-        : maskInviteSecret(roomCode);
   return {
     canCopy,
     canShow,
     canRotate,
     showLockedBanner: roomLocked,
-    displayCode,
+    displayCode: formatInviteDisplayCode(roomCode, roomPassword, canShow, revealed),
   };
 }
 

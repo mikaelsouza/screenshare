@@ -205,6 +205,76 @@ function verifyNoFatalErrors(pageErrors: readonly string[], consoleErrors: reado
   }
 }
 
+function attachPageListeners(page: Page, consoleErrors: string[], pageErrors: string[]): void {
+  page.on("console", (msg) => {
+    const type = msg.type();
+    const text = msg.text();
+    if (type === "error") {
+      console.error(`[smoke-test:browser-console-error] ${text}`);
+      consoleErrors.push(text);
+    } else {
+      console.log(`[smoke-test:browser-console-${type}] ${text}`);
+    }
+  });
+
+  page.on("pageerror", (err) => {
+    const message = err.message || String(err);
+    console.error(`[smoke-test:browser-page-error] ${message}`);
+    pageErrors.push(message);
+  });
+}
+
+async function verifyPreloadBridge(page: Page): Promise<void> {
+  const preloadInfo = await page.evaluate(() => {
+    const api = window.electronAPI;
+    return {
+      isElectron: api?.isElectron === true,
+      platform: typeof api?.platform === "string" ? api.platform : null,
+      hasOnFollowUpdate: typeof api?.onFollowUpdate === "function",
+      hasStopFollow: typeof api?.stopFollow === "function",
+      hasStartWindowAudio: typeof api?.startWindowAudio === "function",
+      hasStartSystemAudio: typeof api?.startSystemAudio === "function",
+      hasStopAudio: typeof api?.stopAudio === "function",
+      hasOnAudioPcm: typeof api?.onAudioPcm === "function",
+    };
+  });
+  console.log(
+    `[smoke-test] Preload context check: isElectron=${String(preloadInfo.isElectron)}, platform=${String(preloadInfo.platform)}`,
+  );
+  const allPresent =
+    preloadInfo.isElectron &&
+    preloadInfo.platform !== null &&
+    preloadInfo.hasOnFollowUpdate &&
+    preloadInfo.hasStopFollow &&
+    preloadInfo.hasStartWindowAudio &&
+    preloadInfo.hasStartSystemAudio &&
+    preloadInfo.hasStopAudio &&
+    preloadInfo.hasOnAudioPcm;
+  if (!allPresent) {
+    throw new Error(`Preload electronAPI bridge incomplete: ${JSON.stringify(preloadInfo)}`);
+  }
+}
+
+async function cleanupSmokeResources(
+  app: ElectronApplication | null,
+  localServer: StaticServer | null,
+  smokeUserDataDir: string,
+): Promise<void> {
+  if (app) {
+    console.log("[smoke-test] Closing Electron application...");
+    await app.close();
+    console.log("[smoke-test] Electron application closed cleanly.");
+  }
+  if (localServer) {
+    await new Promise<void>((r) => localServer.server.close(() => r()));
+  }
+  try {
+    fs.rmSync(smokeUserDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {
+    // Best-effort cleanup if Windows holds a transient file handle
+  }
+}
+
 async function executeSmokeChecks(): Promise<void> {
   console.log("[smoke-test] ========================================");
   console.log("[smoke-test] Starting Electron Automated Smoke Check");
@@ -218,7 +288,7 @@ async function executeSmokeChecks(): Promise<void> {
   const envUrl = process.env["SCREENSHARE_URL"];
   const smokeUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), "screenshare-smoke-"));
   let localServer: StaticServer | null = null;
-  let app: Awaited<ReturnType<typeof electron.launch>> | null = null;
+  let app: ElectronApplication | null = null;
 
   try {
     localServer = envUrl ? null : await startStaticDistServer();
@@ -236,22 +306,7 @@ async function executeSmokeChecks(): Promise<void> {
     const page = await app.firstWindow();
     console.log("[smoke-test] BrowserWindow acquired.");
 
-    page.on("console", (msg) => {
-      const type = msg.type();
-      const text = msg.text();
-      if (type === "error") {
-        console.error(`[smoke-test:browser-console-error] ${text}`);
-        consoleErrors.push(text);
-      } else {
-        console.log(`[smoke-test:browser-console-${type}] ${text}`);
-      }
-    });
-
-    page.on("pageerror", (err) => {
-      const message = err.message || String(err);
-      console.error(`[smoke-test:browser-page-error] ${message}`);
-      pageErrors.push(message);
-    });
+    attachPageListeners(page, consoleErrors, pageErrors);
 
     await page.waitForLoadState("domcontentloaded");
     console.log("[smoke-test] DOMContentLoaded event received.");
@@ -266,55 +321,14 @@ async function executeSmokeChecks(): Promise<void> {
 
     await verifyRequiredSelectors(page);
     await verifyInputInteractions(page);
-
-    const preloadInfo = await page.evaluate(() => {
-      const api = window.electronAPI;
-      return {
-        isElectron: api?.isElectron === true,
-        platform: typeof api?.platform === "string" ? api.platform : null,
-        hasOnFollowUpdate: typeof api?.onFollowUpdate === "function",
-        hasStopFollow: typeof api?.stopFollow === "function",
-        hasStartWindowAudio: typeof api?.startWindowAudio === "function",
-        hasStartSystemAudio: typeof api?.startSystemAudio === "function",
-        hasStopAudio: typeof api?.stopAudio === "function",
-        hasOnAudioPcm: typeof api?.onAudioPcm === "function",
-      };
-    });
-    console.log(
-      `[smoke-test] Preload context check: isElectron=${String(preloadInfo.isElectron)}, platform=${String(preloadInfo.platform)}`,
-    );
-    if (
-      !preloadInfo.isElectron ||
-      preloadInfo.platform === null ||
-      !preloadInfo.hasOnFollowUpdate ||
-      !preloadInfo.hasStopFollow ||
-      !preloadInfo.hasStartWindowAudio ||
-      !preloadInfo.hasStartSystemAudio ||
-      !preloadInfo.hasStopAudio ||
-      !preloadInfo.hasOnAudioPcm
-    ) {
-      throw new Error(`Preload electronAPI bridge incomplete: ${JSON.stringify(preloadInfo)}`);
-    }
-
+    await verifyPreloadBridge(page);
     verifyNoFatalErrors(pageErrors, consoleErrors);
 
     console.log("[smoke-test] ========================================");
     console.log("[smoke-test] ALL SMOKE CHECKS PASSED SUCCESSFULLY!");
     console.log("[smoke-test] ========================================");
   } finally {
-    if (app) {
-      console.log("[smoke-test] Closing Electron application...");
-      await app.close();
-      console.log("[smoke-test] Electron application closed cleanly.");
-    }
-    if (localServer) {
-      await new Promise<void>((r) => localServer?.server.close(() => r()));
-    }
-    try {
-      fs.rmSync(smokeUserDataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-    } catch {
-      // Best-effort cleanup if Windows holds a transient file handle
-    }
+    await cleanupSmokeResources(app, localServer, smokeUserDataDir);
   }
 }
 

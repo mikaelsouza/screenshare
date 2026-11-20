@@ -1816,6 +1816,10 @@ describe("RoomDO security & PR 1 flows", () => {
     const throttled = await Client.connect(CODE, { "CF-Connecting-IP": guessIp });
     throttled.send({ t: "join", room: CODE, displayName: "guesser", password: "WRONG23456789ABC" });
     expect((await throttled.nextOf("error")).code).toBe("rate-limited");
+    // Even the correct password must be refused while the IP's failure budget is exhausted.
+    const throttledCorrect = await Client.connect(CODE, { "CF-Connecting-IP": guessIp });
+    throttledCorrect.send({ t: "join", room: CODE, displayName: "guesser", password: PASSWORD });
+    expect((await throttledCorrect.nextOf("error")).code).toBe("rate-limited");
     h.close();
   });
 
@@ -1871,7 +1875,7 @@ describe("RoomDO security & PR 1 flows", () => {
     );
     expect(membersAfterRotate).toBe(128);
 
-    // Kick triggers deny cap at 128 and purges all disconnected members (leaving only host h).
+    // Kick triggers deny cap at 128 and purges all disconnected members (leaving only host h's fresh + grace tickets).
     const c = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.222" });
     const wc = await c.join("carol", rot.password ? { password: rot.password } : undefined);
     await h.nextOf("peer-joined");
@@ -1883,7 +1887,7 @@ describe("RoomDO security & PR 1 flows", () => {
       members: Object.keys((await state.storage.get<Record<string, unknown>>("members")) ?? {}).length,
       deny: Object.keys((await state.storage.get<Record<string, unknown>>("deny")) ?? {}).length,
     }));
-    expect(counts.members).toBe(1);
+    expect(counts.members).toBe(2);
     expect(counts.deny).toBe(128);
     h.close();
   });
@@ -2883,6 +2887,134 @@ describe("RoomDO security & PR 1 flows", () => {
 
     const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
     expect(remainingKeys).toBe(0);
+  });
+
+  it("adversarial: lock action on an expired/unclaimed room performs zero storage writes", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.70" });
+    await h.joinAsHost("host");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+
+    // Simulate storage having been cleared (room expired/unclaimed) before a stale lock frame is processed.
+    await runInDurableObject(stub, (_i, state) => state.storage.deleteAll());
+
+    h.send({ t: "lock", locked: true });
+    // Flush DO message queue with a PING -> PONG roundtrip.
+    h.ws.send(PING);
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no PONG received")), 2000);
+      const onMsg = (ev: MessageEvent) => {
+        if (ev.data === PONG) {
+          clearTimeout(timer);
+          h.ws.removeEventListener("message", onMsg);
+          resolve();
+        }
+      };
+      h.ws.addEventListener("message", onMsg);
+    });
+
+    const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
+    h.close();
+    expect(remainingKeys).toBe(0);
+  });
+
+  it("adversarial: rejects cross-site Sec-Fetch-Site and Origin: null on /api/room and /ws/:code with strict CSP/Trusted Types", async () => {
+    const crossSiteCreate = await SELF.fetch("https://example.com/api/room", {
+      method: "POST",
+      headers: { "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(crossSiteCreate.status).toBe(403);
+    const csp = crossSiteCreate.headers.get("Content-Security-Policy") ?? "";
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).toContain("require-trusted-types-for 'script'");
+    expect(csp).toContain("trusted-types 'none'");
+
+    const nullOriginCreate = await SELF.fetch("https://example.com/api/room", {
+      method: "POST",
+      headers: { Origin: "null" },
+    });
+    expect(nullOriginCreate.status).toBe(403);
+
+    const crossSiteWs = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(await refusal(crossSiteWs)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    const nullOriginWs = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", Origin: "null" },
+    });
+    expect(await refusal(nullOriginWs)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+  });
+
+  it("adversarial: kick in a locked room atomically bans IP, rotates password without leaking to guests, and purges disconnected tickets", async () => {
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.80" });
+    await h.joinAsHost("host");
+    const stay = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.81" });
+    const wStay = await stay.join("stay");
+    expect(wStay.rejoinToken).toBeTruthy();
+    await h.nextOf("peer-joined");
+    const target = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.82" });
+    const wTarget = await target.join("target");
+    await h.nextOf("peer-joined");
+    await stay.nextOf("peer-joined");
+    const gone = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.83" });
+    const wGone = await gone.join("gone");
+    expect(wGone.rejoinToken).toBeTruthy();
+    await h.nextOf("peer-joined");
+    await stay.nextOf("peer-joined");
+    await target.nextOf("peer-joined");
+
+    // Disconnect 'gone' so they hold a disconnected rejoin ticket, then lock the room.
+    gone.close();
+    await h.nextOf("peer-left");
+    await stay.nextOf("peer-left");
+    await target.nextOf("peer-left");
+
+    h.send({ t: "lock", locked: true });
+    await h.nextOf("room-state");
+    await stay.nextOf("room-state");
+    await target.nextOf("room-state");
+
+    const targetClosed = closeCodeOf(target.ws);
+    h.send({ t: "kick", id: wTarget.selfId });
+
+    const targetErr = await target.nextOf("error");
+    expect(targetErr.code).toBe("kicked");
+    expect(await targetClosed).toBe(1008);
+
+    const hostRot = await h.nextOf("room-password");
+    const stayRot = await stay.nextOf("room-password");
+    expect(hostRot.password).toBeTruthy();
+    expect(hostRot.password).not.toBe(PASSWORD);
+    expect(hostRot.rejoinToken).toBeTruthy();
+    // Locked room: non-host receives fresh rejoinToken but NO plaintext password.
+    expect(stayRot.password).toBeUndefined();
+    expect(stayRot.rejoinToken).toBeTruthy();
+
+    // Verify the kicked address was persisted in the deny list independently of room lock.
+    const denyEntry = await runInDurableObject(stub, async (_i, state) => {
+      const deny = await state.storage.get<Record<string, number>>("deny");
+      return deny?.["198.51.100.82"];
+    });
+    expect(denyEntry).toBeGreaterThan(Date.now());
+
+    // Disconnected peer's old rejoin ticket was purged by kick.
+    const goneRetry = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.83" });
+    goneRetry.send({ t: "join", room: CODE, displayName: "gone", rejoinToken: wGone.rejoinToken });
+    expect((await goneRetry.nextOf("error")).code).toBe("bad-password");
+    goneRetry.close();
+
+    // Remaining non-kicked peer retains a short grace window for their pre-kick ticket if they drop before receiving room-password.
+    stay.close();
+    await h.nextOf("peer-left");
+    const stayReconnect = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.81" });
+    stayReconnect.send({ t: "join", room: CODE, displayName: "stay", rejoinToken: wStay.rejoinToken, resume: true });
+    const wStayRejoined = await stayReconnect.nextOf("welcome");
+    expect(wStayRejoined.selfId).toBe(wStay.selfId);
+    stayReconnect.close();
+
+    h.close();
   });
 
   // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)

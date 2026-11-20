@@ -958,6 +958,73 @@ describe("SignalingClient keepalive and session resumption", () => {
     vi.advanceTimersByTime(120_000);
     expect(FakeWebSocket.instances.length).toBe(8);
   });
+
+  it("tracks isReady, ignores raw ping/pong frames without warning, and handles 1008/1009/stale-socket events", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const h = handlers();
+      const c = new SignalingClient("ABCDEFGH", "alice", h);
+      expect(c.isReady).toBe(false);
+      c.connect();
+      expect(h.onStatus).toHaveBeenCalledWith("connecting");
+
+      const ws1 = FakeWebSocket.instances[0]!;
+      ws1.open();
+      expect(h.onStatus).toHaveBeenCalledWith("open");
+      expect(c.isReady).toBe(false);
+
+      // Raw ping/pong keepalive frames are silently ignored
+      ws1.onmessage?.({ data: "ping" });
+      ws1.onmessage?.({ data: "pong" });
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      // Welcome makes isReady true
+      ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p1", peers: [] }) });
+      expect(c.isReady).toBe(true);
+
+      // Normal 1006 close transitions status to closed and schedules reconnect
+      ws1.serverClose(1006);
+      expect(c.isReady).toBe(false);
+      expect(h.onStatus).toHaveBeenCalledWith("closed");
+
+      // Reconnect opens ws2; stale error/close on ws1 are ignored
+      vi.advanceTimersByTime(20_000);
+      const ws2 = FakeWebSocket.instances[1]!;
+      ws2.open();
+      ws1.onerror?.();
+      ws1.serverClose(1008, "stale");
+      expect(c.isFatal).toBe(false);
+
+      // Explicit close() cancels a newly scheduled reconnect timer
+      ws2.serverClose(1006);
+      c.close();
+      vi.advanceTimersByTime(60_000);
+      expect(FakeWebSocket.instances.length).toBe(2);
+
+      // 1009 MESSAGE_TOO_BIG without prior error triggers fallback bad-password fatal error
+      const h2 = handlers();
+      const c2 = new SignalingClient("ABCDEFGH", "bob", h2);
+      c2.connect();
+      const ws3 = FakeWebSocket.instances[2]!;
+      ws3.open();
+      ws3.serverClose(1009, "");
+      expect(c2.isFatal).toBe(true);
+      expect(h2.onError).toHaveBeenCalledWith("bad-password", "Invalid or expired room invite.");
+
+      // 1008 with custom reason and no prior error uses ev.reason
+      const h3 = handlers();
+      const c3 = new SignalingClient("ABCDEFGH", "carol", h3);
+      c3.connect();
+      const ws4 = FakeWebSocket.instances[3]!;
+      ws4.open();
+      ws4.serverClose(1008, "Custom rejection reason");
+      expect(c3.isFatal).toBe(true);
+      expect(h3.onError).toHaveBeenCalledWith("bad-password", "Custom rejection reason");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
+
 
 
