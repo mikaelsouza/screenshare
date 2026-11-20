@@ -233,12 +233,17 @@ await describe("network-impaired WebRTC P2P E2E", { concurrency: 1 }, async () =
   });
 
   await it("recovers share stop/restart and simultaneous mutual-share glare without m=-line bloat or page errors", async () => {
-    // Stop host share -> all links close under impairment
+    // Stop host share -> all links close on BOTH host and viewer under impairment
     await host.click("#share");
     await waitFor(
       host,
       () => window.__pcs.every((pc) => pc.connectionState === "closed"),
-      { label: "impaired links closed when sharing stops", timeout: 20_000 },
+      { label: "host impaired links closed when sharing stops", timeout: 20_000 },
+    );
+    await waitFor(
+      viewer,
+      () => window.__pcs.every((pc) => pc.connectionState === "closed"),
+      { label: "viewer impaired links closed when sharing stops", timeout: 20_000 },
     );
 
     // Trigger simultaneous mutual share (glare) under impairment
