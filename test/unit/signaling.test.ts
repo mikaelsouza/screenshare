@@ -1024,6 +1024,72 @@ describe("SignalingClient keepalive and session resumption", () => {
       warnSpy.mockRestore();
     }
   });
+
+  it("dispatches chat messages, handles omitted onChat, keeps chat-rate-limited non-fatal, and never queues sendChat", () => {
+    const h = { ...handlers(), onChat: vi.fn() };
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+
+    // sendChat returns false before connect()
+    expect(c.sendChat("too early")).toBe(false);
+
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    // sendChat returns false while connecting / before welcome
+    expect(c.sendChat("still connecting")).toBe(false);
+    ws1.open();
+    expect(c.sendChat("pre-welcome")).toBe(false);
+    expect(ws1.sent).toHaveLength(1); // only join
+
+    ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+    expect(c.sendChat("hello room")).toBe(true);
+    expect(JSON.parse(ws1.sent[1]!)).toEqual({ t: "chat", text: "hello room" });
+
+    // Dispatches incoming chat payload without leaking discriminant `t`
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "chat", id: "m1", from: "p2", name: "bob", text: "hi!", ts: 12345 }),
+    });
+    expect(h.onChat).toHaveBeenCalledTimes(1);
+    expect(h.onChat).toHaveBeenCalledWith({ id: "m1", from: "p2", name: "bob", text: "hi!", ts: 12345 });
+
+    // Non-fatal chat-rate-limited error leaves socket open and usable
+    ws1.onmessage?.({
+      data: JSON.stringify({ t: "error", code: "chat-rate-limited", message: "Slow down" }),
+    });
+    expect(h.onError).toHaveBeenCalledWith("chat-rate-limited", "Slow down");
+    expect(c.isFatal).toBe(false);
+    expect(c.isReady).toBe(true);
+    expect(c.sendChat("after rate limit")).toBe(true);
+
+    // Disconnect: sendChat returns false and is NEVER queued into pendingMessages
+    ws1.serverClose(1006);
+    expect(c.sendChat("dropped while offline")).toBe(false);
+    c.setSharing(true);
+
+    vi.advanceTimersByTime(20_000);
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    ws2.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+
+    // Reconnect flushes join + queued state, NOT the dropped chat message
+    expect(ws2.sent).toHaveLength(2);
+    expect(JSON.parse(ws2.sent[1]!)).toEqual({ t: "state", sharing: true });
+
+    c.close();
+    expect(c.sendChat("after close")).toBe(false);
+
+    // Omitted onChat does not throw
+    const cNoChat = new SignalingClient("ABCDEFGH", "bob", handlers());
+    cNoChat.connect();
+    const ws3 = FakeWebSocket.instances[2]!;
+    ws3.open();
+    ws3.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p2", peers: [] }) });
+    expect(() =>
+      ws3.onmessage?.({
+        data: JSON.stringify({ t: "chat", id: "m2", from: "p1", name: "alice", text: "yo", ts: 999 }),
+      }),
+    ).not.toThrow();
+    cNoChat.close();
+  });
 });
 
 

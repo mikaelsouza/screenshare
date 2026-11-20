@@ -220,6 +220,26 @@ describe("SessionController", () => {
       severity: "ignore",
       clearPendingKicks: false,
     });
+    ctrl.startPendingKick("p-chat", "Bob", vi.fn(), 5000);
+    expect(
+      ctrl.classifyError("ABCD1234", "chat-rate-limited", "You're sending messages too fast. Wait a moment.", false),
+    ).toEqual({
+      friendly: "You're sending messages too fast. Wait a moment.",
+      severity: "ignore",
+      clearPendingKicks: false,
+    });
+    expect(ctrl.classifyError("ABCD1234", "chat-rate-limited", "Custom chat throttle", false)).toEqual({
+      friendly: "Custom chat throttle",
+      severity: "ignore",
+      clearPendingKicks: false,
+    });
+    expect(ctrl.classifyError("ABCD1234", "chat-rate-limited", "Slow down", true)).toEqual({
+      friendly: "Slow down",
+      severity: "fatal",
+      clearPendingKicks: true,
+    });
+    expect(ctrl.hasPendingKick("p-chat")).toBe(true);
+    ctrl.clearPendingKicks();
     expect(ctrl.classifyError("ABCD1234", "rate-limited", "Slow down", false)).toEqual({
       friendly: "Slow down",
       severity: "error",
@@ -686,6 +706,162 @@ describe("SessionController", () => {
     expect(ctrl.currentTransientNotice).toBeNull();
     vi.advanceTimersByTime(5000);
     expect(kickTimeout).not.toHaveBeenCalled();
+  });
+
+  it("hardens storage, async lock guards, transient notice timers, and host/lock transitions", async () => {
+    // writeSession / readSession direct sessionStorage sync and null sessionStorage
+    const { ctrl: nullSessCtrl } = makeController({ session: null });
+    expect(nullSessCtrl.readSession("missing")).toBeUndefined();
+    nullSessCtrl.writeSession("k", "v");
+    expect(nullSessCtrl.readSession("k")).toBe("v");
+    nullSessCtrl.writeSession("k", undefined);
+    expect(nullSessCtrl.readSession("k")).toBeUndefined();
+
+    const { ctrl: sessCtrl, sess: realSess } = makeController();
+    sessCtrl.writeSession("k", "v");
+    expect(realSess?.getItem("k")).toBe("v");
+    sessCtrl.writeSession("k", undefined);
+    expect(realSess?.getItem("k")).toBeNull();
+
+    // Fresh controller sees persisted-only creator tokens without in-memory cache
+    const localOnly = createMemoryStorage();
+    writePersistedHostToken(localOnly, "ABCD2345", "persisted-only-tok");
+    const { ctrl: freshCtrl } = makeController({ local: localOnly });
+    expect(freshCtrl.hasSavedCreatorHostFor("ABCD2345")).toBe(true);
+    expect(freshCtrl.hasAnySavedCreatorHosts()).toBe(true);
+    expect(freshCtrl.hasSavedCreatorHostFor("ZZZZ9999")).toBe(false);
+
+    // Pending async LockManager: forgetCreatorHostToken with mismatched vs matching token
+    const lockLocal = createMemoryStorage();
+    const lockSess = createMemoryStorage();
+    const lockTasks: Promise<unknown>[] = [];
+    const pendingReleases: Array<() => void> = [];
+    const onForgetUi = vi.fn();
+    const locks = {
+      request: vi.fn((_name: string, cb: () => unknown) => {
+        return new Promise<unknown>((resolve) => {
+          pendingReleases.push(() => resolve(cb()));
+        });
+      }),
+    } as unknown as LockManager;
+    const lockCtrl = new SessionController({
+      getLocalStorage: () => lockLocal,
+      getSessionStorage: () => lockSess,
+      getLocks: () => locks,
+      runBackground: (p) => {
+        lockTasks.push(p);
+      },
+      onForgetHostUiChange: onForgetUi,
+    });
+    writePersistedHostToken(lockLocal, "ABCD2345", "creator-tok");
+    lockCtrl.forgetCreatorHostToken("ABCD2345", "wrong-tok");
+    expect(lockCtrl.hasSavedCreatorHostFor("ABCD2345")).toBe(true);
+    expect(lockCtrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
+    while (pendingReleases.length > 0) pendingReleases.shift()?.();
+    await Promise.all(lockTasks.splice(0));
+    expect(readPersistedHostToken(lockLocal, "ABCD2345")).toBe("creator-tok");
+
+    // Pending async LockManager: forgetAllHostTokens keeps non-host keys and suppresses persisted lookup until resolved
+    lockCtrl.writeSession("activeRoom", "ABCD2345");
+    lockCtrl.writeSession("host:ABCD2345", "legacy-host");
+    onForgetUi.mockClear();
+    lockCtrl.forgetAllHostTokens();
+    expect(onForgetUi).toHaveBeenCalledTimes(1);
+    expect(lockCtrl.readSession("activeRoom")).toBe("ABCD2345");
+    expect(lockCtrl.readSession("host:ABCD2345")).toBeUndefined();
+    expect(lockCtrl.hasAnySavedCreatorHosts()).toBe(false);
+    expect(lockCtrl.hostTokenFor("ABCD2345")).toBeUndefined();
+    while (pendingReleases.length > 0) pendingReleases.shift()?.();
+    await Promise.all(lockTasks.splice(0));
+    expect(onForgetUi).toHaveBeenCalledTimes(2);
+    writePersistedHostToken(lockLocal, "WXYZ2345", "new-creator-tok");
+    expect(lockCtrl.hasAnySavedCreatorHosts()).toBe(true);
+
+    // Transient notice timer replacement cancels prior timer and clear/dismiss clear all timers
+    const { ctrl: timerCtrl } = makeController();
+    timerCtrl.selfId = "self1";
+    timerCtrl.lastJoinCode = "ABCD2345";
+    const onShow = vi.fn();
+    const onExpire1 = vi.fn();
+    const onExpire2 = vi.fn();
+    timerCtrl.showTransientNotice("Same", onShow, onExpire1, 3000);
+    vi.advanceTimersByTime(2000);
+    timerCtrl.showTransientNotice("Same", onShow, onExpire2, 3000);
+    vi.advanceTimersByTime(1500);
+    expect(onExpire1).not.toHaveBeenCalled();
+    expect(onExpire2).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1500);
+    expect(onExpire2).toHaveBeenCalledWith("Same");
+    expect(timerCtrl.currentTransientNotice).toBeNull();
+
+    timerCtrl.showTransientNotice("Temp", onShow, vi.fn(), 3000);
+    expect(vi.getTimerCount()).toBe(1);
+    const onRestore = vi.fn();
+    timerCtrl.dismissTransientNotice("Temp", false, onRestore);
+    expect(onRestore).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+
+    timerCtrl.selfId = null;
+    timerCtrl.showTransientNotice("Temp2", onShow, vi.fn(), 3000);
+    timerCtrl.dismissTransientNotice("Temp2", true, onRestore);
+    expect(onRestore).not.toHaveBeenCalled();
+
+    timerCtrl.selfId = "self1";
+    timerCtrl.lastJoinCode = null;
+    timerCtrl.showTransientNotice("Temp3", onShow, vi.fn(), 3000);
+    timerCtrl.dismissTransientNotice("Temp3", true, onRestore);
+    expect(onRestore).not.toHaveBeenCalled();
+
+    timerCtrl.showTransientNotice("Temp4", onShow, vi.fn(), 3000);
+    expect(vi.getTimerCount()).toBe(1);
+    timerCtrl.clearTransientNoticeState();
+    expect(vi.getTimerCount()).toBe(0);
+
+    // Host/locked state preservation branches
+    const { ctrl: stateCtrl, tasks: stateTasks } = makeController();
+    stateCtrl.saveCreatorHostToken("ABCD2345", "creator-tok");
+    await Promise.all(stateTasks);
+    stateCtrl.isHost = true;
+    stateCtrl.roomLocked = true;
+    stateCtrl.roomPassword = "HOSTPASS12345678";
+    stateCtrl.applyRoomState(true);
+    expect(stateCtrl.roomPassword).toBe("HOSTPASS12345678");
+    stateCtrl.applyRoomState(false);
+    expect(stateCtrl.roomPassword).toBe("HOSTPASS12345678");
+    stateCtrl.applyRoomPassword("ABCD2345", undefined, undefined);
+    expect(stateCtrl.roomPassword).toBe("HOSTPASS12345678");
+
+    stateCtrl.selfId = "self1";
+    stateCtrl.isHost = false;
+    stateCtrl.applyHostPromoted("ABCD2345", "otherPeer", "other-tok", "OTHERPASS1234567");
+    expect(stateCtrl.isHost).toBe(false);
+    expect(stateCtrl.roomPassword).toBe("HOSTPASS12345678");
+    expect(stateCtrl.hostTokenFor("ABCD2345")).toBe("creator-tok");
+
+    const welcomeRes = stateCtrl.applyWelcomeCredentials(
+      "ABCD2345",
+      { host: true, locked: true },
+      "wrong-tok",
+    );
+    expect(welcomeRes.hideInvite).toBe(false);
+    expect(stateCtrl.roomPassword).toBe("HOSTPASS12345678");
+
+    // applyFatalErrorCleanup invokes onForgetHostUiChange when kicked without lastPresentedHostToken
+    const onKickUi = vi.fn();
+    const { ctrl: fatalCtrl } = makeController({ onForgetHostUiChange: onKickUi });
+    fatalCtrl.applyFatalErrorCleanup("ABCD2345", "kicked", true, undefined);
+    expect(onKickUi).toHaveBeenCalledTimes(1);
+
+    // resolveBootAction with saved activeRoom during hashchange vs empty boot with no activeRoom
+    const { ctrl: bootCtrl } = makeController();
+    expect(bootCtrl.resolveBootAction("", false, { active: false, fatal: false, ready: false })).toEqual({
+      kind: "none",
+    });
+    bootCtrl.saveActiveRoom("ABCD2345");
+    bootCtrl.saveRejoinToken("ABCD2345", "rj-1");
+    expect(bootCtrl.resolveBootAction("", true, { active: false, fatal: false, ready: false })).toEqual({
+      kind: "none",
+    });
   });
 });
 

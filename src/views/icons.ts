@@ -12,7 +12,9 @@ export type IconName =
   | "pip"
   | "stats"
   | "fullscreen"
-  | "exitFullscreen";
+  | "exitFullscreen"
+  | "chat"
+  | "close";
 
 const ICON_PATHS: Record<IconName, readonly string[]> = {
   play: ["M6 4l14 8-14 8V4z"],
@@ -35,6 +37,8 @@ const ICON_PATHS: Record<IconName, readonly string[]> = {
   exitFullscreen: [
     "M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3",
   ],
+  chat: ["M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"],
+  close: ["M18 6L6 18", "M6 6l12 12"],
 };
 
 /**

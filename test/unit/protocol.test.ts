@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   MAX_CANDIDATE_LENGTH,
+  MAX_CHAT_LENGTH,
   MAX_SDP_LENGTH,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
@@ -284,6 +285,37 @@ describe("parseClientMessage join options", () => {
       displayName: "  bob  ",
     });
     expect(parseClientMessage(JSON.stringify({ t: "rename", displayName: "x".repeat(129) }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: "a" }))).toEqual({ t: "chat", text: "a" });
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: "x".repeat(MAX_CHAT_LENGTH) }))).toEqual({
+      t: "chat",
+      text: "x".repeat(MAX_CHAT_LENGTH),
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: "   " }))).toEqual({ t: "chat", text: "   " });
+    expect(
+      parseClientMessage(JSON.stringify({ t: "chat", text: "hi", from: P1, id: "evil", ts: 1 })),
+    ).toEqual({ t: "chat", text: "hi" });
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: "" }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: "x".repeat(MAX_CHAT_LENGTH + 1) }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "chat" }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: 123 }))).toBeNull();
+  });
+
+  it("enforces UTF-16 code-unit bounds for astral emojis on client chat text", () => {
+    const emojiAtLimit = "😀".repeat(250); // 500 UTF-16 code units
+    const emojiOverLimit = "😀".repeat(251); // 502 UTF-16 code units, 251 code points
+    const mixedAtLimit = `${"a".repeat(498)}😀`; // 500 UTF-16 code units
+    const mixedOverLimit = `${"a".repeat(499)}😀`; // 501 UTF-16 code units, 500 code points
+
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: emojiAtLimit }))).toEqual({
+      t: "chat",
+      text: emojiAtLimit,
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: mixedAtLimit }))).toEqual({
+      t: "chat",
+      text: mixedAtLimit,
+    });
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: emojiOverLimit }))).toBeNull();
+    expect(parseClientMessage(JSON.stringify({ t: "chat", text: mixedOverLimit }))).toBeNull();
   });
 
   it("ignores non-boolean or false resume and sharing values", () => {
@@ -407,6 +439,54 @@ describe("parseServerMessage", () => {
     expect(
       parseServerMessage(JSON.stringify({ t: "error", code: "session-replaced", message: "Replaced" })),
     ).toEqual({ t: "error", code: "session-replaced", message: "Replaced" });
+
+    expect(
+      parseServerMessage(JSON.stringify({ t: "error", code: "chat-rate-limited", message: "Slow down" })),
+    ).toEqual({ t: "error", code: "chat-rate-limited", message: "Slow down" });
+
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          t: "chat",
+          id: "m1",
+          from: "p2",
+          name: "bob",
+          text: "hello",
+          ts: 1700000000000,
+          extra: true,
+        }),
+      ),
+    ).toEqual({ t: "chat", id: "m1", from: "p2", name: "bob", text: "hello", ts: 1700000000000 });
+
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          t: "chat",
+          id: "i".repeat(64),
+          from: "p2",
+          name: "",
+          text: "t".repeat(MAX_CHAT_LENGTH),
+          ts: 0,
+        }),
+      ),
+    ).toEqual({ t: "chat", id: "i".repeat(64), from: "p2", name: "", text: "t".repeat(MAX_CHAT_LENGTH), ts: 0 });
+
+    expect(
+      parseServerMessage(
+        JSON.stringify({
+          t: "chat",
+          id: "m2",
+          from: "p2",
+          name: "n".repeat(32),
+          text: "ok",
+          ts: 42,
+        }),
+      ),
+    ).toEqual({ t: "chat", id: "m2", from: "p2", name: "n".repeat(32), text: "ok", ts: 42 });
+
+    const negZero = parseServerMessage('{"t":"chat","id":"m3","from":"p2","name":"bob","text":"hi","ts":-0}');
+    expect(negZero).not.toBeNull();
+    expect(Object.is((negZero as { ts: number }).ts, -0)).toBe(true);
   });
 
   it("rejects malformed or invalid server messages", () => {
@@ -420,6 +500,37 @@ describe("parseServerMessage", () => {
     expect(
       parseServerMessage(JSON.stringify({ t: "welcome", selfId: P1, peers: [], rejoinToken: "" })),
     ).toBeNull();
+    const baseChat = { t: "chat", id: "m1", from: "p2", name: "bob", text: "hi", ts: 1000 };
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, id: "" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, id: "i".repeat(65) }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, from: "" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, name: "n".repeat(33) }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: "" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: "t".repeat(MAX_CHAT_LENGTH + 1) }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, ts: "1000" }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, ts: NaN }))).toBeNull();
+    expect(parseServerMessage('{"t":"chat","id":"m1","from":"p2","name":"bob","text":"hi","ts":1e309}')).toBeNull();
+    expect(parseServerMessage('{"t":"chat","id":"m1","from":"p2","name":"bob","text":"hi","ts":-1e309}')).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ t: "chat", id: "m1", from: "p2", name: "bob", text: "hi" }))).toBeNull();
+  });
+
+  it("enforces UTF-16 code-unit bounds for astral emojis on server chat text", () => {
+    const emojiAtLimit = "😀".repeat(250); // 500 UTF-16 code units
+    const emojiOverLimit = "😀".repeat(251); // 502 UTF-16 code units, 251 code points
+    const mixedAtLimit = `${"a".repeat(498)}😀`; // 500 UTF-16 code units
+    const mixedOverLimit = `${"a".repeat(499)}😀`; // 501 UTF-16 code units, 500 code points
+    const baseChat = { t: "chat", id: "m1", from: "p2", name: "bob", ts: 1000 };
+
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: emojiAtLimit }))).toEqual({
+      ...baseChat,
+      text: emojiAtLimit,
+    });
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: mixedAtLimit }))).toEqual({
+      ...baseChat,
+      text: mixedAtLimit,
+    });
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: emojiOverLimit }))).toBeNull();
+    expect(parseServerMessage(JSON.stringify({ ...baseChat, text: mixedOverLimit }))).toBeNull();
   });
 });
 

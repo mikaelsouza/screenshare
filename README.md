@@ -133,6 +133,8 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   leaked links remain invalid, and restoring the creator's host authority—while room credentials
   remain reusable for **90 days** from the room creator's last activity (non-host visits do not
   extend the 90-day cap, and rotated or kicked secrets stay revoked).
+- **Room chat** is relayed ephemerally in transit over the room's encrypted WebSocket (`wss://`)
+  only to currently connected participants, with zero server storage or message history.
 
 Known limitations and open defects are tracked in
 [Issues](https://github.com/mikaelsouza/screenshare/issues).

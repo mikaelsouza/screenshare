@@ -9,6 +9,7 @@ import {
   PING,
   PONG,
   parseServerMessage,
+  type ChatMessage,
   type ClientMessage,
   type PeerId,
   type PeerInfo,
@@ -39,6 +40,7 @@ export interface SignalingHandlers {
   onRoomPassword?(password: string | undefined, rejoinToken: string | undefined): void;
   onPeerRenamed?(id: PeerId, name: string): void;
   onHostPromoted?(hostId: PeerId, hostToken?: string, password?: string): void;
+  onChat?(msg: ChatMessage): void;
   onError(code: string, message: string): void;
   onStatus(status: "connecting" | "open" | "closed"): void;
 }
@@ -304,6 +306,23 @@ export class SignalingClient {
         this.handlers.onPeerState(msg.id, msg.sharing);
         break;
       case "room-state":
+      case "room-password":
+      case "peer-renamed":
+      case "host-promoted":
+      case "chat":
+        this.dispatchRoomEvent(msg);
+        break;
+      case "error":
+        this.handleError(msg);
+        break;
+    }
+  }
+
+  private dispatchRoomEvent(
+    msg: Extract<ServerMessage, { t: "room-state" | "room-password" | "peer-renamed" | "host-promoted" | "chat" }>,
+  ): void {
+    switch (msg.t) {
+      case "room-state":
         this.handlers.onRoomState?.(msg.locked, msg.password);
         break;
       case "room-password":
@@ -315,8 +334,8 @@ export class SignalingClient {
       case "host-promoted":
         this.handlers.onHostPromoted?.(msg.hostId, msg.hostToken, msg.password);
         break;
-      case "error":
-        this.handleError(msg);
+      case "chat":
+        this.handlers.onChat?.({ id: msg.id, from: msg.from, name: msg.name, text: msg.text, ts: msg.ts });
         break;
     }
   }
@@ -372,6 +391,12 @@ export class SignalingClient {
   rename(displayName: string): void {
     this.displayName = displayName;
     this.send({ t: "rename", displayName });
+  }
+
+  /** Send an ephemeral chat message when the signaling socket is ready (never queued across disconnects). */
+  sendChat(text: string): boolean {
+    if (!this.isReady) return false;
+    return this.sendRaw({ t: "chat", text });
   }
 
   private onVisibilityChange = (): void => {

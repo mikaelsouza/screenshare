@@ -37,6 +37,9 @@ export const MAX_SDP_LENGTH: number = 64 * 1024;
 /** Largest ICE candidate line accepted. Real ones are a couple of hundred bytes. */
 export const MAX_CANDIDATE_LENGTH = 1024;
 
+/** Maximum UTF-16 code units allowed in a chat message. */
+export const MAX_CHAT_LENGTH = 500;
+
 /**
  * Peer ids are server-issued crypto.randomUUID() values. Anything else in a `to` field
  * cannot name a peer, so it is rejected at parse time rather than carried further.
@@ -68,6 +71,14 @@ export type SignalData =
   | { k: "answer"; sdp: string }
   | { k: "ice"; candidate: IceCandidateInit };
 
+export interface ChatMessage {
+  id: string;
+  from: PeerId;
+  name: string;
+  text: string;
+  ts: number;
+}
+
 export type ClientMessage =
   | {
       t: "join";
@@ -93,7 +104,9 @@ export type ClientMessage =
   /** Host only: mint a fresh room invite secret and invalidate previous links. */
   | { t: "rotate-password" }
   /** Joined peer: update display name in place without dropping the room session. */
-  | { t: "rename"; displayName: string };
+  | { t: "rename"; displayName: string }
+  /** Joined peer: broadcast an ephemeral chat message to the room. */
+  | { t: "chat"; text: string };
 
 export type ServerMessage =
   | {
@@ -118,6 +131,7 @@ export type ServerMessage =
   | { t: "room-password"; password?: string; rejoinToken?: string }
   | { t: "peer-renamed"; id: PeerId; name: string }
   | { t: "host-promoted"; hostId: PeerId; hostToken?: string; password?: string }
+  | ({ t: "chat" } & ChatMessage)
   | { t: "error"; code: ErrorCode; message: string };
 
 export type ErrorCode =
@@ -133,7 +147,8 @@ export type ErrorCode =
   | "kicked"
   | "room-locked"
   | "not-host"
-  | "not-sharing";
+  | "not-sharing"
+  | "chat-rate-limited";
 
 /** Longest host token accepted. Real ones are UUIDs, 36 characters. */
 const MAX_HOST_TOKEN_LENGTH = 64;
@@ -156,6 +171,8 @@ export type InviteParseResult =
 const RoomCodeSchema: z.ZodType<string> = z.string().regex(ROOM_CODE_REGEX);
 
 const PeerUuidSchema: z.ZodType<PeerId> = z.string().regex(PEER_ID);
+
+const ChatTextSchema: z.ZodType<string> = z.string().min(1).refine((s) => s.length <= MAX_CHAT_LENGTH);
 
 const IceCandidateInitSchema: z.ZodType<IceCandidateInit> = z
   .object({
@@ -236,6 +253,10 @@ const ClientMessageSchema: z.ZodType<ClientMessage> = z.discriminatedUnion("t", 
     t: z.literal("rename"),
     displayName: z.string().max(128),
   }),
+  z.object({
+    t: z.literal("chat"),
+    text: ChatTextSchema,
+  }),
 ]);
 
 const PeerInfoSchema: z.ZodType<PeerInfo> = z
@@ -268,6 +289,7 @@ const ErrorCodeSchema: z.ZodType<ErrorCode> = z.enum([
   "room-locked",
   "not-host",
   "not-sharing",
+  "chat-rate-limited",
 ]);
 
 const WelcomeServerMessageSchema = z
@@ -383,6 +405,14 @@ const ServerMessageSchema: z.ZodType<ServerMessage> = z.discriminatedUnion("t", 
     name: z.string().max(32),
   }),
   HostPromotedServerMessageSchema,
+  z.object({
+    t: z.literal("chat"),
+    id: z.string().min(1).max(64),
+    from: z.string().min(1),
+    name: z.string().max(32),
+    text: ChatTextSchema,
+    ts: z.number().finite(),
+  }),
   z.object({
     t: z.literal("error"),
     code: ErrorCodeSchema,

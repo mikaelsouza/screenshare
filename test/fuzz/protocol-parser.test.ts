@@ -9,6 +9,7 @@ import {
   type ClientMessage,
   MAX_SDP_LENGTH,
   MAX_CANDIDATE_LENGTH,
+  MAX_CHAT_LENGTH,
   ROOM_CODE_ALPHABET,
   ROOM_CODE_LENGTH,
   ROOM_PASSWORD_LENGTH,
@@ -33,7 +34,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
 
         if (result !== null) {
           expect(typeof result).toBe("object");
-          expect(["join", "signal", "state", "kick", "lock", "rotate-password", "rename"]).toContain(
+          expect(["join", "signal", "state", "kick", "lock", "rotate-password", "rename", "chat"]).toContain(
             result.t,
           );
         }
@@ -142,9 +143,14 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         else if (result.t === "kick") expect(PEER_ID_REGEX.test(result.id)).toBe(true);
         else if (result.t === "lock") expect(typeof result.locked).toBe("boolean");
         else if (result.t === "rotate-password") expect(result.t).toBe("rotate-password");
-        else {
+        else if (result.t === "rename") {
           expect(typeof result.displayName).toBe("string");
           expect(result.displayName.length).toBeLessThanOrEqual(128);
+        } else {
+          expect(result.t).toBe("chat");
+          expect(typeof result.text).toBe("string");
+          expect(result.text.length).toBeGreaterThanOrEqual(1);
+          expect(result.text.length).toBeLessThanOrEqual(MAX_CHAT_LENGTH);
         }
 
         return true;
@@ -153,7 +159,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
     );
   });
 
-  it("enforces structural invariants across structured 7-variant ClientMessage fuzzing", () => {
+  it("enforces structural invariants across structured 8-variant ClientMessage fuzzing", () => {
     const signalDataArb = fc.oneof(
       fc.record({ k: fc.constant("offer" as const), sdp: fc.string({ maxLength: 512 }) }),
       fc.record({ k: fc.constant("answer" as const), sdp: fc.string({ maxLength: 512 }) }),
@@ -190,6 +196,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
       fc.record({ t: fc.constant("lock" as const), locked: fc.boolean() }),
       fc.record({ t: fc.constant("rotate-password" as const) }),
       fc.record({ t: fc.constant("rename" as const), displayName: fc.string({ maxLength: 160 }) }),
+      fc.record({ t: fc.constant("chat" as const), text: fc.string({ maxLength: MAX_CHAT_LENGTH + 50 }) }),
     );
 
     fc.assert(
@@ -198,6 +205,9 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         if (result === null) {
           if (payload.t === "join") expect(payload.displayName.length).toBeGreaterThan(512);
           else if (payload.t === "rename") expect(payload.displayName.length).toBeGreaterThan(128);
+          else if (payload.t === "chat") {
+            expect(payload.text.length === 0 || payload.text.length > MAX_CHAT_LENGTH).toBe(true);
+          }
           return true;
         }
         if (result.t === "join") {
@@ -216,8 +226,12 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
           expect(typeof result.locked).toBe("boolean");
         } else if (result.t === "rotate-password") {
           expect(result.t).toBe("rotate-password");
-        } else {
+        } else if (result.t === "rename") {
           expect(result.displayName.length).toBeLessThanOrEqual(128);
+        } else {
+          expect(result.t).toBe("chat");
+          expect(result.text.length).toBeGreaterThanOrEqual(1);
+          expect(result.text.length).toBeLessThanOrEqual(MAX_CHAT_LENGTH);
         }
         return true;
       }),
@@ -236,6 +250,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
       "room-password",
       "peer-renamed",
       "host-promoted",
+      "chat",
       "error",
     ];
 
@@ -323,6 +338,14 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
         password: fc.option(fc.string({ maxLength: 64 }), { nil: undefined }),
       }),
       fc.record({
+        t: fc.constant("chat" as const),
+        id: fc.string({ maxLength: 80 }),
+        from: fc.string({ maxLength: 40 }),
+        name: fc.string({ maxLength: 48 }),
+        text: fc.string({ maxLength: MAX_CHAT_LENGTH + 50 }),
+        ts: fc.oneof(fc.double(), fc.integer(), fc.constantFrom(0, -0, NaN, Infinity, -Infinity)),
+      }),
+      fc.record({
         t: fc.constant("error" as const),
         code: fc.constantFrom(
           "room-full",
@@ -338,6 +361,7 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
           "room-locked",
           "not-host",
           "not-sharing",
+          "chat-rate-limited",
           "unknown-code",
         ),
         message: fc.string({ maxLength: 120 }),
@@ -354,6 +378,14 @@ describe("Fuzzing Suite: Client Message & Candidate Parser (Features 41, 45)", (
             expect(res.hostToken).not.toBe("");
             expect(res.rejoinToken).not.toBe("");
             expect(res.password).not.toBe("");
+          } else if (res.t === "chat") {
+            expect(res.id.length).toBeGreaterThanOrEqual(1);
+            expect(res.id.length).toBeLessThanOrEqual(64);
+            expect(res.from.length).toBeGreaterThanOrEqual(1);
+            expect(res.name.length).toBeLessThanOrEqual(32);
+            expect(res.text.length).toBeGreaterThanOrEqual(1);
+            expect(res.text.length).toBeLessThanOrEqual(MAX_CHAT_LENGTH);
+            expect(Number.isFinite(res.ts)).toBe(true);
           }
         }
         return true;

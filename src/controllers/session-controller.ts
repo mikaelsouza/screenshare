@@ -423,7 +423,11 @@ export class SessionController {
     if (codeErr === "not-host") {
       return { friendly, severity: "warn", clearPendingKicks: true };
     }
-    if (codeErr === "unknown-peer" || codeErr === "not-sharing") {
+    if (
+      codeErr === "unknown-peer" ||
+      codeErr === "not-sharing" ||
+      codeErr === "chat-rate-limited"
+    ) {
       return { friendly, severity: "ignore", clearPendingKicks: codeErr === "unknown-peer" };
     }
     const formatted = codeErr === "rate-limited" ? friendly : `${codeErr}: ${friendly}`;
