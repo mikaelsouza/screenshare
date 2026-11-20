@@ -550,6 +550,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
           const inviteCopyEl = document.getElementById("invite-copy-link");
           const inviteCopyRect = inviteCopyEl?.getBoundingClientRect();
           const inviteCopyLabel = inviteCopyEl?.querySelector<HTMLElement>(".invite-copy-label");
+          const inviteCopyLabelRect = inviteCopyLabel?.getBoundingClientRect();
           const inviteBtnRect = document.getElementById("invite-btn")?.getBoundingClientRect();
           const rosterBtnRect = document.getElementById("roster-btn")?.getBoundingClientRect();
           return {
@@ -559,6 +560,8 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
             inviteCopyWidth: Math.round(inviteCopyRect?.width ?? 0),
             inviteCopyHeight: Math.round(inviteCopyRect?.height ?? 0),
             inviteCopyLabelDisplay: inviteCopyLabel ? getComputedStyle(inviteCopyLabel).display : "",
+            inviteCopyLabelWidth: Math.round(inviteCopyLabelRect?.width ?? 0),
+            inviteCopyLabelHeight: Math.round(inviteCopyLabelRect?.height ?? 0),
             scrollWidth: document.documentElement.scrollWidth,
             innerWidth: window.innerWidth,
           };
@@ -581,10 +584,14 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
             32,
             `#invite-copy-link height at ${String(width)}x${String(height)} should be 32px`,
           );
-          assert.equal(
+          assert.notEqual(
             metrics.inviteCopyLabelDisplay,
             "none",
-            `.invite-copy-label must be display: none at ${String(width)}x${String(height)}`,
+            `.invite-copy-label must remain in the accessibility tree at ${String(width)}x${String(height)}`,
+          );
+          assert.ok(
+            metrics.inviteCopyLabelWidth <= 1 && metrics.inviteCopyLabelHeight <= 1,
+            `.invite-copy-label must be visually hidden at ${String(width)}x${String(height)}, got ${String(metrics.inviteCopyLabelWidth)}x${String(metrics.inviteCopyLabelHeight)}`,
           );
         }
       }
