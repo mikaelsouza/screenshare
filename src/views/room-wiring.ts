@@ -1,4 +1,4 @@
-import type { PeerId, PeerInfo } from "@shared/protocol";
+import type { ChatMessage, PeerId, PeerInfo } from "@shared/protocol";
 import { QUALITY_PRESETS, type CaptureResult } from "../capture";
 import type { InviteController } from "../controllers/invite-controller";
 import type { PopoverToastController } from "../controllers/popover-toast-controller";
@@ -23,6 +23,12 @@ export interface RoomWiringContext {
   tileView: TileView;
   health: HealthPoller;
   peerLeftTimers: Map<PeerId, ReturnType<typeof setTimeout>>;
+  chat: {
+    onMessage: (msg: ChatMessage) => void;
+    onRateLimited: (friendly: string) => void;
+    syncReady: (ready: boolean) => void;
+    onFreshWelcome: () => void;
+  };
   getClient: () => SignalingClient | null;
   getMesh: () => Mesh | null;
   setMesh: (mesh: Mesh | null) => void;
@@ -105,6 +111,7 @@ function handleFreshWelcome(
   session.members.clear();
   tileCtrl.clearListening();
   popovers.resetRoom();
+  ctx.chat.onFreshWelcome();
   session.selfId = null;
 
   for (const id of tileView.videoPeerIds()) {
@@ -191,6 +198,7 @@ export function buildSignalingHandlers(
         session.clearPendingKicks();
         ctx.setStatus(`Connection ${status}…`, "warn");
       }
+      ctx.chat.syncReady(Boolean(ctx.getClient()?.isReady));
       if (session.selfId !== null) ctx.renderInviteMenu();
     },
 
@@ -225,6 +233,7 @@ export function buildSignalingHandlers(
       }
       ctx.renderInviteMenu();
       ctx.syncViewState();
+      ctx.chat.syncReady(Boolean(ctx.getClient()?.isReady));
       health.start();
       ctx.renderRoster();
     },
@@ -341,6 +350,11 @@ export function buildSignalingHandlers(
       ctx.renderInviteMenu();
     },
 
+    onChat: (msg) => {
+      if (isStale()) return;
+      ctx.chat.onMessage(msg);
+    },
+
     onError: (codeErr, message) => {
       if (isStale()) return;
       const activeClient = ctx.getClient();
@@ -359,6 +373,7 @@ export function buildSignalingHandlers(
       }
       if (classified.severity === "warn") ctx.setStatus(classified.friendly, "warn");
       else if (classified.severity === "error") ctx.setStatus(classified.friendly, "error");
+      else if (codeErr === "chat-rate-limited") ctx.chat.onRateLimited(classified.friendly);
     },
   };
 }

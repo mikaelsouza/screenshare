@@ -21,6 +21,7 @@ import {
   handleSignalAction,
   handleStateAction,
 } from "./room-actions";
+import { RoomChatRelay } from "./room-chat";
 import { hashRoomSecret, preMintEmptyResetSecret, timingSafeEqualStr } from "./room-crypto";
 import {
   closeStaleUnjoinedSockets,
@@ -73,6 +74,7 @@ import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 export class RoomDO extends DurableObject<Env> {
   private readonly budgets = new Map<string, MessageBudget>();
   private readonly badMessages = new Map<string, number>();
+  private readonly chat = new RoomChatRelay();
   private readonly refused = new WeakSet<WebSocket>();
   private readonly joining = new Set<string>();
   private readonly gone = new Set<string>();
@@ -324,6 +326,9 @@ export class RoomDO extends DurableObject<Env> {
       case "state":
         await handleStateAction(this.lifecycleHost, ws, attachment, clientMsg);
         break;
+      case "chat":
+        this.chat.handleChat(this.lifecycleHost, ws, attachment, clientMsg);
+        break;
     }
   }
 
@@ -422,8 +427,7 @@ export class RoomDO extends DurableObject<Env> {
     attachment.joinedAt = supersededSocket?.att.joinedAt ?? admission.memberTicket?.joinedAt ?? joinNow;
     if (isResume) {
       applyResumeState(attachment, clientMsg, supersededSocket, admission.memberTicket, (oldId, newId) => {
-        this.budgets.delete(oldId);
-        this.badMessages.delete(oldId);
+        this.clearPeerState(oldId);
         this.gone.delete(newId);
       });
     }
@@ -432,7 +436,7 @@ export class RoomDO extends DurableObject<Env> {
     await evictSupersededPeers(
       this.lifecycleHost,
       {
-        deletePeerState: (id) => { this.budgets.delete(id); this.badMessages.delete(id); },
+        deletePeerState: (id) => this.clearPeerState(id),
         clearGone: (id) => this.gone.delete(id),
         handleLeaveNoSync: (oldWs) => this.handleLeaveInternal(oldWs, { skipAlarmSync: true }),
       },
@@ -492,11 +496,14 @@ export class RoomDO extends DurableObject<Env> {
     try { ws.close(1011, "socket error"); } catch { /* already closed */ }
   }
 
+  private clearPeerState(id: string): void {
+    this.budgets.delete(id); this.badMessages.delete(id); this.chat.forget(id);
+  }
+
   private forgetBudget(ws: WebSocket): void {
     const att = getAttachment(ws);
     if (!att) return;
-    this.budgets.delete(att.id);
-    this.badMessages.delete(att.id);
+    this.clearPeerState(att.id);
     if (this.joining.has(att.id)) this.gone.add(att.id);
   }
 

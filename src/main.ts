@@ -16,6 +16,7 @@ import { createCaptureController } from "./platform";
 import type { EndReason } from "./platform/types";
 import { SignalingClient } from "./signaling";
 import { describeInviteParseFailure, type PopoverKind, type ViewState } from "./ui-model";
+import { mountChatFeature } from "./views/chat-view";
 import { currentNameDom, queryUiElements, scrubRoomUrlDom, setLobbyErrorDom, setStatusDom, syncNameInputsDom } from "./views/dom";
 import { bindAllDomEvents } from "./views/dom-events";
 import { HealthPoller } from "./views/health-view";
@@ -112,6 +113,13 @@ const share = new ShareLifecycle({
   closeAllPopovers: () => applyPopoverState(null),
   setStatus, syncViewState, renderRoster, runBackground,
 });
+const chat = mountChatFeature({
+  stage: ui.stage,
+  roomBar: ui.roomBar,
+  getSelfId: () => session.selfId,
+  sendMessage: (text) => Boolean(client?.sendChat(text)),
+  hasOpenPopover: () => popovers.activePopover !== null,
+});
 
 function renderInviteMenu(): void {
   renderInviteMenuView(ui, invite, session, popovers.activePopover, Boolean(client?.isReady));
@@ -149,8 +157,10 @@ function applyPopoverState(target: PopoverKind | null): void {
 
 function syncViewState(): ViewState {
   const sharing = share.capture !== null;
-  const state = tileCtrl.deriveView(session.selfId !== null && client !== null, sharing);
+  const connected = session.selfId !== null && client !== null;
+  const state = tileCtrl.deriveView(connected, sharing);
   applyViewStateDom(ui, state);
+  chat.syncConnected(connected);
   const active = popovers.activePopover;
   if (client === null || (!sharing && (active === "preset" || active === "codec" || active === "degradation"))) {
     applyPopoverState(null);
@@ -197,6 +207,7 @@ function leaveRoom(): void {
   session.joinGeneration++;
   invite.reset();
   popovers.resetRoom();
+  chat.reset();
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   health.stop();
@@ -239,6 +250,12 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
   const handlers = buildSignalingHandlers(
     {
       ui, session, invite, tileCtrl, popovers, tileView, health, peerLeftTimers,
+      chat: {
+        onMessage: (msg) => chat.onMessage(msg),
+        onRateLimited: (friendly) => chat.onRateLimited(friendly),
+        syncReady: (ready) => chat.syncReady(ready),
+        onFreshWelcome: () => chat.reset(),
+      },
       getClient: () => client, getMesh: () => mesh, setMesh: (m) => { mesh = m; },
       getCapture: () => share.capture, isFocusedAndVisible, setStatus, setLobbyError,
       showTransientRoomNotice, scrubRoomUrl, teardownPeer, renderInviteMenu,

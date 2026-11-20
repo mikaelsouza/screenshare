@@ -185,6 +185,11 @@
               never inspects SDP media contents or sees video/audio frames.
             </li>
             <li>
+              <strong>Room chat:</strong> Plain-text room chat messages are relayed ephemerally in transit over the
+              encrypted WebSocket (<code>wss://</code>) only to currently connected participants, with zero server
+              storage or message history retention.
+            </li>
+            <li>
               <strong>Invite URL scrubbing &amp; token lifetimes:</strong> Invite links carry <code>#CODE-SECRET</code>
               in the URL fragment only (never transmitted in HTTP requests), and the app immediately scrubs the browser
               address bar to <code>/</code> while keeping temporary <code>rejoinToken</code> state in
