@@ -678,6 +678,9 @@ interface RoomModel {
   locked: boolean;
   connectedIds: string[];
   hostIds: string[];
+  emptySince: number | null;
+  hostGoneAt: number | null;
+  sessionCleaned: boolean;
   disconnectedTokens: Map<string, { ip: string; rejoinToken: string; issuedAt: number; rotatedAt?: number }>;
   kickedIps: Map<string, number>;
   leakedPreLockPasswords: string[];
@@ -690,6 +693,14 @@ type RoomCommand = fc.Command<RoomModel, VirtualRoomHarness>;
 
 const IP_POOL = ["198.51.100.1", "198.51.100.2", "198.51.100.3", "198.51.100.4", "198.51.100.5"];
 
+function syncHostGoneAt(m: RoomModel, now: number): void {
+  if (m.connectedIds.length === 0 || m.hostIds.length > 0) {
+    m.hostGoneAt = null;
+  } else if (m.hostGoneAt === null) {
+    m.hostGoneAt = now;
+  }
+}
+
 function assertRoomInvariants(m: Readonly<RoomModel>, real: VirtualRoomHarness): void {
   assert.ok(real.peers.size <= MAX_ROOM_SIZE);
   assert.ok(Object.keys(real.members).length <= MAX_STORED_ENTRIES);
@@ -698,6 +709,10 @@ function assertRoomInvariants(m: Readonly<RoomModel>, real: VirtualRoomHarness):
   const actualHosts = [...real.peers.values()].filter((p) => p.host);
   assert.ok(actualHosts.length <= 1);
   assert.ok(m.hostIds.length <= 1);
+  assert.deepEqual(
+    actualHosts.map((p) => p.id),
+    m.hostIds,
+  );
 
   if (!real.claimed) {
     assert.equal(real.peers.size, 0);
@@ -706,8 +721,75 @@ function assertRoomInvariants(m: Readonly<RoomModel>, real: VirtualRoomHarness):
     assert.equal(real.alarmDeadline, null);
   } else {
     assert.equal(real.locked, m.locked);
+    assert.equal(real.sessionCleaned, m.sessionCleaned);
     assert.notEqual(real.alarmDeadline, null);
   }
+}
+
+function syncModelAfterAlarm(
+  m: RoomModel,
+  real: VirtualRoomHarness,
+  ctx: {
+    wasEmpty: boolean;
+    wasLocked: boolean;
+    wasSessionCleaned: boolean;
+    emptySinceBefore: number | null;
+    hostGoneAtBefore: number | null;
+    preEmptyPassword: string;
+    hadNoHost: boolean;
+  },
+): void {
+  if (!real.claimed) {
+    m.expired = true;
+    m.connectedIds = [];
+    m.hostIds = [];
+    m.locked = false;
+    m.emptySince = null;
+    m.hostGoneAt = null;
+    m.sessionCleaned = false;
+    m.disconnectedTokens.clear();
+    m.kickedIps.clear();
+    assertRoomInvariants(m, real);
+    return;
+  }
+
+  const reachedEmptyCleanup =
+    ctx.wasEmpty &&
+    !ctx.wasSessionCleaned &&
+    ctx.emptySinceBefore !== null &&
+    real.now - ctx.emptySinceBefore >= EMPTY_SESSION_CLEANUP_MS;
+
+  if (reachedEmptyCleanup) {
+    m.sessionCleaned = true;
+    m.locked = false;
+    m.kickedIps.clear();
+    m.disconnectedTokens.clear();
+    if (ctx.wasLocked) {
+      assert.notEqual(real.password, ctx.preEmptyPassword);
+      m.leakedPreLockPasswords.push(ctx.preEmptyPassword);
+    }
+    if (real.creatorHostHash !== null) {
+      assert.equal(real.hostHash, real.creatorHostHash);
+    } else if (m.promotedSinceLastReset) {
+      assert.equal(real.hostHash, null);
+    }
+    m.promotedSinceLastReset = false;
+  }
+
+  const reachedHostPromotion =
+    ctx.hadNoHost &&
+    ctx.hostGoneAtBefore !== null &&
+    real.now - ctx.hostGoneAtBefore >= HOST_GRACE_MS &&
+    real.peers.size > 0;
+
+  if (reachedHostPromotion) {
+    m.promotedSinceLastReset = true;
+    m.hostIds = [...real.peers.values()].filter((p) => p.host).map((p) => p.id);
+    m.hostGoneAt = null;
+    assert.equal(m.hostIds.length, 1);
+    assert.equal(real.locked, m.locked);
+  }
+  assertRoomInvariants(m, real);
 }
 
 class JoinCreatorCommand implements RoomCommand {
@@ -732,19 +814,27 @@ class JoinCreatorCommand implements RoomCommand {
       m.connectedIds = [];
       m.hostIds = [];
       m.locked = false;
+      m.emptySince = null;
+      m.hostGoneAt = null;
+      m.sessionCleaned = false;
       m.disconnectedTokens.clear();
       m.kickedIps.clear();
       assertRoomInvariants(m, real);
       return;
     }
     if (!res.ok) {
-      if (m.locked) assert.ok(res.code === "room-locked" || res.code === "bad-password");
+      if (m.locked) {
+        assert.ok(res.code === "room-locked" || res.code === "bad-password" || res.code === "rate-limited");
+      }
       assertRoomInvariants(m, real);
       return;
     }
     m.everJoined = true;
+    m.emptySince = null;
+    m.sessionCleaned = false;
     m.connectedIds = [...real.peers.keys()];
     m.hostIds = [...real.peers.values()].filter((p) => p.host).map((p) => p.id);
+    syncHostGoneAt(m, real.now);
     if (!m.promotedSinceLastReset && real.creatorHostHash !== null) {
       assert.equal(res.peer.host, true);
       assert.equal(res.password, real.password);
@@ -776,15 +866,21 @@ class JoinGuestCommand implements RoomCommand {
     const res = real.admitAndJoin({ name: `guest-${String(this.ipIdx)}`, ip, password: real.password });
     const banUntil = m.kickedIps.get(ip);
     const isBanned = banUntil !== undefined && banUntil > real.now;
-    if (m.locked) {
-      assert.deepEqual(res, { ok: false, code: "room-locked" });
-    } else if (isBanned) {
-      assert.deepEqual(res, { ok: false, code: "kicked" });
-    } else if (!real.claimed) {
+    if (!real.claimed) {
       assert.deepEqual(res, { ok: false, code: "bad-password" });
       m.expired = true;
       m.connectedIds = [];
       m.hostIds = [];
+      m.locked = false;
+      m.emptySince = null;
+      m.hostGoneAt = null;
+      m.sessionCleaned = false;
+      m.disconnectedTokens.clear();
+      m.kickedIps.clear();
+    } else if (m.locked) {
+      assert.deepEqual(res, { ok: false, code: "room-locked" });
+    } else if (isBanned) {
+      assert.deepEqual(res, { ok: false, code: "kicked" });
     } else {
       assert.equal(res.ok, true);
       if (res.ok) {
@@ -794,7 +890,10 @@ class JoinGuestCommand implements RoomCommand {
           assert.equal(real.lastHostActiveAt, prevLastActive);
         }
         m.everJoined = true;
+        m.emptySince = null;
+        m.sessionCleaned = false;
         m.connectedIds = [...real.peers.keys()];
+        syncHostGoneAt(m, real.now);
       }
     }
     assertRoomInvariants(m, real);
@@ -804,11 +903,28 @@ class JoinGuestCommand implements RoomCommand {
 
 class OpenUnjoinedPreemptCommand implements RoomCommand {
   check = (m: Readonly<RoomModel>): boolean => !m.expired;
-  run(_m: RoomModel, real: VirtualRoomHarness): void {
+  run(m: RoomModel, real: VirtualRoomHarness): void {
+    const hadNoHost = real.peers.size > 0 && m.hostIds.length === 0;
+    const wasEmpty = real.peers.size === 0;
+    const wasLocked = real.locked;
+    const wasSessionCleaned = m.sessionCleaned;
+    const emptySinceBefore = m.emptySince;
+    const hostGoneAtBefore = m.hostGoneAt;
+    const preEmptyPassword = real.password;
+
     real.openUnjoinedSocket();
     assert.ok(real.alarmDeadline !== null && real.alarmDeadline <= real.now + 10_000);
     real.advanceTimeAndRunAlarm(10_000);
     assert.equal(real.unjoinedSockets.length, 0);
+    syncModelAfterAlarm(m, real, {
+      wasEmpty,
+      wasLocked,
+      wasSessionCleaned,
+      emptySinceBefore,
+      hostGoneAtBefore,
+      preEmptyPassword,
+      hadNoHost,
+    });
   }
   toString = (): string => "OpenUnjoinedPreempt()";
 }
@@ -846,8 +962,11 @@ class JoinWithStaleSecretCommand implements RoomCommand {
     const pool = this.usePreLock ? m.leakedPreLockPasswords : m.rotatedPasswords;
     const staleSecret = pool[pool.length - 1];
     if (!staleSecret || staleSecret === real.password) return;
+    const recentFailures = (real.passwordFailures.get("198.51.100.99") ?? []).filter(
+      (t) => real.now - t < 60_000,
+    ).length;
     const res = real.admitAndJoin({ name: "eve", ip: "198.51.100.99", password: staleSecret });
-    assert.deepEqual(res, { ok: false, code: "bad-password" });
+    assert.deepEqual(res, { ok: false, code: recentFailures >= 20 ? "rate-limited" : "bad-password" });
     assertRoomInvariants(m, real);
   }
   toString = (): string => `JoinWithStaleSecret(preLock=${String(this.usePreLock)})`;
@@ -872,6 +991,11 @@ class DisconnectPeerCommand implements RoomCommand {
     real.disconnect(peer.id);
     m.connectedIds = [...real.peers.keys()];
     m.hostIds = [...real.peers.values()].filter((p) => p.host).map((p) => p.id);
+    if (m.connectedIds.length === 0) {
+      m.emptySince = real.now;
+      m.sessionCleaned = false;
+    }
+    syncHostGoneAt(m, real.now);
     assertRoomInvariants(m, real);
   }
   toString = (): string => `DisconnectPeer(${String(this.idx)})`;
@@ -900,9 +1024,12 @@ class ReconnectResumeCommand implements RoomCommand {
       assert.equal(res.ok, false);
     }
     if (res.ok) {
+      m.emptySince = null;
+      m.sessionCleaned = false;
       m.disconnectedTokens.delete(peerId);
       m.connectedIds = [...real.peers.keys()];
       m.hostIds = [...real.peers.values()].filter((p) => p.host).map((p) => p.id);
+      syncHostGoneAt(m, real.now);
       if (m.locked && !res.peer.host) {
         assert.equal(res.password, undefined);
       }
@@ -1020,6 +1147,9 @@ class AdvanceClockAlarmCommand implements RoomCommand {
     const hadNoHost = real.peers.size > 0 && m.hostIds.length === 0;
     const wasEmpty = real.peers.size === 0;
     const wasLocked = real.locked;
+    const wasSessionCleaned = m.sessionCleaned;
+    const emptySinceBefore = m.emptySince;
+    const hostGoneAtBefore = m.hostGoneAt;
     const preEmptyPassword = real.password;
 
     const delta =
@@ -1032,41 +1162,15 @@ class AdvanceClockAlarmCommand implements RoomCommand {
             : EMPTY_ROOM_TTL_MS + 1000;
 
     real.advanceTimeAndRunAlarm(delta);
-
-    if (!real.claimed) {
-      m.expired = true;
-      m.connectedIds = [];
-      m.hostIds = [];
-      m.locked = false;
-      m.disconnectedTokens.clear();
-      m.kickedIps.clear();
-      assertRoomInvariants(m, real);
-      return;
-    }
-
-    if (wasEmpty && delta >= EMPTY_SESSION_CLEANUP_MS) {
-      m.locked = false;
-      m.kickedIps.clear();
-      m.disconnectedTokens.clear();
-      if (wasLocked) {
-        assert.notEqual(real.password, preEmptyPassword);
-        m.leakedPreLockPasswords.push(preEmptyPassword);
-      }
-      if (real.creatorHostHash !== null) {
-        assert.equal(real.hostHash, real.creatorHostHash);
-      } else if (m.promotedSinceLastReset) {
-        assert.equal(real.hostHash, null);
-      }
-      m.promotedSinceLastReset = false;
-    }
-
-    if (hadNoHost && delta >= HOST_GRACE_MS && real.peers.size > 0) {
-      m.promotedSinceLastReset = true;
-      m.hostIds = [...real.peers.values()].filter((p) => p.host).map((p) => p.id);
-      assert.equal(m.hostIds.length, 1);
-      assert.equal(real.locked, m.locked);
-    }
-    assertRoomInvariants(m, real);
+    syncModelAfterAlarm(m, real, {
+      wasEmpty,
+      wasLocked,
+      wasSessionCleaned,
+      emptySinceBefore,
+      hostGoneAtBefore,
+      preEmptyPassword,
+      hadNoHost,
+    });
   }
   toString = (): string => `AdvanceClockAlarm(${this.step})`;
 }
@@ -1280,6 +1384,9 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
             locked: false,
             connectedIds: [],
             hostIds: [],
+            emptySince: real.now,
+            hostGoneAt: null,
+            sessionCleaned: legacyVariant === "legacy-joined",
             disconnectedTokens: new Map(),
             kickedIps: new Map(),
             leakedPreLockPasswords: [],
@@ -1293,6 +1400,76 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       { numRuns: 150 },
     );
     expect(totalRuns).toBe(150);
+
+    // Deterministic regression 1: creator joins, locks, disconnects, then 3x host-grace steps (301s each = 903s >= 15m)
+    // must trigger cumulative empty-session cleanup (unlock + secret rotation) in both harness and model.
+    const regReal = new VirtualRoomHarness();
+    const regModel: RoomModel = {
+      expired: false,
+      everJoined: false,
+      locked: false,
+      connectedIds: [],
+      hostIds: [],
+      emptySince: regReal.now,
+      hostGoneAt: null,
+      sessionCleaned: false,
+      disconnectedTokens: new Map(),
+      kickedIps: new Map(),
+      leakedPreLockPasswords: [],
+      rotatedPasswords: [],
+      legacyVariant: "modern",
+      promotedSinceLastReset: false,
+    };
+    const preLockPassword = regReal.password;
+    for (const cmd of [
+      new JoinCreatorCommand(true),
+      new ToggleLockCommand(true),
+      new DisconnectPeerCommand(0),
+      new AdvanceClockAlarmCommand("host-grace"),
+      new AdvanceClockAlarmCommand("host-grace"),
+      new AdvanceClockAlarmCommand("host-grace"),
+    ]) {
+      assert.equal(cmd.check(regModel), true);
+      cmd.run(regModel, regReal);
+    }
+    expect(regReal.locked).toBe(false);
+    expect(regModel.locked).toBe(false);
+    expect(regModel.sessionCleaned).toBe(true);
+    expect(regReal.password).not.toBe(preLockPassword);
+
+    // Deterministic regression 2: creator + guest join, creator leaves, then 30x 10s unjoined-socket alarms
+    // reach cumulative HOST_GRACE_MS (300s) and promote guest; returning creator stays non-host creatorHost.
+    const promoReal = new VirtualRoomHarness();
+    const promoModel: RoomModel = {
+      expired: false,
+      everJoined: false,
+      locked: false,
+      connectedIds: [],
+      hostIds: [],
+      emptySince: promoReal.now,
+      hostGoneAt: null,
+      sessionCleaned: false,
+      disconnectedTokens: new Map(),
+      kickedIps: new Map(),
+      leakedPreLockPasswords: [],
+      rotatedPasswords: [],
+      legacyVariant: "modern",
+      promotedSinceLastReset: false,
+    };
+    const promoSeq: RoomCommand[] = [
+      new JoinCreatorCommand(true),
+      new JoinGuestCommand(1),
+      new DisconnectPeerCommand(0),
+      ...Array.from({ length: 30 }, () => new OpenUnjoinedPreemptCommand()),
+      new JoinCreatorCommand(true),
+    ];
+    for (const cmd of promoSeq) {
+      assert.equal(cmd.check(promoModel), true);
+      cmd.run(promoModel, promoReal);
+    }
+    expect(promoModel.promotedSinceLastReset).toBe(true);
+    expect(promoModel.hostIds).toHaveLength(1);
+    expect(promoModel.hostGoneAt).toBeNull();
   });
 
   it("verifies partial-mesh zero-idle-link, bounded-transceiver, reemit, and degradation invariants across randomized Mesh command sequences", async () => {
@@ -1504,7 +1681,8 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       fc.constant<fc.Command<SigModel, SignalingClient>>({
         check: (m) => !m.fatal && !m.closed,
         run(m, real) {
-          const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+          const prevCount = FakeWebSocket.instances.length;
+          const ws = FakeWebSocket.instances[prevCount - 1];
           if (!ws || ws.readyState === FakeWebSocket.CLOSED) return;
           ws.close(1013, "room-full");
           m.capRefusals += 1;
@@ -1513,7 +1691,10 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
             assert.equal(real.isFatal, true);
           } else {
             assert.equal(real.isFatal, false);
-            vi.advanceTimersByTime(16_000);
+            if (!m.welcomed) m.initAttempts += 1;
+            // Max reconnect delay is 15_000 * 1.3 = 19_500ms; advance 25s so replacement socket always opens.
+            vi.advanceTimersByTime(25_000);
+            assert.equal(FakeWebSocket.instances.length, prevCount + 1);
           }
         },
         toString: () => "Transient1013()",
@@ -1521,7 +1702,8 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       fc.constant<fc.Command<SigModel, SignalingClient>>({
         check: (m) => !m.fatal && !m.closed && !m.welcomed,
         run(m, real) {
-          const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+          const prevCount = FakeWebSocket.instances.length;
+          const ws = FakeWebSocket.instances[prevCount - 1];
           if (!ws || ws.readyState === FakeWebSocket.CLOSED) return;
           ws.close(1006, "abnormal");
           m.initAttempts += 1;
@@ -1530,7 +1712,8 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
             assert.equal(real.isFatal, true);
           } else {
             assert.equal(real.isFatal, false);
-            vi.advanceTimersByTime(16_000);
+            vi.advanceTimersByTime(25_000);
+            assert.equal(FakeWebSocket.instances.length, prevCount + 1);
           }
         },
         toString: () => "Transient1006()",

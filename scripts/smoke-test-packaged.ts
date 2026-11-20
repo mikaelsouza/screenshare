@@ -157,19 +157,32 @@ function canConnectTcp(port: number, timeoutMs = 400): Promise<boolean> {
   });
 }
 
+function hasProcessExited(proc: ReturnType<typeof spawn>): boolean {
+  return proc.exitCode !== null || proc.signalCode !== null;
+}
+
+function formatExitStatus(proc: ReturnType<typeof spawn>): string {
+  return `code=${String(proc.exitCode)}, signal=${String(proc.signalCode)}`;
+}
+
 async function terminateProcessTree(pid: number | undefined, proc: ReturnType<typeof spawn>): Promise<void> {
-  if (pid === undefined) return;
+  if (pid === undefined || hasProcessExited(proc)) return;
+  let killErr: string | null = null;
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+    const res = spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { encoding: "utf8" });
+    if (res.error) killErr = res.error.message;
+    else if (res.status !== 0 && !hasProcessExited(proc)) {
+      killErr = `taskkill exited with status ${String(res.status)}: ${(res.stderr || res.stdout || "").trim()}`;
+    }
   } else {
     try {
       proc.kill("SIGKILL");
-    } catch {
-      /* already exited */
+    } catch (err) {
+      if (!hasProcessExited(proc)) killErr = err instanceof Error ? err.message : String(err);
     }
   }
   await new Promise<void>((resolve) => {
-    if (proc.exitCode !== null) {
+    if (hasProcessExited(proc)) {
       resolve();
       return;
     }
@@ -180,6 +193,37 @@ async function terminateProcessTree(pid: number | undefined, proc: ReturnType<ty
       resolve();
     });
   });
+  if (!hasProcessExited(proc)) {
+    throw new Error(
+      `Failed to terminate smoke child process (pid=${String(pid)})${killErr ? `: ${killErr}` : ""}`,
+    );
+  }
+}
+
+async function runWithChildCleanup(
+  child: ReturnType<typeof spawn>,
+  probe: () => Promise<void>,
+): Promise<void> {
+  let primaryErr: Error | undefined;
+  let cleanupErr: Error | undefined;
+  try {
+    await probe();
+  } catch (err) {
+    primaryErr = err instanceof Error ? err : new Error(String(err));
+  } finally {
+    try {
+      await terminateProcessTree(child.pid, child);
+    } catch (err) {
+      cleanupErr = err instanceof Error ? err : new Error(String(err));
+    }
+  }
+  if (primaryErr !== undefined) {
+    if (cleanupErr !== undefined) {
+      console.error("[smoke-packaged] cleanup failed after primary probe error:", cleanupErr);
+    }
+    throw primaryErr;
+  }
+  if (cleanupErr !== undefined) throw cleanupErr;
 }
 
 async function checkRunAsNodeBlocked(execPath: string): Promise<void> {
@@ -198,15 +242,17 @@ async function checkRunAsNodeBlocked(execPath: string): Promise<void> {
   child.stderr?.on("data", (d: Buffer) => {
     stderr += d.toString();
   });
-  await new Promise((r) => setTimeout(r, 2500));
-  if (stdout.includes(marker) || child.exitCode === 42) {
-    await terminateProcessTree(child.pid, child);
-    throw new Error("ELECTRON_RUN_AS_NODE=1 executed arbitrary -e script despite RunAsNode=DISABLE fuse");
-  }
-  if (child.exitCode !== null && /asar|integrity|corrupt/i.test(stderr)) {
-    throw new Error(`ASAR integrity error during ELECTRON_RUN_AS_NODE probe (code=${String(child.exitCode)}):\n${stderr}`);
-  }
-  await terminateProcessTree(child.pid, child);
+  await runWithChildCleanup(child, async () => {
+    await new Promise((r) => setTimeout(r, 2500));
+    if (stdout.includes(marker) || child.exitCode === 42) {
+      throw new Error("ELECTRON_RUN_AS_NODE=1 executed arbitrary -e script despite RunAsNode=DISABLE fuse");
+    }
+    if (hasProcessExited(child) && /asar|integrity|corrupt/i.test(stderr)) {
+      throw new Error(
+        `ASAR integrity error during ELECTRON_RUN_AS_NODE probe (${formatExitStatus(child)}):\n${stderr}`,
+      );
+    }
+  });
 }
 
 async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
@@ -226,12 +272,12 @@ async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
     stderr += d.toString();
   });
 
-  try {
+  await runWithChildCleanup(child, async () => {
     const deadline = Date.now() + 4_000;
     while (Date.now() < deadline) {
-      if (child.exitCode !== null) {
+      if (hasProcessExited(child)) {
         throw new Error(
-          `Packaged executable exited prematurely (code=${String(child.exitCode)}):\n${stderr}`,
+          `Packaged executable exited prematurely (${formatExitStatus(child)}):\n${stderr}`,
         );
       }
       if (await canConnectTcp(inspectPort, 250)) {
@@ -239,8 +285,8 @@ async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
       }
       await new Promise((r) => setTimeout(r, 350));
     }
-    if (child.exitCode !== null) {
-      throw new Error(`Packaged executable exited within 4s window (code=${String(child.exitCode)}):\n${stderr}`);
+    if (hasProcessExited(child)) {
+      throw new Error(`Packaged executable exited within 4s window (${formatExitStatus(child)}):\n${stderr}`);
     }
     if (/debugger listening/i.test(stderr)) {
       throw new Error(`Packaged executable printed inspector listener banner:\n${stderr}`);
@@ -248,9 +294,7 @@ async function checkInspectAndNativeStartup(execPath: string): Promise<void> {
     if (/nonexistent-smoke-fuse-probe/i.test(stderr)) {
       throw new Error(`NODE_OPTIONS was evaluated despite EnableNodeOptionsEnvironmentVariable=DISABLE:\n${stderr}`);
     }
-  } finally {
-    await terminateProcessTree(child.pid, child);
-  }
+  });
 }
 
 async function runPackagedSmokeVerifier(): Promise<void> {

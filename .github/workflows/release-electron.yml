@@ -50,20 +50,22 @@ jobs:
 
           TARGET_SHA="$(git rev-parse HEAD)"
 
+          # Verify the target commit is reachable from origin/main (full history, no shallow boundary)
+          # so untrusted/unreviewed side-branch commits or tags cannot trigger a release.
+          git fetch origin +refs/heads/main:refs/remotes/origin/main >/dev/null 2>&1 || true
+          if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main 2>/dev/null; then
+            echo "::error::Target commit ${TARGET_SHA} (${REF_NAME}) is not an ancestor of origin/main."
+            exit 1
+          fi
+
           if [ "$EVENT_NAME" = "push" ]; then
             if [[ ! "$REF_NAME" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
               echo "::error::Tag '$REF_NAME' must match vMAJOR.MINOR.PATCH"
               exit 1
             fi
             RELEASE_VERSION="${BASH_REMATCH[1]}"
-            # Verify the tagged commit is reachable from origin/main so untrusted/unreviewed side-branch tags cannot release.
-            git fetch origin main --depth=100 >/dev/null 2>&1 || true
-            if ! git merge-base --is-ancestor "$TARGET_SHA" origin/main 2>/dev/null; then
-              echo "::error::Tagged commit ${TARGET_SHA} (${REF_NAME}) is not an ancestor of origin/main."
-              exit 1
-            fi
           else
-            TRIMMED_INPUT="$(printf '%s' "${INPUT_VERSION:-}" | xargs)"
+            TRIMMED_INPUT="$(printf '%s' "${INPUT_VERSION:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
             if [ -n "$TRIMMED_INPUT" ]; then
               RAW_VERSION="${TRIMMED_INPUT#v}"
             else
@@ -98,16 +100,16 @@ jobs:
             fi
           fi
 
-          echo "Verifying CI and CodeQL status for commit ${TARGET_SHA}..."
+          echo "Verifying main-branch CI and CodeQL status for commit ${TARGET_SHA}..."
           for WORKFLOW_FILE in "ci.yml" "codeql.yml"; do
             ATTEMPTS=0
             while true; do
-              RUN_JSON="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$TARGET_SHA&per_page=10")"
+              RUN_JSON="$(gh api "repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs?head_sha=$TARGET_SHA&branch=main&event=push&per_page=10")"
               STATUS="$(printf '%s' "$RUN_JSON" | jq -r '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")][0].status // (.workflow_runs[0].status // "missing")')"
               CONCLUSION="$(printf '%s' "$RUN_JSON" | jq -r '[.workflow_runs[] | select(.status == "completed" and .conclusion == "success")][0].conclusion // (.workflow_runs[0].conclusion // "null")')"
 
               if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" = "success" ]; then
-                echo "${WORKFLOW_FILE} succeeded for ${TARGET_SHA}."
+                echo "${WORKFLOW_FILE} succeeded on main for ${TARGET_SHA}."
                 break
               fi
               if [ "$STATUS" = "completed" ] && [ "$CONCLUSION" != "cancelled" ] && [ "$CONCLUSION" != "skipped" ]; then
@@ -117,7 +119,7 @@ jobs:
 
               ATTEMPTS=$((ATTEMPTS + 1))
               if [ "$ATTEMPTS" -ge 60 ]; then
-                echo "::error::Timed out waiting for ${WORKFLOW_FILE} on ${TARGET_SHA} (last status: ${STATUS}, conclusion: ${CONCLUSION})."
+                echo "::error::Timed out waiting for ${WORKFLOW_FILE} (push on main) on ${TARGET_SHA} (last status: ${STATUS}, conclusion: ${CONCLUSION})."
                 exit 1
               fi
               sleep 10
@@ -285,6 +287,28 @@ jobs:
             fi
           fi
 
+          # Recheck version floor against published releases/tags before modifying --latest
+          PUBLISHED_TAGS="$({
+            jq -r '.[] | select(.draft == false) | .tag_name // empty' "$TMP_DIR/releases.json"
+            jq -r '.[] | sub("^refs/tags/"; "")' "$TMP_DIR/tags.json"
+          } | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV || true)"
+          LATEST_PUBLISHED=""
+          if [ -n "$PUBLISHED_TAGS" ]; then
+            LATEST_PUBLISHED="$(printf '%s\n' "$PUBLISHED_TAGS" | tail -n 1)"
+          fi
+          if [ -n "$LATEST_PUBLISHED" ] && [ "$LATEST_PUBLISHED" != "$TAG" ]; then
+            if ! RELEASE_VERSION="$RELEASE_VERSION" LATEST_TAG="$LATEST_PUBLISHED" node -e '
+              const parse = (v) => v.replace(/^v/, "").split(".").map((n) => Number.parseInt(n, 10));
+              const [na, nb, nc] = parse(process.env.RELEASE_VERSION);
+              const [la, lb, lc] = parse(process.env.LATEST_TAG);
+              const ge = na > la || (na === la && (nb > lb || (nb === lb && nc >= lc)));
+              process.exit(ge ? 0 : 1);
+            '; then
+              echo "::error::A newer version (${LATEST_PUBLISHED}) was published while building ${TAG}; refusing to move --latest backwards."
+              exit 1
+            fi
+          fi
+
           EXISTING_COUNT="$(jq -r --arg tag "$TAG" '[.[] | select(.tag_name == $tag)] | length' "$TMP_DIR/releases.json")"
           if [ "$EXISTING_COUNT" -gt 1 ]; then
             echo "::error::Multiple releases found for ${TAG}."
@@ -299,7 +323,7 @@ jobs:
                 exit 1
               fi
               gh release upload "$TAG" "${ASSETS[@]}" --clobber --repo "$REPO"
-              gh release edit "$TAG" --draft=false --latest --target "$TARGET_SHA" --repo "$REPO"
+              gh release edit "$TAG" --draft=false --prerelease=false --latest --target "$TARGET_SHA" --repo "$REPO"
               exit 0
             fi
             echo "::error::Release ${TAG} already exists; refusing to overwrite published release."

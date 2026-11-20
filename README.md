@@ -164,18 +164,18 @@ Picture-in-Picture, live stats, and fullscreen controls.
 1. Add a comma after `ratelimits`, uncomment `routes` in `wrangler.jsonc`, replace the
    `<tld>` placeholder with your custom domain, and configure `CLOUDFLARE_API_TOKEN` and
    `CLOUDFLARE_ACCOUNT_ID` in GitHub Actions repository secrets.
-2. Push to `main`.
-   - **Frontend & Worker:** `.github/workflows/deploy.yml` verifies that both `CI` and
-     `CodeQL` succeeded for the `main` commit and deploys with `cloudflare/wrangler-action`.
-     Existing desktop app installs pick up web/UI updates immediately because they load
-     the hosted site.
-   - **Desktop app (Windows):** `.github/workflows/release-electron.yml` runs on
-     `vMAJOR.MINOR.PATCH` tag pushes (or `workflow_dispatch`), verifies `CI` and `CodeQL`
-     passed for that commit, builds the Windows installer with all 6 `@electron/fuses` burned,
-     runs both unpackaged (`electron:smoke`) and packaged fuse/ASAR (`electron:smoke:packaged`)
-     checks, attaches SLSA build provenance via `actions/attest-build-provenance`, and publishes
-     the GitHub Release (`latest.yml`, `.blockmap`, and `SHA256SUMS.txt`).
+2. Push to `main` to deploy the web frontend and Worker.
+   - `.github/workflows/deploy.yml` verifies that both `CI` and `CodeQL` succeeded for the
+     `main` commit and deploys with `cloudflare/wrangler-action`. Existing desktop app installs
+     pick up web/UI updates immediately because they load the hosted site.
    - `npm run deploy` builds and deploys the Worker locally without running any checks.
+3. Release the Windows desktop app by pushing a `vMAJOR.MINOR.PATCH` tag on the target `main`
+   commit (or manually dispatching `.github/workflows/release-electron.yml` for that commit).
+   - The workflow verifies `CI` and `CodeQL` passed on `main` for that commit, builds the
+     Windows installer with all 6 `@electron/fuses` burned, runs both unpackaged
+     (`electron:smoke`) and packaged fuse/ASAR (`electron:smoke:packaged`) checks, attaches
+     SLSA build provenance via `actions/attest-build-provenance`, and publishes the GitHub
+     Release (`latest.yml`, `.blockmap`, and `SHA256SUMS.txt`).
 
 ## Development
 

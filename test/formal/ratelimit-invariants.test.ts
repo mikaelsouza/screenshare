@@ -55,8 +55,8 @@ describe("Property-Based Invariants: Rate Limiting (Feature 38)", () => {
             }
             expect(limiter.check(key, time)).toBe(false);
 
-            // Advance time past the window
-            time += windowMs + 1;
+            // Advance time to exact resetAt boundary (now === resetAt)
+            time += windowMs;
 
             // Invariant: Next request must be allowed and start a fresh window
             expect(limiter.check(key, time)).toBe(true);

@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   check-and-test:
-    name: Check, Lint & Test (Unit, Worker, Model Invariants, Fuzz)
+    name: Check, Lint & Test (Unit, Worker, Formal, Fuzz)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

@@ -2074,12 +2074,18 @@ describe("adversarial persistent-transceiver & race probes", () => {
     expect(createCalls).toBe(0);
     pc.signalingState = "stable";
 
-    // 2. Remote offer lands mid-createOffer -> local offer aborted, answer sent, then local offer retried
+    // 2. Remote offer lands mid-createOffer -> local offer aborted before setLocalDescription, answer sent, then fresh local offer retried
     let resolveCreate!: (d: RTCSessionDescriptionInit) => void;
     const createGate = new Promise<RTCSessionDescriptionInit>((r) => { resolveCreate = r; });
     pc.createOffer = () => {
       createCalls++;
       return createCalls === 1 ? createGate : origCreate();
+    };
+    const origSetLocal = pc.setLocalDescription.bind(pc);
+    const appliedLocalSdps: string[] = [];
+    pc.setLocalDescription = async (desc?: RTCSessionDescriptionInit) => {
+      if (desc?.sdp) appliedLocalSdps.push(desc.sdp);
+      return desc ? origSetLocal(desc) : Promise.resolve();
     };
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
@@ -2089,6 +2095,7 @@ describe("adversarial persistent-transceiver & race probes", () => {
       resolveCreate({ type: "offer", sdp: "v=0\r\nm=stale 9\r\n" });
       await raceOffer;
       await new Promise((r) => setTimeout(r, 15));
+      expect(appliedLocalSdps.every((sdp) => !sdp.includes("m=stale"))).toBe(true);
       expect(sent.some((m) => m.k === "answer")).toBe(true);
       expect(sent.some((m) => m.k === "offer")).toBe(true);
       expect(errSpy).not.toHaveBeenCalled();
@@ -2096,13 +2103,15 @@ describe("adversarial persistent-transceiver & race probes", () => {
       // Acknowledge the outgoing offer so FakeRTCPeerConnection returns to stable
       await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
 
-      // 3. Reject setLocalDescription after signalingState changes -> handled as superseded retry, not console.error
+      // 3. Reject setLocalDescription after signalingState transiently flips, then return to stable WITHOUT
+      // delivering a colliding remote offer -> fresh offer MUST originate solely from catch-recorded retryOffer()
       sent.length = 0;
-      const origSetLocal = pc.setLocalDescription.bind(pc);
       let failOnce = true;
       pc.setLocalDescription = async (desc?: RTCSessionDescriptionInit) => {
         if (failOnce && desc?.type === "offer") {
           failOnce = false;
+          // Simulate browser flipping signalingState while rejecting stale setLocalDescription,
+          // then restoring stable once remote answer settles (no colliding remote offer).
           pc.signalingState = "have-remote-offer";
           throw new DOMException("m-line order mismatch", "InvalidAccessError");
         }
@@ -2112,7 +2121,11 @@ describe("adversarial persistent-transceiver & race probes", () => {
       await new Promise((r) => setTimeout(r, 10));
       expect(errSpy).not.toHaveBeenCalled();
       expect(failOnce).toBe(false);
-      await mesh.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+      expect(sent.some((m) => m.k === "offer")).toBe(false);
+      // Delivering an answer (never sets offerPending) brings signalingState back to stable and flushes
+      // the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
+      pc.signalingState = "stable";
+      await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
       await new Promise((r) => setTimeout(r, 15));
       expect(sent.some((m) => m.k === "offer")).toBe(true);
     } finally {
