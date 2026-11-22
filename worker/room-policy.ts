@@ -296,7 +296,11 @@ export function evaluateUpgradeOrigin(
     url.protocol === "ws:" ? `http://${url.host}` :
     url.origin;
   try {
-    if (new URL(originHeader).origin !== expectedOrigin) {
+    const parsedOrigin = new URL(originHeader);
+    if (
+      (parsedOrigin.protocol !== "https:" && parsedOrigin.protocol !== "http:") ||
+      parsedOrigin.origin !== expectedOrigin
+    ) {
       return { allowed: false, code: "forbidden-origin", message: "Connections from this origin are not allowed" };
     }
     return { allowed: true };

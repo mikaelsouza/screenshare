@@ -1166,6 +1166,18 @@ describe("negotiation recovery", () => {
       await Promise.resolve();
       expect(mesh.isPeerViewing("bob")).toBe(false);
       expect(bobSetParamsSpy).toHaveBeenCalledTimes(callsAtLimit + 1);
+
+      // Exhaust bob's new window, then simulate a backward wall-clock jump: window resets cleanly
+      for (let i = 0; i < 25; i++) {
+        bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      }
+      bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      expect(mesh.isPeerViewing("bob")).toBe(false);
+
+      vi.setSystemTime(Date.now() - 5_000);
+      bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      await Promise.resolve();
+      expect(mesh.isPeerViewing("bob")).toBe(true);
     } finally {
       vi.useRealTimers();
     }

@@ -56,6 +56,8 @@ describe("electron/security", () => {
         "ht\ttps://example.com",
         "https://example.com/\r\nX-Injected: 1",
         "https://example.com/\0null",
+        " https://example.com",
+        "https://example.com ",
       ];
       for (const url of blocked) {
         expect({ url, allowed: isAllowedExternalUrl(url) }).toEqual({ url, allowed: false });

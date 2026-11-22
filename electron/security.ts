@@ -31,7 +31,7 @@ function hasControlChar(value: string): boolean {
  * control characters.
  */
 export function isAllowedExternalUrl(url: string | undefined): boolean {
-  if (!url || hasControlChar(url)) return false;
+  if (!url || url !== url.trim() || hasControlChar(url)) return false;
   try {
     const parsed = new URL(url);
     return ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol);

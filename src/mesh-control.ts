@@ -37,7 +37,7 @@ export class ControlRateLimiter {
   private messageCount = 0;
 
   allow(now: number = Date.now()): boolean {
-    if (now - this.windowStart >= CONTROL_RATE_LIMIT_WINDOW_MS) {
+    if (now < this.windowStart || now - this.windowStart >= CONTROL_RATE_LIMIT_WINDOW_MS) {
       this.windowStart = now;
       this.messageCount = 0;
     }

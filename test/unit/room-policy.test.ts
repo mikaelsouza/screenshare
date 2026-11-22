@@ -346,6 +346,15 @@ describe("worker/room-policy", () => {
       allowed: false,
       code: "forbidden-origin",
     });
+    expect(
+      evaluateUpgradeOrigin(
+        new URL("https://example.com/ws/ABCD2345"),
+        "blob:https://example.com/550e8400-e29b-41d4-a716-446655440000",
+      ),
+    ).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
 
     // Local HTTP dev/test allows missing or matching Origin, rejects cross-origin
     expect(evaluateUpgradeOrigin(new URL("http://localhost:8787/ws/ABCD2345"), null)).toEqual({ allowed: true });
