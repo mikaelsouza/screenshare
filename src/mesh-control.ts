@@ -56,13 +56,15 @@ export function parseControlMessage(data: unknown): ControlMessage | null {
 export class ControlRateLimiter {
   private windowStart = 0;
   private messageCount = 0;
-  private deferredRaw: string | null = null;
+  private deferredParseCount = 0;
+  private deferredMsg: ControlMessage | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
 
   allow(now: number = Date.now()): boolean {
     if (now < this.windowStart || now - this.windowStart >= CONTROL_RATE_LIMIT_WINDOW_MS) {
       this.windowStart = now;
       this.messageCount = 0;
+      this.deferredParseCount = 0;
     }
     if (this.messageCount >= CONTROL_RATE_LIMIT_MAX) return false;
     this.messageCount++;
@@ -75,19 +77,25 @@ export class ControlRateLimiter {
   }
 
   /**
-   * Process an inbound control payload within the rate limit. Excess messages
-   * are coalesced in O(1) space without parsing until the window resets, so the
-   * final valid state (e.g. `want: true` after a burst of `want: false`) is not lost.
+   * Process an inbound control payload within the rate limit. Excess valid
+   * messages are coalesced (with a bounded parse cap per window) until the
+   * window resets, so the final valid state is preserved and never clobbered
+   * by subsequent invalid payloads.
    */
   handle(data: unknown, apply: (msg: ControlMessage) => void): void {
     if (this.allow()) {
-      this.clearDeferred();
       const msg = parseControlMessage(data);
-      if (msg) apply(msg);
+      if (msg) {
+        this.clearDeferred();
+        apply(msg);
+      }
       return;
     }
-    if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return;
-    this.deferredRaw = data;
+    if (this.deferredParseCount >= CONTROL_RATE_LIMIT_MAX) return;
+    this.deferredParseCount++;
+    const msg = parseControlMessage(data);
+    if (!msg) return;
+    this.deferredMsg = msg;
     this.scheduleFlush(apply);
   }
 
@@ -96,20 +104,19 @@ export class ControlRateLimiter {
     const delay = Math.max(1, this.msUntilReset());
     this.timer = setTimeout(() => {
       this.timer = null;
-      const raw = this.deferredRaw;
-      if (raw === null) return;
+      const msg = this.deferredMsg;
+      if (msg === null) return;
       if (!this.allow()) {
         this.scheduleFlush(apply);
         return;
       }
-      this.deferredRaw = null;
-      const msg = parseControlMessage(raw);
-      if (msg) apply(msg);
+      this.deferredMsg = null;
+      apply(msg);
     }, delay);
   }
 
   private clearDeferred(): void {
-    this.deferredRaw = null;
+    this.deferredMsg = null;
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;

@@ -75,7 +75,7 @@ class PeerLink {
     selfId: PeerId, peerId: PeerId, opts: MeshOptions,
     send: (data: SignalData) => void, cb: MeshCallbacks,
     /** Whether this side opens the control channel; see Mesh.addPeer. */
-    createsControl: boolean = selfId >= peerId,
+    createsControl: boolean,
   ) {
     this.selfId = selfId;
     this.peerId = peerId;
@@ -133,7 +133,7 @@ class PeerLink {
     offer.sdp = mungeSdp(offer.sdp ?? "");
     await this.pc.setLocalDescription(offer);
     if (this.isClosed()) return;
-    if (wasSending && this.isStale(gen)) { await this.rollbackLocalOffer(); return; }
+    if (wasSending && this.isStale(gen)) { this.offerPending = true; await this.rollbackLocalOffer(); return; }
     const sdp = this.pc.localDescription?.sdp;
     if (sdp) this.send({ k: "offer", sdp });
   }
@@ -146,7 +146,8 @@ class PeerLink {
     try {
       this.makingOffer = true;
       const offer = await this.pc.createOffer();
-      if (this.isClosed() || (wasSending && this.isStale(gen))) return;
+      if (this.isClosed()) return;
+      if (wasSending && this.isStale(gen)) { this.offerPending = true; return; }
       if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") return this.retryOffer();
       await this.commitLocalOffer(offer, wasSending, gen);
     } catch (err) {
@@ -174,6 +175,7 @@ class PeerLink {
 
   async handleSignal(data: SignalData): Promise<void> {
     if (data.k === "ice") return this.addIce(data.candidate);
+    if (data.k === "answer" && this.pc.signalingState !== "have-local-offer") return;
     return this.applyDescription(data.k, data.sdp);
   }
 
@@ -402,7 +404,6 @@ class PeerLink {
   detachCapture(): Promise<void> {
     this.captureGeneration++;
     this.isSending = false;
-    this.offerPending = false;
     return Promise.race([
       this.enqueueMedia(() => this.runDetachCapture()),
       this.closedPromise,
@@ -415,9 +416,12 @@ class PeerLink {
       .filter((tx): tx is RTCRtpTransceiver => tx !== null)
       .map((tx) => tx.sender.replaceTrack(null).catch(() => {}));
     await Promise.race([Promise.allSettled(ops), this.closedPromise]);
-    if (!this.makingOffer && this.pc.signalingState === "have-local-offer") {
-      await this.rollbackLocalOffer();
-    }
+  }
+
+  async rollbackRejectedOffer(): Promise<void> {
+    if (this.isClosed() || this.isSending || this.makingOffer || this.pc.signalingState !== "have-local-offer") return;
+    this.offerPending = true;
+    await this.rollbackLocalOffer();
   }
 
   /**
@@ -693,6 +697,10 @@ export class Mesh {
     if (!link) return false;
     const state = link.connectionState;
     return state === "connected" || state === "connecting";
+  }
+
+  rollbackRejectedOffers(): Promise<void> {
+    return Promise.all([...this.links.values()].map((l) => l.rollbackRejectedOffer())).then(() => {});
   }
 
   close(): void {

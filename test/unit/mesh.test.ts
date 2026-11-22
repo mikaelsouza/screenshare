@@ -50,6 +50,7 @@ class FakeRTCPeerConnection {
   senders: RTCRtpSender[] = [];
   transceivers: RTCRtpTransceiver[] = [];
   dataChannels: FakeDataChannel[] = [];
+  dataChannelInits: Array<RTCDataChannelInit | undefined> = [];
   addedCandidates: RTCIceCandidateInit[] = [];
   closed = false;
 
@@ -59,9 +60,10 @@ class FakeRTCPeerConnection {
     FakeRTCPeerConnection.instances.push(this);
   }
 
-  createDataChannel(label: string): FakeDataChannel {
+  createDataChannel(label: string, init?: RTCDataChannelInit): FakeDataChannel {
     const ch = new FakeDataChannel(label);
     this.dataChannels.push(ch);
+    this.dataChannelInits.push(init);
     return ch;
   }
 
@@ -2369,9 +2371,9 @@ describe("adversarial persistent-transceiver & race probes", () => {
       expect(errSpy).not.toHaveBeenCalled();
       expect(failOnce).toBe(false);
       expect(sent.some((m) => m.k === "offer")).toBe(false);
-      // Delivering an answer (never sets offerPending) brings signalingState back to stable and flushes
-      // the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
-      pc.signalingState = "stable";
+      // Delivering an answer (never sets offerPending) brings signalingState from have-local-offer back
+      // to stable and flushes the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
+      pc.signalingState = "have-local-offer";
       await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
       await new Promise((r) => setTimeout(r, 15));
       expect(sent.some((m) => m.k === "offer")).toBe(true);
@@ -2403,11 +2405,12 @@ describe("adversarial persistent-transceiver & race probes", () => {
       await vi.advanceTimersByTimeAsync(1_050);
       expect(mesh.isPeerViewing("alice")).toBe(true);
 
-      // Oversized payload during rate limit is ignored and does not clobber a valid coalesced state
+      // Oversized or short invalid payloads during rate limit do not clobber a valid coalesced state
       for (let i = 0; i < 20; i++) {
         ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
       }
       ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      ch.onmessage?.({ data: "{}" });
       ch.onmessage?.({ data: "x".repeat(300) });
       await vi.advanceTimersByTimeAsync(1_050);
       expect(mesh.isPeerViewing("alice")).toBe(true);
@@ -2454,14 +2457,16 @@ describe("adversarial persistent-transceiver & race probes", () => {
     expect(sent.some((m) => m.k === "offer")).toBe(false);
     expect(pc.signalingState).toBe("stable");
 
-    // 2. Restart sharing, then stop capture mid-setLocalDescription -> rolls back to stable, no offer sent
+    // 2. Restart sharing WITHOUT manual onnegotiationneeded -> preserved offerPending renegotiates automatically
     pc.createOffer = origCreate;
     pc.setLocalDescription = origSetLocal;
     await mesh.setCapture(makeCapture(false));
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 15));
+    expect(sent.some((m) => m.k === "offer")).toBe(true);
     await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
     sent.length = 0;
 
+    // 3. Stop capture mid-setLocalDescription -> rolls back to stable, no offer sent, preserves offerPending
     let resolveSetLocal!: () => void;
     const setLocalTypes: string[] = [];
     pc.setLocalDescription = async (desc: RTCSessionDescriptionInit) => {
@@ -2485,17 +2490,186 @@ describe("adversarial persistent-transceiver & race probes", () => {
     expect(setLocalTypes).toContain("rollback");
     expect(pc.signalingState).toBe("stable");
 
-    // 3. Subsequent share restart negotiates cleanly because signalingState returned to stable
+    // 4. Subsequent share restart negotiates automatically (without manual onnegotiationneeded)
     pc.setLocalDescription = origSetLocal;
     await mesh.setCapture(makeCapture(false));
-    pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 15));
     expect(sent.some((m) => m.k === "offer")).toBe(true);
     expect(pc.signalingState).toBe("have-local-offer");
 
-    // 4. Stopping capture while an already-sent offer is still un-answered rolls back to stable
+    // 5. Stopping capture while an already-sent offer (e.g. ICE restart) is in-flight preserves have-local-offer
+    // so a delayed answer still succeeds cleanly
     await mesh.setCapture(null);
+    expect(pc.signalingState).toBe("have-local-offer");
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
     expect(pc.signalingState).toBe("stable");
+
+    // 6. Out-of-state answer when stable is ignored without calling setRemoteDescription
+    const remoteDescSpy = vi.spyOn(pc, "setRemoteDescription");
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+    expect(remoteDescSpy).not.toHaveBeenCalled();
+    remoteDescSpy.mockRestore();
+
+    // 7. Server-rejected offer (not-sharing) rolls back via rollbackRejectedOffers() and renegotiates on next share
+    sent.length = 0;
+    await mesh.setCapture(makeCapture(false));
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 15));
+    expect(pc.signalingState).toBe("have-local-offer");
+    await mesh.setCapture(null);
+    await mesh.rollbackRejectedOffers();
+    expect(pc.signalingState).toBe("stable");
+
+    sent.length = 0;
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 15));
+    expect(sent.some((m) => m.k === "offer")).toBe(true);
+  });
+
+  it("enforces rollbackRejectedOffers guards, logs rollback errors only when open, and flushes queued view on open control channel", async () => {
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("zoe", { ...opts }, (_to, data) => sent.push(data), cb());
+    mesh.addMember("alice", true);
+    await mesh.setCapture(makeCapture(false));
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 15));
+
+    // 1. rollbackRejectedOffers() is a no-op while still actively sending
+    expect(pc.signalingState).toBe("have-local-offer");
+    const setLocalSpy = vi.spyOn(pc, "setLocalDescription");
+    await mesh.rollbackRejectedOffers();
+    expect(setLocalSpy).not.toHaveBeenCalled();
+    expect(pc.signalingState).toBe("have-local-offer");
+
+    // 2. rollbackRejectedOffers() is a no-op when signalingState is stable
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+    await mesh.setCapture(null);
+    setLocalSpy.mockClear();
+    await mesh.rollbackRejectedOffers();
+    expect(setLocalSpy).not.toHaveBeenCalled();
+
+    // 3. rollbackLocalOffer() logs warning when rollback rejects on open link, and stays silent when closed
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      pc.signalingState = "have-local-offer";
+      setLocalSpy.mockRejectedValueOnce(new Error("rollback boom"));
+      await mesh.rollbackRejectedOffers();
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("[mesh] rollback failed for alice"), expect.any(Error));
+
+      warnSpy.mockClear();
+      setLocalSpy.mockImplementationOnce(async () => {
+        pc.signalingState = "closed";
+        throw new Error("closed rollback");
+      });
+      await mesh.rollbackRejectedOffers();
+      expect(warnSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      setLocalSpy.mockRestore();
+    }
+
+    // 4. bindControl flushes pre-queued desiredView immediately on already-open incoming channel,
+    // and defers on connecting channel until onopen (sending nothing when desiredView is null)
+    const mesh2 = new Mesh("alice", { ...opts }, () => {}, cb());
+    mesh2.addMember("zoe", true);
+    await mesh2.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    const pc2 = FakeRTCPeerConnection.instances[1]!;
+
+    const connectingCh = new FakeDataChannel("control");
+    connectingCh.readyState = "connecting";
+    pc2.ondatachannel?.({ channel: connectingCh });
+    expect(connectingCh.sent).toHaveLength(0);
+    connectingCh.readyState = "open";
+    connectingCh.onopen?.();
+    expect(connectingCh.sent).toHaveLength(0);
+
+    mesh2.setViewing("zoe", false);
+    const alreadyOpenCh = new FakeDataChannel("control");
+    alreadyOpenCh.readyState = "open";
+    pc2.ondatachannel?.({ channel: alreadyOpenCh });
+    expect(alreadyOpenCh.sent).toEqual([JSON.stringify({ c: "view", want: false })]);
+
+    // 5. Verify RTCPeerConnection config, ordered DataChannel init, ICE candidate forwarding/null guard,
+    // non-failed connectionState guard, self/unknown member guards, and fallback MediaStream wrapping
+    expect(pc.config).toEqual({
+      iceServers: opts.iceServers,
+      bundlePolicy: "max-bundle",
+      rtcpMuxPolicy: "require",
+    });
+    expect(pc.dataChannelInits[0]).toEqual({ ordered: true });
+
+    sent.length = 0;
+    pc.onicecandidate?.({ candidate: null });
+    expect(sent).toHaveLength(0);
+    pc.onicecandidate?.({
+      candidate: {
+        candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 54400 typ host",
+        sdpMid: "0",
+        sdpMLineIndex: 0,
+        usernameFragment: "ufrag1",
+      } as RTCIceCandidate,
+    });
+    expect(sent).toEqual([
+      {
+        k: "ice",
+        candidate: {
+          candidate: "candidate:1 1 UDP 2122260223 192.0.2.1 54400 typ host",
+          sdpMid: "0",
+          sdpMLineIndex: 0,
+          usernameFragment: "ufrag1",
+        },
+      },
+    ]);
+
+    const mesh3 = new Mesh("zoe", { ...opts }, () => {}, cb());
+    mesh3.addMember("zoe", true);
+    expect(mesh3.memberIds()).not.toContain("zoe");
+    mesh3.addMember("bob", false);
+    await mesh3.setCapture(makeCapture(false));
+    const pc3 = FakeRTCPeerConnection.instances[2]!;
+    pc3.connectionState = "connected";
+    pc3.onconnectionstatechange?.();
+    expect(pc3.restartIceCalls).toBe(0);
+    await mesh3.handleSignal("unknown", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    expect(mesh3.peers()).not.toContain("unknown");
+
+    // Fallback MediaStream wrapping when RTCTrackEvent.streams is empty
+    const receivedStreams: MediaStream[] = [];
+    const origMediaStream = globalThis.MediaStream;
+    globalThis.MediaStream = class FakeMediaStream {
+      private readonly tracks: MediaStreamTrack[];
+      constructor(tracks: MediaStreamTrack[] = []) { this.tracks = tracks; }
+      getTracks(): MediaStreamTrack[] { return this.tracks; }
+    } as unknown as typeof MediaStream;
+    try {
+      const mesh4 = new Mesh(
+        "alice",
+        { ...opts },
+        () => {},
+        {
+          onRemoteStream: (_id, stream) => receivedStreams.push(stream),
+          onRemoteStreamGone: () => {},
+          onConnectionState: () => {},
+        },
+      );
+      mesh4.addMember("zoe", true);
+      await mesh4.handleSignal("zoe", { k: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+      const pc4 = FakeRTCPeerConnection.instances[3]!;
+      const fallbackTrack = { kind: "video", addEventListener: vi.fn() } as unknown as MediaStreamTrack;
+      pc4.ontrack?.({
+        track: fallbackTrack,
+        streams: [],
+        receiver: {} as RTCRtpReceiver,
+      } as unknown as RTCTrackEvent);
+      expect(receivedStreams).toHaveLength(1);
+      expect(receivedStreams[0]!.getTracks()).toEqual([fallbackTrack]);
+      // Keep open link when remote member stays sharing and local capture is null
+      mesh4.setMemberSharing("zoe", true);
+      expect(mesh4.peers()).toContain("zoe");
+    } finally {
+      globalThis.MediaStream = origMediaStream;
+    }
   });
 });
 

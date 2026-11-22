@@ -46,12 +46,16 @@ export function selectChangedMutateFiles(
   const eligible = new Set(eligibleFiles.map(toPosix));
   const selected = new Set<string>();
   for (const file of changedFiles) {
-    const normalized = toPosix(file.trim());
-    if (normalized && eligible.has(normalized)) {
+    const normalized = toPosix(file);
+    if (normalized.length > 0 && eligible.has(normalized)) {
       selected.add(normalized);
     }
   }
   return [...selected].sort();
+}
+
+export function parseNullDelimitedPaths(output: string): string[] {
+  return output.split("\0").filter((entry) => entry.length > 0);
 }
 
 function resolveBaseRef(): string {
@@ -61,19 +65,19 @@ function resolveBaseRef(): string {
 }
 
 function getChangedFiles(baseRef: string, cwd: string = process.cwd()): string[] {
-  const threeDot = spawnSync("git", ["diff", "--name-only", "--diff-filter=ACMR", `${baseRef}...HEAD`], {
+  const threeDot = spawnSync("git", ["diff", "--name-only", "-z", "--diff-filter=ACMR", `${baseRef}...HEAD`], {
     cwd,
     encoding: "utf8",
   });
   if (threeDot.status === 0) {
-    return threeDot.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    return parseNullDelimitedPaths(threeDot.stdout);
   }
-  const twoDot = spawnSync("git", ["diff", "--name-only", "--diff-filter=ACMR", baseRef, "HEAD"], {
+  const twoDot = spawnSync("git", ["diff", "--name-only", "-z", "--diff-filter=ACMR", baseRef, "HEAD"], {
     cwd,
     encoding: "utf8",
   });
   if (twoDot.status === 0) {
-    return twoDot.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    return parseNullDelimitedPaths(twoDot.stdout);
   }
   const errMsg = (threeDot.stderr || twoDot.stderr || "").trim();
   throw new Error(`git diff against '${baseRef}' failed: ${errMsg}`);
