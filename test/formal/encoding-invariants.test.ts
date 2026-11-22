@@ -123,6 +123,79 @@ describe("Exhaustive & Property-Based Invariants: Video Encoding & Quality", () 
     }
   });
 
+  it("exhaustively verifies the 3-step Clarity fallback chain preserves ceilings, active state, and fresh transaction IDs", async () => {
+    const presets = Object.values(QUALITY_PRESETS);
+    const activeStates: Array<boolean | undefined> = [undefined, false, true];
+    const rejectionProfiles = [
+      {
+        reject: new Set<string>(),
+        expectedOrder: ["maintain-framerate-and-resolution"],
+        expectedFinal: "maintain-framerate-and-resolution",
+      },
+      {
+        reject: new Set(["maintain-framerate-and-resolution"]),
+        expectedOrder: ["maintain-framerate-and-resolution", "maintain-resolution"],
+        expectedFinal: "maintain-resolution",
+      },
+      {
+        reject: new Set(["maintain-framerate-and-resolution", "maintain-resolution"]),
+        expectedOrder: [
+          "maintain-framerate-and-resolution",
+          "maintain-resolution",
+          "maintain-framerate",
+        ],
+        expectedFinal: "maintain-framerate",
+      },
+    ] as const;
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      for (const preset of presets) {
+        for (const initialActive of activeStates) {
+          for (const profile of rejectionProfiles) {
+            let state: Record<string, unknown> = {
+              encodings: [initialActive === undefined ? { rid: "f" } : { active: initialActive, rid: "f" }],
+            };
+            let nextTx = 1;
+            let activeTx: number | null = null;
+            const attempted: unknown[] = [];
+
+            const sender = {
+              getParameters: () => {
+                activeTx = nextTx++;
+                return { ...structuredClone(state), transactionId: String(activeTx) };
+              },
+              setParameters: async (next: Record<string, unknown>) => {
+                const expectedTx = activeTx !== null ? String(activeTx) : null;
+                activeTx = null;
+                if (expectedTx === null || next["transactionId"] !== expectedTx) {
+                  throw new DOMException("stale transactionId", "InvalidStateError");
+                }
+                const pref = next["degradationPreference"];
+                attempted.push(pref);
+                if (typeof pref === "string" && profile.reject.has(pref)) {
+                  throw new TypeError(`unsupported degradationPreference: ${pref}`);
+                }
+                state = structuredClone(next);
+              },
+            } as unknown as RTCRtpSender;
+
+            await applyVideoEncoding(sender, preset, "clarity");
+            const enc = (state["encodings"] as Array<Record<string, unknown>>)[0]!;
+            expect(attempted).toEqual(profile.expectedOrder);
+            expect(state["degradationPreference"]).toBe(profile.expectedFinal);
+            expect(enc["maxBitrate"]).toBe(preset.maxBitrate);
+            expect(enc["maxFramerate"]).toBe(preset.frameRate);
+            expect(enc["scaleResolutionDownBy"]).toBe(1);
+            expect(enc["active"]).toBe(initialActive);
+          }
+        }
+      }
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it("exhaustively verifies applyAudioEncoding idempotence and 256 kbps ceiling across all initial sender states", async () => {
     const activeStates: Array<boolean | undefined> = [undefined, false, true];
     const shapes = ["populated", "empty", "missing"] as const;

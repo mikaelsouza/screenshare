@@ -1,12 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignalData } from "@shared/protocol";
 import type { CaptureResult } from "@src/capture";
+import { InviteController } from "@src/controllers/invite-controller";
+import { SessionController } from "@src/controllers/session-controller";
+import { TileController } from "@src/controllers/tile-controller";
 import {
   Mesh,
   type MeshCallbacks,
   type MeshOptions,
   parseControlMessage,
 } from "@src/mesh";
+import { createElectronCaptureController } from "@src/platform/electron";
+import type { UiElements } from "@src/views/dom";
+import type { HealthPoller } from "@src/views/health-view";
+import { ShareLifecycle } from "@src/views/share-view";
+import type { TileView } from "@src/views/tile-view";
 
 class FakeDataChannel {
   readyState = "open";
@@ -1115,10 +1123,237 @@ describe("negotiation recovery", () => {
     }
   });
 
-  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
-  it.todo("rate-limits inbound DataChannel view control messages per peer to drop high-frequency floods");
-  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
-  it.todo("tears down active loopback audio capture deterministically if leaveRoom races an in-flight startShare");
+  it("rate-limits inbound DataChannel view control messages per peer to drop high-frequency floods", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const mesh = new Mesh("me", opts, () => {}, cb());
+      mesh.addMember("bob", false);
+      mesh.addMember("carol", false);
+      await mesh.setCapture(capture());
+
+      const bobPc = FakeRTCPeerConnection.instances[0]!;
+      const carolPc = FakeRTCPeerConnection.instances[1]!;
+      const bobCh = bobPc.dataChannels[0]!;
+      const carolCh = carolPc.dataChannels[0]!;
+      const bobSetParamsSpy = vi.spyOn(bobPc.senders[0]!, "setParameters");
+
+      // Send 20 alternating messages (budget = 20 per 1000ms window): last is i=19 -> want=true
+      for (let i = 0; i < 20; i++) {
+        bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: i % 2 === 1 }) });
+      }
+      await Promise.resolve();
+      expect(mesh.isPeerViewing("bob")).toBe(true);
+      const callsAtLimit = bobSetParamsSpy.mock.calls.length;
+      expect(callsAtLimit).toBeGreaterThan(0);
+
+      // Flood 50 more messages within the same window: all dropped, state & setParameters unchanged
+      for (let i = 0; i < 50; i++) {
+        bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      }
+      await Promise.resolve();
+      expect(mesh.isPeerViewing("bob")).toBe(true);
+      expect(bobSetParamsSpy).toHaveBeenCalledTimes(callsAtLimit);
+
+      // Rate limit is per-peer: carol is unaffected by bob's flood
+      carolCh.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      await Promise.resolve();
+      expect(mesh.isPeerViewing("carol")).toBe(false);
+
+      // Once the 1s window elapses, bob's budget resets and view toggles work again
+      vi.advanceTimersByTime(1_000);
+      bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      await Promise.resolve();
+      expect(mesh.isPeerViewing("bob")).toBe(false);
+      expect(bobSetParamsSpy).toHaveBeenCalledTimes(callsAtLimit + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tears down active loopback audio capture deterministically if leaveRoom races an in-flight startShare", async () => {
+    vi.stubGlobal("navigator", {
+      mediaDevices: { getDisplayMedia: vi.fn() },
+    });
+    vi.stubGlobal("isSecureContext", true);
+    const makeNode = () => ({ setAttribute: vi.fn(), append: vi.fn(), textContent: "" });
+    vi.stubGlobal("document", {
+      createElement: () => makeNode(),
+      createElementNS: () => makeNode(),
+      createTextNode: (t: string) => ({ textContent: t }),
+    });
+
+    const makeShareHarness = (optsArg: {
+      startWindowAudio: () => Promise<boolean>;
+      stopAudio: () => void;
+      videoStop: () => void;
+      pcmAudioStop: () => void;
+      hangSetParameters?: boolean;
+    }) => {
+      const session = new SessionController({
+        getLocalStorage: () => null,
+        getSessionStorage: () => null,
+        getLocks: () => null,
+        runBackground: vi.fn(),
+        onForgetHostUiChange: vi.fn(),
+      });
+      let activeMesh: Mesh | null = new Mesh("me", opts, () => {}, cb());
+      activeMesh.addMember("bob", false);
+
+      let restoreAddTx: (() => void) | null = null;
+      if (optsArg.hangSetParameters) {
+        const spy = vi
+          .spyOn(FakeRTCPeerConnection.prototype, "addTransceiver")
+          .mockImplementation(function (
+            this: FakeRTCPeerConnection,
+            trackOrKind: MediaStreamTrack | string,
+          ): RTCRtpTransceiver {
+            const sender = this.addTrack(typeof trackOrKind === "string" ? null : trackOrKind);
+            const tx = this.transceivers.find((t) => t.sender === sender)!;
+            tx.sender.setParameters = () => new Promise<void>(() => {});
+            return tx;
+          });
+        restoreAddTx = () => spy.mockRestore();
+      }
+
+      const videoTrack = {
+        kind: "video",
+        readyState: "live",
+        stop: optsArg.videoStop,
+        addEventListener: vi.fn(),
+      } as unknown as MediaStreamTrack;
+      const pcmAudioTrack = {
+        kind: "audio",
+        readyState: "live",
+        enabled: true,
+        stop: () => {
+          optsArg.pcmAudioStop();
+          optsArg.stopAudio();
+        },
+        addEventListener: vi.fn(),
+      } as unknown as MediaStreamTrack;
+
+      const captureController = createElectronCaptureController(
+        {
+          onFollowUpdate: () => () => {},
+          stopFollow: vi.fn(),
+          startWindowAudio: optsArg.startWindowAudio,
+          startSystemAudio: vi.fn().mockResolvedValue(true),
+          stopAudio: optsArg.stopAudio,
+          onAudioPcm: () => () => {},
+        },
+        {
+          onEnded: vi.fn(),
+          onFollowState: vi.fn(),
+          onVideoTrackSwapped: vi.fn().mockResolvedValue(undefined),
+        },
+        {
+          captureScreen: async () => ({
+            stream: { getTracks: () => [videoTrack] } as unknown as MediaStream,
+            video: videoTrack,
+            audio: null,
+            surface: "window",
+          }),
+          captureSource: vi.fn(),
+          makeStream: (tracks) => ({ getTracks: () => tracks }) as unknown as MediaStream,
+          createPcmTrack: () => pcmAudioTrack,
+        },
+      );
+
+      const share = new ShareLifecycle({
+        ui: {
+          muteAudioBtn: { hidden: true, setAttribute: vi.fn(), classList: { toggle: vi.fn() }, replaceChildren: vi.fn() },
+        } as unknown as UiElements,
+        session,
+        invite: new InviteController({ onChange: vi.fn() }),
+        tileCtrl: new TileController(),
+        tileView: { renderSelfPreview: vi.fn() } as unknown as TileView,
+        health: { clearOutbound: vi.fn() } as unknown as HealthPoller,
+        captureController,
+        getClient: () => null,
+        getMesh: () => activeMesh,
+        closeAllPopovers: vi.fn(),
+        setStatus: vi.fn(),
+        syncViewState: vi.fn(),
+        renderRoster: vi.fn(),
+        runBackground: vi.fn(),
+      });
+
+      const simulateLeaveRoom = (): void => {
+        session.joinGeneration++;
+        if (share.isPending && !share.capture) captureController.stop();
+        activeMesh?.close();
+        activeMesh = null;
+      };
+
+      return {
+        share,
+        simulateLeaveRoom,
+        cleanup: () => {
+          restoreAddTx?.();
+        },
+      };
+    };
+
+    try {
+      // Case 1: leaveRoom races while startWindowAudio() is still in flight
+      let resolveAudio!: (ok: boolean) => void;
+      const stopAudio1 = vi.fn();
+      const videoStop1 = vi.fn();
+      const pcmAudioStop1 = vi.fn();
+      const h1 = makeShareHarness({
+        startWindowAudio: () =>
+          new Promise<boolean>((r) => {
+            resolveAudio = r;
+          }),
+        stopAudio: stopAudio1,
+        videoStop: videoStop1,
+        pcmAudioStop: pcmAudioStop1,
+      });
+
+      const start1 = h1.share.start();
+      await Promise.resolve();
+      await Promise.resolve();
+      h1.simulateLeaveRoom();
+      resolveAudio(true);
+      await start1;
+
+      expect(h1.share.capture).toBeNull();
+      expect(videoStop1).toHaveBeenCalled();
+      expect(stopAudio1).toHaveBeenCalled();
+      h1.cleanup();
+
+      // Case 2: leaveRoom races after capture + loopback audio are acquired while mesh.setCapture is hung
+      const stopAudio2 = vi.fn();
+      const videoStop2 = vi.fn();
+      const pcmAudioStop2 = vi.fn();
+      const h2 = makeShareHarness({
+        startWindowAudio: async () => true,
+        stopAudio: stopAudio2,
+        videoStop: videoStop2,
+        pcmAudioStop: pcmAudioStop2,
+        hangSetParameters: true,
+      });
+
+      const start2 = h2.share.start();
+      try {
+        // Let acquireCapture resolve and enter hung mesh.setCapture(cap)
+        await new Promise((r) => setTimeout(r, 0));
+        expect(h2.share.capture).not.toBeNull();
+        h2.simulateLeaveRoom();
+        await start2;
+
+        expect(h2.share.capture).toBeNull();
+        expect(videoStop2).toHaveBeenCalled();
+        expect(pcmAudioStop2).toHaveBeenCalled();
+        expect(stopAudio2).toHaveBeenCalled();
+      } finally {
+        h2.cleanup();
+      }
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("persistent sendonly transceivers", () => {

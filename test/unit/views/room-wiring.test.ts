@@ -71,49 +71,60 @@ function makeWiringHarness(options?: {
   });
 
   const ctx: RoomWiringContext = {
-    ui: {
-      roomInput: { value: code },
-      nameInput: { value: "Tester" },
-      roomNameInput: { value: "Tester" },
-    } as unknown as UiElements,
-    session,
-    recentRooms,
-    invite: new InviteController({ onChange: vi.fn() }),
-    tileCtrl: new TileController(),
-    popovers: new PopoverToastController({ onJoinChipChange: vi.fn() }),
-    tileView: {
-      videoPeerIds: () => [],
-      getVideo: () => undefined,
-      removeTile: vi.fn(),
-      updateTileLabel: vi.fn(),
-      renderSelfPreview: vi.fn(),
-    } as unknown as TileView,
-    health: { start: vi.fn(), clearAll: vi.fn() } as unknown as RoomWiringContext["health"],
-    peerLeftTimers: new Map(),
-    chat: {
-      onMessage: vi.fn(),
-      onRateLimited: vi.fn(),
-      syncReady: vi.fn(),
-      onFreshWelcome: vi.fn(),
+    controllers: {
+      session,
+      recentRooms,
+      invite: new InviteController({ onChange: vi.fn() }),
+      tileCtrl: new TileController(),
+      popovers: new PopoverToastController({ onJoinChipChange: vi.fn() }),
     },
-    getClient: () => ({ isReady: true, isFatal: true, setSharing: vi.fn(), signal: vi.fn() }) as unknown as ReturnType<RoomWiringContext["getClient"]>,
-    getMesh: () => null,
-    setMesh: vi.fn(),
-    getCapture: () => null,
-    isFocusedAndVisible: () => true,
-    setStatus: vi.fn(),
-    setLobbyError: (msg) => {
-      lobbyErrors.push(msg);
+    views: {
+      ui: {
+        roomInput: { value: code },
+        nameInput: { value: "Tester" },
+        roomNameInput: { value: "Tester" },
+      } as unknown as UiElements,
+      tileView: {
+        videoPeerIds: () => [],
+        getVideo: () => undefined,
+        removeTile: vi.fn(),
+        updateTileLabel: vi.fn(),
+        renderSelfPreview: vi.fn(),
+      } as unknown as TileView,
+      health: { start: vi.fn(), clearAll: vi.fn() } as unknown as RoomWiringContext["views"]["health"],
+      chat: {
+        onMessage: vi.fn(),
+        onRateLimited: vi.fn(),
+        syncReady: vi.fn(),
+        onFreshWelcome: vi.fn(),
+      },
     },
-    showTransientRoomNotice: vi.fn(),
-    scrubRoomUrl: vi.fn(),
-    teardownPeer: vi.fn(),
-    renderInviteMenu: vi.fn(),
-    renderRoster: vi.fn(),
-    renderJoinChip: vi.fn(),
-    syncViewState: vi.fn(),
-    stopSharing: vi.fn().mockResolvedValue(undefined),
-    leaveRoom: vi.fn(),
+    state: {
+      peerLeftTimers: new Map(),
+      getClient: () =>
+        ({ isReady: true, isFatal: true, setSharing: vi.fn(), signal: vi.fn() }) as unknown as ReturnType<
+          RoomWiringContext["state"]["getClient"]
+        >,
+      getMesh: () => null,
+      setMesh: vi.fn(),
+      getCapture: () => null,
+      isFocusedAndVisible: () => true,
+    },
+    actions: {
+      setStatus: vi.fn(),
+      setLobbyError: (msg) => {
+        lobbyErrors.push(msg);
+      },
+      showTransientRoomNotice: vi.fn(),
+      scrubRoomUrl: vi.fn(),
+      teardownPeer: vi.fn(),
+      renderInviteMenu: vi.fn(),
+      renderRoster: vi.fn(),
+      renderJoinChip: vi.fn(),
+      syncViewState: vi.fn(),
+      stopSharing: vi.fn().mockResolvedValue(undefined),
+      leaveRoom: vi.fn(),
+    },
   };
 
   const handlers = buildSignalingHandlers(

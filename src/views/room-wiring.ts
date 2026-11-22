@@ -16,37 +16,45 @@ const ICE_SERVERS: RTCIceServer[] = [{ urls: "stun:stun.cloudflare.com:3478" }];
 const RECONNECT_GRACE_MS = 8_000;
 
 export interface RoomWiringContext {
-  ui: UiElements;
-  session: SessionController;
-  recentRooms: RecentRoomsController;
-  invite: InviteController;
-  tileCtrl: TileController;
-  popovers: PopoverToastController;
-  tileView: TileView;
-  health: HealthPoller;
-  peerLeftTimers: Map<PeerId, ReturnType<typeof setTimeout>>;
-  chat: {
-    onMessage: (msg: ChatMessage) => void;
-    onRateLimited: (friendly: string) => void;
-    syncReady: (ready: boolean) => void;
-    onFreshWelcome: () => void;
+  controllers: {
+    session: SessionController;
+    recentRooms: RecentRoomsController;
+    invite: InviteController;
+    tileCtrl: TileController;
+    popovers: PopoverToastController;
   };
-  getClient: () => SignalingClient | null;
-  getMesh: () => Mesh | null;
-  setMesh: (mesh: Mesh | null) => void;
-  getCapture: () => CaptureResult | null;
-  isFocusedAndVisible: () => boolean;
-  setStatus: (text: string, kind?: "info" | "warn" | "error") => void;
-  setLobbyError: (message: string | null) => void;
-  showTransientRoomNotice: (message: string) => void;
-  scrubRoomUrl: () => void;
-  teardownPeer: (peerId: PeerId) => void;
-  renderInviteMenu: () => void;
-  renderRoster: () => void;
-  renderJoinChip: () => void;
-  syncViewState: () => void;
-  stopSharing: () => Promise<void>;
-  leaveRoom: () => void;
+  views: {
+    ui: UiElements;
+    tileView: TileView;
+    health: HealthPoller;
+    chat: {
+      onMessage: (msg: ChatMessage) => void;
+      onRateLimited: (friendly: string) => void;
+      syncReady: (ready: boolean) => void;
+      onFreshWelcome: () => void;
+    };
+  };
+  state: {
+    peerLeftTimers: Map<PeerId, ReturnType<typeof setTimeout>>;
+    getClient: () => SignalingClient | null;
+    getMesh: () => Mesh | null;
+    setMesh: (mesh: Mesh | null) => void;
+    getCapture: () => CaptureResult | null;
+    isFocusedAndVisible: () => boolean;
+  };
+  actions: {
+    setStatus: (text: string, kind?: "info" | "warn" | "error") => void;
+    setLobbyError: (message: string | null) => void;
+    showTransientRoomNotice: (message: string) => void;
+    scrubRoomUrl: () => void;
+    teardownPeer: (peerId: PeerId) => void;
+    renderInviteMenu: () => void;
+    renderRoster: () => void;
+    renderJoinChip: () => void;
+    syncViewState: () => void;
+    stopSharing: () => Promise<void>;
+    leaveRoom: () => void;
+  };
 }
 
 function handleInPlaceResume(
@@ -57,7 +65,9 @@ function handleInPlaceResume(
   room: RoomInfo,
   activeMesh: Mesh,
 ): void {
-  const { session, tileCtrl, popovers, tileView } = ctx;
+  const { session, tileCtrl, popovers } = ctx.controllers;
+  const { tileView } = ctx.views;
+  const { state, actions } = ctx;
   session.isHost = room.host;
   session.roomLocked = room.locked;
 
@@ -67,7 +77,7 @@ function handleInPlaceResume(
   welcomePeerIds.delete(selfIdFromServer);
   for (const id of new Set([...prevMemberIds, ...prevMeshIds, ...activeMesh.peers()])) {
     if (!welcomePeerIds.has(id)) {
-      ctx.teardownPeer(id);
+      actions.teardownPeer(id);
       popovers.removeUnread(id);
     }
   }
@@ -88,15 +98,15 @@ function handleInPlaceResume(
       popovers.enqueueArrivalUnchecked({ id: p.id, name: p.name });
     }
   }
-  ctx.renderJoinChip();
-  if (popovers.joinChipArrivals.length > 0) popovers.armJoinChipTimer(ctx.isFocusedAndVisible());
+  actions.renderJoinChip();
+  if (popovers.joinChipArrivals.length > 0) popovers.armJoinChipTimer(state.isFocusedAndVisible());
 
-  const cap = ctx.getCapture();
+  const cap = state.getCapture();
   if (cap) {
-    ctx.getClient()?.setSharing(true);
+    state.getClient()?.setSharing(true);
     if (!tileView.getVideo(SELF_TILE)) tileView.renderSelfPreview(cap.stream);
   }
-  ctx.setStatus(session.connectedRoomStatusText(code), "info");
+  actions.setStatus(session.connectedRoomStatusText(code), "info");
 }
 
 function handleFreshWelcome(
@@ -106,14 +116,16 @@ function handleFreshWelcome(
   peers: PeerInfo[],
   room: RoomInfo,
 ): void {
-  const { session, tileCtrl, popovers, tileView, health } = ctx;
-  ctx.getMesh()?.close();
+  const { session, tileCtrl, popovers } = ctx.controllers;
+  const { tileView, health, chat } = ctx.views;
+  const { state, actions } = ctx;
+  state.getMesh()?.close();
   health.clearAll();
   tileCtrl.clearOutboundStats();
   session.members.clear();
   tileCtrl.clearListening();
   popovers.resetRoom();
-  ctx.chat.onFreshWelcome();
+  chat.onFreshWelcome();
   session.selfId = null;
 
   for (const id of tileView.videoPeerIds()) {
@@ -133,7 +145,7 @@ function handleFreshWelcome(
       degradation: currentDegradation(),
       jitterBufferTargetMs: 150,
     },
-    (to, data) => ctx.getClient()?.signal(to, data),
+    (to, data) => state.getClient()?.signal(to, data),
     {
       onRemoteStream: (peerId, stream) => {
         if (session.members.get(peerId)?.sharing !== true) return;
@@ -145,18 +157,18 @@ function handleFreshWelcome(
         }
         tileView.applyAudio(peerId);
         tileView.startPlayback(video, peerId);
-        ctx.syncViewState();
+        actions.syncViewState();
       },
       onRemoteStreamGone: (peerId) => tileView.removeTile(peerId),
-      onConnectionState: (peerId, state) => {
-        if ((state === "failed" || state === "closed") && ctx.peerLeftTimers.has(peerId)) {
-          ctx.teardownPeer(peerId);
+      onConnectionState: (peerId, connState) => {
+        if ((connState === "failed" || connState === "closed") && state.peerLeftTimers.has(peerId)) {
+          actions.teardownPeer(peerId);
         }
-        if (state === "failed") console.warn(`[main] connection to ${peerId} failed`);
+        if (connState === "failed") console.warn(`[main] connection to ${peerId} failed`);
       },
     },
   );
-  ctx.setMesh(newMesh);
+  state.setMesh(newMesh);
   session.selfId = selfIdFromServer;
   for (const p of peers) {
     if (p.id === selfIdFromServer) continue;
@@ -164,16 +176,16 @@ function handleFreshWelcome(
     session.members.set(p.id, { name: p.name, sharing: p.sharing, host: p.host === true });
     newMesh.addMember(p.id, p.sharing);
   }
-  ctx.setStatus(session.connectedRoomStatusText(code), "info");
-  const cap = ctx.getCapture();
+  actions.setStatus(session.connectedRoomStatusText(code), "info");
+  const cap = state.getCapture();
   if (cap) {
-    ctx.getClient()?.setSharing(true);
+    state.getClient()?.setSharing(true);
     if (!tileView.getVideo(SELF_TILE)) tileView.renderSelfPreview(cap.stream);
     void newMesh.setCapture(cap).catch((err: unknown) => {
-      if (ctx.getMesh() !== newMesh || ctx.getCapture() !== cap) return;
+      if (state.getMesh() !== newMesh || state.getCapture() !== cap) return;
       console.error("[main] failed to reattach capture to peers", err);
-      ctx.setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
-      void ctx.stopSharing();
+      actions.setStatus("Could not start sharing to peers. Screen capture stopped.", "error");
+      void actions.stopSharing();
     });
   }
 }
@@ -184,7 +196,9 @@ export function buildSignalingHandlers(
   activeGen: number,
   getLastPresentedHostToken: () => string | undefined,
 ): SignalingHandlers {
-  const { ui, session, invite, tileCtrl, popovers, tileView, health } = ctx;
+  const { session, recentRooms, invite, tileCtrl, popovers } = ctx.controllers;
+  const { ui, tileView, health, chat } = ctx.views;
+  const { state, actions } = ctx;
   let hasWelcomed = false;
   let pendingKickRotationName: string | null = null;
   const isStale = (): boolean => activeGen !== session.joinGeneration;
@@ -194,14 +208,14 @@ export function buildSignalingHandlers(
       if (isStale()) return;
       session.clearTransientNoticeState();
       if (status === "open") {
-        ctx.setStatus(`In room ${code}`, "info");
+        actions.setStatus(`In room ${code}`, "info");
       } else {
         pendingKickRotationName = null;
         session.clearPendingKicks();
-        ctx.setStatus(`Connection ${status}…`, "warn");
+        actions.setStatus(`Connection ${status}…`, "warn");
       }
-      ctx.chat.syncReady(Boolean(ctx.getClient()?.isReady));
-      if (session.selfId !== null) ctx.renderInviteMenu();
+      chat.syncReady(Boolean(state.getClient()?.isReady));
+      if (session.selfId !== null) actions.renderInviteMenu();
     },
 
     onWelcome: (selfIdFromServer, peers, room) => {
@@ -214,55 +228,55 @@ export function buildSignalingHandlers(
       invite.cancelRotate();
       session.clearTransientNoticeState();
       ui.roomInput.value = "";
-      ctx.setLobbyError(null);
-      ctx.scrubRoomUrl();
+      actions.setLobbyError(null);
+      actions.scrubRoomUrl();
 
-      for (const timer of ctx.peerLeftTimers.values()) clearTimeout(timer);
-      ctx.peerLeftTimers.clear();
+      for (const timer of state.peerLeftTimers.values()) clearTimeout(timer);
+      state.peerLeftTimers.clear();
       session.clearPendingKicks();
 
       session.applyWelcomeCredentials(code, room, getLastPresentedHostToken());
       invite.hideIfRevealed();
 
-      const currentMesh = ctx.getMesh();
+      const currentMesh = state.getMesh();
       if (currentMesh !== null && session.selfId !== null && session.selfId === selfIdFromServer) {
         handleInPlaceResume(ctx, code, selfIdFromServer, peers, room, currentMesh);
       } else {
         handleFreshWelcome(ctx, code, selfIdFromServer, peers, room);
       }
-      ctx.recentRooms.recordJoin({
+      recentRooms.recordJoin({
         code,
         ...(room.password !== undefined ? { password: room.password } : {}),
         peerNames: [...session.members.values()].map((m) => m.name),
       });
       if (rejectedStoredHostToken) {
-        ctx.showTransientRoomNotice("Joined as participant \u2014 another member is hosting this session.");
+        actions.showTransientRoomNotice("Joined as participant \u2014 another member is hosting this session.");
       }
-      ctx.renderInviteMenu();
-      ctx.syncViewState();
-      ctx.chat.syncReady(Boolean(ctx.getClient()?.isReady));
+      actions.renderInviteMenu();
+      actions.syncViewState();
+      chat.syncReady(Boolean(state.getClient()?.isReady));
       health.start();
-      ctx.renderRoster();
+      actions.renderRoster();
     },
 
     onPeerJoined: (peer, replaces) => {
       if (isStale()) return;
       if (replaces && replaces !== peer.id) {
-        ctx.teardownPeer(replaces);
+        actions.teardownPeer(replaces);
         popovers.removeUnread(replaces);
       }
-      const existingTimer = ctx.peerLeftTimers.get(peer.id);
+      const existingTimer = state.peerLeftTimers.get(peer.id);
       if (existingTimer) {
         clearTimeout(existingTimer);
-        ctx.peerLeftTimers.delete(peer.id);
+        state.peerLeftTimers.delete(peer.id);
       }
       tileCtrl.setName(peer.id, peer.name);
       session.members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
-      ctx.recentRooms.updatePeers(
+      recentRooms.updatePeers(
         code,
         [...session.members.values()].map((m) => m.name),
       );
-      const activeMesh = ctx.getMesh();
+      const activeMesh = state.getMesh();
       if (activeMesh) {
         if (activeMesh.memberIds().includes(peer.id)) {
           if (!peer.sharing) tileView.removeTile(peer.id);
@@ -273,10 +287,10 @@ export function buildSignalingHandlers(
       }
       popovers.recordArrival(
         { id: peer.id, name: peer.name },
-        { replaces, isFocusedAndVisible: ctx.isFocusedAndVisible() },
+        { replaces, isFocusedAndVisible: state.isFocusedAndVisible() },
       );
-      ctx.setStatus(`${peer.name} joined room ${code}`, "info");
-      ctx.renderRoster();
+      actions.setStatus(`${peer.name} joined room ${code}`, "info");
+      actions.renderRoster();
     },
 
     onPeerLeft: (id, kicked) => {
@@ -284,63 +298,63 @@ export function buildSignalingHandlers(
       const kickedName = session.consumePendingKick(id);
       if (kickedName !== null && kicked && session.isHost) {
         pendingKickRotationName = kickedName;
-        ctx.showTransientRoomNotice(`Removed ${kickedName}.`);
+        actions.showTransientRoomNotice(`Removed ${kickedName}.`);
       }
       if (!kicked) popovers.recordDeparture(id);
       popovers.removeUnread(id);
-      if (kicked || !ctx.getMesh()?.hasConnectedLink(id)) {
-        ctx.teardownPeer(id);
+      if (kicked || !state.getMesh()?.hasConnectedLink(id)) {
+        actions.teardownPeer(id);
         return;
       }
-      const prev = ctx.peerLeftTimers.get(id);
+      const prev = state.peerLeftTimers.get(id);
       if (prev) clearTimeout(prev);
-      ctx.peerLeftTimers.set(
+      state.peerLeftTimers.set(
         id,
-        setTimeout(() => ctx.teardownPeer(id), RECONNECT_GRACE_MS),
+        setTimeout(() => actions.teardownPeer(id), RECONNECT_GRACE_MS),
       );
     },
 
     onSignal: (from, data) => {
       if (isStale()) return;
-      void ctx.getMesh()?.handleSignal(from, data);
+      void state.getMesh()?.handleSignal(from, data);
     },
 
     onPeerState: (id, sharing) => {
       if (isStale()) return;
-      const prev = ctx.peerLeftTimers.get(id);
+      const prev = state.peerLeftTimers.get(id);
       if (prev) {
         clearTimeout(prev);
-        ctx.peerLeftTimers.delete(id);
+        state.peerLeftTimers.delete(id);
       }
       if (!sharing) tileView.removeTile(id);
       const m = session.members.get(id);
       if (m) m.sharing = sharing;
-      ctx.getMesh()?.setMemberSharing(id, sharing);
-      ctx.renderRoster();
+      state.getMesh()?.setMemberSharing(id, sharing);
+      actions.renderRoster();
     },
 
     onRoomState: (locked, password) => {
       if (isStale()) return;
       session.applyRoomState(locked, password);
-      ctx.recentRooms.updatePassword(code, password, locked);
+      recentRooms.updatePassword(code, password, locked);
       if (locked) invite.onRoomLocked();
-      ctx.renderRoster();
-      ctx.renderInviteMenu();
+      actions.renderRoster();
+      actions.renderInviteMenu();
     },
 
     onRoomPassword: (password, rejoinToken) => {
       if (isStale()) return;
       session.applyRoomPassword(code, password, rejoinToken);
-      ctx.recentRooms.updatePassword(code, password, false);
+      recentRooms.updatePassword(code, password, false);
       invite.completeRotate();
       if (password && pendingKickRotationName !== null && session.isHost) {
         const kickedName = pendingKickRotationName;
         pendingKickRotationName = null;
-        ctx.showTransientRoomNotice(
+        actions.showTransientRoomNotice(
           `Removed ${kickedName} \u2014 invite link rotated. Share the new link with Copy invite link.`,
         );
       }
-      ctx.renderInviteMenu();
+      actions.renderInviteMenu();
     },
 
     onPeerRenamed: (id, name) => {
@@ -352,52 +366,52 @@ export function buildSignalingHandlers(
         ui.nameInput.value = name;
         ui.roomNameInput.value = name;
       } else {
-        ctx.recentRooms.updatePeers(
+        recentRooms.updatePeers(
           code,
           [...session.members.values()].map((m) => m.name),
         );
       }
       tileView.updateTileLabel(id, name);
-      ctx.renderRoster();
+      actions.renderRoster();
     },
 
     onHostPromoted: (hostId, hostToken, password) => {
       if (isStale()) return;
       session.applyHostPromoted(code, hostId, hostToken, password);
-      ctx.renderRoster();
-      ctx.renderInviteMenu();
+      actions.renderRoster();
+      actions.renderInviteMenu();
     },
 
     onChat: (msg) => {
       if (isStale()) return;
-      ctx.chat.onMessage(msg);
+      chat.onMessage(msg);
     },
 
     onError: (codeErr, message) => {
       if (isStale()) return;
-      const activeClient = ctx.getClient();
+      const activeClient = state.getClient();
       const classified = session.classifyError(code, codeErr, message, Boolean(activeClient?.isFatal));
       if (classified.severity === "fatal") {
         const lastHostToken = getLastPresentedHostToken();
-        void ctx.stopSharing();
-        const removedRecent = ctx.recentRooms.handleFatalError(code, codeErr, lastHostToken);
+        void actions.stopSharing();
+        const removedRecent = recentRooms.handleFatalError(code, codeErr, lastHostToken);
         session.applyFatalErrorCleanup(code, codeErr, hasWelcomed, lastHostToken, codeErr !== "kicked");
-        ctx.leaveRoom();
+        actions.leaveRoom();
         const lobbyMsg =
           removedRecent && (codeErr === "kicked" || codeErr === "bad-password")
             ? `${classified.friendly} Removed ${code} from saved rooms.`
             : classified.friendly;
-        ctx.setLobbyError(lobbyMsg);
-        ctx.setStatus("", "info");
+        actions.setLobbyError(lobbyMsg);
+        actions.setStatus("", "info");
         return;
       }
       if (classified.clearPendingKicks) {
         session.clearPendingKicks();
-        ctx.renderRoster();
+        actions.renderRoster();
       }
-      if (classified.severity === "warn") ctx.setStatus(classified.friendly, "warn");
-      else if (classified.severity === "error") ctx.setStatus(classified.friendly, "error");
-      else if (codeErr === "chat-rate-limited") ctx.chat.onRateLimited(classified.friendly);
+      if (classified.severity === "warn") actions.setStatus(classified.friendly, "warn");
+      else if (classified.severity === "error") actions.setStatus(classified.friendly, "error");
+      else if (codeErr === "chat-rate-limited") chat.onRateLimited(classified.friendly);
     },
   };
 }

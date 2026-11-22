@@ -309,17 +309,39 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
 
   const handlers = buildSignalingHandlers(
     {
-      ui, session, recentRooms, invite, tileCtrl, popovers, tileView, health, peerLeftTimers,
-      chat: {
-        onMessage: (msg) => chat.onMessage(msg),
-        onRateLimited: (friendly) => chat.onRateLimited(friendly),
-        syncReady: (ready) => chat.syncReady(ready),
-        onFreshWelcome: () => chat.reset(),
+      controllers: { session, recentRooms, invite, tileCtrl, popovers },
+      views: {
+        ui,
+        tileView,
+        health,
+        chat: {
+          onMessage: (msg) => chat.onMessage(msg),
+          onRateLimited: (friendly) => chat.onRateLimited(friendly),
+          syncReady: (ready) => chat.syncReady(ready),
+          onFreshWelcome: () => chat.reset(),
+        },
       },
-      getClient: () => client, getMesh: () => mesh, setMesh: (m) => { mesh = m; },
-      getCapture: () => share.capture, isFocusedAndVisible, setStatus, setLobbyError,
-      showTransientRoomNotice, scrubRoomUrl, teardownPeer, renderInviteMenu,
-      renderRoster, renderJoinChip, syncViewState, stopSharing: () => share.stop(), leaveRoom,
+      state: {
+        peerLeftTimers,
+        getClient: () => client,
+        getMesh: () => mesh,
+        setMesh: (m) => { mesh = m; },
+        getCapture: () => share.capture,
+        isFocusedAndVisible,
+      },
+      actions: {
+        setStatus,
+        setLobbyError,
+        showTransientRoomNotice,
+        scrubRoomUrl,
+        teardownPeer,
+        renderInviteMenu,
+        renderRoster,
+        renderJoinChip,
+        syncViewState,
+        stopSharing: () => share.stop(),
+        leaveRoom,
+      },
     },
     code,
     activeGen,
@@ -403,12 +425,35 @@ if (blocked) {
 }
 
 bindAllDomEvents({
-  ui, session, recentRooms, invite, popovers, tileView, getClient: () => client, isSharing: () => share.capture !== null,
-  isFocusedAndVisible, runBackground, setStatus, setLobbyError, setLobbyNotice, showTransientRoomNotice,
-  dismissTransientRoomNotice, togglePopover: (w) => applyPopoverState(w), closeAllPopovers: () => applyPopoverState(null),
-  renderInviteMenu, renderJoinChip, renderRoster, scrubRoomUrl,
-  startSharing: () => share.start(), stopSharing: () => share.stop(),
-  enterInvite, joinRoom, leaveRoom, currentName, syncNameInputs, joinFromBootOrHash,
+  controllers: { session, recentRooms, invite, popovers },
+  views: { ui, tileView },
+  state: {
+    getClient: () => client,
+    isSharing: () => share.capture !== null,
+    isFocusedAndVisible,
+    currentName,
+  },
+  actions: {
+    runBackground,
+    setStatus,
+    setLobbyError,
+    setLobbyNotice,
+    showTransientRoomNotice,
+    dismissTransientRoomNotice,
+    togglePopover: (w) => applyPopoverState(w),
+    closeAllPopovers: () => applyPopoverState(null),
+    renderInviteMenu,
+    renderJoinChip,
+    renderRoster,
+    scrubRoomUrl,
+    startSharing: () => share.start(),
+    stopSharing: () => share.stop(),
+    enterInvite,
+    joinRoom,
+    leaveRoom,
+    syncNameInputs,
+    joinFromBootOrHash,
+  },
 });
 
 renderForgetHostButtons(ui, session);

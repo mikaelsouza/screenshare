@@ -58,26 +58,34 @@ function buildVideoParameters(
   return params;
 }
 
+const CLARITY_FALLBACK_PREFERENCES: readonly ExtendedDegradationPreference[] = [
+  "maintain-framerate-and-resolution",
+  "maintain-resolution",
+];
+
 export async function applyVideoEncoding(
   sender: RTCRtpSender,
   preset: QualityPreset,
   degradation: DegradationMode = DEFAULT_DEGRADATION_MODE,
 ): Promise<void> {
   if (degradation === "clarity") {
-    try {
-      await sender.setParameters(
-        buildVideoParameters(sender, preset, "maintain-framerate-and-resolution"),
-      );
-      return;
-    } catch (err) {
-      // Fallback for older browsers whose WebIDL enum or engine rejects
-      // "maintain-framerate-and-resolution". Re-read getParameters() so the retry
-      // carries a fresh WebRTC transaction ID and current active state.
-      console.error(
-        "[quality] Focus Clarity (maintain-framerate-and-resolution) was rejected; " +
-          "falling back to Focus Framerate (maintain-framerate).",
-        err,
-      );
+    for (const pref of CLARITY_FALLBACK_PREFERENCES) {
+      try {
+        await sender.setParameters(buildVideoParameters(sender, preset, pref));
+        return;
+      } catch (err) {
+        const next =
+          pref === "maintain-framerate-and-resolution"
+            ? "maintain-resolution"
+            : "maintain-framerate";
+        // Fallback for older browsers whose WebIDL enum or engine rejects a
+        // Clarity degradationPreference. Re-read getParameters() so each retry
+        // carries a fresh WebRTC transaction ID and current active state.
+        console.error(
+          `[quality] Focus Clarity (${pref}) was rejected; falling back to ${next}.`,
+          err,
+        );
+      }
     }
   }
 

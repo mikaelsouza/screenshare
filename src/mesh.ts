@@ -9,12 +9,15 @@
  * sharer's uplink. See MAX_ROOM_SIZE.
  */
 
-import { z, type IceCandidateInit, type PeerId, type SignalData } from "@shared/protocol";
+import type { IceCandidateInit, PeerId, SignalData } from "@shared/protocol";
 import type { CaptureResult, QualityPreset } from "./capture";
+import { type ControlMessage, ControlRateLimiter, parseControlMessage } from "./mesh-control";
 import {
   applyAudioEncoding, applyVideoEncoding, type CodecName, DEFAULT_DEGRADATION_MODE,
   type DegradationMode, mungeOpusSdp, mungeVideoSdp, preferCodec, tuneReceiverLatency,
 } from "./quality";
+
+export { parseControlMessage };
 
 function mungeSdp(sdp: string): string {
   return mungeVideoSdp(mungeOpusSdp(sdp));
@@ -33,34 +36,6 @@ export interface MeshCallbacks {
   onRemoteStream: (peerId: PeerId, stream: MediaStream) => void;
   onRemoteStreamGone: (peerId: PeerId) => void;
   onConnectionState: (peerId: PeerId, state: RTCPeerConnectionState) => void;
-}
-
-/** Peer-to-peer control traffic. Deliberately NOT routed through the server. */
-type ControlMessage = { c: "view"; want: boolean };
-
-/** Real control messages are ~25 bytes. Anything far larger is not ours. */
-const MAX_CONTROL_MESSAGE_LENGTH = 256;
-
-const ControlMessageSchema: z.ZodType<ControlMessage> = z.object({
-  c: z.literal("view"),
-  want: z.boolean(),
-});
-
-/**
- * Parse a control message from the far end, or null if it is not one.
- *
- * The far end is another browser in the room, not something we control, so the shape
- * is checked rather than cast: a `want` that is not a boolean would otherwise flow
- * straight into `encodings[0].active`.
- */
-export function parseControlMessage(data: unknown): ControlMessage | null {
-  if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
-  try {
-    const parsed = ControlMessageSchema.safeParse(JSON.parse(data));
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
 }
 
 class PeerLink {
@@ -87,6 +62,7 @@ class PeerLink {
   private remoteWantsVideo = true;
   /** What we last asked the far end for; flushed when the channel opens. */
   private desiredView: boolean | null = null;
+  private readonly controlLimiter = new ControlRateLimiter();
 
   private videoTransceiver: RTCRtpTransceiver | null = null;
   private audioTransceiver: RTCRtpTransceiver | null = null;
@@ -329,7 +305,10 @@ class PeerLink {
   attachCapture(capture: CaptureResult): Promise<void> {
     const gen = ++this.captureGeneration;
     this.attachingCount++;
-    return this.enqueueMedia(() => this.runAttachCapture(capture, gen));
+    return Promise.race([
+      this.enqueueMedia(() => this.runAttachCapture(capture, gen)),
+      this.closedPromise,
+    ]);
   }
 
   private async ensureSendTransceivers(capture: CaptureResult): Promise<void> {
@@ -468,6 +447,7 @@ class PeerLink {
     // The receiving side binds an already-open channel, so onopen will not fire.
     if (ch.readyState === "open") this.flushViewRequest();
     ch.onmessage = (ev) => {
+      if (!this.controlLimiter.allow()) return;
       const msg = parseControlMessage(ev.data);
       if (!msg) return;
       this.remoteWantsVideo = msg.want;
