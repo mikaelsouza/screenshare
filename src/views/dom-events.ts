@@ -5,8 +5,10 @@ import {
 } from "@shared/protocol";
 import type { InviteController } from "../controllers/invite-controller";
 import type { PopoverToastController } from "../controllers/popover-toast-controller";
+import type { RecentRoomsController } from "../controllers/recent-rooms-controller";
 import type { SessionController } from "../controllers/session-controller";
 import { HOST_ROOMS_STORAGE_KEY } from "../host-tokens";
+import { RECENT_ROOMS_OPT_OUT_KEY, RECENT_ROOMS_STORAGE_KEY } from "../recent-rooms";
 import type { SignalingClient } from "../signaling";
 import { describeInviteParseFailure, type PopoverKind } from "../ui-model";
 import type { UiElements } from "./dom";
@@ -16,6 +18,7 @@ import type { TileView } from "./tile-view";
 export interface DomEventsContext {
   ui: UiElements;
   session: SessionController;
+  recentRooms: RecentRoomsController;
   invite: InviteController;
   popovers: PopoverToastController;
   tileView: TileView;
@@ -25,6 +28,7 @@ export interface DomEventsContext {
   runBackground: (task: Promise<unknown>) => void;
   setStatus: (text: string, kind?: "info" | "warn" | "error") => void;
   setLobbyError: (message: string | null) => void;
+  setLobbyNotice: (message: string | null) => void;
   showTransientRoomNotice: (message: string) => void;
   dismissTransientRoomNotice: () => void;
   togglePopover: (which: PopoverKind) => void;
@@ -76,11 +80,12 @@ async function submitLobbyJoin(ctx: DomEventsContext): Promise<void> {
     return;
   }
   ctx.setLobbyError(null);
+  ctx.setLobbyNotice(null);
   await ctx.enterInvite(parsed.code, parsed.password);
 }
 
 async function handleCreateRoom(ctx: DomEventsContext): Promise<void> {
-  const { ui, session } = ctx;
+  const { ui, session, recentRooms } = ctx;
   const genBeforeFetch = session.joinGeneration;
   try {
     const res = await fetch("/api/room", { method: "POST" });
@@ -92,7 +97,11 @@ async function handleCreateRoom(ctx: DomEventsContext): Promise<void> {
     const previous = session.lastJoinCode ?? session.activeRoomFor();
     if (previous && previous !== code) session.clearRoomSession(previous);
     session.saveActiveRoom(code);
-    session.saveCreatorHostToken(code, hostToken);
+    if (recentRooms.isDisabled()) {
+      session.saveSessionHostToken(code, hostToken);
+    } else {
+      session.saveCreatorHostToken(code, hostToken);
+    }
     ui.roomInput.value = "";
     ctx.scrubRoomUrl();
     await ctx.joinRoom(code, password);
@@ -117,10 +126,10 @@ function bindInviteAndRosterEvents(ctx: DomEventsContext): void {
     const code = session.lastJoinCode;
     if (!code) return;
     session.forgetCreatorHostToken(code);
+    ctx.recentRooms.handleCreatorHostForgotten(code);
     ctx.closeAllPopovers();
     ctx.showTransientRoomNotice("Removed saved host access for this room on this device.");
   });
-  ui.lobbyForgetHostsBtn.addEventListener("click", () => session.forgetAllHostTokens());
   ui.inviteRotateBtn.addEventListener("click", () => {
     const client = ctx.getClient();
     if (!client || !session.isHost || !session.lastJoinCode || invite.isRotatePending) return;
@@ -146,6 +155,7 @@ function bindLobbyAndNavEvents(ctx: DomEventsContext): void {
     ctx.leaveRoom();
     ctx.scrubRoomUrl();
     ctx.setLobbyError(null);
+    ctx.setLobbyNotice(null);
     ctx.setStatus("", "info");
   });
 
@@ -165,7 +175,10 @@ function bindLobbyAndNavEvents(ctx: DomEventsContext): void {
     if (client && session.selfId !== null) client.rename(ctx.currentName());
   });
 
-  ui.roomInput.addEventListener("input", () => ctx.setLobbyError(null));
+  ui.roomInput.addEventListener("input", () => {
+    ctx.setLobbyError(null);
+    ctx.setLobbyNotice(null);
+  });
   ui.joinBtn.addEventListener("click", () => ctx.runBackground(submitLobbyJoin(ctx)));
   ui.roomInput.addEventListener("keydown", (ev) => {
     if (ev.key !== "Enter") return;
@@ -175,6 +188,7 @@ function bindLobbyAndNavEvents(ctx: DomEventsContext): void {
   ui.createBtn.addEventListener("click", () => {
     if (ui.createBtn.disabled) return;
     ctx.setLobbyError(null);
+    ctx.setLobbyNotice(null);
     ui.createBtn.disabled = true;
     ctx.runBackground(handleCreateRoom(ctx));
   });
@@ -216,8 +230,18 @@ function bindWindowAndDocumentEvents(ctx: DomEventsContext): void {
   window.addEventListener("pagehide", () => ctx.leaveRoom());
   window.addEventListener("hashchange", () => ctx.joinFromBootOrHash(true));
   window.addEventListener("storage", (ev) => {
-    if (ev.key !== HOST_ROOMS_STORAGE_KEY && ev.key !== null) return;
-    session.syncCreatorTokensFromStorage();
+    if (
+      ev.key !== HOST_ROOMS_STORAGE_KEY &&
+      ev.key !== RECENT_ROOMS_STORAGE_KEY &&
+      ev.key !== RECENT_ROOMS_OPT_OUT_KEY &&
+      ev.key !== null
+    ) {
+      return;
+    }
+    if (ev.key === HOST_ROOMS_STORAGE_KEY || ev.key === null) {
+      session.syncCreatorTokensFromStorage();
+    }
+    ctx.recentRooms.syncFromStorage();
   });
 }
 

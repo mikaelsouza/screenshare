@@ -194,13 +194,20 @@
               in the URL fragment only (never transmitted in HTTP requests), and the app immediately scrubs the browser
               address bar to <code>/</code> while keeping temporary <code>rejoinToken</code> state in
               <code>sessionStorage</code> (for page refreshes). Room creators also store a bounded
-              <code>hostToken</code> in <code>localStorage</code> (up to 20 rooms, 90-day local expiry) that grants
-              creator host re-entry and recovers the current invite link—cleared anytime via <strong>Forget host on
-              this device</strong>; temporary session-promoted hosts keep their <code>hostToken</code> in memory only.
-              Disconnected <code>rejoinToken</code> tickets expire <strong>5 minutes</strong> after leaving (or
-              <strong>25 seconds</strong> after a manual invite rotation); if no host is present in an occupied room
-              for <strong>5 minutes</strong>, the earliest-joined active participant is temporarily promoted for that
-              session without unlocking occupied locked rooms.
+              <code>hostToken</code> in <code>localStorage</code> (<code>host-rooms</code>, up to 20 rooms, 90-day local
+              expiry) that grants creator host re-entry and recovers the current invite link—cleared per room inside the
+              Invite menu via <strong>Forget host on this device</strong> or across all rooms in the lobby via
+              <strong>Clear saved rooms</strong>; temporary session-promoted hosts keep their <code>hostToken</code> in
+              memory only. For passwordless rejoin, the app also saves up to 20 recent rooms in
+              <code>localStorage</code> (<code>recent-rooms</code>, 90-day local expiry) containing the room code, role,
+              last-visited timestamp, latest invite secret (when unlocked or hosted), optional local nickname, and up to
+              4 last-seen participant display names. You can remove individual entries, wipe both
+              <code>recent-rooms</code> and <code>host-rooms</code> with <strong>Clear saved rooms</strong>, or disable
+              saving on shared devices via <strong>Don't save rooms on this device</strong>
+              (<code>recent-rooms-disabled</code>). Disconnected <code>rejoinToken</code> tickets expire
+              <strong>5 minutes</strong> after leaving (or <strong>25 seconds</strong> after a manual invite
+              rotation); if no host is present in an occupied room for <strong>5 minutes</strong>, the earliest-joined
+              active participant is temporarily promoted for that session without unlocking occupied locked rooms.
             </li>
             <li>
               <strong>Automatic erasure:</strong> Unused rooms that are never joined expire automatically after
@@ -227,10 +234,16 @@
         <section>
           <h2>4. Local Storage &amp; App Updates</h2>
           <p>
-            Your browser or desktop app stores only lightweight local preferences (such as your chosen display name,
-            temporary <code>sessionStorage</code> rejoin tokens, bounded <code>localStorage</code> creator
-            <code>hostToken</code> credentials for up to 20 rooms with a 90-day expiry that can recover the room&rsquo;s
-            invite link—erasable via the app&rsquo;s forget-host buttons—and standard window state) on your device.
+            Your browser or desktop app stores only lightweight local preferences and rejoin data on your device: your
+            chosen display name, temporary <code>sessionStorage</code> rejoin tokens, bounded <code>localStorage</code>
+            creator <code>hostToken</code> credentials (<code>host-rooms</code>, up to 20 rooms, 90-day expiry) that
+            can recover a hosted room&rsquo;s invite link, bounded <code>localStorage</code> recent rooms
+            (<code>recent-rooms</code>, up to 20 rooms, 90-day expiry, storing room codes, roles, invite secrets,
+            optional local nicknames, and up to 4 last-seen participant display names for passwordless rejoin), your
+            shared-device opt-out setting (<code>recent-rooms-disabled</code>), and standard window state. You can opt
+            out anytime via <strong>Don't save rooms on this device</strong>, wipe all saved recent rooms and host
+            tokens via <strong>Clear saved rooms</strong>, or remove a single room&rsquo;s host access in-room via
+            <strong>Forget host on this device</strong>.
           </p>
           <p>
             Standalone desktop installers downloaded from GitHub Releases periodically check GitHub Releases for newer

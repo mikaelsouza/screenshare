@@ -9,6 +9,7 @@ import { isValidRoomCode, type PeerId } from "@shared/protocol";
 import { QUALITY_PRESETS } from "./capture";
 import { InviteController } from "./controllers/invite-controller";
 import { PopoverToastController } from "./controllers/popover-toast-controller";
+import { RecentRoomsController } from "./controllers/recent-rooms-controller";
 import { SessionController } from "./controllers/session-controller";
 import { TileController } from "./controllers/tile-controller";
 import type { Mesh } from "./mesh";
@@ -17,10 +18,19 @@ import type { EndReason } from "./platform/types";
 import { SignalingClient } from "./signaling";
 import { describeInviteParseFailure, type PopoverKind, type ViewState } from "./ui-model";
 import { mountChatFeature } from "./views/chat-view";
-import { currentNameDom, queryUiElements, scrubRoomUrlDom, setLobbyErrorDom, setStatusDom, syncNameInputsDom } from "./views/dom";
+import {
+  currentNameDom,
+  queryUiElements,
+  scrubRoomUrlDom,
+  setLobbyErrorDom,
+  setLobbyNoticeDom,
+  setStatusDom,
+  syncNameInputsDom,
+} from "./views/dom";
 import { bindAllDomEvents } from "./views/dom-events";
 import { HealthPoller } from "./views/health-view";
 import { captureBlockedReason, initQualityControls, renderFollowChip, syncMuteAudioButton } from "./views/quality-view";
+import { RecentRoomsView } from "./views/recent-rooms-view";
 import { buildSignalingHandlers } from "./views/room-wiring";
 import {
   JoinChipView, applyPopoverDom, applyViewStateDom, renderForgetHostButtons,
@@ -56,13 +66,53 @@ const isFocusedAndVisible = (): boolean =>
 
 const joinChipView = new JoinChipView(ui);
 const tileCtrl = new TileController();
+const getLocalStorage = (): Storage | null =>
+  safeStorage(() => (typeof localStorage !== "undefined" ? localStorage : undefined));
+let recentRoomsCtrl: RecentRoomsController | null = null;
 const session = new SessionController({
-  getLocalStorage: () => safeStorage(() => (typeof localStorage !== "undefined" ? localStorage : undefined)),
+  getLocalStorage,
   getSessionStorage: () => safeStorage(() => (typeof sessionStorage !== "undefined" ? sessionStorage : undefined)),
   getLocks: safeLocks,
   runBackground,
-  onForgetHostUiChange: () => renderForgetHostButtons(ui, session),
+  onForgetHostUiChange: () => {
+    renderForgetHostButtons(ui, session);
+    recentRoomsCtrl?.syncFromStorage();
+  },
 });
+const setStatus = (text: string, kind: "info" | "warn" | "error" = "info"): void => setStatusDom(ui, text, kind);
+const setLobbyError = (message: string | null): void => setLobbyErrorDom(ui, message);
+const setLobbyNotice = (message: string | null): void => setLobbyNoticeDom(ui, message);
+const recentRoomsView = new RecentRoomsView(ui.lobbyCard, ui.recentRoomsRoot, {
+  onRejoin: (code) => runBackground(rejoinRecentRoom(code)),
+  onStartRename: (code) => recentRooms.setEditingCode(code),
+  onCommitRename: (code, label) => recentRooms.rename(code, label),
+  onCancelRename: () => recentRooms.setEditingCode(null),
+  onRemove: (code) => {
+    recentRooms.remove(code);
+    setLobbyNotice(`Removed ${code} from saved rooms.`);
+  },
+  onClearAll: () => {
+    recentRooms.clearAll();
+    setLobbyNotice("Cleared all saved rooms and host keys on this device.");
+  },
+  onSetDisabled: (disabled) => {
+    recentRooms.setDisabled(disabled);
+    setLobbyNotice(
+      disabled ? "Room saving turned off for this shared device." : "Room saving enabled on this device.",
+    );
+  },
+  onSearchChange: (q) => recentRooms.setSearchQuery(q),
+});
+const recentRooms = new RecentRoomsController({
+  getLocalStorage,
+  getLocks: safeLocks,
+  runBackground,
+  hasSavedCreatorHostFor: (code) => session.hasSavedCreatorHostFor(code),
+  onRemoveHostToken: (code, onlyIfMatching) => session.forgetCreatorHostToken(code, onlyIfMatching),
+  onForgetAllHostTokens: () => session.forgetAllHostTokens(),
+  onChange: () => renderRecentRooms(),
+});
+recentRoomsCtrl = recentRooms;
 const invite = new InviteController({ onChange: () => renderInviteMenu() });
 const popovers = new PopoverToastController({ onJoinChipChange: () => renderJoinChip() });
 const tileView = new TileView(ui, tileCtrl, {
@@ -83,8 +133,6 @@ const health = new HealthPoller({
   },
   runBackground,
 });
-const setStatus = (text: string, kind: "info" | "warn" | "error" = "info"): void => setStatusDom(ui, text, kind);
-const setLobbyError = (message: string | null): void => setLobbyErrorDom(ui, message);
 const scrubRoomUrl = (): void => scrubRoomUrlDom();
 const currentName = (): string => currentNameDom(ui);
 const syncNameInputs = (value: string): void => {
@@ -120,6 +168,16 @@ const chat = mountChatFeature({
   sendMessage: (text) => Boolean(client?.sendChat(text)),
   hasOpenPopover: () => popovers.activePopover !== null,
 });
+
+function renderRecentRooms(): void {
+  recentRoomsView.render({
+    disabled: recentRooms.isDisabled(),
+    totalCount: recentRooms.getRooms().length,
+    filteredRooms: recentRooms.getFilteredRooms(),
+    searchQuery: recentRooms.getSearchQuery(),
+    editingCode: recentRooms.getEditingCode(),
+  });
+}
 
 function renderInviteMenu(): void {
   renderInviteMenuView(ui, invite, session, popovers.activePopover, Boolean(client?.isReady));
@@ -226,6 +284,8 @@ function leaveRoom(): void {
   renderRoster();
   syncViewState();
   renderForgetHostButtons(ui, session);
+  recentRooms.setEditingCode(null);
+  renderRecentRooms();
 }
 
 async function joinRoom(code: string, initialPassword?: string): Promise<void> {
@@ -249,7 +309,7 @@ async function joinRoom(code: string, initialPassword?: string): Promise<void> {
 
   const handlers = buildSignalingHandlers(
     {
-      ui, session, invite, tileCtrl, popovers, tileView, health, peerLeftTimers,
+      ui, session, recentRooms, invite, tileCtrl, popovers, tileView, health, peerLeftTimers,
       chat: {
         onMessage: (msg) => chat.onMessage(msg),
         onRateLimited: (friendly) => chat.onRateLimited(friendly),
@@ -281,8 +341,24 @@ async function enterInvite(code: string, password: string): Promise<void> {
   const previous = session.lastJoinCode ?? session.activeRoomFor();
   if (previous && previous !== code) session.clearRoomSession(previous);
   session.saveActiveRoom(code);
+  setLobbyNotice(null);
   scrubRoomUrl();
   await joinRoom(code, password);
+}
+
+async function rejoinRecentRoom(code: string): Promise<void> {
+  const entry = recentRooms.getRooms().find((r) => r.code === code);
+  if (!entry) return;
+  if (share.capture && session.lastJoinCode && session.lastJoinCode !== code) {
+    if (!window.confirm("Leave your current room and stop sharing your screen to join the new room?")) return;
+  }
+  const previous = session.lastJoinCode ?? session.activeRoomFor();
+  if (previous && previous !== code) session.clearRoomSession(previous);
+  session.saveActiveRoom(code);
+  setLobbyError(null);
+  setLobbyNotice(null);
+  scrubRoomUrl();
+  await joinRoom(code, entry.password);
 }
 
 function joinFromBootOrHash(isHashChange: boolean): void {
@@ -327,8 +403,8 @@ if (blocked) {
 }
 
 bindAllDomEvents({
-  ui, session, invite, popovers, tileView, getClient: () => client, isSharing: () => share.capture !== null,
-  isFocusedAndVisible, runBackground, setStatus, setLobbyError, showTransientRoomNotice,
+  ui, session, recentRooms, invite, popovers, tileView, getClient: () => client, isSharing: () => share.capture !== null,
+  isFocusedAndVisible, runBackground, setStatus, setLobbyError, setLobbyNotice, showTransientRoomNotice,
   dismissTransientRoomNotice, togglePopover: (w) => applyPopoverState(w), closeAllPopovers: () => applyPopoverState(null),
   renderInviteMenu, renderJoinChip, renderRoster, scrubRoomUrl,
   startSharing: () => share.start(), stopSharing: () => share.stop(),
@@ -336,5 +412,6 @@ bindAllDomEvents({
 });
 
 renderForgetHostButtons(ui, session);
+renderRecentRooms();
 syncViewState();
 joinFromBootOrHash(false);

@@ -75,7 +75,7 @@ export class SessionController {
   private readonly memorySession = new Map<string, string>();
   private readonly creatorHostTokens = new Map<string, string>();
   private readonly sessionHostTokens = new Map<string, string>();
-  private readonly pendingForgets = new Map<string, { match: string | null; gen: number }>();
+  private readonly pendingForgets = new Map<string, Map<number, string | null>>();
   readonly members: Map<PeerId, MemberRecord> = new Map<PeerId, MemberRecord>();
   private readonly pendingKicks = new Map<PeerId, { name: string; timer: ReturnType<typeof setTimeout> }>();
 
@@ -142,7 +142,11 @@ export class SessionController {
     const persisted = readPersistedHostToken(this.env.getLocalStorage(), code);
     if (persisted === undefined) return undefined;
     const pending = this.pendingForgets.get(code);
-    if (pending && (pending.match === null || pending.match === persisted)) return undefined;
+    if (pending) {
+      for (const match of pending.values()) {
+        if (match === null || match === persisted) return undefined;
+      }
+    }
     return persisted;
   }
 
@@ -187,9 +191,12 @@ export class SessionController {
     }
     if (onlyIfMatching === undefined) this.writeSession(`host:${code}`, undefined);
     const gen = ++this.forgetGen;
-    const prev = this.pendingForgets.get(code);
-    const match = prev?.match === null || onlyIfMatching === undefined ? null : onlyIfMatching;
-    this.pendingForgets.set(code, { match, gen });
+    let pending = this.pendingForgets.get(code);
+    if (!pending) {
+      pending = new Map();
+      this.pendingForgets.set(code, pending);
+    }
+    pending.set(gen, onlyIfMatching ?? null);
     this.env.onForgetHostUiChange();
     this.env.runBackground(
       runWithHostRoomsLock(this.env.getLocks(), () => {
@@ -200,7 +207,11 @@ export class SessionController {
             writePersistedHostToken(this.env.getLocalStorage(), code, undefined);
           }
         } finally {
-          if (this.pendingForgets.get(code)?.gen === gen) this.pendingForgets.delete(code);
+          const entry = this.pendingForgets.get(code);
+          if (entry) {
+            entry.delete(gen);
+            if (entry.size === 0) this.pendingForgets.delete(code);
+          }
         }
         this.env.onForgetHostUiChange();
       }),
@@ -439,6 +450,7 @@ export class SessionController {
     codeErr: string,
     hasWelcomed: boolean,
     lastPresentedHostToken: string | undefined,
+    forgetCreatorToken: boolean = true,
   ): void {
     if (SESSION_WIPING_ERRORS.has(codeErr)) {
       this.clearRoomSession(codeToJoin);
@@ -448,7 +460,7 @@ export class SessionController {
     if (codeErr === "bad-password" || CREATOR_TOKEN_WIPING_ERRORS.has(codeErr)) {
       this.sessionHostTokens.delete(codeToJoin);
     }
-    if (CREATOR_TOKEN_WIPING_ERRORS.has(codeErr)) {
+    if (forgetCreatorToken && CREATOR_TOKEN_WIPING_ERRORS.has(codeErr)) {
       if (lastPresentedHostToken !== undefined) {
         this.forgetCreatorHostToken(codeToJoin, lastPresentedHostToken);
       } else {

@@ -2,6 +2,7 @@ import type { ChatMessage, PeerId, PeerInfo } from "@shared/protocol";
 import { QUALITY_PRESETS, type CaptureResult } from "../capture";
 import type { InviteController } from "../controllers/invite-controller";
 import type { PopoverToastController } from "../controllers/popover-toast-controller";
+import type { RecentRoomsController } from "../controllers/recent-rooms-controller";
 import type { SessionController } from "../controllers/session-controller";
 import { SELF_TILE, type TileController } from "../controllers/tile-controller";
 import { Mesh } from "../mesh";
@@ -17,6 +18,7 @@ const RECONNECT_GRACE_MS = 8_000;
 export interface RoomWiringContext {
   ui: UiElements;
   session: SessionController;
+  recentRooms: RecentRoomsController;
   invite: InviteController;
   tileCtrl: TileController;
   popovers: PopoverToastController;
@@ -228,6 +230,11 @@ export function buildSignalingHandlers(
       } else {
         handleFreshWelcome(ctx, code, selfIdFromServer, peers, room);
       }
+      ctx.recentRooms.recordJoin({
+        code,
+        ...(room.password !== undefined ? { password: room.password } : {}),
+        peerNames: [...session.members.values()].map((m) => m.name),
+      });
       if (rejectedStoredHostToken) {
         ctx.showTransientRoomNotice("Joined as participant \u2014 another member is hosting this session.");
       }
@@ -251,6 +258,10 @@ export function buildSignalingHandlers(
       }
       tileCtrl.setName(peer.id, peer.name);
       session.members.set(peer.id, { name: peer.name, sharing: peer.sharing, host: peer.host === true });
+      ctx.recentRooms.updatePeers(
+        code,
+        [...session.members.values()].map((m) => m.name),
+      );
       const activeMesh = ctx.getMesh();
       if (activeMesh) {
         if (activeMesh.memberIds().includes(peer.id)) {
@@ -311,6 +322,7 @@ export function buildSignalingHandlers(
     onRoomState: (locked, password) => {
       if (isStale()) return;
       session.applyRoomState(locked, password);
+      ctx.recentRooms.updatePassword(code, password, locked);
       if (locked) invite.onRoomLocked();
       ctx.renderRoster();
       ctx.renderInviteMenu();
@@ -319,6 +331,7 @@ export function buildSignalingHandlers(
     onRoomPassword: (password, rejoinToken) => {
       if (isStale()) return;
       session.applyRoomPassword(code, password, rejoinToken);
+      ctx.recentRooms.updatePassword(code, password, false);
       invite.completeRotate();
       if (password && pendingKickRotationName !== null && session.isHost) {
         const kickedName = pendingKickRotationName;
@@ -338,6 +351,11 @@ export function buildSignalingHandlers(
       if (id === session.selfId) {
         ui.nameInput.value = name;
         ui.roomNameInput.value = name;
+      } else {
+        ctx.recentRooms.updatePeers(
+          code,
+          [...session.members.values()].map((m) => m.name),
+        );
       }
       tileView.updateTileLabel(id, name);
       ctx.renderRoster();
@@ -360,10 +378,16 @@ export function buildSignalingHandlers(
       const activeClient = ctx.getClient();
       const classified = session.classifyError(code, codeErr, message, Boolean(activeClient?.isFatal));
       if (classified.severity === "fatal") {
+        const lastHostToken = getLastPresentedHostToken();
         void ctx.stopSharing();
-        session.applyFatalErrorCleanup(code, codeErr, hasWelcomed, getLastPresentedHostToken());
+        const removedRecent = ctx.recentRooms.handleFatalError(code, codeErr, lastHostToken);
+        session.applyFatalErrorCleanup(code, codeErr, hasWelcomed, lastHostToken, codeErr !== "kicked");
         ctx.leaveRoom();
-        ctx.setLobbyError(classified.friendly);
+        const lobbyMsg =
+          removedRecent && (codeErr === "kicked" || codeErr === "bad-password")
+            ? `${classified.friendly} Removed ${code} from saved rooms.`
+            : classified.friendly;
+        ctx.setLobbyError(lobbyMsg);
         ctx.setStatus("", "info");
         return;
       }

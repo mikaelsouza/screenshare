@@ -1,0 +1,235 @@
+/* Recent Rooms & Passwordless Rejoin (Mock #12) */
+.lobby-card.has-recent-rooms {
+  max-width: 400px;
+}
+
+.lobby-notice {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #93c5fd;
+  background-color: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.35);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+}
+
+.recent-rooms-root {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recent-rooms-disabled {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-color);
+  background-color: var(--bg-color);
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.recent-rooms-search {
+  width: 100%;
+  height: 30px;
+  font-size: 12px;
+}
+
+.recent-rooms-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.recent-rooms-list.is-scrollable {
+  max-height: 208px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.recent-rooms-empty-filter {
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 8px 4px;
+}
+
+.recent-room-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background-color: var(--bg-color);
+  border: 1px solid var(--border-color);
+  transition: border-color 0.12s, background-color 0.12s;
+}
+
+.recent-room-row:hover {
+  border-color: #3f3f46;
+  background-color: #141418;
+}
+
+.recent-room-rejoin {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.recent-room-rejoin:focus-visible {
+  outline: 2px solid var(--accent-color);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.recent-room-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.recent-room-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-room-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.recent-room-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  border: 1px solid var(--border-color);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.recent-room-badge.host {
+  color: #93c5fd;
+  border-color: rgba(59, 130, 246, 0.4);
+  background-color: rgba(59, 130, 246, 0.12);
+}
+
+.recent-room-badge.guest {
+  color: #cbd5e1;
+  border-color: rgba(148, 163, 184, 0.3);
+  background-color: rgba(148, 163, 184, 0.08);
+}
+
+.recent-room-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-room-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.recent-icon-btn {
+  height: 24px;
+  min-width: 24px;
+  padding: 0 6px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.12s, color 0.12s;
+}
+
+.recent-icon-btn:hover {
+  background-color: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.recent-room-rename {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.recent-room-rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 28px;
+  font-size: 12px;
+}
+
+.recent-btn-sm {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.recent-btn-xs {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.recent-rooms-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-color);
+  font-size: 11px;
+}
+
+.recent-rooms-footer.recent-rooms-footer-empty {
+  justify-content: flex-start;
+  padding-top: 10px;
+}
+
+.recent-rooms-optout {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.recent-rooms-optout input {
+  accent-color: var(--accent-color);
+  cursor: pointer;
+}

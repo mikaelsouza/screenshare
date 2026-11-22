@@ -1076,7 +1076,7 @@
     </header>
 
     <div id="lobby">
-      <div class="lobby-card app-card">
+      <div id="lobby-card" class="lobby-card app-card">
         <h2>Start or join a room</h2>
         <div class="lobby-field">
           <label for="display-name">Display name</label>
@@ -1091,10 +1091,9 @@
             <button type="button" id="join" class="ui-btn">Join room</button>
           </div>
           <p id="lobby-error" class="lobby-error" role="alert" hidden></p>
+          <p id="lobby-notice" class="lobby-notice" role="status" aria-live="polite" hidden></p>
         </div>
-        <button type="button" id="lobby-forget-hosts" class="ui-btn forget-host-btn" hidden title="Remove saved host tokens for all rooms from this device">
-          Forget saved host rooms on this device
-        </button>
+        <div id="recent-rooms-root" class="recent-rooms-root" hidden></div>
       </div>
     </div>
 
