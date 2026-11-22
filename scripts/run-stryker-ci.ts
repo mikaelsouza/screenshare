@@ -14,7 +14,7 @@ function readMutatePatterns(configPath: string): string[] {
 }
 
 function toPosix(filePath: string): string {
-  return filePath.split(path.sep).join("/");
+  return filePath.replaceAll("\\", "/");
 }
 
 /**
