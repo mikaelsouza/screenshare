@@ -24,6 +24,7 @@ import {
   evaluateAdmission,
   evaluateJoinPromotion,
   evaluateSignalRelay,
+  evaluateUpgradeOrigin,
   resolveResumeAttachment,
   selectHostPromotionCandidate,
   type AdmissionInput,
@@ -286,15 +287,81 @@ describe("worker/room-policy", () => {
     ).toEqual({ id: "temp", sharing: false });
   });
 
-  it("evaluateSignalRelay blocks viewer-to-viewer offers and allows sharer/non-offer signals", () => {
+  it("evaluateSignalRelay blocks offers from non-sharing senders even when target is sharing, and allows sharer/non-offer signals", () => {
     expect(evaluateSignalRelay({ sharing: false }, { sharing: false }, "offer")).toEqual({
       allowed: false,
       code: "not-sharing",
-      message: "Neither of you is sharing",
+      message: "Only an active sharer can send an offer",
+    });
+    expect(evaluateSignalRelay({ sharing: false }, { sharing: true }, "offer")).toEqual({
+      allowed: false,
+      code: "not-sharing",
+      message: "Only an active sharer can send an offer",
     });
     expect(evaluateSignalRelay({ sharing: true }, { sharing: false }, "offer")).toEqual({ allowed: true });
-    expect(evaluateSignalRelay({ sharing: false }, { sharing: true }, "offer")).toEqual({ allowed: true });
+    expect(evaluateSignalRelay({ sharing: true }, { sharing: true }, "offer")).toEqual({ allowed: true });
     expect(evaluateSignalRelay({ sharing: false }, { sharing: false }, "ice")).toEqual({ allowed: true });
+    expect(evaluateSignalRelay({ sharing: false }, { sharing: true }, "answer")).toEqual({ allowed: true });
+  });
+
+  it("evaluateUpgradeOrigin enforces wss/https and same-origin Origin on production while keeping local HTTP dev safe", () => {
+    // Production HTTPS / WSS with matching Origin -> allowed
+    expect(evaluateUpgradeOrigin(new URL("https://example.com/ws/ABCD2345"), "https://example.com")).toEqual({
+      allowed: true,
+    });
+    expect(evaluateUpgradeOrigin(new URL("wss://example.com/ws/ABCD2345"), "https://example.com")).toEqual({
+      allowed: true,
+    });
+
+    // Production HTTPS / WSS with missing Origin -> rejected
+    expect(evaluateUpgradeOrigin(new URL("https://example.com/ws/ABCD2345"), null)).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+    expect(evaluateUpgradeOrigin(new URL("wss://example.com/ws/ABCD2345"), null)).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+
+    // Production insecure HTTP / WS -> rejected even with matching Origin
+    expect(evaluateUpgradeOrigin(new URL("http://example.com/ws/ABCD2345"), "http://example.com")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+    expect(evaluateUpgradeOrigin(new URL("ws://example.com/ws/ABCD2345"), "http://example.com")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+
+    // Cross-origin or scheme-downgraded or malformed Origin -> rejected
+    expect(evaluateUpgradeOrigin(new URL("https://example.com/ws/ABCD2345"), "https://evil.example")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+    expect(evaluateUpgradeOrigin(new URL("https://example.com/ws/ABCD2345"), "http://example.com")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+    expect(evaluateUpgradeOrigin(new URL("https://example.com/ws/ABCD2345"), "null")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+
+    // Local HTTP dev/test allows missing or matching Origin, rejects cross-origin
+    expect(evaluateUpgradeOrigin(new URL("http://localhost:8787/ws/ABCD2345"), null)).toEqual({ allowed: true });
+    expect(evaluateUpgradeOrigin(new URL("http://127.0.0.1:8787/ws/ABCD2345"), null)).toEqual({ allowed: true });
+    expect(evaluateUpgradeOrigin(new URL("ws://[::1]:8787/ws/ABCD2345"), "http://[::1]:8787")).toEqual({
+      allowed: true,
+    });
+    expect(evaluateUpgradeOrigin(new URL("http://localhost:8787/ws/ABCD2345"), "https://evil.example")).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
+    // Even on localhost, HTTPS/WSS requires Origin
+    expect(evaluateUpgradeOrigin(new URL("https://localhost:8787/ws/ABCD2345"), null)).toMatchObject({
+      allowed: false,
+      code: "forbidden-origin",
+    });
   });
 
   it("computeDisconnectTicket preserves active rotation grace and shrinks normal tickets to 5m", () => {

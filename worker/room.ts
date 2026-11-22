@@ -68,7 +68,7 @@ import {
   type MessageBudget,
   type PeerAttachment,
 } from "./room-models";
-import { computeDisconnectTicket, type AdmissionDecision } from "./room-policy";
+import { computeDisconnectTicket, evaluateUpgradeOrigin, type AdmissionDecision } from "./room-policy";
 import { TRY_AGAIN_LATER, rejectUpgrade } from "./upgrade";
 
 export class RoomDO extends DurableObject<Env> {
@@ -83,6 +83,7 @@ export class RoomDO extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(PING, PONG));
     this.lifecycleHost = {
       ctx: this.ctx,
       refused: this.refused,
@@ -188,16 +189,8 @@ export class RoomDO extends DurableObject<Env> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("Expected Upgrade: websocket", { status: 426 });
     }
-    const origin = request.headers.get("Origin");
-    if (!origin) return null;
-    try {
-      if (new URL(origin).origin !== url.origin) {
-        return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
-      }
-      return null;
-    } catch {
-      return rejectUpgrade("forbidden-origin", "Malformed Origin header");
-    }
+    const verdict = evaluateUpgradeOrigin(url, request.headers.get("Origin"));
+    return verdict.allowed ? null : rejectUpgrade(verdict.code, verdict.message);
   }
 
   private checkSocketCapacity(live: readonly WebSocket[], clientIp: string | null): Response | null {
@@ -275,10 +268,6 @@ export class RoomDO extends DurableObject<Env> {
     }
     if (!this.spendMessage(attachment.id)) {
       this.refuse(ws, "rate-limited", "Too many messages");
-      return;
-    }
-    if (message === PING) {
-      try { ws.send(PONG); } catch { /* ignore */ }
       return;
     }
     if (message === PONG) return;
@@ -426,7 +415,13 @@ export class RoomDO extends DurableObject<Env> {
     const supersededSocket = superseded[0];
     attachment.joinedAt = supersededSocket?.att.joinedAt ?? admission.memberTicket?.joinedAt ?? joinNow;
     if (isResume) {
-      applyResumeState(attachment, clientMsg, supersededSocket, admission.memberTicket, (oldId, newId) => {
+      const supersededSockets = new Set(superseded.map((s) => s.ws));
+      const activePeerIds = new Set(
+        this.joinedPeers(ws)
+          .filter((p) => !supersededSockets.has(p.ws))
+          .map((p) => p.att.id),
+      );
+      applyResumeState(attachment, clientMsg, supersededSocket, admission.memberTicket, activePeerIds, (oldId, newId) => {
         this.clearPeerState(oldId);
         this.gone.delete(newId);
       });

@@ -32,8 +32,11 @@ import {
   computeCredentialExpiry,
   computeNextAlarmDeadline,
   selectHostPromotionCandidate,
+  sendSafe,
   type AlarmDeadlineInput,
 } from "./room-policy";
+
+export { sendSafe };
 
 export interface JoinedSocket {
   ws: WebSocket;
@@ -46,15 +49,6 @@ export function getAttachment(ws: WebSocket): PeerAttachment | null {
     return parsed.success ? parsed.data : null;
   } catch {
     return null;
-  }
-}
-
-export function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
-  try {
-    ws.send(JSON.stringify(msg));
-    return true;
-  } catch {
-    return false;
   }
 }
 

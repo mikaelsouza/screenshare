@@ -240,20 +240,25 @@ export async function handleStateAction(
   attachment: PeerAttachment,
   clientMsg: Extract<ClientMessage, { t: "state" }>,
 ): Promise<void> {
-  if (!attachment.joined) return;
-  attachment.sharing = clientMsg.sharing;
-  try { ws.serializeAttachment(attachment); } catch { /* ignore */ }
-  if (attachment.rejoinHash) {
-    await host.ctx.blockConcurrencyWhile(async () => {
+  if (!attachment.joined || host.refused.has(ws)) return;
+  await host.ctx.blockConcurrencyWhile(async () => {
+    if (host.refused.has(ws)) return;
+    if ((await host.ctx.storage.get<boolean>(CLAIMED_KEY)) !== true) return;
+    const freshCaller = getAttachment(ws);
+    if (!freshCaller?.joined) return;
+    freshCaller.sharing = clientMsg.sharing;
+    try { ws.serializeAttachment(freshCaller); } catch { return; }
+    if (freshCaller.rejoinHash) {
       const members = await getMembers(host, Date.now());
-      const member = attachment.rejoinHash ? members[attachment.rejoinHash] : undefined;
-      if (!member) return;
-      member.sharing = attachment.sharing;
-      await host.ctx.storage.put({
-        [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, host.activeRejoinHashes()),
-      });
-    });
-  }
-  const stateMsg: ServerMessage = { t: "peer-state", id: attachment.id, sharing: attachment.sharing };
-  for (const { ws: s } of host.joinedPeers(ws)) sendSafe(s, stateMsg);
+      const member = members[freshCaller.rejoinHash];
+      if (member) {
+        member.sharing = freshCaller.sharing;
+        await host.ctx.storage.put({
+          [MEMBERS_KEY]: capByExpiry(members, (m) => m.until, MAX_STORED_ENTRIES, host.activeRejoinHashes()),
+        });
+      }
+    }
+    const stateMsg: ServerMessage = { t: "peer-state", id: freshCaller.id, sharing: freshCaller.sharing };
+    for (const { ws: s } of host.joinedPeers(ws)) sendSafe(s, stateMsg);
+  });
 }

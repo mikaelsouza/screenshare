@@ -1,4 +1,4 @@
-import type { ErrorCode } from "@shared/protocol";
+import type { ErrorCode, ServerMessage } from "@shared/protocol";
 import { timingSafeEqualStr } from "./room-crypto";
 import {
   DISCONNECTED_REJOIN_TTL_MS,
@@ -12,6 +12,15 @@ import {
   type PeerAttachment,
   type PromotedHostRecord,
 } from "./room-models";
+
+export function sendSafe(ws: WebSocket, msg: ServerMessage): boolean {
+  try {
+    ws.send(JSON.stringify(msg));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Compute empty-room credential expiry:
@@ -242,20 +251,58 @@ export function resolveResumeAttachment(input: ResumeAttachmentInput): { id: str
   return { id, sharing };
 }
 
-/** Enforce partial-mesh invariant on signal relay: viewers never offer to viewers. */
+/** Enforce partial-mesh invariant on signal relay: only active sharers may originate SDP offers. */
 export function evaluateSignalRelay(
   sender: Pick<PeerAttachment, "sharing">,
-  target: Pick<PeerAttachment, "sharing">,
+  _target: Pick<PeerAttachment, "sharing">,
   signalKind: string,
 ): { allowed: true } | { allowed: false; code: ErrorCode; message: string } {
-  if (signalKind === "offer" && !sender.sharing && !target.sharing) {
+  if (signalKind === "offer" && !sender.sharing) {
     return {
       allowed: false,
       code: "not-sharing",
-      message: "Neither of you is sharing",
+      message: "Only an active sharer can send an offer",
     };
   }
   return { allowed: true };
+}
+
+/**
+ * Validate WebSocket upgrade scheme and Origin header.
+ *
+ * Production (non-localhost) upgrades require HTTPS/WSS and a matching same-origin
+ * `Origin` header. Local HTTP dev/test (`localhost`, `127.0.0.1`, `[::1]`) allows
+ * omitted `Origin` (e.g. local tooling), while still rejecting cross-origin or
+ * malformed `Origin` headers.
+ */
+export function evaluateUpgradeOrigin(
+  url: URL,
+  originHeader: string | null,
+): { allowed: true } | { allowed: false; code: "forbidden-origin"; message: string } {
+  const isLocalHost =
+    url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
+  const isSecure = url.protocol === "https:" || url.protocol === "wss:";
+  if (!isSecure && !isLocalHost) {
+    return { allowed: false, code: "forbidden-origin", message: "Secure WebSocket (wss://) is required" };
+  }
+  if (!originHeader) {
+    if (!isLocalHost || isSecure) {
+      return { allowed: false, code: "forbidden-origin", message: "Missing Origin header" };
+    }
+    return { allowed: true };
+  }
+  const expectedOrigin =
+    url.protocol === "wss:" ? `https://${url.host}` :
+    url.protocol === "ws:" ? `http://${url.host}` :
+    url.origin;
+  try {
+    if (new URL(originHeader).origin !== expectedOrigin) {
+      return { allowed: false, code: "forbidden-origin", message: "Connections from this origin are not allowed" };
+    }
+    return { allowed: true };
+  } catch {
+    return { allowed: false, code: "forbidden-origin", message: "Malformed Origin header" };
+  }
 }
 
 export interface DisconnectTicketInput {

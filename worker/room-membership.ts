@@ -195,6 +195,7 @@ export function applyResumeState(
   clientMsg: Extract<ClientMessage, { t: "join" }>,
   supersededSocket: JoinedSocket | undefined,
   memberTicket: MemberEntry | undefined,
+  activePeerIds: ReadonlySet<string>,
   onIdReplaced: (oldId: string, newId: string) => void,
 ): void {
   const tempJoinId = attachment.id;
@@ -203,7 +204,7 @@ export function applyResumeState(
     clientSharing: clientMsg.sharing,
     superseded: supersededSocket?.att,
     memberTicket,
-    activePeerIds: new Set<string>(),
+    activePeerIds,
   });
   if (res.id !== tempJoinId) {
     attachment.id = res.id;
