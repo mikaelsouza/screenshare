@@ -184,14 +184,19 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
       { requiredKeys: [] }
     );
     const modeArb = fc.constantFrom(undefined, "framerate" as const, "clarity" as const);
+    const supportArb = fc.constantFrom(
+      "full" as const,
+      "standard" as const,
+      "framerate-only" as const,
+    );
 
     await fc.assert(
       fc.asyncProperty(
         presetArb,
         paramsArb,
         modeArb,
-        fc.boolean(),
-        async (preset, initialParams, mode, supportsClarity) => {
+        supportArb,
+        async (preset, initialParams, mode, claritySupport) => {
           let state = structuredClone(initialParams) as Record<string, unknown>;
           const initialActive = (initialParams.encodings?.[0] as Record<string, unknown> | undefined)?.["active"];
           let nextTx = 1;
@@ -209,8 +214,14 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
                 throw new Error("stale WebRTC transactionId");
               }
               if (
-                !supportsClarity &&
+                claritySupport !== "full" &&
                 next["degradationPreference"] === "maintain-framerate-and-resolution"
+              ) {
+                throw new TypeError("unsupported enum value");
+              }
+              if (
+                claritySupport === "framerate-only" &&
+                next["degradationPreference"] === "maintain-resolution"
               ) {
                 throw new TypeError("unsupported enum value");
               }
@@ -223,8 +234,15 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
           const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
           try {
             await applyVideoEncoding(sender, preset, mode);
-            const fellBack = mode === "clarity" && !supportsClarity;
-            expect(errorSpy).toHaveBeenCalledTimes(fellBack ? 1 : 0);
+            const expectedErrors =
+              mode !== "clarity"
+                ? 0
+                : claritySupport === "full"
+                  ? 0
+                  : claritySupport === "standard"
+                    ? 1
+                    : 2;
+            expect(errorSpy).toHaveBeenCalledTimes(expectedErrors);
             const firstVideo = structuredClone(state);
             const vEnc = (firstVideo["encodings"] as Array<Record<string, unknown>>)[0]!;
 
@@ -233,9 +251,13 @@ describe("Fuzzing Suite: Opus & Video SDP Munging (Feature 42)", () => {
             expect(vEnc["scaleResolutionDownBy"]).toBe(1);
             expect(vEnc["active"]).toBe(initialActive);
             const expectedPref =
-              mode === "clarity" && supportsClarity
-                ? "maintain-framerate-and-resolution"
-                : "maintain-framerate";
+              mode !== "clarity"
+                ? "maintain-framerate"
+                : claritySupport === "full"
+                  ? "maintain-framerate-and-resolution"
+                  : claritySupport === "standard"
+                    ? "maintain-resolution"
+                    : "maintain-framerate";
             expect(firstVideo["degradationPreference"]).toBe(expectedPref);
 
             // Idempotence

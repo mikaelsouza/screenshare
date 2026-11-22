@@ -20,6 +20,7 @@ const config: ViteUserConfig = defineConfig({
         "electron/follow/**/*.ts",
         "electron/audio/**/*.ts",
         "electron/picker.ts",
+        "electron/security.ts",
         "electron/updater.ts",
         "scripts/check-guardrails-diff.ts",
         "scripts/smoke-test-packaged.ts",
