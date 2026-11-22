@@ -7,11 +7,13 @@ function el<T extends HTMLElement>(id: string): T {
 
 export interface UiElements {
   lobby: HTMLElement;
+  lobbyCard: HTMLElement;
   nameInput: HTMLInputElement;
   roomNameInput: HTMLInputElement;
   roomInput: HTMLInputElement;
   lobbyError: HTMLElement;
-  lobbyForgetHostsBtn: HTMLButtonElement;
+  lobbyNotice: HTMLElement;
+  recentRoomsRoot: HTMLElement;
   joinBtn: HTMLButtonElement;
   createBtn: HTMLButtonElement;
   brandHomeBtn: HTMLButtonElement;
@@ -65,11 +67,13 @@ export interface UiElements {
 export function queryUiElements(): UiElements {
   return {
     lobby: el<HTMLElement>("lobby"),
+    lobbyCard: el<HTMLElement>("lobby-card"),
     nameInput: el<HTMLInputElement>("display-name"),
     roomNameInput: el<HTMLInputElement>("room-name"),
     roomInput: el<HTMLInputElement>("room-code"),
     lobbyError: el<HTMLElement>("lobby-error"),
-    lobbyForgetHostsBtn: el<HTMLButtonElement>("lobby-forget-hosts"),
+    lobbyNotice: el<HTMLElement>("lobby-notice"),
+    recentRoomsRoot: el<HTMLElement>("recent-rooms-root"),
     joinBtn: el<HTMLButtonElement>("join"),
     createBtn: el<HTMLButtonElement>("create"),
     brandHomeBtn: el<HTMLButtonElement>("brand-home"),
@@ -128,9 +132,25 @@ export function setStatusDom(ui: UiElements, text: string, kind: "info" | "warn"
 }
 
 export function setLobbyErrorDom(ui: UiElements, message: string | null): void {
+  const hasMessage = message !== null && message.length > 0;
   ui.lobbyError.textContent = message ?? "";
-  ui.lobbyError.hidden = message === null || message.length === 0;
-  ui.roomInput.classList.toggle("input-error", message !== null && message.length > 0);
+  ui.lobbyError.hidden = !hasMessage;
+  ui.roomInput.classList.toggle("input-error", hasMessage);
+  if (hasMessage) {
+    ui.lobbyNotice.textContent = "";
+    ui.lobbyNotice.hidden = true;
+  }
+}
+
+export function setLobbyNoticeDom(ui: UiElements, message: string | null): void {
+  const hasMessage = message !== null && message.length > 0;
+  ui.lobbyNotice.textContent = message ?? "";
+  ui.lobbyNotice.hidden = !hasMessage;
+  if (hasMessage) {
+    ui.lobbyError.textContent = "";
+    ui.lobbyError.hidden = true;
+    ui.roomInput.classList.remove("input-error");
+  }
 }
 
 export function scrubRoomUrlDom(): void {

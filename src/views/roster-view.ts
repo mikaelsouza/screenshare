@@ -80,7 +80,6 @@ export function renderInviteMenuView(
 }
 
 export function renderForgetHostButtons(ui: UiElements, session: SessionController): void {
-  ui.lobbyForgetHostsBtn.hidden = !session.hasAnySavedCreatorHosts();
   ui.inviteForgetHostBtn.hidden = !(
     session.lastJoinCode !== null && session.hasSavedCreatorHostFor(session.lastJoinCode)
   );

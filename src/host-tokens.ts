@@ -34,6 +34,12 @@ export interface LockManagerLike {
   request(name: string, callback: () => Promise<void> | void): Promise<unknown>;
 }
 
+/** Summary of a valid persisted creator host room entry. */
+export interface PersistedHostRoom {
+  code: string;
+  updatedAt: number;
+}
+
 interface HostRoomEntry {
   code: string;
   token: string;
@@ -117,6 +123,17 @@ export function hasAnyPersistedHostTokens(
 ): boolean {
   if (!storage) return false;
   return loadHostRooms(storage, now).length > 0;
+}
+
+/**
+ * List valid, non-expired persisted creator host rooms from `storage` without exposing tokens.
+ */
+export function listPersistedHostRooms(
+  storage: StorageLike | null | undefined,
+  now: number = Date.now(),
+): PersistedHostRoom[] {
+  if (!storage) return [];
+  return loadHostRooms(storage, now).map(({ code, updatedAt }) => ({ code, updatedAt }));
 }
 
 /**

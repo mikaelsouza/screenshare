@@ -633,11 +633,11 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     const afterLobby = await host.evaluate((roomCode) => ({
       legacyHostSession: sessionStorage.getItem(`host:${roomCode}`),
       persistedHosts: localStorage.getItem("host-rooms") ?? "",
-      forgetLobbyHidden: document.getElementById("lobby-forget-hosts")?.hidden ?? true,
+      clearSavedVisible: document.getElementById("recent-rooms-clear") !== null,
     }), code);
     assert.equal(afterLobby.legacyHostSession, null, "sessionStorage must not keep a redundant host: copy");
     assert.ok(afterLobby.persistedHosts.includes(code), "Return to lobby must keep host-rooms entry in localStorage");
-    assert.equal(afterLobby.forgetLobbyHidden, false, "#lobby-forget-hosts should be visible while saved host rooms exist");
+    assert.equal(afterLobby.clearSavedVisible, true, "Clear saved rooms should be visible while saved rooms exist");
 
     await joinWith(host, inviteCode);
     await waitFor(host, inRoom, { label: "host re-enters room via invite after Return to lobby" });
@@ -691,11 +691,11 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       host,
       () =>
         document.getElementById("lobby")?.hidden === false &&
-        document.getElementById("lobby-forget-hosts")?.hidden === true,
-      { label: "#lobby-forget-hosts hides once all saved host rooms are forgotten" },
+        document.querySelector(".recent-room-badge")?.textContent === "Guest",
+      { label: "saved room badge demotes to Guest once host token is forgotten" },
     );
 
-    // Create another room to test #lobby-forget-hosts, including purging legacy host: entries from sessionStorage.
+    // Create another room to test Clear saved rooms, including purging legacy host: entries from sessionStorage.
     await host.click("#create");
     await waitFor(host, inRoom, { label: "host creates second room" });
     await host.click("#brand-home");
@@ -703,22 +703,23 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
       host,
       () =>
         document.getElementById("lobby")?.hidden === false &&
-        document.getElementById("lobby-forget-hosts")?.hidden === false,
-      { label: "#lobby-forget-hosts is visible for newly created room" },
+        document.getElementById("recent-rooms-clear") !== null,
+      { label: "Clear saved rooms is visible for newly created room" },
     );
     await host.evaluate(() => {
       sessionStorage.setItem("host:MNPQRSTU", "legacy-token");
       sessionStorage.setItem("unrelatedKey", "keep");
     });
-    await host.click("#lobby-forget-hosts");
+    await host.click("#recent-rooms-clear");
     await waitFor(
       host,
       () =>
         localStorage.getItem("host-rooms") === null &&
+        localStorage.getItem("recent-rooms") === null &&
         sessionStorage.getItem("host:MNPQRSTU") === null &&
         sessionStorage.getItem("unrelatedKey") === "keep" &&
-        document.getElementById("lobby-forget-hosts")?.hidden === true,
-      { label: "#lobby-forget-hosts clears host-rooms and legacy host: entries while keeping unrelated sessionStorage keys" },
+        document.getElementById("recent-rooms-root")?.hidden === true,
+      { label: "Clear saved rooms clears host-rooms, recent-rooms, and legacy host: entries while keeping unrelated sessionStorage keys" },
     );
   });
 

@@ -8,6 +8,7 @@ import {
   clearAllPersistedHostTokens,
   clearLegacySessionHostTokens,
   hasAnyPersistedHostTokens,
+  listPersistedHostRooms,
   readPersistedHostToken,
   removePersistedHostTokenIfMatching,
   runWithHostRoomsLock,
@@ -289,6 +290,23 @@ describe("host-tokens localStorage persistence", () => {
       calls++;
     });
     expect(calls).toBe(1);
+  });
+
+  it("lists valid persisted host rooms without exposing secret tokens", () => {
+    const storage = makeMemoryStorage();
+    const t0 = 1_700_000_000_000;
+    expect(listPersistedHostRooms(null, t0)).toEqual([]);
+    writePersistedHostToken(storage, "ABCDEFGH", "tok-1", t0);
+    writePersistedHostToken(storage, "JKMNPQRS", "tok-2", t0 + 1000);
+    const listed = listPersistedHostRooms(storage, t0 + 2000);
+    expect(listed).toEqual([
+      { code: "ABCDEFGH", updatedAt: t0 },
+      { code: "JKMNPQRS", updatedAt: t0 + 1000 },
+    ]);
+    expect("token" in (listed[0] ?? {})).toBe(false);
+    expect(listPersistedHostRooms(storage, t0 + HOST_TOKEN_TTL_MS)).toEqual([
+      { code: "JKMNPQRS", updatedAt: t0 + 1000 },
+    ]);
   });
 });
 
