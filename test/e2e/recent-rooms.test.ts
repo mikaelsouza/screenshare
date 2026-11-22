@@ -38,6 +38,10 @@ function attachErrorListeners(name: string, page: Page): void {
   });
 }
 
+async function assertNoCspViolations(name: string, page: Page): Promise<void> {
+  assert.deepEqual(await page.evaluate(() => window.__csp), [], `${name} hit a CSP violation`);
+}
+
 async function createPageWithContext(name: string): Promise<{ ctx: BrowserContext; page: Page }> {
   if (!browser) throw new Error("Browser not initialized");
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 720 } });
@@ -78,21 +82,48 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
     }
   });
 
-  await it("shows clean 0-room lobby with no recents UI, opt-out toggle, or debug strip", async () => {
+  await it("shows clean 0-room lobby with subtle opt-out toggle and no recents list or debug strip", async () => {
     const state = await host.evaluate(() => ({
-      rootHidden: document.getElementById("recent-rooms-root")?.hidden ?? false,
+      rootHidden: document.getElementById("recent-rooms-root")?.hidden ?? true,
       hasExpandedClass: document.getElementById("lobby-card")?.classList.contains("has-recent-rooms") ?? true,
       hasOptOut: document.getElementById("recent-rooms-optout") !== null,
+      optOutChecked: (document.getElementById("recent-rooms-optout") as HTMLInputElement | null)?.checked ?? true,
       hasClear: document.getElementById("recent-rooms-clear") !== null,
+      hasDivider: document.querySelector("#recent-rooms-root .lobby-divider") !== null,
+      hasSearch: document.getElementById("recent-rooms-search") !== null,
+      rowCount: document.querySelectorAll(".recent-room-row").length,
       hasOldForgetBtn: document.getElementById("lobby-forget-hosts") !== null,
       bodyText: document.body.textContent ?? "",
     }));
-    assert.equal(state.rootHidden, true);
+    assert.equal(state.rootHidden, false);
     assert.equal(state.hasExpandedClass, false);
-    assert.equal(state.hasOptOut, false);
+    assert.equal(state.hasOptOut, true);
+    assert.equal(state.optOutChecked, false);
     assert.equal(state.hasClear, false);
+    assert.equal(state.hasDivider, false);
+    assert.equal(state.hasSearch, false);
+    assert.equal(state.rowCount, 0);
     assert.equal(state.hasOldForgetBtn, false);
     assert.equal(state.bodyText.includes("Simulate count"), false);
+
+    // User can opt out before ever saving a first room, and re-enable cleanly
+    await host.click("#recent-rooms-optout");
+    await waitFor(
+      host,
+      () =>
+        localStorage.getItem("recent-rooms-disabled") === "1" &&
+        document.getElementById("recent-rooms-enable") !== null,
+      { label: "0-room opt-out toggles shared-device mode on" },
+    );
+    await host.click("#recent-rooms-enable");
+    await waitFor(
+      host,
+      () =>
+        localStorage.getItem("recent-rooms-disabled") === null &&
+        document.getElementById("recent-rooms-optout") !== null &&
+        document.getElementById("recent-rooms-clear") === null,
+      { label: "Enable restores clean 0-room lobby with opt-out toggle" },
+    );
   });
 
   await it("saves rooms on join, shows quick rejoin, and supports passwordless rejoin for guest and host", async () => {
@@ -135,9 +166,14 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
     assert.equal(guestSnap.badge, "Guest");
     assert.ok(guestSnap.sub.includes("with host"), `expected host peer name in subtitle: ${guestSnap.sub}`);
 
-    // Clear sessionStorage and rejoin via click without entering password
+    // Clear sessionStorage, reload both pages for a cold boot from localStorage, and rejoin via click without password
     await guest.evaluate(() => sessionStorage.clear());
     await host.evaluate(() => sessionStorage.clear());
+    await assertNoCspViolations("host", host);
+    await assertNoCspViolations("guest", guest);
+    await Promise.all([host.reload(), guest.reload()]);
+    await host.waitForSelector(`[data-room-code="${code1}"] .recent-room-rejoin`);
+    await guest.waitForSelector(`[data-room-code="${code1}"] .recent-room-rejoin`);
     await host.click(`[data-room-code="${code1}"] .recent-room-rejoin`);
     await waitFor(host, inRoom, { label: "host rejoins room via recent row" });
     await host.click("#roster-btn");
@@ -162,7 +198,7 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
     );
     assert.ok(firstCode.length === 8);
 
-    // Inline rename: Escape cancels, Enter commits
+    // Inline rename: Escape cancels, Enter commits, and focus returns to .recent-room-edit-btn
     await host.click(`[data-room-code="${firstCode}"] .recent-room-edit-btn`);
     await host.fill(".recent-room-rename-input", "Should Not Save");
     await host.press(".recent-room-rename-input", "Escape");
@@ -171,6 +207,11 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
       () => document.querySelector(".recent-room-rename-input") === null,
       { label: "Escape closes rename input" },
     );
+    const focusAfterEsc = await host.evaluate(
+      (c) => document.activeElement === document.querySelector(`[data-room-code="${c}"] .recent-room-edit-btn`),
+      firstCode,
+    );
+    assert.equal(focusAfterEsc, true);
     const titleAfterEsc = await host.textContent(`[data-room-code="${firstCode}"] .recent-room-title`);
     assert.equal(titleAfterEsc, firstCode);
 
@@ -181,6 +222,11 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
       (c) => document.querySelector(`[data-room-code="${c}"] .recent-room-title`)?.textContent === "Weekly Design Sync",
       firstCode,
     );
+    const focusAfterEnter = await host.evaluate(
+      (c) => document.activeElement === document.querySelector(`[data-room-code="${c}"] .recent-room-edit-btn`),
+      firstCode,
+    );
+    assert.equal(focusAfterEnter, true);
 
     // Create 2 more rooms so host has 3 rooms -> triggers "recent rooms (3)" + live search
     await host.click("#create");
@@ -323,6 +369,7 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
         ]),
       );
     }, badCode);
+    await assertNoCspViolations("guest", guest);
     await guest.reload();
     await guest.waitForFunction((c) => document.querySelector(`[data-room-code="${c}"]`) !== null, badCode);
     await guest.click(`[data-room-code="${badCode}"] .recent-room-rejoin`);
@@ -367,12 +414,16 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
     await waitFor(
       host,
       () =>
-        document.getElementById("recent-rooms-root")?.hidden === true &&
+        document.getElementById("recent-rooms-root")?.hidden === false &&
+        document.getElementById("recent-rooms-optout") !== null &&
+        document.getElementById("recent-rooms-clear") === null &&
+        document.querySelectorAll(".recent-room-row").length === 0 &&
         localStorage.getItem("recent-rooms-disabled") === null,
       { label: "Enable restores clean 0-room lobby" },
     );
 
     // Verify privacy.html §3 & §4 disclosures and zero CSP violations
+    await assertNoCspViolations("host", host);
     await host.goto(`${BASE_URL}/privacy.html`);
     const privacyText = await host.evaluate(() => document.body.textContent ?? "");
     assert.ok(privacyText.includes("recent-rooms"));
@@ -385,7 +436,7 @@ await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { con
       ["host", host],
       ["guest", guest],
     ] as const) {
-      assert.deepEqual(await p.evaluate(() => window.__csp), [], `${name} hit a CSP violation`);
+      await assertNoCspViolations(name, p);
     }
     assert.deepEqual(pageErrors, [], `unexpected page errors: ${pageErrors.join("; ")}`);
     assert.deepEqual(consoleErrors, [], `unexpected console errors: ${consoleErrors.join("; ")}`);

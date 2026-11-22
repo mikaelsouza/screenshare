@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   HOST_ROOMS_LOCK_NAME,
   HOST_ROOMS_STORAGE_KEY,
@@ -307,6 +307,92 @@ describe("host-tokens localStorage persistence", () => {
     expect(listPersistedHostRooms(storage, t0 + HOST_TOKEN_TTL_MS)).toEqual([
       { code: "JKMNPQRS", updatedAt: t0 + 1000 },
     ]);
+  });
+
+  it("kills remaining boundary, ordering, trimming, and spy-guard mutants", () => {
+    // 1. Bad JSON / non-array / invalid-only entries
+    const badJson = makeMemoryStorage({ [HOST_ROOMS_STORAGE_KEY]: "{not json" });
+    expect(hasAnyPersistedHostTokens(badJson)).toBe(false);
+    expect(listPersistedHostRooms(badJson)).toEqual([]);
+
+    const nonArray = makeMemoryStorage({ [HOST_ROOMS_STORAGE_KEY]: JSON.stringify({ code: "ABCDEFGH" }) });
+    expect(hasAnyPersistedHostTokens(nonArray)).toBe(false);
+    expect(listPersistedHostRooms(nonArray)).toEqual([]);
+
+    const invalidOnly = makeMemoryStorage({
+      [HOST_ROOMS_STORAGE_KEY]: JSON.stringify([{ code: "INVALID", token: "tok", updatedAt: 1000 }]),
+    });
+    expect(hasAnyPersistedHostTokens(invalidOnly, 2000)).toBe(false);
+    expect(listPersistedHostRooms(invalidOnly, 2000)).toEqual([]);
+
+    const mixed = makeMemoryStorage({
+      [HOST_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "INVALID", token: "bad", updatedAt: 1000 },
+        { code: "ABCDEFGH", token: "newer", updatedAt: 2000 },
+        { code: "ABCDEFGH", token: "older", updatedAt: 1000 },
+      ]),
+    });
+    expect(listPersistedHostRooms(mixed, 3000)).toEqual([{ code: "ABCDEFGH", updatedAt: 2000 }]);
+    expect(readPersistedHostToken(mixed, "ABCDEFGH", 3000)).toBe("newer");
+
+    // 2. Whitespace-trimmed code in storage
+    const trimmedStorage = makeMemoryStorage({
+      [HOST_ROOMS_STORAGE_KEY]: JSON.stringify([{ code: " abcdefgh ", token: "tok-trim", updatedAt: 2000 }]),
+    });
+    expect(readPersistedHostToken(trimmedStorage, "ABCDEFGH", 2500)).toBe("tok-trim");
+
+    // 3. Out-of-order timestamps in 21-room eviction
+    const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    const makeCode = (idx: number): string => `${alphabet[idx] ?? "A"}BCDEFG2`;
+    const evictStorage = makeMemoryStorage();
+    writePersistedHostToken(evictStorage, makeCode(0), "tok-0-newest-first", 5000);
+    for (let i = 1; i < MAX_STORED_HOST_ROOMS; i++) {
+      writePersistedHostToken(evictStorage, makeCode(i), `tok-${i}`, 1000 + i * 10);
+    }
+    writePersistedHostToken(evictStorage, makeCode(MAX_STORED_HOST_ROOMS), "tok-20", 6000);
+    expect(readPersistedHostToken(evictStorage, makeCode(1), 6000)).toBeUndefined();
+    expect(readPersistedHostToken(evictStorage, makeCode(0), 6000)).toBe("tok-0-newest-first");
+
+    // 4. Spy guards on invalid code / empty token avoid storage.getItem
+    const getItemSpy = vi.fn(() => null);
+    const spyStorage: StorageLike = {
+      getItem: getItemSpy,
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+    };
+    expect(readPersistedHostToken(spyStorage, "BAD")).toBeUndefined();
+    expect(removePersistedHostTokenIfMatching(spyStorage, "BAD", "tok")).toBe(false);
+    expect(removePersistedHostTokenIfMatching(spyStorage, "ABCDEFGH", "")).toBe(false);
+    expect(getItemSpy).not.toHaveBeenCalled();
+
+    // 5. Oversized >64-char token does not write to raw storage
+    const rawCheckStorage = makeMemoryStorage();
+    writePersistedHostToken(rawCheckStorage, "ABCDEFGH", "b".repeat(65), 1002);
+    expect(rawCheckStorage.store.has(HOST_ROOMS_STORAGE_KEY)).toBe(false);
+
+    // 6. removePersistedHostTokenIfMatching trims code and removes non-first entry while keeping first
+    const multiStorage = makeMemoryStorage();
+    writePersistedHostToken(multiStorage, "ABCDEFGH", "tok-first", 2000);
+    writePersistedHostToken(multiStorage, "JKMNPQRS", "tok-second", 2100);
+    expect(removePersistedHostTokenIfMatching(multiStorage, "  jkmnpqrs  ", "tok-second", 2500)).toBe(true);
+    expect(readPersistedHostToken(multiStorage, "ABCDEFGH", 2500)).toBe("tok-first");
+    expect(readPersistedHostToken(multiStorage, "JKMNPQRS", 2500)).toBeUndefined();
+
+    // 7. clearLegacySessionHostTokens spies + sparse null key before host:* key
+    const keys: Array<string | null> = [null, "activeRoom", "host:ABCDEFGH", "name"];
+    const keySpy = vi.fn((idx: number) => keys[idx] ?? null);
+    const removeSpy = vi.fn();
+    const sparseSession: SessionStorageLike = {
+      get length() {
+        return keys.length;
+      },
+      key: keySpy,
+      removeItem: removeSpy,
+    };
+    clearLegacySessionHostTokens(sparseSession);
+    expect(keySpy).toHaveBeenCalledTimes(keys.length);
+    expect(removeSpy).toHaveBeenCalledTimes(1);
+    expect(removeSpy).toHaveBeenCalledWith("host:ABCDEFGH");
   });
 });
 

@@ -25,7 +25,14 @@ export interface RecentRoomsRenderState {
   editingCode: string | null;
 }
 
-type ViewMode = "hidden" | "disabled" | "few" | "many";
+type ViewMode = "empty" | "disabled" | "few" | "many";
+
+interface RenameControls {
+  wrap: HTMLDivElement;
+  input: HTMLInputElement;
+  saveBtn: HTMLButtonElement;
+  cancelBtn: HTMLButtonElement;
+}
 
 interface RenameDraft {
   code: string;
@@ -42,6 +49,16 @@ function isFocusedByOtherElement(detachedInput: HTMLInputElement): boolean {
   return activeEl !== null && activeEl !== detachedInput && activeEl !== document.body;
 }
 
+function isFocusInsideRenameRow(active: {
+  input: HTMLInputElement;
+  saveBtn: HTMLButtonElement;
+  cancelBtn: HTMLButtonElement;
+}): boolean {
+  if (typeof document === "undefined") return false;
+  const activeEl = document.activeElement;
+  return activeEl === active.input || activeEl === active.saveBtn || activeEl === active.cancelBtn;
+}
+
 function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   className?: string,
@@ -56,7 +73,7 @@ function el<K extends keyof HTMLElementTagNameMap>(
 function buildRenameRow(
   room: RecentRoomEntry,
   callbacks: RecentRoomsViewCallbacks,
-): { wrap: HTMLDivElement; input: HTMLInputElement } {
+): RenameControls {
   const wrap = el("div", "recent-room-rename");
   const input = el("input", "ui-input recent-room-rename-input");
   input.type = "text";
@@ -70,7 +87,10 @@ function buildRenameRow(
     if (ev.key === "Enter") {
       ev.preventDefault();
       callbacks.onCommitRename(room.code, input.value);
-    } else if (ev.key === "Escape") {
+    }
+  });
+  wrap.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
       callbacks.onCancelRename();
@@ -86,7 +106,7 @@ function buildRenameRow(
   cancelBtn.addEventListener("click", () => callbacks.onCancelRename());
 
   wrap.append(input, saveBtn, cancelBtn);
-  return { wrap, input };
+  return { wrap, input, saveBtn, cancelBtn };
 }
 
 function buildRoomSubtitle(room: RecentRoomEntry): string {
@@ -103,14 +123,14 @@ function buildRoomRow(
   room: RecentRoomEntry,
   editingCode: string | null,
   callbacks: RecentRoomsViewCallbacks,
-): { row: HTMLDivElement; renameInput: HTMLInputElement | null } {
+): { row: HTMLDivElement; renameControls: RenameControls | null; editBtn: HTMLButtonElement | null } {
   const row = el("div", "recent-room-row");
   row.dataset["roomCode"] = room.code;
 
   if (editingCode === room.code) {
-    const { wrap, input } = buildRenameRow(room, callbacks);
-    row.append(wrap);
-    return { row, renameInput: input };
+    const renameControls = buildRenameRow(room, callbacks);
+    row.append(renameControls.wrap);
+    return { row, renameControls, editBtn: null };
   }
 
   const rejoinBtn = el("button", "recent-room-rejoin");
@@ -145,14 +165,14 @@ function buildRoomRow(
 
   actions.append(editBtn, removeBtn);
   row.append(rejoinBtn, actions);
-  return { row, renameInput: null };
+  return { row, renameControls: null, editBtn };
 }
 
 function buildPrivacyFooter(
   disabled: boolean,
-  totalCount: number,
+  includeClear: boolean,
   callbacks: RecentRoomsViewCallbacks,
-): { footer: HTMLDivElement; clearBtn: HTMLButtonElement; checkbox: HTMLInputElement } {
+): { footer: HTMLDivElement; clearBtn: HTMLButtonElement | null; checkbox: HTMLInputElement } {
   const footer = el("div", "recent-rooms-footer");
   const label = el("label", "recent-rooms-optout");
   const checkbox = el("input");
@@ -162,10 +182,14 @@ function buildPrivacyFooter(
   checkbox.addEventListener("change", () => callbacks.onSetDisabled(checkbox.checked));
   label.append(checkbox, el("span", undefined, "Don't save rooms on this device"));
 
+  if (!includeClear) {
+    footer.append(label);
+    return { footer, clearBtn: null, checkbox };
+  }
+
   const clearBtn = el("button", "ui-btn danger recent-btn-xs", "Clear saved rooms");
   clearBtn.id = "recent-rooms-clear";
   clearBtn.type = "button";
-  clearBtn.disabled = totalCount === 0;
   clearBtn.title = "Remove all saved recent rooms and host tokens from this device";
   clearBtn.addEventListener("click", () => callbacks.onClearAll());
 
@@ -181,14 +205,19 @@ export class RecentRoomsView {
   private readonly lobbyCard: HTMLElement;
   private readonly root: HTMLElement;
   private readonly callbacks: RecentRoomsViewCallbacks;
-  private mode: ViewMode = "hidden";
+  private mode: ViewMode | null = null;
   private dividerEl: HTMLDivElement | null = null;
   private searchInput: HTMLInputElement | null = null;
   private listEl: HTMLDivElement | null = null;
   private clearBtn: HTMLButtonElement | null = null;
   private optOutCheckbox: HTMLInputElement | null = null;
   private lastFocusedEditCode: string | null = null;
-  private activeRename: { code: string; input: HTMLInputElement } | null = null;
+  private activeRename: {
+    code: string;
+    input: HTMLInputElement;
+    saveBtn: HTMLButtonElement;
+    cancelBtn: HTMLButtonElement;
+  } | null = null;
   private hiddenRenameDraft: RenameDraft | null = null;
 
   constructor(lobbyCard: HTMLElement, root: HTMLElement, callbacks: RecentRoomsViewCallbacks) {
@@ -199,7 +228,7 @@ export class RecentRoomsView {
 
   private resolveMode(state: RecentRoomsRenderState): ViewMode {
     if (state.disabled) return "disabled";
-    if (state.totalCount === 0) return "hidden";
+    if (state.totalCount === 0) return "empty";
     return state.totalCount <= 2 ? "few" : "many";
   }
 
@@ -209,6 +238,15 @@ export class RecentRoomsView {
     this.listEl = null;
     this.clearBtn = null;
     this.optOutCheckbox = null;
+  }
+
+  private renderEmpty(disabled: boolean): void {
+    this.resetRefs();
+    const { footer, checkbox } = buildPrivacyFooter(disabled, false, this.callbacks);
+    footer.classList.add("recent-rooms-footer-empty");
+    this.optOutCheckbox = checkbox;
+    this.root.replaceChildren(footer);
+    this.root.hidden = false;
   }
 
   private renderDisabled(): void {
@@ -227,7 +265,7 @@ export class RecentRoomsView {
   private buildContainer(mode: "few" | "many"): void {
     const divider = el("div", "lobby-divider");
     const list = el("div", mode === "many" ? "recent-rooms-list is-scrollable" : "recent-rooms-list");
-    const { footer, clearBtn, checkbox } = buildPrivacyFooter(false, 1, this.callbacks);
+    const { footer, clearBtn, checkbox } = buildPrivacyFooter(false, true, this.callbacks);
 
     this.dividerEl = divider;
     this.listEl = list;
@@ -252,21 +290,28 @@ export class RecentRoomsView {
     this.root.hidden = false;
   }
 
-  private renderList(state: RecentRoomsRenderState): HTMLInputElement | null {
-    if (!this.listEl) return null;
+  private renderList(
+    state: RecentRoomsRenderState,
+    restoreEditFocusCode: string | null,
+  ): { renameControls: RenameControls | null; editBtnToFocus: HTMLButtonElement | null } {
+    if (!this.listEl) return { renameControls: null, editBtnToFocus: null };
     if (state.filteredRooms.length === 0) {
       this.listEl.replaceChildren(el("p", "recent-rooms-empty-filter", "No matching rooms."));
-      return null;
+      return { renameControls: null, editBtnToFocus: null };
     }
-    let renameInputToFocus: HTMLInputElement | null = null;
+    let renameControls: RenameControls | null = null;
+    let editBtnToFocus: HTMLButtonElement | null = null;
     const rows: HTMLDivElement[] = [];
     for (const room of state.filteredRooms) {
       const built = buildRoomRow(room, state.editingCode, this.callbacks);
       rows.push(built.row);
-      if (built.renameInput) renameInputToFocus = built.renameInput;
+      if (built.renameControls) renameControls = built.renameControls;
+      if (restoreEditFocusCode !== null && room.code === restoreEditFocusCode && built.editBtn) {
+        editBtnToFocus = built.editBtn;
+      }
     }
     this.listEl.replaceChildren(...rows);
-    return renameInputToFocus;
+    return { renameControls, editBtnToFocus };
   }
 
   private updateHeaderAndFooter(mode: "few" | "many", state: RecentRoomsRenderState): void {
@@ -306,7 +351,7 @@ export class RecentRoomsView {
 
   private applyRenameInputState(
     editingCode: string | null,
-    input: HTMLInputElement | null,
+    controls: RenameControls | null,
     draft: RenameDraft | null,
   ): void {
     if (editingCode === null) {
@@ -315,14 +360,15 @@ export class RecentRoomsView {
       this.lastFocusedEditCode = null;
       return;
     }
-    if (!input) {
+    if (!controls) {
       this.activeRename = null;
       this.hiddenRenameDraft = draft;
       if (this.lastFocusedEditCode !== editingCode) this.lastFocusedEditCode = null;
       return;
     }
+    const { input, saveBtn, cancelBtn } = controls;
     this.hiddenRenameDraft = null;
-    this.activeRename = { code: editingCode, input };
+    this.activeRename = { code: editingCode, input, saveBtn, cancelBtn };
     if (draft) {
       input.value = draft.value;
       if (draft.focused) input.focus();
@@ -345,16 +391,24 @@ export class RecentRoomsView {
   render(state: RecentRoomsRenderState): void {
     const nextMode = this.resolveMode(state);
     const renameDraft = this.captureRenameDraft(nextMode, state.editingCode);
+    const restoreEditFocusCode =
+      state.editingCode === null &&
+      this.activeRename !== null &&
+      isFocusInsideRenameRow(this.activeRename)
+        ? this.activeRename.code
+        : null;
     this.lobbyCard.classList.toggle("has-recent-rooms", !state.disabled && state.totalCount > 0);
 
-    if (nextMode === "hidden") {
-      this.mode = "hidden";
+    if (nextMode === "empty") {
       this.lastFocusedEditCode = null;
       this.activeRename = null;
       this.hiddenRenameDraft = null;
-      this.resetRefs();
-      this.root.hidden = true;
-      this.root.replaceChildren();
+      if (this.mode !== "empty") {
+        this.mode = "empty";
+        this.renderEmpty(state.disabled);
+      } else if (this.optOutCheckbox) {
+        this.optOutCheckbox.checked = state.disabled;
+      }
       return;
     }
 
@@ -373,7 +427,8 @@ export class RecentRoomsView {
     }
 
     this.updateHeaderAndFooter(nextMode, state);
-    const renameInputToFocus = this.renderList(state);
-    this.applyRenameInputState(state.editingCode, renameInputToFocus, renameDraft);
+    const rendered = this.renderList(state, restoreEditFocusCode);
+    this.applyRenameInputState(state.editingCode, rendered.renameControls, renameDraft);
+    rendered.editBtnToFocus?.focus();
   }
 }

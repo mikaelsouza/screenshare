@@ -38,6 +38,7 @@ function createMemoryStorage(): Storage {
 function makeWiringHarness(options?: {
   code?: string;
   lastHostToken?: string | undefined;
+  getLastHostToken?: () => string | undefined;
 }) {
   const code = options?.code ?? "WXYZ2345";
   const storage = createMemoryStorage();
@@ -64,7 +65,7 @@ function makeWiringHarness(options?: {
       tasks.push(t);
     },
     hasSavedCreatorHostFor: (c) => session.hasSavedCreatorHostFor(c),
-    onRemoveHostToken: (c) => session.forgetCreatorHostToken(c),
+    onRemoveHostToken: (c, onlyIfMatching) => session.forgetCreatorHostToken(c, onlyIfMatching),
     onForgetAllHostTokens: () => session.forgetAllHostTokens(),
     onChange: vi.fn(),
   });
@@ -119,7 +120,7 @@ function makeWiringHarness(options?: {
     ctx,
     code,
     session.joinGeneration,
-    () => options?.lastHostToken,
+    () => (options?.getLastHostToken ? options.getLastHostToken() : options?.lastHostToken),
   );
 
   return {
@@ -168,21 +169,31 @@ describe("room-wiring recent rooms integration", () => {
     expect(loadRecentRooms(h.storage)[0]?.password).toBe("ROTATED_PASS_222");
   });
 
-  it("reports Removed CODE notice and prevents resurrection on bad-password/kicked for legacy host-rooms entries even when lastHostToken is undefined", async () => {
+  it("reports Removed CODE notice, removes matching presented legacy token, and calls forgetCreatorHostToken once on bad-password/kicked", async () => {
     for (const [errCode, expectedSubstr] of [
       ["bad-password", "Invalid or expired room invite"],
       ["kicked", "removed"],
     ] as const) {
-      const h = makeWiringHarness({ code: "WXYZ2345", lastHostToken: undefined });
+      let presentedToken: string | undefined;
+      const h = makeWiringHarness({
+        code: "WXYZ2345",
+        getLastHostToken: () => presentedToken,
+      });
       writePersistedHostToken(h.storage, "WXYZ2345", "legacy-host-tok", Date.now());
       h.session.syncCreatorTokensFromStorage();
       h.recentRooms.syncFromStorage();
+      // Mirrors main.ts getAuth(): connecting reads hostTokenFor(code) into lastPresentedHostToken
+      presentedToken = h.session.hostTokenFor("WXYZ2345");
+      expect(presentedToken).toBe("legacy-host-tok");
       expect(h.recentRooms.getRooms().map((r) => r.code)).toEqual(["WXYZ2345"]);
 
+      const forgetSpy = vi.spyOn(h.session, "forgetCreatorHostToken");
       h.handlers.onError(errCode, errCode);
       await Promise.all(h.tasks);
       h.recentRooms.syncFromStorage();
 
+      expect(forgetSpy).toHaveBeenCalledTimes(1);
+      expect(forgetSpy).toHaveBeenCalledWith("WXYZ2345", "legacy-host-tok");
       const lastErr = h.lobbyErrors[h.lobbyErrors.length - 1] ?? "";
       expect(lastErr).toContain(expectedSubstr);
       expect(lastErr).toContain("Removed WXYZ2345 from saved rooms.");
@@ -190,6 +201,232 @@ describe("room-wiring recent rooms integration", () => {
       expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBeUndefined();
       expect(loadRecentRooms(h.storage)).toEqual([]);
     }
+  });
+
+  it("preserves another tab's creator host token when an unauthenticated guest (lastHostToken=undefined) gets bad-password or kicked", async () => {
+    for (const errCode of ["bad-password", "kicked"] as const) {
+      const h = makeWiringHarness({ code: "WXYZ2345", lastHostToken: undefined });
+      h.recentRooms.recordJoin({ code: "WXYZ2345", password: "WRONG_PASS_12345" });
+      await Promise.all(h.tasks);
+
+      // Concurrent Tab B creates/saves a valid creator token while Tab A connected as a guest
+      writePersistedHostToken(h.storage, "WXYZ2345", "tok-tab-b", Date.now());
+      const forgetSpy = vi.spyOn(h.session, "forgetCreatorHostToken");
+
+      h.handlers.onError(errCode, errCode);
+      await Promise.all(h.tasks);
+
+      expect(forgetSpy).not.toHaveBeenCalled();
+      expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBe("tok-tab-b");
+      expect(loadRecentRooms(h.storage)).toEqual([]);
+      expect(h.lobbyErrors[h.lobbyErrors.length - 1] ?? "").toContain("Removed WXYZ2345 from saved rooms.");
+    }
+  });
+
+  it("preserves newer cross-tab host-rooms token when fatal kicked or bad-password used a superseded lastHostToken", async () => {
+    for (const errCode of ["kicked", "bad-password"] as const) {
+      const h = makeWiringHarness({ code: "WXYZ2345", lastHostToken: "tok-old" });
+      writePersistedHostToken(h.storage, "WXYZ2345", "tok-old", Date.now());
+      h.session.syncCreatorTokensFromStorage();
+      h.recentRooms.recordJoin({ code: "WXYZ2345", password: "ROOM_PASS_123456" });
+      await Promise.all(h.tasks);
+
+      // Another tab rotates/saves a newer creator token in host-rooms
+      writePersistedHostToken(h.storage, "WXYZ2345", "tok-new", Date.now() + 1000);
+
+      h.handlers.onError(errCode, errCode);
+      await Promise.all(h.tasks);
+
+      expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBe("tok-new");
+      expect(loadRecentRooms(h.storage)).toEqual([]);
+      expect(h.recentRooms.getRooms()).toHaveLength(1);
+      expect(h.recentRooms.getRooms()[0]?.password).toBeUndefined();
+      expect(h.lobbyErrors[h.lobbyErrors.length - 1] ?? "").toContain("Removed WXYZ2345 from saved rooms.");
+    }
+
+    // Matching lastHostToken removes the token
+    const hMatch = makeWiringHarness({ code: "MNPQ2345", lastHostToken: "tok-new" });
+    writePersistedHostToken(hMatch.storage, "MNPQ2345", "tok-new", Date.now());
+    hMatch.session.syncCreatorTokensFromStorage();
+    hMatch.recentRooms.recordJoin({ code: "MNPQ2345", password: "ROOM_PASS_123456" });
+    await Promise.all(hMatch.tasks);
+    hMatch.handlers.onError("kicked", "kicked");
+    await Promise.all(hMatch.tasks);
+    expect(readPersistedHostToken(hMatch.storage, "MNPQ2345")).toBeUndefined();
+  });
+
+  it("renders subtle opt-out footer in empty mode (0 rooms) and handles empty <-> disabled <-> few transitions", () => {
+    withFakeRecentRoomsDom(({ root, lobbyCard, view, findById, findAllByClass }) => {
+      view.render({
+        disabled: false,
+        totalCount: 0,
+        filteredRooms: [],
+        searchQuery: "",
+        editingCode: null,
+      });
+
+      expect(root.hidden).toBe(false);
+      expect(lobbyCard.classes.has("has-recent-rooms")).toBe(false);
+      const optOut = findById(root, "recent-rooms-optout");
+      expect(optOut).not.toBeNull();
+      expect(optOut?.checked).toBe(false);
+      expect(findById(root, "recent-rooms-clear")).toBeNull();
+      expect(findAllByClass(root, "lobby-divider")).toHaveLength(0);
+
+      // Transition empty -> disabled -> empty
+      view.render({
+        disabled: true,
+        totalCount: 0,
+        filteredRooms: [],
+        searchQuery: "",
+        editingCode: null,
+      });
+      expect(findById(root, "recent-rooms-enable")).not.toBeNull();
+      expect(findById(root, "recent-rooms-optout")).toBeNull();
+
+      view.render({
+        disabled: false,
+        totalCount: 0,
+        filteredRooms: [],
+        searchQuery: "",
+        editingCode: null,
+      });
+      expect(findById(root, "recent-rooms-optout")).not.toBeNull();
+      expect(findById(root, "recent-rooms-clear")).toBeNull();
+
+      // Transition empty -> few -> empty
+      const t0 = 1_700_000_000_000;
+      view.render({
+        disabled: false,
+        totalCount: 1,
+        filteredRooms: [{ code: "AAAA2345", role: "host", lastJoinedAt: t0, peerNames: [] }],
+        searchQuery: "",
+        editingCode: null,
+      });
+      expect(lobbyCard.classes.has("has-recent-rooms")).toBe(true);
+      expect(findById(root, "recent-rooms-clear")).not.toBeNull();
+      expect(findAllByClass(root, "lobby-divider")).toHaveLength(1);
+
+      view.render({
+        disabled: false,
+        totalCount: 0,
+        filteredRooms: [],
+        searchQuery: "",
+        editingCode: null,
+      });
+      expect(lobbyCard.classes.has("has-recent-rooms")).toBe(false);
+      expect(findById(root, "recent-rooms-optout")).not.toBeNull();
+      expect(findById(root, "recent-rooms-clear")).toBeNull();
+      expect(findAllByClass(root, "lobby-divider")).toHaveLength(0);
+    });
+  });
+
+  it("restores focus to .recent-room-edit-btn on rename Save/Escape only when focus was inside the rename row", () => {
+    withFakeRecentRoomsDom(({ root, view, docState, callbacks, findRenameInput, findById, findAllByClass }) => {
+      const t0 = 1_700_000_000_000;
+      const r1 = { code: "AAAA2345", role: "host" as const, lastJoinedAt: t0, peerNames: [], label: "One" };
+      const r2 = { code: "BBBB2345", role: "guest" as const, lastJoinedAt: t0 - 1000, peerNames: [] };
+      const r3 = { code: "CCCC2345", role: "guest" as const, lastJoinedAt: t0 - 2000, peerNames: [] };
+
+      // 1. Focus on input -> Escape on wrap cancels and restores focus to AAAA2345's editBtn
+      view.render({
+        disabled: false,
+        totalCount: 2,
+        filteredRooms: [r1, r2],
+        searchQuery: "",
+        editingCode: "AAAA2345",
+      });
+      const input1 = findRenameInput(root);
+      expect(docState.activeElement).toBe(input1);
+
+      const wrap = findAllByClass(root, "recent-room-rename")[0];
+      expect(wrap).toBeDefined();
+      const preventDefault = vi.fn();
+      const stopPropagation = vi.fn();
+      wrap?.dispatch("keydown", { key: "Escape", preventDefault, stopPropagation });
+      expect(preventDefault).toHaveBeenCalledTimes(1);
+      expect(stopPropagation).toHaveBeenCalledTimes(1);
+      expect(callbacks.onCancelRename).toHaveBeenCalledTimes(1);
+
+      view.render({
+        disabled: false,
+        totalCount: 2,
+        filteredRooms: [r1, r2],
+        searchQuery: "",
+        editingCode: null,
+      });
+      const editBtnsAfterEsc = findAllByClass(root, "recent-room-edit-btn");
+      expect(editBtnsAfterEsc[0]?.focusCalls).toBe(1);
+      expect(docState.activeElement).toBe(editBtnsAfterEsc[0]);
+
+      // 2. Focus on Save or Cancel button -> Save/Cancel restores focus to editBtn
+      for (const btnText of ["Save", "Cancel"] as const) {
+        view.render({
+          disabled: false,
+          totalCount: 2,
+          filteredRooms: [r1, r2],
+          searchQuery: "",
+          editingCode: "AAAA2345",
+        });
+        const actionBtn = findAllByClass(root, "recent-btn-xs").find((b) => b.textContent === btnText);
+        expect(actionBtn).toBeDefined();
+        actionBtn?.focus();
+        expect(docState.activeElement).toBe(actionBtn);
+
+        view.render({
+          disabled: false,
+          totalCount: 2,
+          filteredRooms: [r1, r2],
+          searchQuery: "",
+          editingCode: null,
+        });
+        const editBtns = findAllByClass(root, "recent-room-edit-btn");
+        expect(editBtns[0]?.focusCalls).toBe(1);
+        expect(docState.activeElement).toBe(editBtns[0]);
+      }
+
+      // 3. Focus elsewhere (#recent-rooms-search) -> editingCode -> null does NOT steal focus
+      view.render({
+        disabled: false,
+        totalCount: 3,
+        filteredRooms: [r1, r2, r3],
+        searchQuery: "",
+        editingCode: "AAAA2345",
+      });
+      const searchInput = findById(root, "recent-rooms-search");
+      searchInput?.focus();
+      expect(docState.activeElement).toBe(searchInput);
+
+      view.render({
+        disabled: false,
+        totalCount: 3,
+        filteredRooms: [r1, r2, r3],
+        searchQuery: "",
+        editingCode: null,
+      });
+      const editBtnsSearch = findAllByClass(root, "recent-room-edit-btn");
+      expect(editBtnsSearch[0]?.focusCalls).toBe(0);
+      expect(docState.activeElement).toBe(searchInput);
+
+      // 4. Edited row absent from filteredRooms on editingCode -> null does not throw or steal focus
+      view.render({
+        disabled: false,
+        totalCount: 3,
+        filteredRooms: [r1, r2, r3],
+        searchQuery: "",
+        editingCode: "AAAA2345",
+      });
+      expect(() => {
+        view.render({
+          disabled: false,
+          totalCount: 3,
+          filteredRooms: [r2, r3],
+          searchQuery: "BBBB",
+          editingCode: null,
+        });
+      }).not.toThrow();
+      expect(findAllByClass(root, "recent-room-edit-btn").every((b) => b.focusCalls === 0)).toBe(true);
+    });
   });
 
   it("preserves unsaved rename draft, focus, and caret across simulated cross-tab updates in RecentRoomsView", () => {
@@ -474,19 +711,26 @@ interface FakeRecentDomEl {
   className: string;
   textContent: string;
   hidden: boolean;
+  checked: boolean;
+  disabled: boolean;
   value: string;
   selectionStart: number | null;
   selectionEnd: number | null;
   dataset: Record<string, string>;
   children: FakeRecentDomEl[];
+  classes: Set<string>;
   focusCalls: number;
   selectCalls: number;
   selectionRestores: Array<[number, number]>;
-  classList: { toggle: (name: string, force?: boolean) => void };
+  classList: {
+    add: (name: string) => void;
+    toggle: (name: string, force?: boolean) => void;
+  };
   append: (...nodes: FakeRecentDomEl[]) => void;
   replaceChildren: (...nodes: FakeRecentDomEl[]) => void;
   setAttribute: (_k: string, _v: string) => void;
-  addEventListener: (_type: string, _fn: (...args: unknown[]) => void) => void;
+  addEventListener: (type: string, fn: (ev: unknown) => void) => void;
+  dispatch: (type: string, ev?: unknown) => void;
   focus: () => void;
   select?: () => void;
   setSelectionRange?: (start: number, end: number) => void;
@@ -495,31 +739,51 @@ interface FakeRecentDomEl {
 function withFakeRecentRoomsDom(
   fn: (ctx: {
     root: FakeRecentDomEl;
+    lobbyCard: FakeRecentDomEl;
     view: RecentRoomsView;
     docState: { activeElement: FakeRecentDomEl | null };
+    callbacks: {
+      onRejoin: ReturnType<typeof vi.fn>;
+      onStartRename: ReturnType<typeof vi.fn>;
+      onCommitRename: ReturnType<typeof vi.fn>;
+      onCancelRename: ReturnType<typeof vi.fn>;
+      onRemove: ReturnType<typeof vi.fn>;
+      onClearAll: ReturnType<typeof vi.fn>;
+      onSetDisabled: ReturnType<typeof vi.fn>;
+      onSearchChange: ReturnType<typeof vi.fn>;
+    };
     findRenameInput: (root: FakeRecentDomEl) => FakeRecentDomEl | null;
     findById: (root: FakeRecentDomEl, id: string) => FakeRecentDomEl | null;
+    findAllByClass: (root: FakeRecentDomEl, cls: string) => FakeRecentDomEl[];
   }) => void,
   options?: { minimalInput?: boolean },
 ): void {
   const docState: { activeElement: FakeRecentDomEl | null } = { activeElement: null };
   const makeEl = (tag: string): FakeRecentDomEl => {
     const classes = new Set<string>();
+    const listeners = new Map<string, Array<(ev: unknown) => void>>();
     const node: FakeRecentDomEl = {
       id: "",
       tagName: tag.toUpperCase(),
       className: "",
       textContent: "",
       hidden: false,
+      checked: false,
+      disabled: false,
       value: "",
       selectionStart: null,
       selectionEnd: null,
       dataset: {},
       children: [],
+      classes,
       focusCalls: 0,
       selectCalls: 0,
       selectionRestores: [],
       classList: {
+        add: (name) => {
+          classes.add(name);
+          node.className = `${node.className} ${name}`.trim();
+        },
         toggle: (name, force) => {
           if (force === undefined) {
             if (classes.has(name)) classes.delete(name);
@@ -538,7 +802,14 @@ function withFakeRecentRoomsDom(
         node.children = [...nodes];
       },
       setAttribute: () => {},
-      addEventListener: () => {},
+      addEventListener: (type, listener) => {
+        const list = listeners.get(type) ?? [];
+        list.push(listener);
+        listeners.set(type, list);
+      },
+      dispatch: (type, ev) => {
+        for (const listener of listeners.get(type) ?? []) listener(ev);
+      },
       focus: () => {
         node.focusCalls += 1;
         docState.activeElement = node;
@@ -575,6 +846,15 @@ function withFakeRecentRoomsDom(
     return null;
   };
 
+  const findAllByClass = (root: FakeRecentDomEl, cls: string): FakeRecentDomEl[] => {
+    const out: FakeRecentDomEl[] = [];
+    for (const child of root.children) {
+      if (child.className.split(/\s+/).includes(cls)) out.push(child);
+      out.push(...findAllByClass(child, cls));
+    }
+    return out;
+  };
+
   const prevDoc = (globalThis as { document?: unknown }).document;
   (globalThis as { document?: unknown }).document = {
     get activeElement() {
@@ -586,21 +866,22 @@ function withFakeRecentRoomsDom(
   try {
     const lobbyCard = makeEl("div");
     const root = makeEl("div");
+    const callbacks = {
+      onRejoin: vi.fn(),
+      onStartRename: vi.fn(),
+      onCommitRename: vi.fn(),
+      onCancelRename: vi.fn(),
+      onRemove: vi.fn(),
+      onClearAll: vi.fn(),
+      onSetDisabled: vi.fn(),
+      onSearchChange: vi.fn(),
+    };
     const view = new RecentRoomsView(
       lobbyCard as unknown as HTMLElement,
       root as unknown as HTMLElement,
-      {
-        onRejoin: vi.fn(),
-        onStartRename: vi.fn(),
-        onCommitRename: vi.fn(),
-        onCancelRename: vi.fn(),
-        onRemove: vi.fn(),
-        onClearAll: vi.fn(),
-        onSetDisabled: vi.fn(),
-        onSearchChange: vi.fn(),
-      },
+      callbacks,
     );
-    fn({ root, view, docState, findRenameInput, findById });
+    fn({ root, lobbyCard, view, docState, callbacks, findRenameInput, findById, findAllByClass });
   } finally {
     if (prevDoc === undefined) delete (globalThis as { document?: unknown }).document;
     else (globalThis as { document?: unknown }).document = prevDoc;

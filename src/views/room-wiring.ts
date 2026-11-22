@@ -380,11 +380,8 @@ export function buildSignalingHandlers(
       if (classified.severity === "fatal") {
         const lastHostToken = getLastPresentedHostToken();
         void ctx.stopSharing();
-        const removedRecent = ctx.recentRooms.handleFatalError(code, codeErr);
-        session.applyFatalErrorCleanup(code, codeErr, hasWelcomed, lastHostToken);
-        if (codeErr === "bad-password" && lastHostToken !== undefined) {
-          session.forgetCreatorHostToken(code, lastHostToken);
-        }
+        const removedRecent = ctx.recentRooms.handleFatalError(code, codeErr, lastHostToken);
+        session.applyFatalErrorCleanup(code, codeErr, hasWelcomed, lastHostToken, codeErr !== "kicked");
         ctx.leaveRoom();
         const lobbyMsg =
           removedRecent && (codeErr === "kicked" || codeErr === "bad-password")

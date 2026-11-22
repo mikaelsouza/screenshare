@@ -215,6 +215,11 @@
   font-size: 11px;
 }
 
+.recent-rooms-footer.recent-rooms-footer-empty {
+  justify-content: flex-start;
+  padding-top: 10px;
+}
+
 .recent-rooms-optout {
   display: inline-flex;
   align-items: center;

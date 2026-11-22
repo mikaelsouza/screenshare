@@ -108,7 +108,7 @@ const recentRooms = new RecentRoomsController({
   getLocks: safeLocks,
   runBackground,
   hasSavedCreatorHostFor: (code) => session.hasSavedCreatorHostFor(code),
-  onRemoveHostToken: (code) => session.forgetCreatorHostToken(code),
+  onRemoveHostToken: (code, onlyIfMatching) => session.forgetCreatorHostToken(code, onlyIfMatching),
   onForgetAllHostTokens: () => session.forgetAllHostTokens(),
   onChange: () => renderRecentRooms(),
 });

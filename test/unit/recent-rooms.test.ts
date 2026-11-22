@@ -12,9 +12,13 @@ import {
   clearAllPersistedRecentRooms,
   filterRecentRooms,
   formatRelativeTime,
+  hasStaleRecentRooms,
   isRecentRoomsDisabled,
+  isRecentRoomsKeyAbsent,
   loadRecentRooms,
   mergeSynthesizedHostRooms,
+  pruneExpiredRecentRooms,
+  removePersistedRecentRoom,
   removeRecentRoom,
   renameRecentRoom,
   runWithRecentRoomsLock,
@@ -23,10 +27,12 @@ import {
   sanitizeRecentRoomLabel,
   setRecentRoomsDisabled,
   sortAndBoundEntries,
+  tryLoadRecentRooms,
   upsertRecentRoom,
   type LockManagerLike,
   type StorageLike,
 } from "@src/recent-rooms";
+import { applyPatchToEntry, type RecentRoomEntry } from "@src/recent-rooms-model";
 
 function makeMemoryStorage(initial: Record<string, string> = {}): StorageLike & { store: Map<string, string> } {
   const store = new Map<string, string>(Object.entries(initial));
@@ -235,6 +241,7 @@ describe("recent-rooms localStorage persistence", () => {
 
     const clearedLabel = renameRecentRoom(storage, "ABCDEFGH", "   ", t0 + 30);
     const updatedFirst = clearedLabel.find((r) => r.code === "ABCDEFGH");
+    expect(updatedFirst).toBeDefined();
     expect(updatedFirst?.label).toBeUndefined();
     expect("label" in (updatedFirst ?? {})).toBe(false);
 
@@ -431,6 +438,8 @@ describe("recent-rooms localStorage persistence", () => {
 
     // clearLabel: true with label: undefined clears existing label atomically
     const cleared = upsertRecentRoom(storage, { code: "AAAA2345", role: "guest", lastJoinedAt: t0, clearLabel: true }, t0);
+    expect(cleared).toHaveLength(1);
+    expect(cleared[0]).toBeDefined();
     expect(cleared[0]?.label).toBeUndefined();
     expect("label" in (cleared[0] ?? {})).toBe(false);
 
@@ -502,5 +511,132 @@ describe("recent-rooms localStorage persistence", () => {
     );
     expect(synthesized).toEqual(["CCCC2345"]);
     expect(merged.map((e) => e.code)).toEqual(["BBBB2345", "CCCC2345", "AAAA2345"]);
+  });
+
+  it("detects and prunes expired, corrupt, duplicate, and empty-array records while reporting storage write outcomes", () => {
+    const t0 = 1_700_000_000_000;
+    const empty = makeMemoryStorage();
+    expect(hasStaleRecentRooms(null, t0)).toBe(false);
+    expect(hasStaleRecentRooms(empty, t0)).toBe(false);
+    expect(pruneExpiredRecentRooms(empty, t0)).toBe(false);
+    expect(tryLoadRecentRooms(null, t0)).toEqual({ entries: [], ok: false });
+    expect(tryLoadRecentRooms(empty, t0)).toEqual({ entries: [], ok: true });
+
+    // Clean fresh entries are not stale -> prune is a no-op
+    upsertRecentRoom(empty, { code: "AAAA2345", role: "guest", lastJoinedAt: t0 }, t0);
+    expect(hasStaleRecentRooms(empty, t0)).toBe(false);
+    expect(pruneExpiredRecentRooms(empty, t0)).toBe(false);
+
+    // Mixed expired + valid preserves only valid
+    const mixed = makeMemoryStorage({
+      [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "EXPD2345", role: "guest", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+        { code: "KEEP2345", role: "host", lastJoinedAt: t0 - 1000, label: "Valid" },
+      ]),
+    });
+    expect(hasStaleRecentRooms(mixed, t0)).toBe(true);
+    expect(pruneExpiredRecentRooms(mixed, t0)).toBe(true);
+    expect(hasStaleRecentRooms(mixed, t0)).toBe(false);
+    expect(loadRecentRooms(mixed, t0).map((r) => r.code)).toEqual(["KEEP2345"]);
+
+    // All expired removes the key completely
+    const allExpired = makeMemoryStorage({
+      [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "EXPD2345", role: "guest", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+      ]),
+    });
+    expect(pruneExpiredRecentRooms(allExpired, t0)).toBe(true);
+    expect(allExpired.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+    // Corrupt JSON, non-array, empty-array leftovers are cleaned up
+    for (const raw of ["{bad", JSON.stringify({ a: 1 }), "[]"]) {
+      const s = makeMemoryStorage({ [RECENT_ROOMS_STORAGE_KEY]: raw });
+      expect(hasStaleRecentRooms(s, t0)).toBe(true);
+      expect(pruneExpiredRecentRooms(s, t0)).toBe(true);
+      expect(s.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+    }
+
+    // Boolean status helpers report success vs failure without throwing
+    expect(setRecentRoomsDisabled(null, true)).toBe(false);
+    expect(isRecentRoomsKeyAbsent(null)).toBe(false);
+    expect(isRecentRoomsKeyAbsent(makeMemoryStorage())).toBe(true);
+    expect(isRecentRoomsKeyAbsent(empty)).toBe(false);
+    expect(isRecentRoomsKeyAbsent(makeMemoryStorage({ [RECENT_ROOMS_STORAGE_KEY]: "" }))).toBe(true);
+    expect(isRecentRoomsKeyAbsent(makeMemoryStorage({ [RECENT_ROOMS_STORAGE_KEY]: "[]" }))).toBe(false);
+    expect(clearAllPersistedRecentRooms(null)).toBe(false);
+    expect(removePersistedRecentRoom(null, "AAAA2345", t0)).toBe(false);
+    expect(removePersistedRecentRoom(empty, "BAD", t0)).toBe(false);
+    expect(removePersistedRecentRoom(empty, "ZZZZ2345", t0)).toBe(true); // already absent -> true
+    expect(removePersistedRecentRoom(empty, "AAAA2345", t0)).toBe(true);
+    expect(empty.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+    const throwing: StorageLike = {
+      getItem: () => {
+        throw new Error("denied");
+      },
+      setItem: () => {
+        throw new Error("quota");
+      },
+      removeItem: () => {
+        throw new Error("denied");
+      },
+    };
+    expect(tryLoadRecentRooms(throwing, t0)).toEqual({ entries: [], ok: false });
+    expect(hasStaleRecentRooms(throwing, t0)).toBe(false);
+    expect(pruneExpiredRecentRooms(throwing, t0)).toBe(false);
+    expect(setRecentRoomsDisabled(throwing, true)).toBe(false);
+    expect(isRecentRoomsKeyAbsent(throwing)).toBe(false);
+    expect(clearAllPersistedRecentRooms(throwing)).toBe(false);
+    expect(removePersistedRecentRoom(throwing, "AAAA2345", t0)).toBe(false);
+  });
+
+  it("clones peerNames on applyPatchToEntry so base entries never share mutable array references", () => {
+    const base: RecentRoomEntry = {
+      code: "AAAA2345",
+      role: "host",
+      lastJoinedAt: 1_700_000_000_000,
+      peerNames: ["Alice"],
+      label: "Team",
+    };
+    const afterPw = applyPatchToEntry(base, {
+      kind: "patch",
+      code: "AAAA2345",
+      field: "password",
+      password: "PASS_123456789012",
+    });
+    const afterLabel = applyPatchToEntry(base, {
+      kind: "patch",
+      code: "AAAA2345",
+      field: "label",
+      label: "Updated",
+    });
+    const afterClearLabel = applyPatchToEntry(base, {
+      kind: "patch",
+      code: "AAAA2345",
+      field: "label",
+      clearLabel: true,
+    });
+    const afterRole = applyPatchToEntry(base, {
+      kind: "patch",
+      code: "AAAA2345",
+      field: "role",
+      role: "guest",
+    });
+    const incomingPeers = ["Bob"];
+    const afterPeers = applyPatchToEntry(base, {
+      kind: "patch",
+      code: "AAAA2345",
+      field: "peerNames",
+      peerNames: incomingPeers,
+    });
+
+    expect(afterPw.peerNames).not.toBe(base.peerNames);
+    expect(afterLabel.peerNames).not.toBe(base.peerNames);
+    expect(afterClearLabel.peerNames).not.toBe(base.peerNames);
+    expect("label" in afterClearLabel).toBe(false);
+    expect(afterRole.peerNames).not.toBe(base.peerNames);
+    expect(afterPeers.peerNames).not.toBe(incomingPeers);
+    afterPw.peerNames.push("Mutated");
+    expect(base.peerNames).toEqual(["Alice"]);
   });
 });

@@ -863,5 +863,56 @@ describe("SessionController", () => {
       kind: "none",
     });
   });
+
+  it("tracks concurrent pendingForgets by generation and honors forgetCreatorToken flag on applyFatalErrorCleanup", async () => {
+    const local = createMemoryStorage();
+    const sess = createMemoryStorage();
+    const tasks: Promise<unknown>[] = [];
+    const pendingReleases: Array<() => void> = [];
+    const locks = {
+      request: vi.fn((_name: string, cb: () => unknown) => {
+        return new Promise<unknown>((resolve) => {
+          pendingReleases.push(() => resolve(cb()));
+        });
+      }),
+    } as unknown as LockManager;
+    const ctrl = new SessionController({
+      getLocalStorage: () => local,
+      getSessionStorage: () => sess,
+      getLocks: () => locks,
+      runBackground: (p) => {
+        tasks.push(p);
+      },
+      onForgetHostUiChange: vi.fn(),
+    });
+
+    writePersistedHostToken(local, "WXYZ2345", "tok-1");
+    expect(ctrl.hasSavedCreatorHostFor("WXYZ2345")).toBe(true);
+
+    // Two overlapping matching forgets must keep tok-1 suppressed regardless of lock resolution order
+    ctrl.forgetCreatorHostToken("WXYZ2345", "tok-1");
+    ctrl.forgetCreatorHostToken("WXYZ2345", "tok-2");
+    expect(ctrl.hasSavedCreatorHostFor("WXYZ2345")).toBe(false);
+    expect(ctrl.hostTokenFor("WXYZ2345")).toBeUndefined();
+
+    // Even if lock 2 ("tok-2") resolves BEFORE lock 1 ("tok-1"), tok-1 stays suppressed until lock 1 runs
+    const lock1 = pendingReleases.shift();
+    const lock2 = pendingReleases.shift();
+    lock2?.();
+    await Promise.resolve();
+    expect(ctrl.hasSavedCreatorHostFor("WXYZ2345")).toBe(false);
+
+    lock1?.();
+    await Promise.all(tasks.splice(0));
+    expect(readPersistedHostToken(local, "WXYZ2345")).toBeUndefined();
+    expect(ctrl.hasSavedCreatorHostFor("WXYZ2345")).toBe(false);
+
+    // applyFatalErrorCleanup(..., forgetCreatorToken = false) skips duplicate forgetCreatorHostToken
+    writePersistedHostToken(local, "ABCD2345", "tok-creator");
+    const forgetSpy = vi.spyOn(ctrl, "forgetCreatorHostToken");
+    ctrl.applyFatalErrorCleanup("ABCD2345", "kicked", true, "tok-creator", false);
+    expect(forgetSpy).not.toHaveBeenCalled();
+    expect(readPersistedHostToken(local, "ABCD2345")).toBe("tok-creator");
+  });
 });
 

@@ -87,8 +87,7 @@ function loadHostRooms(storage: StorageLike, now: number): HostRoomEntry[] {
 
 function persistEntries(storage: StorageLike, entries: HostRoomEntry[]): void {
   entries.sort((a, b) => a.updatedAt - b.updatedAt);
-  const bounded =
-    entries.length > MAX_STORED_HOST_ROOMS ? entries.slice(entries.length - MAX_STORED_HOST_ROOMS) : entries;
+  const bounded = entries.slice(-MAX_STORED_HOST_ROOMS);
 
   try {
     if (bounded.length === 0) {

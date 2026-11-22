@@ -718,7 +718,9 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
         localStorage.getItem("recent-rooms") === null &&
         sessionStorage.getItem("host:MNPQRSTU") === null &&
         sessionStorage.getItem("unrelatedKey") === "keep" &&
-        document.getElementById("recent-rooms-root")?.hidden === true,
+        document.getElementById("recent-rooms-clear") === null &&
+        document.querySelectorAll(".recent-room-row").length === 0 &&
+        document.getElementById("recent-rooms-optout") !== null,
       { label: "Clear saved rooms clears host-rooms, recent-rooms, and legacy host: entries while keeping unrelated sessionStorage keys" },
     );
   });
