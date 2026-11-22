@@ -2369,9 +2369,9 @@ describe("adversarial persistent-transceiver & race probes", () => {
       expect(errSpy).not.toHaveBeenCalled();
       expect(failOnce).toBe(false);
       expect(sent.some((m) => m.k === "offer")).toBe(false);
-      // Delivering an answer (never sets offerPending) brings signalingState back to stable and flushes
-      // the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
-      pc.signalingState = "stable";
+      // Delivering an answer (never sets offerPending) brings signalingState from have-local-offer back
+      // to stable and flushes the offerPending flag recorded exclusively by negotiate()'s catch -> retryOffer().
+      pc.signalingState = "have-local-offer";
       await mesh.handleSignal("zoe", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
       await new Promise((r) => setTimeout(r, 15));
       expect(sent.some((m) => m.k === "offer")).toBe(true);
@@ -2403,11 +2403,12 @@ describe("adversarial persistent-transceiver & race probes", () => {
       await vi.advanceTimersByTimeAsync(1_050);
       expect(mesh.isPeerViewing("alice")).toBe(true);
 
-      // Oversized payload during rate limit is ignored and does not clobber a valid coalesced state
+      // Oversized or short invalid payloads during rate limit do not clobber a valid coalesced state
       for (let i = 0; i < 20; i++) {
         ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
       }
       ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      ch.onmessage?.({ data: "{}" });
       ch.onmessage?.({ data: "x".repeat(300) });
       await vi.advanceTimersByTimeAsync(1_050);
       expect(mesh.isPeerViewing("alice")).toBe(true);
@@ -2454,14 +2455,16 @@ describe("adversarial persistent-transceiver & race probes", () => {
     expect(sent.some((m) => m.k === "offer")).toBe(false);
     expect(pc.signalingState).toBe("stable");
 
-    // 2. Restart sharing, then stop capture mid-setLocalDescription -> rolls back to stable, no offer sent
+    // 2. Restart sharing WITHOUT manual onnegotiationneeded -> preserved offerPending renegotiates automatically
     pc.createOffer = origCreate;
     pc.setLocalDescription = origSetLocal;
     await mesh.setCapture(makeCapture(false));
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 15));
+    expect(sent.some((m) => m.k === "offer")).toBe(true);
     await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
     sent.length = 0;
 
+    // 3. Stop capture mid-setLocalDescription -> rolls back to stable, no offer sent, preserves offerPending
     let resolveSetLocal!: () => void;
     const setLocalTypes: string[] = [];
     pc.setLocalDescription = async (desc: RTCSessionDescriptionInit) => {
@@ -2485,17 +2488,40 @@ describe("adversarial persistent-transceiver & race probes", () => {
     expect(setLocalTypes).toContain("rollback");
     expect(pc.signalingState).toBe("stable");
 
-    // 3. Subsequent share restart negotiates cleanly because signalingState returned to stable
+    // 4. Subsequent share restart negotiates automatically (without manual onnegotiationneeded)
     pc.setLocalDescription = origSetLocal;
     await mesh.setCapture(makeCapture(false));
-    pc.onnegotiationneeded?.();
     await new Promise((r) => setTimeout(r, 15));
     expect(sent.some((m) => m.k === "offer")).toBe(true);
     expect(pc.signalingState).toBe("have-local-offer");
 
-    // 4. Stopping capture while an already-sent offer is still un-answered rolls back to stable
+    // 5. Stopping capture while an already-sent offer (e.g. ICE restart) is in-flight preserves have-local-offer
+    // so a delayed answer still succeeds cleanly
     await mesh.setCapture(null);
+    expect(pc.signalingState).toBe("have-local-offer");
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
     expect(pc.signalingState).toBe("stable");
+
+    // 6. Out-of-state answer when stable is ignored without calling setRemoteDescription
+    const remoteDescSpy = vi.spyOn(pc, "setRemoteDescription");
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+    expect(remoteDescSpy).not.toHaveBeenCalled();
+    remoteDescSpy.mockRestore();
+
+    // 7. Server-rejected offer (not-sharing) rolls back via rollbackRejectedOffers() and renegotiates on next share
+    sent.length = 0;
+    await mesh.setCapture(makeCapture(false));
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 15));
+    expect(pc.signalingState).toBe("have-local-offer");
+    await mesh.setCapture(null);
+    await mesh.rollbackRejectedOffers();
+    expect(pc.signalingState).toBe("stable");
+
+    sent.length = 0;
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 15));
+    expect(sent.some((m) => m.k === "offer")).toBe(true);
   });
 });
 

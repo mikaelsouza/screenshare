@@ -389,6 +389,7 @@ export function buildSignalingHandlers(
 
     onError: (codeErr, message) => {
       if (isStale()) return;
+      if (codeErr === "not-sharing") void state.getMesh()?.rollbackRejectedOffers();
       const activeClient = state.getClient();
       const classified = session.classifyError(code, codeErr, message, Boolean(activeClient?.isFatal));
       if (classified.severity === "fatal") {
