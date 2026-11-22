@@ -62,7 +62,7 @@ class Client {
     const targetRoom = room ?? CODE;
     const ip = `198.18.${Math.floor(roomCounter / 250) % 256}.${(roomCounter % 250) + 1}`;
     const res = await SELF.fetch(`https://example.com/ws/${targetRoom}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": ip, ...extraHeaders },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": ip, ...extraHeaders },
     });
     if (!res.webSocket) throw new Error(`no webSocket on response (status ${res.status})`);
     res.webSocket.accept();

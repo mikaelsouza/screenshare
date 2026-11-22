@@ -9,59 +9,17 @@
  * sharer's uplink. See MAX_ROOM_SIZE.
  */
 
-import { z, type IceCandidateInit, type PeerId, type SignalData } from "@shared/protocol";
+import type { IceCandidateInit, PeerId, SignalData } from "@shared/protocol";
 import type { CaptureResult, QualityPreset } from "./capture";
 import {
+  type ControlMessage, ControlRateLimiter, type MeshCallbacks, type MeshOptions, mungeSdp, parseControlMessage,
+} from "./mesh-control";
+import {
   applyAudioEncoding, applyVideoEncoding, type CodecName, DEFAULT_DEGRADATION_MODE,
-  type DegradationMode, mungeOpusSdp, mungeVideoSdp, preferCodec, tuneReceiverLatency,
+  type DegradationMode, preferCodec, tuneReceiverLatency,
 } from "./quality";
 
-function mungeSdp(sdp: string): string {
-  return mungeVideoSdp(mungeOpusSdp(sdp));
-}
-
-export interface MeshOptions {
-  iceServers: RTCIceServer[];
-  preset: QualityPreset;
-  codec: CodecName;
-  degradation?: DegradationMode;
-  /** Receive-side jitter buffer target, ms. 0 = lowest latency. */
-  jitterBufferTargetMs: number;
-}
-
-export interface MeshCallbacks {
-  onRemoteStream: (peerId: PeerId, stream: MediaStream) => void;
-  onRemoteStreamGone: (peerId: PeerId) => void;
-  onConnectionState: (peerId: PeerId, state: RTCPeerConnectionState) => void;
-}
-
-/** Peer-to-peer control traffic. Deliberately NOT routed through the server. */
-type ControlMessage = { c: "view"; want: boolean };
-
-/** Real control messages are ~25 bytes. Anything far larger is not ours. */
-const MAX_CONTROL_MESSAGE_LENGTH = 256;
-
-const ControlMessageSchema: z.ZodType<ControlMessage> = z.object({
-  c: z.literal("view"),
-  want: z.boolean(),
-});
-
-/**
- * Parse a control message from the far end, or null if it is not one.
- *
- * The far end is another browser in the room, not something we control, so the shape
- * is checked rather than cast: a `want` that is not a boolean would otherwise flow
- * straight into `encodings[0].active`.
- */
-export function parseControlMessage(data: unknown): ControlMessage | null {
-  if (typeof data !== "string" || data.length > MAX_CONTROL_MESSAGE_LENGTH) return null;
-  try {
-    const parsed = ControlMessageSchema.safeParse(JSON.parse(data));
-    return parsed.success ? parsed.data : null;
-  } catch {
-    return null;
-  }
-}
+export { type MeshCallbacks, type MeshOptions, parseControlMessage };
 
 class PeerLink {
   readonly pc: RTCPeerConnection;
@@ -87,6 +45,7 @@ class PeerLink {
   private remoteWantsVideo = true;
   /** What we last asked the far end for; flushed when the channel opens. */
   private desiredView: boolean | null = null;
+  private readonly controlLimiter = new ControlRateLimiter();
 
   private videoTransceiver: RTCRtpTransceiver | null = null;
   private audioTransceiver: RTCRtpTransceiver | null = null;
@@ -162,25 +121,41 @@ class PeerLink {
     return false;
   }
 
+  private hasStoppedCapture(): boolean { return !this.isSending && this.attachingCount === 0 && this.captureGeneration > 0; }
+
+  private async rollbackLocalOffer(): Promise<void> {
+    if (this.isClosed() || this.pc.signalingState !== "have-local-offer") return;
+    try { await this.pc.setLocalDescription({ type: "rollback" }); }
+    catch (err) { if (!this.isClosed()) console.warn(`[mesh] rollback failed for ${this.peerId}`, err); }
+  }
+
+  private async commitLocalOffer(offer: RTCSessionDescriptionInit, wasSending: boolean, gen: number): Promise<void> {
+    offer.sdp = mungeSdp(offer.sdp ?? "");
+    await this.pc.setLocalDescription(offer);
+    if (this.isClosed()) return;
+    if (wasSending && this.isStale(gen)) { await this.rollbackLocalOffer(); return; }
+    const sdp = this.pc.localDescription?.sdp;
+    if (sdp) this.send({ k: "offer", sdp });
+  }
+
   private async negotiate(): Promise<void> {
-    if (this.isClosed() || this.isOfferBlocked()) return;
+    if (this.isClosed() || this.hasStoppedCapture() || this.isOfferBlocked()) return;
     const seen = this.remoteOffers;
+    const gen = this.captureGeneration;
+    const wasSending = this.isSending;
     try {
       this.makingOffer = true;
       const offer = await this.pc.createOffer();
-      if (this.isClosed()) return;
+      if (this.isClosed() || (wasSending && this.isStale(gen))) return;
       if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") return this.retryOffer();
-      offer.sdp = mungeSdp(offer.sdp ?? "");
-      await this.pc.setLocalDescription(offer);
-      const sdp = this.pc.localDescription?.sdp;
-      if (sdp && !this.isClosed()) this.send({ k: "offer", sdp });
+      await this.commitLocalOffer(offer, wasSending, gen);
     } catch (err) {
       if (this.isClosed()) return;
       if (seen !== this.remoteOffers || this.pc.signalingState !== "stable") this.retryOffer();
       else console.error(`[mesh] negotiation failed with ${this.peerId}`, err);
     } finally {
       this.makingOffer = false;
-      if (this.offerPending) this.retryOffer();
+      if (this.offerPending && !this.hasStoppedCapture()) this.retryOffer();
     }
   }
 
@@ -192,7 +167,7 @@ class PeerLink {
   }
 
   private flushPendingOffer(): void {
-    if (!this.offerPending || this.attachingCount > 0 || this.applyingOffer || this.makingOffer || this.isClosed() || this.pc.signalingState !== "stable") return;
+    if (!this.offerPending || this.hasStoppedCapture() || this.attachingCount > 0 || this.applyingOffer || this.makingOffer || this.isClosed() || this.pc.signalingState !== "stable") return;
     this.offerPending = false;
     void this.negotiate();
   }
@@ -329,7 +304,10 @@ class PeerLink {
   attachCapture(capture: CaptureResult): Promise<void> {
     const gen = ++this.captureGeneration;
     this.attachingCount++;
-    return this.enqueueMedia(() => this.runAttachCapture(capture, gen));
+    return Promise.race([
+      this.enqueueMedia(() => this.runAttachCapture(capture, gen)),
+      this.closedPromise,
+    ]);
   }
 
   private async ensureSendTransceivers(capture: CaptureResult): Promise<void> {
@@ -424,6 +402,7 @@ class PeerLink {
   detachCapture(): Promise<void> {
     this.captureGeneration++;
     this.isSending = false;
+    this.offerPending = false;
     return Promise.race([
       this.enqueueMedia(() => this.runDetachCapture()),
       this.closedPromise,
@@ -436,6 +415,9 @@ class PeerLink {
       .filter((tx): tx is RTCRtpTransceiver => tx !== null)
       .map((tx) => tx.sender.replaceTrack(null).catch(() => {}));
     await Promise.race([Promise.allSettled(ops), this.closedPromise]);
+    if (!this.makingOffer && this.pc.signalingState === "have-local-offer") {
+      await this.rollbackLocalOffer();
+    }
   }
 
   /**
@@ -468,10 +450,10 @@ class PeerLink {
     // The receiving side binds an already-open channel, so onopen will not fire.
     if (ch.readyState === "open") this.flushViewRequest();
     ch.onmessage = (ev) => {
-      const msg = parseControlMessage(ev.data);
-      if (!msg) return;
-      this.remoteWantsVideo = msg.want;
-      void this.setSenderActive(msg.want);
+      this.controlLimiter.handle(ev.data, (msg) => {
+        this.remoteWantsVideo = msg.want;
+        void this.setSenderActive(msg.want);
+      });
     };
   }
 
@@ -501,6 +483,7 @@ class PeerLink {
     this.captureGeneration++;
     this.isSending = false;
     this.remoteStream = null;
+    this.controlLimiter.close();
     if (this.control) {
       this.control.onopen = null;
       this.control.onmessage = null;

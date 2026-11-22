@@ -100,7 +100,10 @@ export class ShareLifecycle {
 
   private async attachCapture(cap: CaptureResult, shareGen: number): Promise<void> {
     const mesh = this.ctx.getMesh();
-    if (!mesh) return;
+    if (!mesh || shareGen !== this.ctx.session.joinGeneration) {
+      await this.stop();
+      return;
+    }
     this.ctx.tileCtrl.setSelfPreviewHidden(false);
     if (cap.audio) this.watchAudioEnded(cap.audio);
     this.ctx.tileView.renderSelfPreview(cap.stream);

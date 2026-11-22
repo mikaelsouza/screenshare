@@ -1,6 +1,7 @@
 import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { MAX_ROOM_SIZE, PING, PONG, type ServerMessage } from "@shared/protocol";
+import { applyResumeState } from "../../worker/room-membership";
 
 const CODE2 = "JKMNPQRS";
 
@@ -135,6 +136,7 @@ class Client {
     const defaultIp = `198.18.${Math.floor(roomCounter / 250) % 256}.${(roomCounter % 250) + 1}`;
     const headers: Record<string, string> = {
       Upgrade: "websocket",
+      Origin: "https://example.com",
       "CF-Connecting-IP": defaultIp,
       ...extraHeaders,
     };
@@ -302,7 +304,7 @@ describe("HTTP routing", () => {
     const sockets: WebSocket[] = [];
     for (let i = 0; i < 60; i++) {
       const res = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
-        headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+        headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": ip },
       });
       if (res.webSocket) {
         res.webSocket.accept();
@@ -311,13 +313,13 @@ describe("HTTP routing", () => {
     }
 
     const over = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": ip },
     });
     expect(await refusal(over)).toEqual({ code: "rate-limited", closeCode: 1013 });
 
     // A different address is unaffected.
     const other = await SELF.fetch(`https://example.com/ws/${freshRoom()}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.8" },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "198.51.100.8" },
     });
     expect(other.status).toBe(101);
     if (other.webSocket) {
@@ -375,12 +377,12 @@ describe("HTTP routing", () => {
     const csp = res.headers.get("Content-Security-Policy") ?? "";
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("frame-ancestors 'none'");
-    // 'unsafe-inline' on script-src re-opens the main class of XSS that CSP exists to
-    // stop, and neither page has an inline <script> to justify it. style-src does need
-    // it: both pages carry an inline <style>.
+    // Neither script-src nor style-src allows 'unsafe-inline': both pages load external
+    // same-origin bundled assets and carry no inline <script> or <style>.
     expect(csp).toContain("script-src 'self'");
     expect(csp).not.toMatch(/script-src[^;]*unsafe-inline/);
-    expect(csp).toMatch(/style-src[^;]*'unsafe-inline'/);
+    expect(csp).toContain("style-src 'self'");
+    expect(csp).not.toMatch(/style-src[^;]*unsafe-inline/);
     // A blanket `wss: ws:` would let injected script open a socket to any host — an
     // exfiltration channel in an app whose whole point is that media stays direct.
     expect(csp).toContain("connect-src 'self'");
@@ -585,7 +587,7 @@ describe("RoomDO membership", () => {
     }
 
     const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": ip },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": ip },
     });
     expect(res.status).toBe(101);
     expect(res.webSocket).toBeTruthy();
@@ -886,7 +888,7 @@ describe("RoomDO abuse limits (batch B)", () => {
       sockets.push(await Client.connect(CODE, { "CF-Connecting-IP": `2001:db8:aa:bb::${(i + 1).toString(16)}` }));
     }
     const res = await SELF.fetch(`https://example.com/ws/${CODE}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": "2001:db8:aa:bb:ffff::99" },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "2001:db8:aa:bb:ffff::99" },
     });
     expect(await refusal(res)).toEqual({ code: "rate-limited", closeCode: 1013 });
     for (const s of sockets) s.close();
@@ -1010,7 +1012,7 @@ describe("RoomDO host controls (batch D)", () => {
     oldLinkPeer.close();
 
     const again = await SELF.fetch(`https://example.com/ws/${CODE}`, {
-      headers: { Upgrade: "websocket", "CF-Connecting-IP": "203.0.113.5" },
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "203.0.113.5" },
     });
     const ws = again.webSocket!;
     ws.accept();
@@ -3017,9 +3019,174 @@ describe("RoomDO security & PR 1 flows", () => {
     h.close();
   });
 
-  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
-  it.todo("rejects viewer-originated SDP offer signals when sender is not sharing even if recipient is sharing");
-  // oxlint-disable-next-line vitest/warn-todo -- tracked deferred PR #49 audit item (#50)
-  it.todo("enforces strict wss:// and same-origin Origin header on production WebSocket upgrades");
+  it("rejects viewer-originated SDP offer signals when sender is not sharing even if recipient is sharing", async () => {
+    const sharer = await Client.connect();
+    const wSharer = await sharer.join("sharer");
+    const viewer = await Client.connect();
+    const wViewer = await viewer.join("viewer");
+    await sharer.nextOf("peer-joined");
+
+    // Sharer begins sharing; viewer remains non-sharing.
+    sharer.send({ t: "state", sharing: true });
+    expect(await viewer.nextOf("peer-state")).toEqual({ t: "peer-state", id: wSharer.selfId, sharing: true });
+
+    // Viewer attempts to originate an SDP offer to the active sharer -> rejected with not-sharing.
+    viewer.send({ t: "signal", to: wSharer.selfId, data: { k: "offer", sdp: "v=0\r\n" } });
+    expect((await viewer.nextOf("error")).code).toBe("not-sharing");
+    expect(await sharer.silentFor(200)).toBe(true);
+
+    // Sharer -> viewer offer is still allowed, and viewer -> sharer answer/ice remain allowed.
+    sharer.send({ t: "signal", to: wViewer.selfId, data: { k: "offer", sdp: "v=0\r\n" } });
+    expect((await viewer.nextOf("signal")).data.k).toBe("offer");
+    viewer.send({ t: "signal", to: wSharer.selfId, data: { k: "answer", sdp: "v=0\r\n" } });
+    expect((await sharer.nextOf("signal")).data.k).toBe("answer");
+
+    sharer.close();
+    viewer.close();
+  });
+
+  it("enforces strict wss:// and same-origin Origin header on production WebSocket upgrades", async () => {
+    // Missing Origin on production HTTPS upgrade -> rejected with forbidden-origin (1008).
+    const missingOrigin = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.91" },
+    });
+    expect(await refusal(missingOrigin)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    // Insecure HTTP upgrade on non-localhost production host -> rejected even with matching Origin.
+    const insecureProd = await SELF.fetch(`http://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", Origin: "http://example.com", "CF-Connecting-IP": "198.51.100.92" },
+    });
+    expect(await refusal(insecureProd)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    // Local HTTP dev/test (localhost) without Origin -> allowed.
+    const localDev = await SELF.fetch(`http://localhost:8787/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.93" },
+    });
+    expect(localDev.status).toBe(101);
+    localDev.webSocket?.accept();
+    localDev.webSocket?.close();
+
+    // Production HTTPS with matching same-origin Origin -> allowed.
+    const validProd = await SELF.fetch(`https://example.com/ws/${CODE}`, {
+      headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "198.51.100.94" },
+    });
+    expect(validProd.status).toBe(101);
+    validProd.webSocket?.accept();
+    validProd.webSocket?.close();
+  });
+
+  it("answers PING via WebSocket auto-response without consuming per-socket message rate-limit budget", async () => {
+    const a = await Client.connect();
+    await a.join("alice");
+    const b = await Client.connect();
+    await b.join("bob");
+    await a.nextOf("peer-joined");
+
+    let pongCount = 0;
+    const allPongs = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`only received ${pongCount}/75 PONGs`)), 3000);
+      a.ws.addEventListener("message", (ev) => {
+        if (ev.data === PONG) {
+          pongCount++;
+          if (pongCount === 75) {
+            clearTimeout(timer);
+            resolve();
+          }
+        }
+      });
+    });
+
+    // Send 75 PINGs in one burst (exceeds MESSAGE_BURST = 60).
+    for (let i = 0; i < 75; i++) {
+      a.ws.send(PING);
+    }
+    await allPongs;
+
+    // Socket must still be open and have full message budget for regular frames.
+    a.send({ t: "state", sharing: true });
+    expect((await b.nextOf("peer-state")).sharing).toBe(true);
+    expect(await a.peekError(150)).toBeNull();
+
+    a.close();
+    b.close();
+  });
+
+  it("handleStateAction performs zero writes and no broadcast on unclaimed/expired rooms and stays consistent after rotate-password", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.101" });
+    const wh = await h.joinAsHost("host");
+    const g = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.102" });
+    const wg = await g.join("guest");
+    await h.nextOf("peer-joined");
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+
+    // Rotate password, then guest sends state: sharing=true; must update the rotated rejoinHash record.
+    h.send({ t: "rotate-password" });
+    const hRot = await h.nextOf("room-password");
+    const gRot = await g.nextOf("room-password");
+    g.send({ t: "state", sharing: true });
+    expect(await h.nextOf("peer-state")).toEqual({ t: "peer-state", id: wg.selfId, sharing: true });
+
+    // Verify the rotated member entry persisted sharing: true (not lost to stale rejoinHash).
+    const persistedSharing = await runInDurableObject(stub, async (_i, state) => {
+      const members = await state.storage.get<Record<string, { id?: string; sharing?: boolean }>>("members");
+      return Object.values(members ?? {}).some((m) => m.id === wg.selfId && m.sharing === true);
+    });
+    expect(persistedSharing).toBe(true);
+    expect(gRot.rejoinToken).toBeTruthy();
+
+    // Kicked/refused socket sending a trailing state frame must not broadcast peer-state.
+    expect(hRot.password).toBeTruthy();
+    const k = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.103" });
+    const wk = await k.join("kicked-peer", ...(hRot.password ? [{ password: hRot.password }] : []));
+    await h.nextOf("peer-joined");
+    await g.nextOf("peer-joined");
+    h.send({ t: "kick", id: wk.selfId });
+    k.send({ t: "state", sharing: true });
+    expect((await k.nextOf("error")).code).toBe("kicked");
+    expect((await g.nextOf("peer-left")).id).toBe(wk.selfId);
+    await g.nextOf("room-password");
+    expect(await g.silentFor(200)).toBe(true);
+    k.close();
+
+    // Now clear storage (simulate expired/unclaimed room) and send a state update -> zero writes, no broadcast.
+    await runInDurableObject(stub, (_i, state) => state.storage.deleteAll());
+    h.send({ t: "state", sharing: true });
+    expect(await g.silentFor(250)).toBe(true);
+    const remainingKeys = await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size);
+    expect(remainingKeys).toBe(0);
+    expect(wh.selfId).toBeTruthy();
+
+    h.close();
+    g.close();
+  });
+
+  it("applyResumeState forwards activePeerIds to prevent reusing an active non-superseded peer id", () => {
+    const replaced: Array<[string, string]> = [];
+    const attColliding = { id: "fresh-id-1", name: "bob", sharing: false, joined: false };
+    applyResumeState(
+      attColliding,
+      { t: "join", room: CODE, displayName: "bob", resume: true },
+      undefined,
+      { until: Date.now() + 60_000, id: "active-peer-id", sharing: true },
+      new Set(["active-peer-id"]),
+      (oldId, newId) => replaced.push([oldId, newId]),
+    );
+    expect(attColliding.id).toBe("fresh-id-1");
+    expect(attColliding.sharing).toBe(true);
+    expect(replaced).toEqual([]);
+
+    const attFree = { id: "fresh-id-2", name: "bob", sharing: false, joined: false };
+    applyResumeState(
+      attFree,
+      { t: "join", room: CODE, displayName: "bob", resume: true },
+      undefined,
+      { until: Date.now() + 60_000, id: "free-peer-id", sharing: true },
+      new Set(["active-peer-id"]),
+      (oldId, newId) => replaced.push([oldId, newId]),
+    );
+    expect(attFree.id).toBe("free-peer-id");
+    expect(attFree.sharing).toBe(true);
+    expect(replaced).toEqual([["fresh-id-2", "free-peer-id"]]);
+  });
 });
 

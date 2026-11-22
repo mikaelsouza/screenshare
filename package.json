@@ -30,6 +30,7 @@
     "test:formal": "vitest run test/formal --config vitest.config.ts --passWithNoTests",
     "test:fuzz": "vitest run test/fuzz --config vitest.config.ts --passWithNoTests",
     "test:mutate": "stryker run",
+    "test:mutate:ci": "node scripts/run-stryker-ci.ts",
     "test:e2e": "npm run build && node --test --test-concurrency=1 --test-force-exit test/e2e/*.test.ts",
     "test:e2e:impaired": "npm run build && bash scripts/run-impaired-e2e.sh",
     "test": "npm run check && npm run lint:all && npm run test:unit && npm run test:worker",

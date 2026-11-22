@@ -1,4 +1,5 @@
 import { MAX_CHAT_LENGTH, type ServerMessage } from "@shared/protocol";
+import { sendSafe } from "./room-policy";
 import { spendBudget, type MessageBudget, type PeerAttachment } from "./room-models";
 
 export const CHAT_BURST = 6;
@@ -9,14 +10,6 @@ export interface ChatRelayHost {
 }
 
 const CHAT_CONTROL_RE = /[\p{Cc}\p{Zl}\p{Zp}\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/gu;
-
-function sendChatSafe(ws: WebSocket, msg: ServerMessage): void {
-  try {
-    ws.send(JSON.stringify(msg));
-  } catch {
-    /* socket closed */
-  }
-}
 
 /**
  * Normalise user chat text: strip control/line-separator/bidi characters while
@@ -52,7 +45,7 @@ export class RoomChatRelay {
     const res = spendBudget(this.budgets.get(attachment.id), now, CHAT_BURST, CHAT_REFILL_PER_SEC);
     this.budgets.set(attachment.id, res.budget);
     if (!res.allowed) {
-      sendChatSafe(ws, {
+      sendSafe(ws, {
         t: "error",
         code: "chat-rate-limited",
         message: "You're sending messages too fast. Wait a moment.",
@@ -69,7 +62,7 @@ export class RoomChatRelay {
       ts: now,
     };
     for (const { ws: peerWs } of host.joinedPeers()) {
-      sendChatSafe(peerWs, out);
+      sendSafe(peerWs, out);
     }
   }
 }

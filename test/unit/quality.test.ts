@@ -247,7 +247,7 @@ describe("applyVideoEncoding", () => {
     }
   });
 
-  it("sets maintain-framerate-and-resolution in clarity mode and mints a fresh getParameters() transaction ID on fallback", async () => {
+  it("sets maintain-framerate-and-resolution in clarity mode and falls back through maintain-resolution to maintain-framerate with fresh transaction IDs", async () => {
     const { DEFAULT_DEGRADATION_MODE } = await import("@src/quality");
     expect(DEFAULT_DEGRADATION_MODE).toBe("framerate");
 
@@ -257,58 +257,92 @@ describe("applyVideoEncoding", () => {
       "maintain-framerate-and-resolution",
     );
 
-    let params: Record<string, unknown> = { encodings: [{ active: true }] };
-    let nextTxId = 1;
-    let activeTxId: number | null = null;
-    const seenPreferences: unknown[] = [];
-    const fallbackSender = {
-      getParameters: () => {
-        activeTxId = nextTxId++;
-        return { ...structuredClone(params), transactionId: String(activeTxId) };
-      },
-      setParameters: async (p: Record<string, unknown>) => {
-        // Per W3C WebRTC 1.0 § 5.2, setParameters validates and consumes [[LastReturnedParameters]].
-        const expectedTx = activeTxId !== null ? String(activeTxId) : null;
-        activeTxId = null;
-        if (expectedTx === null || p["transactionId"] !== expectedTx) {
-          throw new DOMException(
-            "getParameters() needs to be called before setParameters().",
-            "InvalidStateError",
-          );
-        }
-        seenPreferences.push(p["degradationPreference"]);
-        if (p["degradationPreference"] === "maintain-framerate-and-resolution") {
-          throw new TypeError("Failed to execute 'setParameters': invalid enum value");
-        }
-        params = structuredClone(p);
-      },
-    } as unknown as RTCRtpSender;
+    const makeRejectingSender = (rejectPrefs: ReadonlySet<unknown>) => {
+      let params: Record<string, unknown> = { encodings: [{ active: true }] };
+      let nextTxId = 1;
+      let activeTxId: number | null = null;
+      const seenPreferences: unknown[] = [];
+      const sender = {
+        getParameters: () => {
+          activeTxId = nextTxId++;
+          return { ...structuredClone(params), transactionId: String(activeTxId) };
+        },
+        setParameters: async (p: Record<string, unknown>) => {
+          // Per W3C WebRTC 1.0 § 5.2, setParameters validates and consumes [[LastReturnedParameters]].
+          const expectedTx = activeTxId !== null ? String(activeTxId) : null;
+          activeTxId = null;
+          if (expectedTx === null || p["transactionId"] !== expectedTx) {
+            throw new DOMException(
+              "getParameters() needs to be called before setParameters().",
+              "InvalidStateError",
+            );
+          }
+          seenPreferences.push(p["degradationPreference"]);
+          if (rejectPrefs.has(p["degradationPreference"])) {
+            throw new TypeError("Failed to execute 'setParameters': invalid enum value");
+          }
+          params = structuredClone(p);
+        },
+      } as unknown as RTCRtpSender;
+      return { sender, seenPreferences, getParams: () => params };
+    };
 
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
     try {
-      await applyVideoEncoding(fallbackSender, PRESET, "clarity");
+      // 1. Reject only maintain-framerate-and-resolution -> falls back to maintain-resolution
+      const s1 = makeRejectingSender(new Set(["maintain-framerate-and-resolution"]));
+      await applyVideoEncoding(s1.sender, PRESET, "clarity");
       expect(errorSpy).toHaveBeenCalledTimes(1);
       expect(errorSpy).toHaveBeenCalledWith(
         "[quality] Focus Clarity (maintain-framerate-and-resolution) was rejected; " +
-          "falling back to Focus Framerate (maintain-framerate).",
+          "falling back to maintain-resolution.",
         expect.any(TypeError),
       );
+      expect(s1.seenPreferences).toEqual([
+        "maintain-framerate-and-resolution",
+        "maintain-resolution",
+      ]);
+      expect(s1.getParams()["degradationPreference"]).toBe("maintain-resolution");
+      expect((s1.getParams()["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(
+        PRESET.maxBitrate,
+      );
 
-      // A browser that accepts Focus Clarity logs nothing.
+      // 2. Reject both maintain-framerate-and-resolution and maintain-resolution -> falls back to maintain-framerate
+      errorSpy.mockClear();
+      const s2 = makeRejectingSender(
+        new Set(["maintain-framerate-and-resolution", "maintain-resolution"]),
+      );
+      await applyVideoEncoding(s2.sender, PRESET, "clarity");
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(errorSpy).toHaveBeenNthCalledWith(
+        1,
+        "[quality] Focus Clarity (maintain-framerate-and-resolution) was rejected; " +
+          "falling back to maintain-resolution.",
+        expect.any(TypeError),
+      );
+      expect(errorSpy).toHaveBeenNthCalledWith(
+        2,
+        "[quality] Focus Clarity (maintain-resolution) was rejected; " +
+          "falling back to maintain-framerate.",
+        expect.any(TypeError),
+      );
+      expect(s2.seenPreferences).toEqual([
+        "maintain-framerate-and-resolution",
+        "maintain-resolution",
+        "maintain-framerate",
+      ]);
+      expect(s2.getParams()["degradationPreference"]).toBe("maintain-framerate");
+      expect((s2.getParams()["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(
+        PRESET.maxBitrate,
+      );
+
+      // 3. A browser that accepts Focus Clarity logs nothing.
       errorSpy.mockClear();
       await applyVideoEncoding(fakeSender({ active: true }).sender, PRESET, "clarity");
       expect(errorSpy).not.toHaveBeenCalled();
     } finally {
       errorSpy.mockRestore();
     }
-    expect(seenPreferences).toEqual([
-      "maintain-framerate-and-resolution",
-      "maintain-framerate",
-    ]);
-    expect(params["degradationPreference"]).toBe("maintain-framerate");
-    expect((params["encodings"] as Array<Record<string, unknown>>)[0]?.["maxBitrate"]).toBe(
-      PRESET.maxBitrate,
-    );
   });
 });
 

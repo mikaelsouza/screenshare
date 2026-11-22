@@ -159,7 +159,7 @@ export function scrubRoomUrlDom(): void {
 
 let memoryName: string | null = null;
 
-function readStoredName(): string | null {
+export function readStoredName(): string | null {
   if (memoryName !== null) return memoryName;
   try {
     return localStorage.getItem("name");

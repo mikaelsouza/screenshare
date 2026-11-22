@@ -181,17 +181,21 @@ Picture-in-Picture, live stats, and fullscreen controls.
 ## Development
 
 ```bash
-npm run check           # typecheck client, worker, and electron (TypeScript 7)
-npm run lint:all        # dead-code & cycle check (knip) + type-aware lint (oxlint)
-npm run test:unit       # unit tests (protocol, mesh, quality, capture, audio, follow, UI)
-npm run test:worker     # RoomDO in real workerd (@cloudflare/vitest-plugin)
-npm run test:formal     # exhaustive & stateful model-based invariant suites
-npm run test:fuzz       # fast-check property and fuzz tests
-npm run test:mutate     # Stryker mutation testing
-npm run test:e2e        # Playwright Chromium peers: P2P media and edge cases
-npm run electron:smoke  # Playwright smoke test for the Electron app
-npm test                # check + lint:all + test:unit + test:worker
-npm run test:all        # test + test:formal + test:fuzz + test:e2e
+npm run check                    # typecheck client, worker, and electron (TypeScript 7)
+npm run lint:all                 # dead-code & cycle check (knip) + type-aware lint (oxlint)
+npm run check:guardrails         # verify protected guardrail diff rules locally
+npm run test:unit                # unit tests (protocol, mesh, quality, capture, audio, follow, UI)
+npm run test:worker              # RoomDO in real workerd (@cloudflare/vitest-plugin)
+npm run test:formal              # exhaustive & stateful model-based invariant suites
+npm run test:fuzz                # fast-check property and fuzz tests
+npm run test:mutate              # Stryker full mutation testing suite (local)
+npm run test:mutate:ci           # Stryker diff-based mutation testing on changed files (used in CI)
+npm run test:e2e                 # Playwright Chromium peers: P2P media and edge cases
+npm run test:e2e:impaired        # network-impaired E2E suite (tc netem + Playwright)
+npm run electron:smoke           # Playwright smoke test for the unpackaged Electron app
+npm run electron:smoke:packaged  # fuse/ASAR smoke test for the packaged Windows Electron build
+npm test                         # check + lint:all + test:unit + test:worker
+npm run test:all                 # test + test:formal + test:fuzz + test:e2e
 ```
 
 Set `CHROMIUM_BIN` if you are not inside `nix develop` (on Windows, E2E tests fall back

@@ -26,6 +26,7 @@ jobs:
   guardrails-diff:
     name: Guardrail & Spec Diff Gate
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       # Always checks out the trusted base branch (default for pull_request_target).
       # PR file metadata is queried read-only via the GitHub API; untrusted PR commits are never fetched or executed.
@@ -56,7 +57,7 @@ jobs:
             FILES_JSON="$(mktemp "${RUNNER_TEMP:-/tmp}/pr-files.XXXXXX.json")"
             trap 'rm -f "$FILES_JSON"' EXIT
             gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" > "$FILES_JSON"
-            CHANGED_FILES_PATH="$FILES_JSON" node --experimental-strip-types scripts/check-guardrails-diff.ts
+            CHANGED_FILES_PATH="$FILES_JSON" node scripts/check-guardrails-diff.ts
           else
-            node --experimental-strip-types scripts/check-guardrails-diff.ts
+            node scripts/check-guardrails-diff.ts
           fi

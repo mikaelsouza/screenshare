@@ -1124,9 +1124,8 @@ class ToggleShareAndRelayCommand implements RoomCommand {
     if (!idA || !idB || idA === idB) return;
     real.setSharing(idA, this.sharingA);
     const peerA = real.peers.get(idA)!;
-    const peerB = real.peers.get(idB)!;
     const relay = real.relayOffer(idA, idB);
-    if (!peerA.sharing && !peerB.sharing) {
+    if (!peerA.sharing) {
       assert.equal(relay.allowed, false);
       if (!relay.allowed) assert.equal(relay.code, "not-sharing");
     } else {

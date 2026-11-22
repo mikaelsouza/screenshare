@@ -17,6 +17,13 @@ import { createPidResolver } from "./audio/pid.js";
 import { createAudioSessionController } from "./audio/capture.js";
 import { createAutoUpdateController } from "./updater.js";
 import { resolveProcessElectronConfig } from "./config.js";
+import {
+  buildOfflinePageUrl,
+  evaluateNavigation,
+  isAllowedExternalUrl,
+  isAllowedPermission,
+  isTrustedFrameUrl,
+} from "./security.js";
 import koffi from "koffi";
 import loopback from "loopback-capture";
 import path from "node:path";
@@ -46,28 +53,8 @@ function runBackground(task: Promise<unknown>, context: string): void {
   pendingTasks.add(tracked);
 }
 
-function isTrustedUrl(url: string | undefined): boolean {
-  if (!url) return false;
-  try {
-    return Boolean(trustedOrigin) && new URL(url).origin === trustedOrigin;
-  } catch {
-    return false;
-  }
-}
-
 function resolveTargetUrl(): string {
   return runtimeConfig.targetUrl;
-}
-
-function offlinePage(url: string, description: string): string {
-  const html = `<!doctype html><meta charset="utf-8"><title>Screenshare</title>
-<body style="margin:0;height:100vh;display:grid;place-items:center;background:#121214;color:#e6e6e6;font:15px system-ui,sans-serif">
-<div style="text-align:center;max-width:460px">
-<h2 style="font-weight:600">Can't reach Screenshare</h2>
-<p>Couldn't load <b>${new URL(url).host}</b> (${description}).</p>
-<p style="opacity:.7">Check your internet connection. Retrying automatically…</p>
-</div></body>`;
-  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
 // ---- audio capture ---------------------------------------------------------
@@ -238,45 +225,47 @@ function setupMediaHandlers(): void {
   // 1. getDisplayMedia: let the user pick a window or screen from a native menu,
   //    as Chrome's own picker does on the web. Audio is Electron's loopback, i.e.
   //    everything the PC plays: Electron cannot capture a single window's audio.
-  session.defaultSession.setDisplayMediaRequestHandler((_request, callback) => {
+  session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
+    if (!isTrustedFrameUrl(request.frame?.url, trustedOrigin)) {
+      try {
+        callback({});
+      } catch {
+        // Ignore synchronous rejection error from Electron
+      }
+      return;
+    }
     runBackground(handleDisplayMediaRequest(callback), "display media request");
   });
 
   ipcMain.on("follow:stop", (event) => {
-    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) stopFollow();
+    if (isTrustedFrameUrl(event.senderFrame?.url, trustedOrigin)) stopFollow();
   });
 
   ipcMain.handle("audio:start-window", (event, sourceId: unknown) => {
-    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    if (!isTrustedFrameUrl(event.senderFrame?.url, trustedOrigin)) return false;
     const targetId = lastPickedSource?.id;
     if (typeof sourceId === "string" && sourceId && sourceId !== targetId) return false;
     return Boolean(targetId && audioSession.startForWindow(targetId));
   });
 
   ipcMain.handle("audio:start-system", (event) => {
-    if (!isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) return false;
+    if (!isTrustedFrameUrl(event.senderFrame?.url, trustedOrigin)) return false;
     return audioSession.startForSystem();
   });
 
   ipcMain.on("audio:stop", (event) => {
-    if (isTrustedUrl(event.senderFrame?.url || event.sender.getURL())) audioSession.stop();
+    if (isTrustedFrameUrl(event.senderFrame?.url, trustedOrigin)) audioSession.stop();
   });
 
   // 2. Permission request handler for display-capture, media & clipboard (trusted origin only,
   //    since the app now loads remote content)
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-    const perm = permission as string;
-    const allowed =
-      perm === "display-capture" || perm === "media" || perm === "clipboard-sanitized-write";
-    callback(allowed && isTrustedUrl(details.requestingUrl || webContents.getURL()));
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+    callback(isAllowedPermission(permission, details.requestingUrl, trustedOrigin));
   });
 
   // 3. Permission check handler
-  session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
-    const perm = permission as string;
-    const allowed =
-      perm === "display-capture" || perm === "media" || perm === "clipboard-sanitized-write";
-    return allowed && isTrustedUrl(requestingOrigin || webContents?.getURL());
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+    return isAllowedPermission(permission, requestingOrigin, trustedOrigin);
   });
 }
 
@@ -313,22 +302,18 @@ async function initApplication(): Promise<void> {
 
   // External links routing to default system browser
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("mailto:")) {
+    if (isAllowedExternalUrl(url)) {
       runBackground(shell.openExternal(url), "openExternal");
     }
     return { action: "deny" };
   });
 
   win.webContents.on("will-navigate", (event, url) => {
-    try {
-      const parsedNav = new URL(url);
-      const parsedTarget = new URL(targetUrl);
-      if (parsedNav.origin !== parsedTarget.origin) {
-        event.preventDefault();
-        runBackground(shell.openExternal(url), "will-navigate openExternal");
-      }
-    } catch {
-      // Invalid URL navigation attempt ignored
+    const decision = evaluateNavigation(url, trustedOrigin);
+    if (decision === "allow") return;
+    event.preventDefault();
+    if (decision === "open-external") {
+      runBackground(shell.openExternal(url), "will-navigate openExternal");
     }
   });
 
@@ -341,7 +326,7 @@ async function initApplication(): Promise<void> {
     console.error(`[main] Failed to load ${validatedURL}: ${errorDescription} (${errorCode})`);
     stopFollow();
     audioSession.stop();
-    runBackground(win.loadURL(offlinePage(targetUrl, errorDescription)), "load offline page");
+    runBackground(win.loadURL(buildOfflinePageUrl(targetUrl, errorDescription)), "load offline page");
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = setTimeout(() => {
       if (mainWindow && !mainWindow.isDestroyed()) {

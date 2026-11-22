@@ -71,10 +71,10 @@ function applySecurityHeaders(res: Response, url: URL): Response {
   if (url.protocol === "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
     headers.set("Strict-Transport-Security", "max-age=63072000; includeSubDomains");
   }
-  // script-src has no 'unsafe-inline': neither page carries an inline <script> (both
-  // load a module by src, and Vite emits external chunks), so allowing it would
-  // re-open the main class of XSS that CSP exists to stop and buy nothing. style-src
-  // keeps it, because both pages do have an inline <style> block.
+  // Neither script-src nor style-src allows 'unsafe-inline': neither page carries an
+  // inline <script> or inline <style> (both load external Vite-bundled same-origin
+  // assets), so allowing 'unsafe-inline' would weaken XSS/CSS-injection defense for
+  // no benefit.
   //
   // connect-src is 'self' rather than a blanket `wss: ws:`. The signalling socket is
   // same-origin, and in an app whose whole point is that media never leaves a direct
@@ -92,7 +92,7 @@ function applySecurityHeaders(res: Response, url: URL): Response {
     [
       "default-src 'self'",
       "script-src 'self'",
-      "style-src 'self' 'unsafe-inline'",
+      "style-src 'self'",
       "img-src 'self' data:",
       "connect-src 'self'",
       "frame-ancestors 'none'",
