@@ -2,11 +2,14 @@ import { isValidRoomCode } from "@shared/protocol";
 import type { LockManagerLike, StorageLike } from "../host-tokens";
 import {
   clearAllPersistedRecentRooms,
+  executePendingRemoval,
+  flushPendingRemovalForWrite,
+  flushPendingRemovalsForRecovery,
+  hasPendingRecoveryRemovals,
   hasStaleRecentRooms,
   isRecentRoomsDisabled,
   isRecentRoomsKeyAbsent,
   pruneExpiredRecentRooms,
-  removePersistedRecentRoom,
   runWithRecentRoomsLock,
   setRecentRoomsDisabled,
 } from "../recent-rooms";
@@ -22,18 +25,15 @@ import {
   setPendingPatchInMap,
   sortAndBoundEntries,
   type RecentRoomEntry,
-  type RecentRoomJoinOp,
   type RecentRoomPatchOp,
   type RecentRoomWriteOp,
 } from "../recent-rooms-model";
 import {
   buildMergedRecentRoomsView,
+  buildQueuedJoinOp,
   clearCodeFromSyncMaps,
   dropFailedWriteOp,
   executeRecentRoomWriteOp,
-  flushPendingRemovalForWrite,
-  flushPendingRemovalsForRecovery,
-  hasPendingRecoveryRemovals,
   pruneFailedPendingJoins,
   resetRecentRoomsSyncMaps,
   shouldSkipWriteOp,
@@ -105,9 +105,11 @@ export class RecentRoomsController {
   private applyExternalOptOut(storage: StorageLike | null): void {
     const gen = ++this.mutationGen;
     this.writeCutoffGen = gen;
-    if (this.persistedClearAllGen === this.clearAllGen || isRecentRoomsKeyAbsent(storage)) {
+    if (isRecentRoomsKeyAbsent(storage)) {
       this.clearAllGen = gen;
       this.persistedClearAllGen = gen;
+    } else if (this.persistedClearAllGen === this.clearAllGen) {
+      this.clearAllGen = gen;
     }
     resetRecentRoomsSyncMaps(this.syncState);
     this.disabled = true;
@@ -284,41 +286,33 @@ export class RecentRoomsController {
     this.rooms = sortAndBoundEntries([nextEntry, ...this.rooms.filter((r) => r.code !== code)]);
     this.normalizeUiState();
 
-    const cleanPw = sanitizePassword(params.password);
-    const cleanPeers = sanitizePeerNames(params.peerNames);
-    const op: RecentRoomJoinOp = {
-      kind: "join",
+    const op = buildQueuedJoinOp(
+      this.syncState,
       code,
       role,
-      lastJoinedAt: now,
-      ...(cleanPw !== undefined ? { password: cleanPw } : {}),
-      ...(cleanPeers.length > 0 ? { peerNames: cleanPeers } : {}),
-    };
-    const firstGen = this.syncState.pendingJoins.get(code)?.firstGen ?? gen;
-    this.syncState.pendingJoins.set(code, { ...op, gen, firstGen });
+      now,
+      gen,
+      sanitizePassword(params.password),
+      sanitizePeerNames(params.peerNames),
+    );
     this.enqueueWrite(gen, op);
     this.env.onChange();
+  }
+
+  private enqueuePatch(upper: string, updated: RecentRoomEntry, op: RecentRoomPatchOp): void {
+    const gen = ++this.mutationGen;
+    this.applyMetadataUpdate(upper, updated, gen);
+    setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
+    this.enqueueWrite(gen, op);
   }
 
   updatePassword(code: string, password: string | undefined, locked: boolean): void {
     const upper = code.trim().toUpperCase();
     const clean = sanitizePassword(password);
     if (locked || clean === undefined || !isValidRoomCode(upper)) return;
-
     const existing = this.rooms.find((r) => r.code === upper);
     if (!existing || existing.password === clean) return;
-
-    const updated: RecentRoomEntry = { ...existing, password: clean };
-    const gen = ++this.mutationGen;
-    this.applyMetadataUpdate(upper, updated, gen);
-    const op: Extract<RecentRoomPatchOp, { field: "password" }> = {
-      kind: "patch",
-      code: upper,
-      field: "password",
-      password: clean,
-    };
-    setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
-    this.enqueueWrite(gen, op);
+    this.enqueuePatch(upper, { ...existing, password: clean }, { kind: "patch", code: upper, field: "password", password: clean });
     this.env.onChange();
   }
 
@@ -327,75 +321,60 @@ export class RecentRoomsController {
     if (!isValidRoomCode(upper)) return;
     const sanitized = sanitizePeerNames(peerNames);
     if (sanitized.length === 0) return;
-
     const existing = this.rooms.find((r) => r.code === upper);
     if (!existing || sameStringArray(existing.peerNames, sanitized)) return;
-
-    const updated: RecentRoomEntry = { ...existing, peerNames: sanitized };
-    const gen = ++this.mutationGen;
-    this.applyMetadataUpdate(upper, updated, gen);
-    const op: Extract<RecentRoomPatchOp, { field: "peerNames" }> = {
-      kind: "patch",
-      code: upper,
-      field: "peerNames",
-      peerNames: sanitized,
-    };
-    setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
-    this.enqueueWrite(gen, op);
+    this.enqueuePatch(upper, { ...existing, peerNames: sanitized }, { kind: "patch", code: upper, field: "peerNames", peerNames: sanitized });
     this.env.onChange();
   }
 
   rename(code: string, label: string): void {
     const upper = code.trim().toUpperCase();
     if (!isValidRoomCode(upper)) return;
-
     const existing = this.rooms.find((r) => r.code === upper);
     this.editingCode = null;
     if (!existing) {
       this.env.onChange();
       return;
     }
-
     const nextLabel = sanitizeRecentRoomLabel(label);
     const { label: _prevLabel, ...withoutLabel } = existing;
     const updated: RecentRoomEntry = nextLabel !== undefined ? { ...withoutLabel, label: nextLabel } : withoutLabel;
-    const gen = ++this.mutationGen;
-    this.applyMetadataUpdate(upper, updated, gen);
-    const op: Extract<RecentRoomPatchOp, { field: "label" }> = {
+    this.enqueuePatch(upper, updated, {
       kind: "patch",
       code: upper,
       field: "label",
       ...(nextLabel !== undefined ? { label: nextLabel } : { clearLabel: true }),
-    };
-    setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
-    this.enqueueWrite(gen, op);
+    });
     this.env.onChange();
   }
 
-  private removeFromRecentsOnly(upper: string): boolean {
+  private removeFromRecentsOnly(upper: string, demoteIfPassworded = false): boolean {
     const existed = this.rooms.some((r) => r.code === upper);
     const gen = ++this.mutationGen;
     this.syncState.lastRemovalGen.set(upper, gen);
     this.syncState.pendingRemovals.set(upper, gen);
     clearCodeFromSyncMaps(this.syncState, upper);
+    if (demoteIfPassworded) this.syncState.hostForgetGen.set(upper, gen);
     this.rooms = this.rooms.filter((r) => r.code !== upper);
     this.normalizeUiState();
 
     this.env.runBackground(
       runWithRecentRoomsLock(this.env.getLocks(), () => {
+        let demoted = false;
         try {
-          if (
-            (this.syncState.persistedRemovalGen.get(upper) ?? 0) < gen &&
-            this.persistedClearAllGen < gen &&
-            (this.syncState.lastJoinGen.get(upper) ?? 0) < gen
-          ) {
-            if (removePersistedRecentRoom(this.env.getLocalStorage(), upper, this.now())) {
-              this.syncState.persistedRemovalGen.set(upper, gen);
-            }
-          }
+          demoted =
+            executePendingRemoval(
+              this.env.getLocalStorage(),
+              this.syncState,
+              upper,
+              gen,
+              this.persistedClearAllGen,
+              this.now(),
+            ) === "demoted";
         } finally {
           if (this.syncState.pendingRemovals.get(upper) === gen) this.syncState.pendingRemovals.delete(upper);
         }
+        if (demoted) this.syncFromStorage(true);
       }),
     );
     return existed;
@@ -416,19 +395,9 @@ export class RecentRoomsController {
     if (!existing) return;
 
     if (existing.password !== undefined) {
-      const updated: RecentRoomEntry = { ...existing, role: "guest" };
-      const gen = ++this.mutationGen;
-      this.applyMetadataUpdate(upper, updated, gen);
-      const op: Extract<RecentRoomPatchOp, { field: "role" }> = {
-        kind: "patch",
-        code: upper,
-        field: "role",
-        role: "guest",
-      };
-      setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
-      this.enqueueWrite(gen, op);
+      this.enqueuePatch(upper, { ...existing, role: "guest" }, { kind: "patch", code: upper, field: "role", role: "guest" });
     } else {
-      this.removeFromRecentsOnly(upper);
+      this.removeFromRecentsOnly(upper, true);
     }
     this.normalizeUiState();
     this.env.onChange();
@@ -476,8 +445,14 @@ export class RecentRoomsController {
       runWithRecentRoomsLock(this.env.getLocks(), () => {
         try {
           const storage = this.env.getLocalStorage();
-          if (this.disabledGen === dGen && this.persistedDisabledGen < dGen && setRecentRoomsDisabled(storage, disabled)) {
-            this.persistedDisabledGen = dGen;
+          if (this.disabledGen === dGen && this.persistedDisabledGen < dGen) {
+            const clearReady =
+              disabled ||
+              this.clearPersistedIfCurrent(storage, this.clearAllGen) ||
+              this.persistedClearAllGen >= this.clearAllGen;
+            if (clearReady && setRecentRoomsDisabled(storage, disabled)) {
+              this.persistedDisabledGen = dGen;
+            }
           }
           if (clearGen !== undefined) this.clearPersistedIfCurrent(storage, clearGen);
         } finally {
@@ -514,13 +489,18 @@ export class RecentRoomsController {
         let changed = false;
         try {
           const storage = this.env.getLocalStorage();
+          if (this.pendingClearAll === 0) changed = this.clearPersistedIfCurrent(storage, this.clearAllGen) || changed;
           const dGen = this.disabledGen;
-          if (this.pendingDisabledSync === 0 && this.persistedDisabledGen < dGen && setRecentRoomsDisabled(storage, this.disabled)) {
+          if (
+            (this.disabled || this.persistedClearAllGen >= this.clearAllGen) &&
+            this.pendingDisabledSync === 0 &&
+            this.persistedDisabledGen < dGen &&
+            setRecentRoomsDisabled(storage, this.disabled)
+          ) {
             if (this.disabledGen === dGen) this.persistedDisabledGen = dGen;
             if (this.disabled) clearAllPersistedRecentRooms(storage);
             changed = true;
           }
-          if (this.pendingClearAll === 0) changed = this.clearPersistedIfCurrent(storage, this.clearAllGen) || changed;
           if (flushPendingRemovalsForRecovery(storage, this.syncState, this.persistedClearAllGen, this.now())) {
             changed = true;
           }

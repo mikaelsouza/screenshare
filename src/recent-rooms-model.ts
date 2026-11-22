@@ -73,6 +73,7 @@ export interface RecentRoomsSyncState {
   readonly pendingPatches: Map<string, PendingPatchMap>;
   readonly persistedFieldGen: Map<string, PersistedFieldGens>;
   readonly lastExternalDeleteGen: Map<string, number>;
+  readonly hostForgetGen: Map<string, number>;
   readonly synthesizedCodes: Set<string>;
 }
 
@@ -91,6 +92,7 @@ export function createRecentRoomsSyncState(): RecentRoomsSyncState {
     pendingPatches: new Map(),
     persistedFieldGen: new Map(),
     lastExternalDeleteGen: new Map(),
+    hostForgetGen: new Map(),
     synthesizedCodes: new Set(),
   };
 }
@@ -340,7 +342,7 @@ export function buildMaterializedJoinEntry(
   return {
     code: pendingJoin.code,
     role,
-    lastJoinedAt: pendingJoin.lastJoinedAt,
+    lastJoinedAt: Math.max(pendingJoin.lastJoinedAt, existing?.lastJoinedAt ?? 0),
     peerNames: [...peerNames],
     ...(password !== undefined ? { password } : {}),
     ...(existing?.label !== undefined ? { label: existing.label } : {}),

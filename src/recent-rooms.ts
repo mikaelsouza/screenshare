@@ -10,6 +10,7 @@ import {
   filterRecentRooms,
   formatRelativeTime,
   insertEntryOrdered,
+  isCodeLocallyRemoved,
   isTimestampValid,
   mergeSynthesizedHostRooms,
   parseRecentRoomItem,
@@ -19,6 +20,7 @@ import {
   sortAndBoundEntries,
   type RecentRoomEntry,
   type RecentRoomRole,
+  type RecentRoomsSyncState,
 } from "./recent-rooms-model";
 
 export type { LockManagerLike, RecentRoomEntry, StorageLike };
@@ -293,11 +295,32 @@ export function removePersistedRecentRoom(
 ): boolean {
   const upper = code.trim().toUpperCase();
   if (!storage || !isValidRoomCode(upper)) return false;
-  const loaded = tryLoadRecentRooms(storage, now);
-  if (!loaded.ok) return false;
-  const next = loaded.entries.filter((entry) => entry.code !== upper);
-  if (next.length === loaded.entries.length) return true;
+  const scanned = scanRecentRooms(storage, now);
+  if (!scanned) return false;
+  const next = scanned.entries.filter((entry) => entry.code !== upper);
+  if (next.length === scanned.entries.length && !scanned.stale) return true;
   return writePersistedRecentRooms(storage, next);
+}
+
+/** Demote a passworded room to `"guest"` or remove a passwordless room when creator host is forgotten. */
+function demoteOrRemovePersistedRecentRoom(
+  storage: StorageLike | null | undefined,
+  code: string,
+  now: number = Date.now(),
+): "demoted" | "removed" | "failed" {
+  const upper = code.trim().toUpperCase();
+  if (!storage || !isValidRoomCode(upper)) return "failed";
+  const scanned = scanRecentRooms(storage, now);
+  if (!scanned) return "failed";
+  const existing = scanned.entries.find((entry) => entry.code === upper);
+  if (existing && existing.password !== undefined) {
+    if (existing.role === "guest" && !scanned.stale) return "demoted";
+    const next = scanned.entries.map((entry) => (entry.code === upper ? { ...entry, role: "guest" as const } : entry));
+    return writePersistedRecentRooms(storage, next) ? "demoted" : "failed";
+  }
+  const next = scanned.entries.filter((entry) => entry.code !== upper);
+  if (next.length === scanned.entries.length && !scanned.stale) return "removed";
+  return writePersistedRecentRooms(storage, next) ? "removed" : "failed";
 }
 
 /** Remove a single room entry from persisted `recent-rooms`. */
@@ -342,4 +365,92 @@ export async function runWithRecentRoomsLock(
   } catch {
     if (!ran) fn();
   }
+}
+
+/** Execute a queued removal (or host-forget demote/remove) under lock if not superseded by a newer join or clearAll. */
+export function executePendingRemoval(
+  storage: StorageLike | null,
+  state: RecentRoomsSyncState,
+  code: string,
+  gen: number,
+  persistedClearAllGen: number,
+  now: number,
+): "demoted" | "removed" | "skipped" | "failed" {
+  if (
+    (state.persistedRemovalGen.get(code) ?? 0) >= gen ||
+    persistedClearAllGen >= gen ||
+    (state.lastJoinGen.get(code) ?? 0) >= gen
+  ) {
+    return "skipped";
+  }
+  const isHostForget = state.hostForgetGen.get(code) === gen;
+  const outcome = isHostForget
+    ? demoteOrRemovePersistedRecentRoom(storage, code, now)
+    : removePersistedRecentRoom(storage, code, now)
+      ? "removed"
+      : "failed";
+  if (outcome !== "failed") {
+    state.persistedRemovalGen.set(code, gen);
+    if (isHostForget) state.hostForgetGen.delete(code);
+  }
+  return outcome;
+}
+
+/** Flush any unpersisted removal for `code` up to `removedGen` before executing a newer write op. */
+export function flushPendingRemovalForWrite(
+  storage: StorageLike | null,
+  state: RecentRoomsSyncState,
+  code: string,
+  removedGen: number | undefined,
+  persistedClearAllGen: number,
+  now: number,
+): boolean {
+  if (
+    removedGen === undefined ||
+    removedGen <= (state.persistedRemovalGen.get(code) ?? 0) ||
+    removedGen <= persistedClearAllGen
+  ) {
+    return true;
+  }
+  if (!removePersistedRecentRoom(storage, code, now)) return false;
+  state.persistedRemovalGen.set(code, removedGen);
+  return true;
+}
+
+/** Return true if any non-pending local room deletion has not yet been flushed to disk. */
+export function hasPendingRecoveryRemovals(state: RecentRoomsSyncState, persistedClearAllGen: number): boolean {
+  for (const code of state.lastRemovalGen.keys()) {
+    if (!state.pendingRemovals.has(code) && isCodeLocallyRemoved(state, code, persistedClearAllGen)) return true;
+  }
+  return false;
+}
+
+/** Flush any unpersisted local room deletions to disk once storage recovers. */
+export function flushPendingRemovalsForRecovery(
+  storage: StorageLike | null,
+  state: RecentRoomsSyncState,
+  persistedClearAllGen: number,
+  now: number,
+): boolean {
+  let changed = false;
+  for (const [code, rGen] of state.lastRemovalGen) {
+    if (state.pendingRemovals.has(code)) continue;
+    const satisfiedBy = Math.max(
+      state.persistedRemovalGen.get(code) ?? 0,
+      persistedClearAllGen,
+      state.lastJoinGen.get(code) ?? 0,
+    );
+    if (rGen > satisfiedBy) {
+      const isHostForget = state.hostForgetGen.get(code) === rGen;
+      const ok = isHostForget
+        ? demoteOrRemovePersistedRecentRoom(storage, code, now) !== "failed"
+        : removePersistedRecentRoom(storage, code, now);
+      if (ok) {
+        state.persistedRemovalGen.set(code, rGen);
+        if (isHostForget) state.hostForgetGen.delete(code);
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }

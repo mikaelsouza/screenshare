@@ -1,5 +1,5 @@
 import { listPersistedHostRooms, type StorageLike } from "./host-tokens";
-import { removePersistedRecentRoom, tryLoadRecentRooms, writePersistedRecentRooms } from "./recent-rooms";
+import { tryLoadRecentRooms, writePersistedRecentRooms } from "./recent-rooms";
 import {
   RECENT_ROOM_FIELDS,
   afterCodesForJoin,
@@ -10,6 +10,7 @@ import {
   hasUnpersistedJoin,
   insertEntryOrdered,
   isCodeLocallyRemoved,
+  isTimestampValid,
   markMaterializedPendingJoin,
   markPersistedField,
   mergePendingRecentRooms,
@@ -24,6 +25,7 @@ import {
   type RecentRoomField,
   type RecentRoomJoinOp,
   type RecentRoomPatchOp,
+  type RecentRoomRole,
   type RecentRoomWriteOp,
   type RecentRoomsSyncState,
 } from "./recent-rooms-model";
@@ -40,6 +42,7 @@ export function resetRecentRoomsSyncMaps(state: RecentRoomsSyncState): void {
   state.pendingRemovals.clear();
   state.persistedFieldGen.clear();
   state.lastExternalDeleteGen.clear();
+  state.hostForgetGen.clear();
   state.synthesizedCodes.clear();
 }
 
@@ -49,7 +52,48 @@ export function clearCodeFromSyncMaps(state: RecentRoomsSyncState, code: string)
   state.pendingJoins.delete(code);
   state.pendingSynthPromotions.delete(code);
   state.pendingPatches.delete(code);
+  state.hostForgetGen.delete(code);
   state.synthesizedCodes.delete(code);
+}
+
+function carryPendingField<T>(
+  incoming: T | undefined,
+  prev: (RecentRoomJoinOp & { gen: number }) | undefined,
+  prevValue: T | undefined,
+  patchGen: number | undefined,
+  persistedGen: number | undefined,
+): T | undefined {
+  if (incoming !== undefined) return incoming;
+  if (!prev || prevValue === undefined) return undefined;
+  return (patchGen ?? 0) <= prev.gen && (persistedGen ?? 0) <= prev.gen ? prevValue : undefined;
+}
+
+/** Build and record a pending join op while carrying forward unpersisted password/peers from prior pending joins. */
+export function buildQueuedJoinOp(
+  state: RecentRoomsSyncState,
+  code: string,
+  role: RecentRoomRole,
+  now: number,
+  gen: number,
+  cleanPw: string | undefined,
+  cleanPeers: string[],
+): RecentRoomJoinOp {
+  const prev = state.pendingJoins.get(code);
+  const patches = state.pendingPatches.get(code);
+  const fieldGens = state.persistedFieldGen.get(code);
+  const carryPw = carryPendingField(cleanPw, prev, prev?.password, patches?.password?.gen, fieldGens?.password);
+  const incomingPeers = cleanPeers.length > 0 ? cleanPeers : undefined;
+  const carryPeers = carryPendingField(incomingPeers, prev, prev?.peerNames, patches?.peerNames?.gen, fieldGens?.peerNames);
+  const op: RecentRoomJoinOp = {
+    kind: "join",
+    code,
+    role,
+    lastJoinedAt: now,
+    ...(carryPw !== undefined ? { password: carryPw } : {}),
+    ...(carryPeers && carryPeers.length > 0 ? { peerNames: [...carryPeers] } : {}),
+  };
+  state.pendingJoins.set(code, { ...op, gen, firstGen: prev?.firstGen ?? gen });
+  return op;
 }
 
 function hasLiveCreatorHostRoom(
@@ -126,6 +170,7 @@ function persistJoinOp(
   gen: number,
   now: number,
 ): RecentRoomPersistResult {
+  if (!isTimestampValid(op.lastJoinedAt, now)) return "failed";
   const loaded = tryLoadRecentRooms(storage, now);
   if (!loaded.ok) return "failed";
   const prevFirstGen = state.pendingJoins.get(op.code)?.firstGen;
@@ -208,25 +253,21 @@ export function shouldSkipWriteOp(
   return (state.persistedFieldGen.get(op.code)?.[op.field] ?? 0) > gen;
 }
 
-/** Flush any unpersisted removal for `code` up to `removedGen` before executing a newer write op. */
-export function flushPendingRemovalForWrite(
-  storage: StorageLike | null,
+function resolvePatchPendingJoin(
   state: RecentRoomsSyncState,
   code: string,
-  removedGen: number | undefined,
-  persistedClearAllGen: number,
+  gen: number,
+  loadedEntries: readonly RecentRoomEntry[],
+  pendingJoin: (RecentRoomJoinOp & { gen: number; firstGen: number; failed?: boolean }) | undefined,
+  synthGen: number | undefined,
   now: number,
-): boolean {
-  if (
-    removedGen === undefined ||
-    removedGen <= (state.persistedRemovalGen.get(code) ?? 0) ||
-    removedGen <= persistedClearAllGen
-  ) {
-    return true;
-  }
-  if (!removePersistedRecentRoom(storage, code, now)) return false;
-  state.persistedRemovalGen.set(code, removedGen);
-  return true;
+): { hasPendingJoin: boolean; failed: boolean } {
+  const rawHasPendingJoin = shouldUsePendingJoinForPatch(state, code, gen, pendingJoin, synthGen);
+  if (!rawHasPendingJoin || !pendingJoin) return { hasPendingJoin: false, failed: false };
+  if (isTimestampValid(pendingJoin.lastJoinedAt, now)) return { hasPendingJoin: true, failed: false };
+  if (loadedEntries.some((e) => e.code === code)) return { hasPendingJoin: false, failed: false };
+  dropFailedJoinState(state, code, pendingJoin.gen);
+  return { hasPendingJoin: false, failed: true };
 }
 
 /** Execute a queued join or field patch against `storage` while preserving newer cross-tab state. */
@@ -249,7 +290,8 @@ export function executeRecentRoomWriteOp(
   ) {
     return "missing-on-disk";
   }
-  const hasPendingJoin = shouldUsePendingJoinForPatch(state, op.code, gen, pendingJoin, synthGen);
+  const { hasPendingJoin, failed } = resolvePatchPendingJoin(state, op.code, gen, loaded.entries, pendingJoin, synthGen, now);
+  if (failed) return "failed";
   const nextEntries = planPatchPersistence(
     loaded.entries,
     op,
@@ -326,6 +368,20 @@ function pruneStaleSynthPromotions(
   }
 }
 
+function resolvePersistedBaselineForJoin(
+  state: RecentRoomsSyncState,
+  code: string,
+  persistedEntry: RecentRoomEntry | undefined,
+  pendingJoin: RecentRoomJoinOp & { gen: number; firstGen: number },
+  persistedClearAllGen: number,
+): RecentRoomEntry | undefined {
+  const removedGen = state.lastRemovalGen.get(code) ?? 0;
+  const unflushedRemoval =
+    removedGen > Math.max(state.persistedRemovalGen.get(code) ?? 0, persistedClearAllGen) &&
+    pendingJoin.firstGen > removedGen;
+  return unflushedRemoval ? undefined : persistedEntry;
+}
+
 function collectPendingRoomEntries(
   rooms: readonly RecentRoomEntry[],
   state: RecentRoomsSyncState,
@@ -348,7 +404,8 @@ function collectPendingRoomEntries(
     const persistedEntry = persistedByCode.get(entry.code);
     const patches = state.pendingPatches.get(entry.code);
     if (pendingJoin && hasUnpersistedJoin(state, entry.code)) {
-      promoted.push(rebuildPendingJoinEntry(pendingJoin, persistedEntry, patches, state.persistedFieldGen.get(entry.code)));
+      const baseline = resolvePersistedBaselineForJoin(state, entry.code, persistedEntry, pendingJoin, persistedClearAllGen);
+      promoted.push(rebuildPendingJoinEntry(pendingJoin, baseline, patches, state.persistedFieldGen.get(entry.code)));
       continue;
     }
     const hostUpdatedAt = hostUpdatedByCode.get(entry.code);
@@ -408,35 +465,4 @@ export function buildMergedRecentRoomsView(
     (code) => !isCodeLocallyRemoved(state, code, persistedClearAllGen) && hasSavedCreatorHostFor(code),
     (code) => state.synthesizedCodes.add(code),
   );
-}
-
-/** Return true if any non-pending local room deletion has not yet been flushed to disk. */
-export function hasPendingRecoveryRemovals(state: RecentRoomsSyncState, persistedClearAllGen: number): boolean {
-  for (const code of state.lastRemovalGen.keys()) {
-    if (!state.pendingRemovals.has(code) && isCodeLocallyRemoved(state, code, persistedClearAllGen)) return true;
-  }
-  return false;
-}
-
-/** Flush any unpersisted local room deletions to disk once storage recovers. */
-export function flushPendingRemovalsForRecovery(
-  storage: StorageLike | null,
-  state: RecentRoomsSyncState,
-  persistedClearAllGen: number,
-  now: number,
-): boolean {
-  let changed = false;
-  for (const [code, rGen] of state.lastRemovalGen) {
-    if (state.pendingRemovals.has(code)) continue;
-    const satisfiedBy = Math.max(
-      state.persistedRemovalGen.get(code) ?? 0,
-      persistedClearAllGen,
-      state.lastJoinGen.get(code) ?? 0,
-    );
-    if (rGen > satisfiedBy && removePersistedRecentRoom(storage, code, now)) {
-      state.persistedRemovalGen.set(code, rGen);
-      changed = true;
-    }
-  }
-  return changed;
 }

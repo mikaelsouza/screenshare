@@ -639,4 +639,37 @@ describe("recent-rooms localStorage persistence", () => {
     afterPw.peerNames.push("Mutated");
     expect(base.peerNames).toEqual(["Alice"]);
   });
+
+  it("rewrites storage in removePersistedRecentRoom when expired or stale records were dropped (CR #10)", () => {
+    const t0 = 1_700_000_000_000;
+
+    // 1. Target expired before lock ran alongside a valid room -> expired entry & its secret are purged from raw JSON
+    const mixed = makeMemoryStorage({
+      [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "EXPD2345", role: "guest", password: "EXPIRED_SECRET_12", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+        { code: "KEEP2345", role: "host", lastJoinedAt: t0 - 1000 },
+      ]),
+    });
+    expect(removePersistedRecentRoom(mixed, "EXPD2345", t0)).toBe(true);
+    const mixedRaw = JSON.parse(mixed.store.get(RECENT_ROOMS_STORAGE_KEY) ?? "[]") as Array<{ code: string }>;
+    expect(mixedRaw.map((r) => r.code)).toEqual(["KEEP2345"]);
+
+    // 2. Only expired target existed -> key is completely deleted from storage
+    const onlyExpired = makeMemoryStorage({
+      [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "EXPD2345", role: "guest", password: "EXPIRED_SECRET_12", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+      ]),
+    });
+    expect(removePersistedRecentRoom(onlyExpired, "EXPD2345", t0)).toBe(true);
+    expect(onlyExpired.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+    // 3. Removing an absent code when stale entries exist still rewrites storage to purge stale secrets
+    const staleOther = makeMemoryStorage({
+      [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+        { code: "EXPD2345", role: "guest", password: "EXPIRED_SECRET_12", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+      ]),
+    });
+    expect(removePersistedRecentRoom(staleOther, "ZZZZ2345", t0)).toBe(true);
+    expect(staleOther.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+  });
 });
