@@ -377,12 +377,12 @@ describe("HTTP routing", () => {
     const csp = res.headers.get("Content-Security-Policy") ?? "";
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("frame-ancestors 'none'");
-    // 'unsafe-inline' on script-src re-opens the main class of XSS that CSP exists to
-    // stop, and neither page has an inline <script> to justify it. style-src does need
-    // it: both pages carry an inline <style>.
+    // Neither script-src nor style-src allows 'unsafe-inline': both pages load external
+    // same-origin bundled assets and carry no inline <script> or <style>.
     expect(csp).toContain("script-src 'self'");
     expect(csp).not.toMatch(/script-src[^;]*unsafe-inline/);
-    expect(csp).toMatch(/style-src[^;]*'unsafe-inline'/);
+    expect(csp).toContain("style-src 'self'");
+    expect(csp).not.toMatch(/style-src[^;]*unsafe-inline/);
     // A blanket `wss: ws:` would let injected script open a socket to any host — an
     // exfiltration channel in an app whose whole point is that media stays direct.
     expect(csp).toContain("connect-src 'self'");
