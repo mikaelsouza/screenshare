@@ -75,7 +75,7 @@ class PeerLink {
     selfId: PeerId, peerId: PeerId, opts: MeshOptions,
     send: (data: SignalData) => void, cb: MeshCallbacks,
     /** Whether this side opens the control channel; see Mesh.addPeer. */
-    createsControl: boolean = selfId >= peerId,
+    createsControl: boolean,
   ) {
     this.selfId = selfId;
     this.peerId = peerId;
