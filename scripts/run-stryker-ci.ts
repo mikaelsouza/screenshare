@@ -1,10 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { randomInt } from "node:crypto";
 import { globSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_SAMPLE_SIZE = 6;
+const ZERO_SHA = /^0+$/;
 
 function readMutatePatterns(configPath: string): string[] {
   const raw: unknown = JSON.parse(readFileSync(configPath, "utf8"));
@@ -38,47 +37,68 @@ export function resolveMutateFiles(patterns: readonly string[], cwd: string = pr
 }
 
 /**
- * Pick a uniformly random subset of at most `sampleSize` items without replacement.
+ * Intersect git-changed file paths with Stryker-eligible files (deterministic, sorted).
  */
-export function selectRandomSubset(
-  files: readonly string[],
-  sampleSize: number,
-  randInt: (maxExclusive: number) => number = (max) => randomInt(max),
+export function selectChangedMutateFiles(
+  eligibleFiles: readonly string[],
+  changedFiles: readonly string[],
 ): string[] {
-  const count = Math.max(1, Math.min(sampleSize, files.length));
-  const pool = [...files];
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = randInt(i + 1);
-    const tmp = pool[i];
-    const swap = pool[j];
-    if (tmp !== undefined && swap !== undefined) {
-      pool[i] = swap;
-      pool[j] = tmp;
+  const eligible = new Set(eligibleFiles.map(toPosix));
+  const selected = new Set<string>();
+  for (const file of changedFiles) {
+    const normalized = toPosix(file.trim());
+    if (normalized && eligible.has(normalized)) {
+      selected.add(normalized);
     }
   }
-  return pool.slice(0, count).sort();
+  return [...selected].sort();
 }
 
-function parseSampleSize(raw: string | undefined): number {
-  if (!raw) return DEFAULT_SAMPLE_SIZE;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SAMPLE_SIZE;
+function resolveBaseRef(): string {
+  const envBase = process.env["STRYKER_BASE_REF"]?.trim();
+  if (envBase && !ZERO_SHA.test(envBase)) return envBase;
+  return "origin/main";
+}
+
+function getChangedFiles(baseRef: string, cwd: string = process.cwd()): string[] {
+  const threeDot = spawnSync("git", ["diff", "--name-only", "--diff-filter=ACMR", `${baseRef}...HEAD`], {
+    cwd,
+    encoding: "utf8",
+  });
+  if (threeDot.status === 0) {
+    return threeDot.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  }
+  const twoDot = spawnSync("git", ["diff", "--name-only", "--diff-filter=ACMR", baseRef, "HEAD"], {
+    cwd,
+    encoding: "utf8",
+  });
+  if (twoDot.status === 0) {
+    return twoDot.stdout.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  }
+  const errMsg = (threeDot.stderr || twoDot.stderr || "").trim();
+  throw new Error(`git diff against '${baseRef}' failed: ${errMsg}`);
 }
 
 function main(): void {
   const configPath = path.resolve(process.cwd(), "stryker.config.json");
   const patterns = readMutatePatterns(configPath);
-  const allFiles = resolveMutateFiles(patterns);
-  if (allFiles.length === 0) {
+  const eligibleFiles = resolveMutateFiles(patterns);
+  if (eligibleFiles.length === 0) {
     console.error("[stryker-ci] No files matched stryker.config.json mutate patterns.");
     process.exit(1);
   }
 
-  const sampleSize = parseSampleSize(process.env["STRYKER_CI_SAMPLE_SIZE"]);
-  const selected = selectRandomSubset(allFiles, sampleSize);
+  const baseRef = resolveBaseRef();
+  const changedFiles = getChangedFiles(baseRef);
+  const selected = selectChangedMutateFiles(eligibleFiles, changedFiles);
+
+  if (selected.length === 0) {
+    console.log(`[stryker-ci] No eligible mutate files changed vs ${baseRef}; skipping mutation testing.`);
+    process.exit(0);
+  }
 
   console.log(
-    `[stryker-ci] Selected ${selected.length} / ${allFiles.length} eligible files for CI mutation testing:`,
+    `[stryker-ci] Mutating ${selected.length} changed eligible file(s) vs ${baseRef} (of ${eligibleFiles.length} total):`,
   );
   for (const file of selected) {
     console.log(`  - ${file}`);

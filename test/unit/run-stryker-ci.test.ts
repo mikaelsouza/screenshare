@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolveMutateFiles, selectRandomSubset } from "../../scripts/run-stryker-ci";
+import { resolveMutateFiles, selectChangedMutateFiles } from "../../scripts/run-stryker-ci";
 
 describe("run-stryker-ci", () => {
   it("resolves stryker.config.json mutate globs while respecting exclusions", () => {
@@ -19,23 +19,20 @@ describe("run-stryker-ci", () => {
     expect(files).not.toContain("electron/main.ts");
   });
 
-  it("selects a unique sorted subset bounded by sampleSize and file count", () => {
-    const files = ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts", "f.ts", "g.ts", "h.ts"];
-    let seed = 0;
-    const deterministicRand = (max: number): number => {
-      seed = (seed * 7 + 3) % max;
-      return seed;
-    };
+  it("intersects changed files with eligible mutate files deterministically", () => {
+    const eligible = ["electron/security.ts", "src/mesh.ts", "worker/room-chat.ts"];
+    const changed = [
+      "README.md",
+      "src\\mesh.ts",
+      "src/main.ts",
+      "electron/security.ts",
+      "electron/security.ts",
+    ];
 
-    const subset = selectRandomSubset(files, 4, deterministicRand);
-    expect(subset).toHaveLength(4);
-    expect(new Set(subset).size).toBe(4);
-    expect(subset).toEqual([...subset].sort());
-
-    const capped = selectRandomSubset(files, 100, deterministicRand);
-    expect(capped).toEqual(files);
-
-    const minOne = selectRandomSubset(files, 0, deterministicRand);
-    expect(minOne).toHaveLength(1);
+    expect(selectChangedMutateFiles(eligible, changed)).toEqual([
+      "electron/security.ts",
+      "src/mesh.ts",
+    ]);
+    expect(selectChangedMutateFiles(eligible, ["README.md", "docs/notes.md"])).toEqual([]);
   });
 });

@@ -189,7 +189,7 @@ npm run test:worker              # RoomDO in real workerd (@cloudflare/vitest-pl
 npm run test:formal              # exhaustive & stateful model-based invariant suites
 npm run test:fuzz                # fast-check property and fuzz tests
 npm run test:mutate              # Stryker full mutation testing suite (local)
-npm run test:mutate:ci           # Stryker random-subset mutation testing (used in CI)
+npm run test:mutate:ci           # Stryker diff-based mutation testing on changed files (used in CI)
 npm run test:e2e                 # Playwright Chromium peers: P2P media and edge cases
 npm run test:e2e:impaired        # network-impaired E2E suite (tc netem + Playwright)
 npm run electron:smoke           # Playwright smoke test for the unpackaged Electron app
