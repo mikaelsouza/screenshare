@@ -2379,5 +2379,123 @@ describe("adversarial persistent-transceiver & race probes", () => {
       errSpy.mockRestore();
     }
   });
+
+  it("coalesces rate-limited inbound view messages and applies the final valid state when the window resets", async () => {
+    vi.useFakeTimers();
+    try {
+      const sent: SignalData[] = [];
+      const mesh = new Mesh("zoe", { ...opts }, (_to, data) => sent.push(data), cb());
+      mesh.addMember("alice", false);
+      await mesh.setCapture(makeCapture(false));
+      const pc = FakeRTCPeerConnection.instances[0]!;
+      const ch = pc.dataChannels[0]!;
+
+      // Exhaust the 20-message window with want:false, then send final want:true (21st message)
+      for (let i = 0; i < 20; i++) {
+        ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      }
+      ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+
+      // Still paused during the current window
+      expect(mesh.isPeerViewing("alice")).toBe(false);
+
+      // Once the 1,000ms window expires, the coalesced final want:true is applied
+      await vi.advanceTimersByTimeAsync(1_050);
+      expect(mesh.isPeerViewing("alice")).toBe(true);
+
+      // Oversized payload during rate limit is ignored and does not clobber a valid coalesced state
+      for (let i = 0; i < 20; i++) {
+        ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      }
+      ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      ch.onmessage?.({ data: "x".repeat(300) });
+      await vi.advanceTimersByTimeAsync(1_050);
+      expect(mesh.isPeerViewing("alice")).toBe(true);
+
+      // Closing the mesh cancels any pending deferred view flush cleanly
+      for (let i = 0; i < 20; i++) {
+        ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+      }
+      ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      mesh.close();
+      await vi.advanceTimersByTimeAsync(1_050);
+      expect(mesh.isPeerViewing("alice")).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts in-flight offers and rolls back local offers when capture stops so future shares can renegotiate", async () => {
+    const sent: SignalData[] = [];
+    const mesh = new Mesh("zoe", { ...opts }, (_to, data) => sent.push(data), cb());
+    // Remote peer is also sharing so the PeerLink stays open across local setCapture(null)
+    mesh.addMember("alice", true);
+    await mesh.setCapture(makeCapture(false));
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    sent.length = 0;
+
+    // 1. Capture stops mid-createOffer -> no setLocalDescription, no offer sent, stays stable
+    let resolveCreate!: (d: RTCSessionDescriptionInit) => void;
+    const origCreate = pc.createOffer.bind(pc);
+    const origSetLocal = pc.setLocalDescription.bind(pc);
+    let setLocalCalls = 0;
+    pc.setLocalDescription = async (desc: RTCSessionDescriptionInit) => {
+      setLocalCalls++;
+      return origSetLocal(desc);
+    };
+    pc.createOffer = () => new Promise<RTCSessionDescriptionInit>((r) => { resolveCreate = r; });
+
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 0));
+    await mesh.setCapture(null);
+    resolveCreate({ type: "offer", sdp: "v=0\r\nm=video 9\r\n" });
+    await new Promise((r) => setTimeout(r, 15));
+    expect(setLocalCalls).toBe(0);
+    expect(sent.some((m) => m.k === "offer")).toBe(false);
+    expect(pc.signalingState).toBe("stable");
+
+    // 2. Restart sharing, then stop capture mid-setLocalDescription -> rolls back to stable, no offer sent
+    pc.createOffer = origCreate;
+    pc.setLocalDescription = origSetLocal;
+    await mesh.setCapture(makeCapture(false));
+    await new Promise((r) => setTimeout(r, 10));
+    await mesh.handleSignal("alice", { k: "answer", sdp: "v=0\r\nm=video 9\r\n" });
+    sent.length = 0;
+
+    let resolveSetLocal!: () => void;
+    const setLocalTypes: string[] = [];
+    pc.setLocalDescription = async (desc: RTCSessionDescriptionInit) => {
+      setLocalTypes.push(desc.type ?? "unknown");
+      if (desc.type === "offer") {
+        await origSetLocal(desc);
+        await new Promise<void>((r) => { resolveSetLocal = r; });
+        return;
+      }
+      return origSetLocal(desc);
+    };
+
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 0));
+    const detachPromise = mesh.setCapture(null);
+    resolveSetLocal();
+    await detachPromise;
+    await new Promise((r) => setTimeout(r, 15));
+
+    expect(sent.some((m) => m.k === "offer")).toBe(false);
+    expect(setLocalTypes).toContain("rollback");
+    expect(pc.signalingState).toBe("stable");
+
+    // 3. Subsequent share restart negotiates cleanly because signalingState returned to stable
+    pc.setLocalDescription = origSetLocal;
+    await mesh.setCapture(makeCapture(false));
+    pc.onnegotiationneeded?.();
+    await new Promise((r) => setTimeout(r, 15));
+    expect(sent.some((m) => m.k === "offer")).toBe(true);
+    expect(pc.signalingState).toBe("have-local-offer");
+
+    // 4. Stopping capture while an already-sent offer is still un-answered rolls back to stable
+    await mesh.setCapture(null);
+    expect(pc.signalingState).toBe("stable");
+  });
 });
 
