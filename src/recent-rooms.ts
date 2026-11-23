@@ -1,4 +1,3 @@
-import { isValidRoomCode } from "@shared/protocol";
 import type { LockManagerLike, StorageLike } from "./host-tokens";
 import {
   MAX_CLOCK_SKEW_MS,
@@ -9,8 +8,6 @@ import {
   RECENT_ROOM_TTL_MS,
   filterRecentRooms,
   formatRelativeTime,
-  insertEntryOrdered,
-  isTimestampValid,
   mergeSynthesizedHostRooms,
   parseRecentRoomItem,
   sanitizePassword,
@@ -18,7 +15,6 @@ import {
   sanitizeRecentRoomLabel,
   sortAndBoundEntries,
   type RecentRoomEntry,
-  type RecentRoomRole,
 } from "./recent-rooms-model";
 
 export type { LockManagerLike, RecentRoomEntry, StorageLike };
@@ -46,18 +42,6 @@ export const RECENT_ROOMS_OPT_OUT_KEY = "recent-rooms-disabled";
 
 /** Web Lock name serializing cross-tab read-modify-write updates to `recent-rooms`. */
 export const RECENT_ROOMS_LOCK_NAME = "screenshare:recent-rooms";
-
-export interface RecentRoomUpsertInput {
-  code: string;
-  role: RecentRoomRole;
-  lastJoinedAt?: number;
-  peerNames?: readonly string[];
-  password?: string;
-  label?: string;
-  clearLabel?: boolean;
-  preserveOrder?: boolean;
-  insertAfterCodes?: readonly string[];
-}
 
 function scanRawRecentRooms(raw: string, now: number): { entries: RecentRoomEntry[]; stale: boolean } {
   let parsed: unknown;
@@ -119,10 +103,6 @@ function persistEntriesResult(
   }
 }
 
-function persistEntries(storage: StorageLike, entries: RecentRoomEntry[]): RecentRoomEntry[] {
-  return persistEntriesResult(storage, entries).entries;
-}
-
 /** Return true if `storage` is accessible and has no persisted `recent-rooms` key. */
 export function isRecentRoomsKeyAbsent(storage: StorageLike | null | undefined): boolean {
   if (!storage) return false;
@@ -145,11 +125,6 @@ export function tryIsRecentRoomsDisabled(
   } catch {
     return { ok: false, disabled: false };
   }
-}
-
-/** Return true if the user opted out of saving rooms on this device. */
-export function isRecentRoomsDisabled(storage: StorageLike | null | undefined): boolean {
-  return tryIsRecentRoomsDisabled(storage).disabled;
 }
 
 /** Persist or clear the shared-device opt-out flag (`recent-rooms-disabled`), returning whether storage succeeded. */
@@ -180,14 +155,6 @@ export function tryLoadRecentRooms(
   return { entries: scanned.entries, ok: true };
 }
 
-/** Load, validate, prune expired/skewed, and sort recent room entries (newest first). */
-export function loadRecentRooms(
-  storage: StorageLike | null | undefined,
-  now: number = Date.now(),
-): RecentRoomEntry[] {
-  return tryLoadRecentRooms(storage, now).entries;
-}
-
 /** Return true if `storage` contains expired, invalid, duplicate, or unbounded `recent-rooms` records needing pruning. */
 export function hasStaleRecentRooms(
   storage: StorageLike | null | undefined,
@@ -213,111 +180,6 @@ export function pruneExpiredRecentRooms(
   const scanned = scanRecentRooms(storage, now);
   if (!scanned || !scanned.stale) return false;
   return writePersistedRecentRooms(storage, scanned.entries);
-}
-
-function mergeUpsertEntry(
-  code: string,
-  input: RecentRoomUpsertInput,
-  existing: RecentRoomEntry | undefined,
-  lastJoinedAt: number,
-): RecentRoomEntry {
-  const password = sanitizePassword(input.password) ?? existing?.password;
-  const label =
-    input.label !== undefined
-      ? sanitizeRecentRoomLabel(input.label)
-      : input.clearLabel === true
-        ? undefined
-        : existing?.label;
-  const incomingPeers = sanitizePeerNames(input.peerNames);
-  const peerNames = incomingPeers.length > 0 ? incomingPeers : (existing?.peerNames ?? []);
-  return {
-    code,
-    role: input.role,
-    lastJoinedAt,
-    peerNames,
-    ...(password !== undefined ? { password } : {}),
-    ...(label !== undefined ? { label } : {}),
-  };
-}
-
-/** Insert or update a recent room entry while retaining omitted password/label/peers from prior state. */
-export function upsertRecentRoom(
-  storage: StorageLike | null | undefined,
-  input: RecentRoomUpsertInput,
-  now: number = Date.now(),
-): RecentRoomEntry[] {
-  const code = input.code.trim().toUpperCase();
-  if (!storage || !isValidRoomCode(code)) return loadRecentRooms(storage, now);
-
-  const entries = loadRecentRooms(storage, now);
-  const lastJoinedAt = input.lastJoinedAt ?? now;
-  if (!isTimestampValid(lastJoinedAt, now)) return entries;
-
-  const existing = entries.find((entry) => entry.code === code);
-  const nextEntry = mergeUpsertEntry(code, input, existing, lastJoinedAt);
-  if (input.preserveOrder === true && existing?.lastJoinedAt === lastJoinedAt) {
-    return persistEntries(
-      storage,
-      entries.map((entry) => (entry.code === code ? nextEntry : entry)),
-    );
-  }
-  const rest = entries.filter((entry) => entry.code !== code);
-  return persistEntries(storage, insertEntryOrdered(rest, nextEntry, input.insertAfterCodes));
-}
-
-/** Update or clear the local custom nickname for an existing saved room entry. */
-export function renameRecentRoom(
-  storage: StorageLike | null | undefined,
-  code: string,
-  label: string,
-  now: number = Date.now(),
-): RecentRoomEntry[] {
-  const upper = code.trim().toUpperCase();
-  if (!storage || !isValidRoomCode(upper)) return loadRecentRooms(storage, now);
-
-  const entries = loadRecentRooms(storage, now);
-  const target = entries.find((entry) => entry.code === upper);
-  if (!target) return entries;
-
-  const nextLabel = sanitizeRecentRoomLabel(label);
-  const updated: RecentRoomEntry = {
-    code: target.code,
-    role: target.role,
-    lastJoinedAt: target.lastJoinedAt,
-    peerNames: target.peerNames,
-    ...(target.password !== undefined ? { password: target.password } : {}),
-    ...(nextLabel !== undefined ? { label: nextLabel } : {}),
-  };
-  const next = entries.map((entry) => (entry.code === upper ? updated : entry));
-  return persistEntries(storage, next);
-}
-
-/** Remove a single room entry from persisted `recent-rooms`, returning whether storage succeeded. */
-export function removePersistedRecentRoom(
-  storage: StorageLike | null | undefined,
-  code: string,
-  now: number = Date.now(),
-): boolean {
-  const upper = code.trim().toUpperCase();
-  if (!storage || !isValidRoomCode(upper)) return false;
-  const scanned = scanRecentRooms(storage, now);
-  if (!scanned) return false;
-  const next = scanned.entries.filter((entry) => entry.code !== upper);
-  if (next.length === scanned.entries.length && !scanned.stale) return true;
-  return writePersistedRecentRooms(storage, next);
-}
-
-/** Remove a single room entry from persisted `recent-rooms`. */
-export function removeRecentRoom(
-  storage: StorageLike | null | undefined,
-  code: string,
-  now: number = Date.now(),
-): RecentRoomEntry[] {
-  const upper = code.trim().toUpperCase();
-  if (!storage || !isValidRoomCode(upper)) return loadRecentRooms(storage, now);
-
-  const next = loadRecentRooms(storage, now).filter((entry) => entry.code !== upper);
-  return persistEntries(storage, next);
 }
 
 /** Remove all persisted entries from `recent-rooms` in `storage`, returning whether storage succeeded. */

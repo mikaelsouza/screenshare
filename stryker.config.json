@@ -11,6 +11,7 @@
     "worker/**/*.ts",
     "scripts/check-guardrails-diff.ts",
     "scripts/run-stryker-ci.ts",
+    "scripts/smoke-test-packaged.ts",
     "!**/*.d.ts",
     "!src/main.ts",
     "!src/views/**/*.ts",

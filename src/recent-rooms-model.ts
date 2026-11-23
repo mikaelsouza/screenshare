@@ -35,8 +35,7 @@ export interface RecentRoomEntry {
 export type RecentRoomPatchOp =
   | { kind: "patch"; code: string; field: "password"; password: string }
   | { kind: "patch"; code: string; field: "peerNames"; peerNames: string[] }
-  | { kind: "patch"; code: string; field: "label"; label?: string; clearLabel?: boolean }
-  | { kind: "patch"; code: string; field: "role"; role: RecentRoomRole };
+  | { kind: "patch"; code: string; field: "label"; label?: string };
 
 export interface RecentRoomJoinOp {
   kind: "join";
@@ -112,7 +111,7 @@ export function sanitizePassword(raw: string | undefined): string | undefined {
 }
 
 /** Return true if a stored/input timestamp is finite and within TTL and forward clock skew bounds. */
-export function isTimestampValid(ts: number, now: number): boolean {
+function isTimestampValid(ts: number, now: number): boolean {
   if (!Number.isFinite(ts)) return false;
   if (now - ts >= RECENT_ROOM_TTL_MS) return false;
   if (ts > now + MAX_CLOCK_SKEW_MS) return false;
@@ -169,29 +168,6 @@ export function filterRecentRooms(entries: readonly RecentRoomEntry[], query: st
   );
 }
 
-/** Insert `nextEntry` at the front or immediately after any same-ms code in `insertAfterCodes`. */
-export function insertEntryOrdered(
-  rest: RecentRoomEntry[],
-  nextEntry: RecentRoomEntry,
-  insertAfterCodes?: readonly string[],
-): RecentRoomEntry[] {
-  const out = [...rest];
-  if (!insertAfterCodes || insertAfterCodes.length === 0) {
-    out.unshift(nextEntry);
-    return out;
-  }
-  const afterSet = new Set(insertAfterCodes);
-  let insertIdx = 0;
-  for (let i = 0; i < out.length; i++) {
-    const item = out[i];
-    if (item && item.lastJoinedAt === nextEntry.lastJoinedAt && afterSet.has(item.code)) {
-      insertIdx = i + 1;
-    }
-  }
-  out.splice(insertIdx, 0, nextEntry);
-  return out;
-}
-
 /** Apply a single field patch to `base` without modifying unrelated fields or `lastJoinedAt`. */
 export function applyPatchToEntry(base: RecentRoomEntry, op: RecentRoomPatchOp): RecentRoomEntry {
   const peerNames = [...base.peerNames];
@@ -204,8 +180,6 @@ export function applyPatchToEntry(base: RecentRoomEntry, op: RecentRoomPatchOp):
       const { label: _prev, ...withoutLabel } = base;
       return op.label !== undefined ? { ...withoutLabel, peerNames, label: op.label } : { ...withoutLabel, peerNames };
     }
-    case "role":
-      return { ...base, peerNames, role: op.role };
   }
 }
 
@@ -434,17 +408,6 @@ function replayOpsWithTracking(
     }
   }
   return { snapshot: current, locallyRemoved };
-}
-
-/** Fold queued operations left-to-right over `initial` without mutating `initial` or its entries. */
-export function replayRecentRoomOps(
-  initial: RecentRoomsSnapshot,
-  ops: readonly RecentRoomOp[],
-  now: number,
-  hostRooms: readonly PersistedHostRoom[],
-  hasSavedCreatorHostFor: (code: string) => boolean,
-): RecentRoomsSnapshot {
-  return replayOpsWithTracking(initial, ops, now, hostRooms, hasSavedCreatorHostFor).snapshot;
 }
 
 /** Compute the effective UI snapshot by replaying `queue` over `diskSnapshot` and merging legacy `host-rooms`. */

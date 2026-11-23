@@ -82,7 +82,7 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   and client/server WebSocket messages (capping SDP at 64 KB and ICE candidates at 1 KB)
   at runtime with Zod in `jitless` mode for Trusted Types CSP compatibility; P2P
   data-channel `view` control messages are validated with the same Zod instance in
-  `src/mesh.ts`.
+  `src/mesh-control.ts`.
 - **Frontend** (`src/`) handles capture (`src/capture.ts`), encoder/decoder tuning
   (`src/quality.ts` — `x-google-start-bitrate=6000` kbps, 48 kHz / 256 kbps stereo Opus,
   150 ms receiver `jitterBufferTarget`, and Chromium's built-in per-peer WebRTC congestion

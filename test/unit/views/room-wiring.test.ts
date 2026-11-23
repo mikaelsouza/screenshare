@@ -5,7 +5,7 @@ import { RecentRoomsController } from "@src/controllers/recent-rooms-controller"
 import { SessionController } from "@src/controllers/session-controller";
 import { TileController } from "@src/controllers/tile-controller";
 import { readPersistedHostToken, writePersistedHostToken } from "@src/host-tokens";
-import { loadRecentRooms } from "@src/recent-rooms";
+import { tryLoadRecentRooms } from "@src/recent-rooms";
 import type { UiElements } from "@src/views/dom";
 import { RecentRoomsView } from "@src/views/recent-rooms-view";
 import { buildSignalingHandlers, type RoomWiringContext } from "@src/views/room-wiring";
@@ -177,7 +177,7 @@ describe("room-wiring recent rooms integration", () => {
 
     expect(h.recentRooms.getRooms()[0]?.role).toBe("guest");
     expect(h.recentRooms.getRooms()[0]?.password).toBe("ROTATED_PASS_222");
-    expect(loadRecentRooms(h.storage)[0]?.password).toBe("ROTATED_PASS_222");
+    expect(tryLoadRecentRooms(h.storage).entries[0]?.password).toBe("ROTATED_PASS_222");
   });
 
   it("reports Removed CODE notice, removes matching presented legacy token, and calls forgetCreatorHostToken once on bad-password/kicked", async () => {
@@ -210,7 +210,7 @@ describe("room-wiring recent rooms integration", () => {
       expect(lastErr).toContain("Removed WXYZ2345 from saved rooms.");
       expect(h.recentRooms.getRooms()).toEqual([]);
       expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBeUndefined();
-      expect(loadRecentRooms(h.storage)).toEqual([]);
+      expect(tryLoadRecentRooms(h.storage).entries).toEqual([]);
     }
   });
 
@@ -229,7 +229,7 @@ describe("room-wiring recent rooms integration", () => {
 
       expect(forgetSpy).not.toHaveBeenCalled();
       expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBe("tok-tab-b");
-      expect(loadRecentRooms(h.storage)).toEqual([]);
+      expect(tryLoadRecentRooms(h.storage).entries).toEqual([]);
       expect(h.lobbyErrors[h.lobbyErrors.length - 1] ?? "").toContain("Removed WXYZ2345 from saved rooms.");
     }
   });
@@ -249,7 +249,7 @@ describe("room-wiring recent rooms integration", () => {
       await Promise.all(h.tasks);
 
       expect(readPersistedHostToken(h.storage, "WXYZ2345")).toBe("tok-new");
-      expect(loadRecentRooms(h.storage)).toEqual([]);
+      expect(tryLoadRecentRooms(h.storage).entries).toEqual([]);
       expect(h.recentRooms.getRooms()).toHaveLength(1);
       expect(h.recentRooms.getRooms()[0]?.password).toBeUndefined();
       expect(h.lobbyErrors[h.lobbyErrors.length - 1] ?? "").toContain("Removed WXYZ2345 from saved rooms.");

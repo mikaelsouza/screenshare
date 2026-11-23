@@ -78,7 +78,6 @@ function shouldReconcileRemove(
 function shouldApplyCarriedPatch(patch: RecentRoomPatchOp, joinOp: RecentRoomJoinOp): boolean {
   if (patch.field === "password" && joinOp.password !== undefined) return false;
   if (patch.field === "peerNames" && joinOp.peerNames !== undefined && joinOp.peerNames.length > 0) return false;
-  if (patch.field === "role") return false;
   return true;
 }
 
@@ -414,7 +413,7 @@ export class RecentRoomsController {
       kind: "patch",
       code: upper,
       field: "label",
-      ...(nextLabel !== undefined ? { label: nextLabel } : { clearLabel: true }),
+      ...(nextLabel !== undefined ? { label: nextLabel } : {}),
     });
   }
 

@@ -111,6 +111,7 @@ export function verifyPackagedResourceEntries(entries: readonly string[]): FuseV
   return { ok: failures.length === 0, failures };
 }
 
+// Stryker disable all: CLI process/executable entrypoint
 /* v8 ignore start */
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -331,3 +332,4 @@ if (isEntrypoint) {
   await runPackagedSmokeVerifier();
 }
 /* v8 ignore stop */
+// Stryker restore all

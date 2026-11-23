@@ -40,15 +40,6 @@ export function normalizeExternalUrl(url: string | undefined): string | null {
 }
 
 /**
- * Returns true only when `url` parses cleanly as an `https:`, `http:`, or
- * `mailto:` URL (case-insensitive per WHATWG URL parsing) without ASCII
- * control characters.
- */
-export function isAllowedExternalUrl(url: string | undefined): boolean {
-  return normalizeExternalUrl(url) !== null;
-}
-
-/**
  * Fail-closed origin check for Electron frames, IPC `senderFrame.url`,
  * display-media `request.frame?.url`, and permission requesting origins.
  */

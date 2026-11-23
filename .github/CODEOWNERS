@@ -11,3 +11,4 @@
 /.github/ @mikaelsouza
 /scripts/check-guardrails-diff.ts @mikaelsouza
 /scripts/run-stryker-ci.ts @mikaelsouza
+/scripts/smoke-test-packaged.ts @mikaelsouza
