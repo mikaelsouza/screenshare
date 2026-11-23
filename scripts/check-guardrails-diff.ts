@@ -192,6 +192,7 @@ export function parsePrFilesApiJson(raw: string): string[] {
   return files;
 }
 
+// Stryker disable all: CLI git/env process entrypoint
 /* v8 ignore start */
 function runGit(args: readonly string[]): string {
   return execFileSync("git", args, {
@@ -249,3 +250,4 @@ if (isEntrypoint) {
   runCli();
 }
 /* v8 ignore stop */
+// Stryker restore all
