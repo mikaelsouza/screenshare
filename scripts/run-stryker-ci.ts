@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 const ZERO_SHA = /^0+$/;
 
-function readMutatePatterns(configPath: string): string[] {
+export function readMutatePatterns(configPath: string): string[] {
   const raw: unknown = JSON.parse(readFileSync(configPath, "utf8"));
   if (typeof raw !== "object" || raw === null || !("mutate" in raw)) return [];
   const { mutate } = raw;
@@ -21,19 +21,27 @@ function toPosix(filePath: string): string {
  * Resolve all repository files matching Stryker's `mutate` include/exclude globs.
  */
 export function resolveMutateFiles(patterns: readonly string[], cwd: string = process.cwd()): string[] {
-  const included = new Set<string>();
-  const excluded = new Set<string>();
+  const includePatterns: string[] = [];
+  const excludePatterns: string[] = [];
 
   for (const raw of patterns) {
-    const isExclude = raw.startsWith("!");
-    const pattern = isExclude ? raw.slice(1) : raw;
-    const target = isExclude ? excluded : included;
-    for (const match of globSync(pattern, { cwd })) {
-      target.add(toPosix(match));
+    if (raw.startsWith("!")) {
+      excludePatterns.push(toPosix(raw.slice(1)));
+    } else {
+      includePatterns.push(toPosix(raw));
     }
   }
 
-  return [...included].filter((f) => !excluded.has(f)).sort();
+  const included = new Set<string>();
+  for (const pattern of includePatterns) {
+    for (const match of globSync(pattern, { cwd })) {
+      included.add(toPosix(match));
+    }
+  }
+
+  return [...included]
+    .filter((file) => !excludePatterns.some((pattern) => path.matchesGlob(file, pattern)))
+    .sort();
 }
 
 /**
@@ -58,12 +66,14 @@ export function parseNullDelimitedPaths(output: string): string[] {
   return output.split("\0").filter((entry) => entry.length > 0);
 }
 
-function resolveBaseRef(): string {
+export function resolveBaseRef(): string {
   const envBase = process.env["STRYKER_BASE_REF"]?.trim();
   if (envBase && !ZERO_SHA.test(envBase)) return envBase;
   return "origin/main";
 }
 
+// Stryker disable all: CLI git/stryker process entrypoint
+/* v8 ignore start */
 function getChangedFiles(baseRef: string, cwd: string = process.cwd()): string[] {
   const threeDot = spawnSync("git", ["diff", "--name-only", "-z", "--diff-filter=ACMR", `${baseRef}...HEAD`], {
     cwd,
@@ -127,3 +137,5 @@ const isEntrypoint =
 if (isEntrypoint) {
   main();
 }
+/* v8 ignore stop */
+// Stryker restore all

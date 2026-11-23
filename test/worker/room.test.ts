@@ -1,6 +1,7 @@
-import { SELF, env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { beforeEach, describe, expect, it } from "vitest";
+import { SELF, env, listDurableObjectIds, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_ROOM_SIZE, PING, PONG, type ServerMessage } from "@shared/protocol";
+import worker, { type Env } from "../../worker/index";
 import { applyResumeState } from "../../worker/room-membership";
 
 const CODE2 = "JKMNPQRS";
@@ -364,6 +365,68 @@ describe("HTTP routing", () => {
       },
     });
     expect(await refusal(res)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+  });
+
+  it("rejects originless HTTPS and insecure production WebSocket upgrades at the edge without waking or creating a Durable Object", async () => {
+    const uncreatedHttpsCode = freshRoom();
+    const uncreatedHttpCode = freshRoom();
+
+    const originlessRes = await SELF.fetch(`https://example.com/ws/${uncreatedHttpsCode}`, {
+      headers: {
+        Upgrade: "websocket",
+        "CF-Connecting-IP": "198.51.100.120",
+      },
+    });
+    expect(await refusal(originlessRes)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    const insecureProdRes = await SELF.fetch(`http://example.com/ws/${uncreatedHttpCode}`, {
+      headers: {
+        Upgrade: "websocket",
+        Origin: "http://example.com",
+        "CF-Connecting-IP": "198.51.100.121",
+      },
+    });
+    expect(await refusal(insecureProdRes)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    const existingIds = new Set((await listDurableObjectIds(env.ROOMS)).map((id) => id.toString()));
+    expect(existingIds.has(env.ROOMS.idFromName(uncreatedHttpsCode).toString())).toBe(false);
+    expect(existingIds.has(env.ROOMS.idFromName(uncreatedHttpCode).toString())).toBe(false);
+
+    const spyIdFromName = vi.fn((name: string) => env.ROOMS.idFromName(name));
+    const spyGet = vi.fn();
+    const spyLimit = vi.fn(async () => ({ success: true }));
+    const spyEnv: Env = {
+      ASSETS: { fetch: vi.fn() } as unknown as Env["ASSETS"],
+      ROOMS: {
+        idFromName: spyIdFromName,
+        get: spyGet,
+      } as unknown as Env["ROOMS"],
+      WS_LIMITER: { limit: spyLimit },
+    };
+
+    const directOriginless = await worker.fetch(
+      new Request(`https://example.com/ws/${uncreatedHttpsCode}`, {
+        headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.122" },
+      }),
+      spyEnv,
+    );
+    expect(await refusal(directOriginless)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    const directInsecure = await worker.fetch(
+      new Request(`http://example.com/ws/${uncreatedHttpCode}`, {
+        headers: {
+          Upgrade: "websocket",
+          Origin: "http://example.com",
+          "CF-Connecting-IP": "198.51.100.123",
+        },
+      }),
+      spyEnv,
+    );
+    expect(await refusal(directInsecure)).toEqual({ code: "forbidden-origin", closeCode: 1008 });
+
+    expect(spyIdFromName).not.toHaveBeenCalled();
+    expect(spyGet).not.toHaveBeenCalled();
+    expect(spyLimit).not.toHaveBeenCalled();
   });
 
   it("applies strict security headers to static asset responses", async () => {

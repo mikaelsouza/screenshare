@@ -32,11 +32,6 @@ export interface RecentRoomEntry {
   label?: string;
 }
 
-export type RecentRoomField = "password" | "peerNames" | "label" | "role";
-
-/** Ordered list of patchable recent-room metadata fields. */
-export const RECENT_ROOM_FIELDS: readonly RecentRoomField[] = ["role", "password", "peerNames", "label"];
-
 export type RecentRoomPatchOp =
   | { kind: "patch"; code: string; field: "password"; password: string }
   | { kind: "patch"; code: string; field: "peerNames"; peerNames: string[] }
@@ -52,57 +47,22 @@ export interface RecentRoomJoinOp {
   peerNames?: string[];
 }
 
-export type RecentRoomWriteOp = RecentRoomJoinOp | RecentRoomPatchOp;
+export type RecentRoomOp =
+  | RecentRoomJoinOp
+  | RecentRoomPatchOp
+  | { kind: "remove"; code: string; demoteIfPassworded?: boolean }
+  | { kind: "clear-all" }
+  | { kind: "set-disabled"; disabled: boolean };
 
-export type PendingPatchMap = {
-  [F in RecentRoomField]?: { gen: number; op: Extract<RecentRoomPatchOp, { field: F }> };
-};
-
-export type PersistedFieldGens = Partial<Record<RecentRoomField, number>>;
-
-export interface RecentRoomsSyncState {
-  readonly pendingRemovals: Map<string, number>;
-  readonly lastRemovalGen: Map<string, number>;
-  readonly persistedRemovalGen: Map<string, number>;
-  readonly lastWriteGen: Map<string, number>;
-  readonly lastJoinGen: Map<string, number>;
-  readonly persistedJoinGen: Map<string, number>;
-  readonly pendingJoins: Map<string, RecentRoomJoinOp & { gen: number; firstGen: number; failed?: boolean }>;
-  readonly pendingSynthPromotions: Map<string, number>;
-  readonly preJoinSynthGen: Map<string, number>;
-  readonly pendingPatches: Map<string, PendingPatchMap>;
-  readonly persistedFieldGen: Map<string, PersistedFieldGens>;
-  readonly lastExternalDeleteGen: Map<string, number>;
-  readonly hostForgetGen: Map<string, number>;
-  readonly synthesizedCodes: Set<string>;
+export interface RecentRoomsSnapshot {
+  entries: RecentRoomEntry[];
+  disabled: boolean;
 }
 
-/** Create empty generation and pending-op tracking maps for `RecentRoomsController`. */
-export function createRecentRoomsSyncState(): RecentRoomsSyncState {
-  return {
-    pendingRemovals: new Map(),
-    lastRemovalGen: new Map(),
-    persistedRemovalGen: new Map(),
-    lastWriteGen: new Map(),
-    lastJoinGen: new Map(),
-    persistedJoinGen: new Map(),
-    pendingJoins: new Map(),
-    pendingSynthPromotions: new Map(),
-    preJoinSynthGen: new Map(),
-    pendingPatches: new Map(),
-    persistedFieldGen: new Map(),
-    lastExternalDeleteGen: new Map(),
-    hostForgetGen: new Map(),
-    synthesizedCodes: new Set(),
-  };
-}
-
-export interface PendingFieldOverlay {
-  password?: string;
-  peerNames?: string[];
-  label?: string;
-  clearLabel?: boolean;
-  role?: RecentRoomRole;
+export interface RecentRoomOpOutcome {
+  snapshot: RecentRoomsSnapshot;
+  changed: boolean;
+  missing: boolean;
 }
 
 const RecentRoomRawSchema = z.object({
@@ -232,78 +192,6 @@ export function insertEntryOrdered(
   return out;
 }
 
-/** Build a normalized `RecentRoomEntry` for `recordJoin`, retaining prior password/peers/label when omitted. */
-export function buildJoinedRoomEntry(
-  code: string,
-  role: RecentRoomRole,
-  now: number,
-  existing: RecentRoomEntry | undefined,
-  passwordRaw: string | undefined,
-  peerNamesRaw: readonly string[] | undefined,
-): RecentRoomEntry {
-  const password = sanitizePassword(passwordRaw) ?? existing?.password;
-  const incomingPeers = sanitizePeerNames(peerNamesRaw);
-  const peerNames = incomingPeers.length > 0 ? incomingPeers : (existing?.peerNames ?? []);
-  return {
-    code,
-    role,
-    lastJoinedAt: now,
-    peerNames,
-    ...(password !== undefined ? { password } : {}),
-    ...(existing?.label !== undefined ? { label: existing.label } : {}),
-  };
-}
-
-/** Record a pending field patch for `code` at generation `gen`. */
-export function setPendingPatchInMap(
-  byCode: Map<string, PendingPatchMap>,
-  code: string,
-  gen: number,
-  op: RecentRoomPatchOp,
-): void {
-  const patches = byCode.get(code) ?? {};
-  switch (op.field) {
-    case "password":
-      patches.password = { gen, op };
-      break;
-    case "peerNames":
-      patches.peerNames = { gen, op };
-      break;
-    case "label":
-      patches.label = { gen, op };
-      break;
-    case "role":
-      patches.role = { gen, op };
-      break;
-  }
-  byCode.set(code, patches);
-}
-
-/** Convert pending field patches for a room into a sparse overlay for `syncFromStorage`. */
-export function buildFieldOverlayFromPatches(patches: PendingPatchMap | undefined): PendingFieldOverlay | null {
-  if (!patches) return null;
-  const overlay: PendingFieldOverlay = {};
-  let hasField = false;
-  if (patches.role) {
-    overlay.role = patches.role.op.role;
-    hasField = true;
-  }
-  if (patches.password) {
-    overlay.password = patches.password.op.password;
-    hasField = true;
-  }
-  if (patches.peerNames) {
-    overlay.peerNames = patches.peerNames.op.peerNames;
-    hasField = true;
-  }
-  if (patches.label) {
-    if (patches.label.op.clearLabel) overlay.clearLabel = true;
-    else if (patches.label.op.label !== undefined) overlay.label = patches.label.op.label;
-    hasField = true;
-  }
-  return hasField ? overlay : null;
-}
-
 /** Apply a single field patch to `base` without modifying unrelated fields or `lastJoinedAt`. */
 export function applyPatchToEntry(base: RecentRoomEntry, op: RecentRoomPatchOp): RecentRoomEntry {
   const peerNames = [...base.peerNames];
@@ -319,125 +207,6 @@ export function applyPatchToEntry(base: RecentRoomEntry, op: RecentRoomPatchOp):
     case "role":
       return { ...base, peerNames, role: op.role };
   }
-}
-
-function pickJoinValue<T>(
-  val: T | undefined,
-  joinGen: number,
-  persistedGen: number | undefined,
-  fallback: T,
-): T {
-  return val !== undefined && joinGen >= (persistedGen ?? 0) ? val : fallback;
-}
-
-/** Build a materialized recent-room entry from an unpersisted `recordJoin` and optional disk baseline. */
-export function buildMaterializedJoinEntry(
-  pendingJoin: RecentRoomJoinOp & { gen: number },
-  existing: RecentRoomEntry | undefined,
-  fieldGens: PersistedFieldGens | undefined,
-): RecentRoomEntry {
-  const role = pickJoinValue(pendingJoin.role, pendingJoin.gen, fieldGens?.role, existing?.role ?? pendingJoin.role);
-  const password = pickJoinValue(pendingJoin.password, pendingJoin.gen, fieldGens?.password, existing?.password);
-  const peerNames = pickJoinValue(pendingJoin.peerNames, pendingJoin.gen, fieldGens?.peerNames, existing?.peerNames ?? []);
-  return {
-    code: pendingJoin.code,
-    role,
-    lastJoinedAt: Math.max(pendingJoin.lastJoinedAt, existing?.lastJoinedAt ?? 0),
-    peerNames: [...peerNames],
-    ...(password !== undefined ? { password } : {}),
-    ...(existing?.label !== undefined ? { label: existing.label } : {}),
-  };
-}
-
-/** Compute next persisted room list for a `recordJoin` operation without clobbering newer cross-tab fields. */
-export function planJoinPersistence(
-  entries: readonly RecentRoomEntry[],
-  joinOp: RecentRoomJoinOp & { gen: number },
-  fieldGens: PersistedFieldGens | undefined,
-  afterCodes: readonly string[],
-): RecentRoomEntry[] {
-  const existing = entries.find((e) => e.code === joinOp.code);
-  const nextEntry = buildMaterializedJoinEntry(joinOp, existing, fieldGens);
-  const rest = entries.filter((e) => e.code !== joinOp.code);
-  return insertEntryOrdered(rest, nextEntry, afterCodes);
-}
-
-/** Return true when a queued patch should apply over a materialized `pendingJoin`. */
-export function shouldApplyPatchOverJoin(
-  op: RecentRoomPatchOp,
-  opGen: number,
-  pendingJoin: RecentRoomJoinOp & { gen: number },
-  fieldGens: PersistedFieldGens | undefined,
-): boolean {
-  if (opGen > pendingJoin.gen || op.field === "label") return true;
-  if (op.field === "role") return false;
-  const joinVal = op.field === "password" ? pendingJoin.password : pendingJoin.peerNames;
-  return joinVal === undefined && opGen >= (fieldGens?.[op.field] ?? 0);
-}
-
-/** Compute next persisted room list for a metadata patch, or return null if absent from disk without an unpersisted join. */
-export function planPatchPersistence(
-  entries: readonly RecentRoomEntry[],
-  op: RecentRoomPatchOp,
-  opGen: number,
-  pendingJoin: (RecentRoomJoinOp & { gen: number }) | undefined,
-  hasPendingJoin: boolean,
-  fieldGens: PersistedFieldGens | undefined,
-  afterCodes: readonly string[],
-): RecentRoomEntry[] | null {
-  const existing = entries.find((e) => e.code === op.code);
-  if (existing && (!hasPendingJoin || !pendingJoin)) {
-    const nextEntry = applyPatchToEntry(existing, op);
-    return entries.map((e) => (e.code === op.code ? nextEntry : e));
-  }
-  if (hasPendingJoin && pendingJoin) {
-    const materialized = buildMaterializedJoinEntry(pendingJoin, existing, fieldGens);
-    const nextEntry = shouldApplyPatchOverJoin(op, opGen, pendingJoin, fieldGens) ? applyPatchToEntry(materialized, op) : materialized;
-    return insertEntryOrdered(entries.filter((e) => e.code !== op.code), nextEntry, afterCodes);
-  }
-  return null;
-}
-
-/** Overlay pending local field edits onto a persisted entry without clobbering newer cross-tab fields. */
-function applyOverlayToEntry(base: RecentRoomEntry, overlay: PendingFieldOverlay): RecentRoomEntry {
-  const { label: baseLabel, ...withoutLabel } = base;
-  const nextLabel = overlay.clearLabel ? undefined : (overlay.label ?? baseLabel);
-  return {
-    ...withoutLabel,
-    role: overlay.role ?? base.role,
-    peerNames: overlay.peerNames !== undefined ? [...overlay.peerNames] : base.peerNames,
-    ...(overlay.password !== undefined
-      ? { password: overlay.password }
-      : base.password !== undefined
-        ? { password: base.password }
-        : {}),
-    ...(nextLabel !== undefined ? { label: nextLabel } : {}),
-  };
-}
-
-/** Merge persisted recent rooms with in-place field overlays and promoted pending entries. */
-export function mergePendingRecentRooms(
-  persisted: readonly RecentRoomEntry[],
-  inPlace: Map<string, PendingFieldOverlay>,
-  promoted: readonly RecentRoomEntry[],
-  isRemoved: (code: string) => boolean,
-  getAfterCodes: (entry: RecentRoomEntry) => readonly string[],
-  onPersistedSeen?: (code: string) => void,
-): RecentRoomEntry[] {
-  const promotedCodes = new Set(promoted.map((entry) => entry.code));
-  let merged: RecentRoomEntry[] = [];
-  for (const entry of persisted) {
-    onPersistedSeen?.(entry.code);
-    if (isRemoved(entry.code) || promotedCodes.has(entry.code)) continue;
-    const overlay = inPlace.get(entry.code);
-    merged.push(overlay ? applyOverlayToEntry(entry, overlay) : entry);
-  }
-  for (let i = promoted.length - 1; i >= 0; i--) {
-    const entry = promoted[i];
-    if (!entry) continue;
-    merged = insertEntryOrdered(merged, entry, getAfterCodes(entry));
-  }
-  return merged;
 }
 
 /** Append legacy `host-rooms` entries absent from `baseEntries` and return sorted, bounded list. */
@@ -463,106 +232,245 @@ export function mergeSynthesizedHostRooms(
   return sortAndBoundEntries(merged);
 }
 
-/** Return true if a room has an in-tab join whose generation has not yet been persisted. */
-export function hasUnpersistedJoin(state: RecentRoomsSyncState, code: string): boolean {
-  return (state.lastJoinGen.get(code) ?? 0) > (state.persistedJoinGen.get(code) ?? 0);
+function cloneEntry(entry: RecentRoomEntry): RecentRoomEntry {
+  return { ...entry, peerNames: [...entry.peerNames] };
 }
 
-/** Return codes of rooms persisted with a join generation newer than `targetGen` for tie-breaking order. */
-export function afterCodesForJoin(state: RecentRoomsSyncState, code: string, targetGen: number): string[] {
-  const after: string[] = [];
-  for (const [otherCode, persistedGen] of state.persistedJoinGen) {
-    if (otherCode !== code && persistedGen > targetGen) after.push(otherCode);
-  }
-  return after;
+function cloneSnapshot(snapshot: RecentRoomsSnapshot): RecentRoomsSnapshot {
+  return {
+    entries: snapshot.entries.map(cloneEntry),
+    disabled: snapshot.disabled,
+  };
 }
 
-/** Mark `field` for `code` as persisted at `gen` and prune satisfied pending patches. */
-export function markPersistedField(
-  state: RecentRoomsSyncState,
-  code: string,
-  field: RecentRoomField,
-  gen: number,
-): void {
-  const map = state.persistedFieldGen.get(code) ?? {};
-  if (gen > (map[field] ?? 0)) {
-    map[field] = gen;
-    state.persistedFieldGen.set(code, map);
-  }
-  const patches = state.pendingPatches.get(code);
-  if (patches && (patches[field]?.gen ?? 0) <= gen) {
-    delete patches[field];
-    if (Object.keys(patches).length === 0) state.pendingPatches.delete(code);
-  }
+function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
-/** Mark an in-tab `recordJoin` operation as persisted in `state`. */
-export function markMaterializedPendingJoin(
-  state: RecentRoomsSyncState,
-  pendingJoin: RecentRoomJoinOp & { gen: number; firstGen?: number },
-): void {
-  state.persistedJoinGen.set(pendingJoin.code, Math.max(state.persistedJoinGen.get(pendingJoin.code) ?? 0, pendingJoin.gen));
-  if (state.pendingJoins.get(pendingJoin.code)?.gen === pendingJoin.gen) {
-    state.pendingJoins.delete(pendingJoin.code);
-  }
-  const synthGen = state.pendingSynthPromotions.get(pendingJoin.code);
-  if (synthGen !== undefined && pendingJoin.firstGen !== undefined && synthGen < pendingJoin.firstGen) {
-    state.preJoinSynthGen.set(pendingJoin.code, Math.max(state.preJoinSynthGen.get(pendingJoin.code) ?? 0, pendingJoin.firstGen - 1));
-  }
-  state.pendingSynthPromotions.delete(pendingJoin.code);
-  markPersistedField(state, pendingJoin.code, "role", pendingJoin.gen);
-  if (pendingJoin.password !== undefined) markPersistedField(state, pendingJoin.code, "password", pendingJoin.gen);
-  if (pendingJoin.peerNames !== undefined) markPersistedField(state, pendingJoin.code, "peerNames", pendingJoin.gen);
-}
-
-function resolvePreJoinExternalDeleteCutoff(state: RecentRoomsSyncState, code: string, failedGen: number): number | undefined {
-  const pendingJoin = state.pendingJoins.get(code);
-  const synthGen = state.pendingSynthPromotions.get(code);
-  if (pendingJoin && pendingJoin.gen > failedGen && synthGen !== undefined && synthGen <= failedGen && synthGen < pendingJoin.firstGen) {
-    return pendingJoin.firstGen - 1;
-  }
-  const preSynth = state.preJoinSynthGen.get(code);
-  return preSynth !== undefined && preSynth > failedGen ? preSynth : undefined;
-}
-
-function prunePendingPatchesUpTo(state: RecentRoomsSyncState, code: string, maxGen: number): void {
-  const patches = state.pendingPatches.get(code);
-  if (!patches) return;
-  for (const field of RECENT_ROOM_FIELDS) {
-    if ((patches[field]?.gen ?? 0) <= maxGen) delete patches[field];
-  }
-  if (Object.keys(patches).length === 0) state.pendingPatches.delete(code);
-}
-
-/** Clear pending ops at or below `failedGen` when a room was deleted externally from storage. */
-export function clearPendingStateOnExternalDelete(state: RecentRoomsSyncState, code: string, failedGen: number): void {
-  const preJoinBoundary = resolvePreJoinExternalDeleteCutoff(state, code, failedGen);
-  const effectiveGen = preJoinBoundary === undefined ? failedGen : Math.max(failedGen, preJoinBoundary);
-  if (effectiveGen > (state.lastExternalDeleteGen.get(code) ?? 0)) state.lastExternalDeleteGen.set(code, effectiveGen);
-  prunePendingPatchesUpTo(state, code, effectiveGen);
-  const pendingJoin = state.pendingJoins.get(code);
-  if (pendingJoin && pendingJoin.gen <= failedGen) state.pendingJoins.delete(code);
-  const synthGen = state.pendingSynthPromotions.get(code);
-  if (synthGen !== undefined && synthGen <= effectiveGen) state.pendingSynthPromotions.delete(code);
-  if (preJoinBoundary !== undefined) {
-    state.preJoinSynthGen.set(code, Math.max(state.preJoinSynthGen.get(code) ?? 0, preJoinBoundary));
-  } else if ((state.preJoinSynthGen.get(code) ?? Infinity) <= failedGen) {
-    state.preJoinSynthGen.delete(code);
-  }
-}
-
-/** Return true if `code` has a local deletion not yet superseded by a newer join or clearAll. */
-export function isCodeLocallyRemoved(
-  state: RecentRoomsSyncState,
-  code: string,
-  persistedClearAllGen: number,
-): boolean {
-  if (state.pendingRemovals.has(code)) return true;
-  const removedGen = state.lastRemovalGen.get(code) ?? 0;
-  const satisfiedBy = Math.max(
-    state.persistedRemovalGen.get(code) ?? 0,
-    persistedClearAllGen,
-    state.lastJoinGen.get(code) ?? 0,
+function isSameEntry(a: RecentRoomEntry, b: RecentRoomEntry): boolean {
+  return (
+    a.role === b.role &&
+    a.password === b.password &&
+    a.label === b.label &&
+    sameStringArray(a.peerNames, b.peerNames)
   );
-  return removedGen > satisfiedBy;
+}
+
+function applyJoinOp(snapshot: RecentRoomsSnapshot, op: RecentRoomJoinOp, now: number): RecentRoomOpOutcome {
+  if (snapshot.disabled || !isTimestampValid(op.lastJoinedAt, now)) {
+    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
+  }
+  const existing = snapshot.entries.find((e) => e.code === op.code);
+  const cleanPw = sanitizePassword(op.password);
+  const cleanPeers = sanitizePeerNames(op.peerNames);
+  const password = cleanPw ?? existing?.password;
+  const peerNames = cleanPeers.length > 0 ? cleanPeers : [...(existing?.peerNames ?? [])];
+  const lastJoinedAt = existing ? Math.max(op.lastJoinedAt, existing.lastJoinedAt) : op.lastJoinedAt;
+  const nextEntry: RecentRoomEntry = {
+    code: op.code,
+    role: op.role,
+    lastJoinedAt,
+    peerNames,
+    ...(password !== undefined ? { password } : {}),
+    ...(existing?.label !== undefined ? { label: existing.label } : {}),
+  };
+  const rest = snapshot.entries.filter((e) => e.code !== op.code).map(cloneEntry);
+  return {
+    snapshot: { entries: sortAndBoundEntries([nextEntry, ...rest]), disabled: false },
+    changed: true,
+    missing: false,
+  };
+}
+
+function applyPatchOp(
+  snapshot: RecentRoomsSnapshot,
+  op: RecentRoomPatchOp,
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+  allowHostSynthesis: boolean = true,
+): RecentRoomOpOutcome {
+  if (snapshot.disabled) {
+    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
+  }
+  const idx = snapshot.entries.findIndex((e) => e.code === op.code);
+  const existing = idx !== -1 ? snapshot.entries[idx] : undefined;
+  if (existing) {
+    const patched = applyPatchToEntry(existing, op);
+    if (isSameEntry(existing, patched)) {
+      return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
+    }
+    const entries = snapshot.entries.map((e, i) => (i === idx ? patched : cloneEntry(e)));
+    return { snapshot: { entries, disabled: false }, changed: true, missing: false };
+  }
+  if (!allowHostSynthesis) {
+    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: true };
+  }
+  const hostRoom = hostRooms.find((hr) => hr.code === op.code);
+  if (!hostRoom || !hasSavedCreatorHostFor(op.code) || !isTimestampValid(hostRoom.updatedAt, now)) {
+    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: true };
+  }
+  const base: RecentRoomEntry = {
+    code: op.code,
+    role: "host",
+    lastJoinedAt: hostRoom.updatedAt,
+    peerNames: [],
+  };
+  const patched = applyPatchToEntry(base, op);
+  return {
+    snapshot: { entries: sortAndBoundEntries([patched, ...snapshot.entries.map(cloneEntry)]), disabled: false },
+    changed: true,
+    missing: false,
+  };
+}
+
+function applyRemoveOp(
+  snapshot: RecentRoomsSnapshot,
+  code: string,
+  demoteIfPassworded: boolean,
+): RecentRoomOpOutcome {
+  const existing = snapshot.entries.find((e) => e.code === code);
+  if (!existing) {
+    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
+  }
+  if (demoteIfPassworded && existing.password !== undefined) {
+    if (existing.role === "guest") {
+      return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
+    }
+    const entries = snapshot.entries.map((e) =>
+      e.code === code ? { ...cloneEntry(e), role: "guest" as const } : cloneEntry(e),
+    );
+    return { snapshot: { entries, disabled: snapshot.disabled }, changed: true, missing: false };
+  }
+  return {
+    snapshot: {
+      entries: snapshot.entries.filter((e) => e.code !== code).map(cloneEntry),
+      disabled: snapshot.disabled,
+    },
+    changed: true,
+    missing: false,
+  };
+}
+
+function applyClearAllOp(snapshot: RecentRoomsSnapshot): RecentRoomOpOutcome {
+  return {
+    snapshot: { entries: [], disabled: snapshot.disabled },
+    changed: snapshot.entries.length > 0,
+    missing: false,
+  };
+}
+
+function applySetDisabledOp(snapshot: RecentRoomsSnapshot, disabled: boolean): RecentRoomOpOutcome {
+  const entries = disabled ? [] : snapshot.entries.map(cloneEntry);
+  const changed = snapshot.disabled !== disabled || (disabled && snapshot.entries.length > 0);
+  return {
+    snapshot: { entries, disabled },
+    changed,
+    missing: false,
+  };
+}
+
+function applyOpWithSynthesis(
+  snapshot: RecentRoomsSnapshot,
+  op: RecentRoomOp,
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+  allowHostSynthesis: boolean,
+): RecentRoomOpOutcome {
+  switch (op.kind) {
+    case "join":
+      return applyJoinOp(snapshot, op, now);
+    case "patch":
+      return applyPatchOp(snapshot, op, now, hostRooms, hasSavedCreatorHostFor, allowHostSynthesis);
+    case "remove":
+      return applyRemoveOp(snapshot, op.code, op.demoteIfPassworded === true);
+    case "clear-all":
+      return applyClearAllOp(snapshot);
+    case "set-disabled":
+      return applySetDisabledOp(snapshot, op.disabled);
+  }
+}
+
+/** Apply a single queued recent-room operation purely against `snapshot` without mutating inputs. */
+export function applyRecentRoomOp(
+  snapshot: RecentRoomsSnapshot,
+  op: RecentRoomOp,
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+): RecentRoomOpOutcome {
+  return applyOpWithSynthesis(snapshot, op, now, hostRooms, hasSavedCreatorHostFor, true);
+}
+
+function shouldSuppressAfterRemove(
+  current: RecentRoomsSnapshot,
+  code: string,
+  demoteIfPassworded: boolean,
+): boolean {
+  if (!demoteIfPassworded) return true;
+  return !current.entries.some((e) => e.code === code && e.password !== undefined);
+}
+
+function replayOpsWithTracking(
+  initial: RecentRoomsSnapshot,
+  ops: readonly RecentRoomOp[],
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+): { snapshot: RecentRoomsSnapshot; locallyRemoved: Set<string> } {
+  let current = cloneSnapshot(initial);
+  const locallyRemoved = new Set<string>();
+  for (const op of ops) {
+    if (op.kind === "clear-all" || (op.kind === "set-disabled" && op.disabled)) {
+      locallyRemoved.clear();
+    } else if (op.kind === "remove" && shouldSuppressAfterRemove(current, op.code, op.demoteIfPassworded === true)) {
+      locallyRemoved.add(op.code);
+    }
+    const allowHostSynthesis = op.kind !== "patch" || !locallyRemoved.has(op.code);
+    current = applyOpWithSynthesis(current, op, now, hostRooms, hasSavedCreatorHostFor, allowHostSynthesis).snapshot;
+    if (op.kind === "join" && current.entries.some((e) => e.code === op.code)) {
+      locallyRemoved.delete(op.code);
+    }
+  }
+  return { snapshot: current, locallyRemoved };
+}
+
+/** Fold queued operations left-to-right over `initial` without mutating `initial` or its entries. */
+export function replayRecentRoomOps(
+  initial: RecentRoomsSnapshot,
+  ops: readonly RecentRoomOp[],
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+): RecentRoomsSnapshot {
+  return replayOpsWithTracking(initial, ops, now, hostRooms, hasSavedCreatorHostFor).snapshot;
+}
+
+/** Compute the effective UI snapshot by replaying `queue` over `diskSnapshot` and merging legacy `host-rooms`. */
+export function computeRecentRoomsView(
+  diskSnapshot: RecentRoomsSnapshot,
+  queue: readonly RecentRoomOp[],
+  now: number,
+  hostRooms: readonly PersistedHostRoom[],
+  hasSavedCreatorHostFor: (code: string) => boolean,
+): RecentRoomsSnapshot {
+  const { snapshot: replayed, locallyRemoved } = replayOpsWithTracking(
+    diskSnapshot,
+    queue,
+    now,
+    hostRooms,
+    hasSavedCreatorHostFor,
+  );
+  if (replayed.disabled) {
+    return { entries: [], disabled: true };
+  }
+  return {
+    entries: mergeSynthesizedHostRooms(
+      replayed.entries,
+      hostRooms.filter((hr) => !locallyRemoved.has(hr.code)),
+      hasSavedCreatorHostFor,
+    ),
+    disabled: false,
+  };
 }

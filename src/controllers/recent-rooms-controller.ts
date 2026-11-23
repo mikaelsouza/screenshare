@@ -1,43 +1,29 @@
 import { isValidRoomCode } from "@shared/protocol";
-import type { LockManagerLike, StorageLike } from "../host-tokens";
+import { listPersistedHostRooms, type LockManagerLike, type StorageLike } from "../host-tokens";
 import {
   clearAllPersistedRecentRooms,
-  executePendingRemoval,
-  flushPendingRemovalForWrite,
-  flushPendingRemovalsForRecovery,
-  hasPendingRecoveryRemovals,
   hasStaleRecentRooms,
-  isRecentRoomsDisabled,
   isRecentRoomsKeyAbsent,
   pruneExpiredRecentRooms,
   runWithRecentRoomsLock,
   setRecentRoomsDisabled,
+  tryIsRecentRoomsDisabled,
+  tryLoadRecentRooms,
+  writePersistedRecentRooms,
 } from "../recent-rooms";
 import {
-  buildJoinedRoomEntry,
-  clearPendingStateOnExternalDelete,
-  createRecentRoomsSyncState,
+  applyRecentRoomOp,
+  computeRecentRoomsView,
   filterRecentRooms,
-  isCodeLocallyRemoved,
   sanitizePassword,
   sanitizePeerNames,
   sanitizeRecentRoomLabel,
-  setPendingPatchInMap,
-  sortAndBoundEntries,
   type RecentRoomEntry,
+  type RecentRoomJoinOp,
+  type RecentRoomOp,
   type RecentRoomPatchOp,
-  type RecentRoomWriteOp,
+  type RecentRoomsSnapshot,
 } from "../recent-rooms-model";
-import {
-  buildMergedRecentRoomsView,
-  buildQueuedJoinOp,
-  clearCodeFromSyncMaps,
-  dropFailedWriteOp,
-  executeRecentRoomWriteOp,
-  pruneFailedPendingJoins,
-  resetRecentRoomsSyncMaps,
-  shouldSkipWriteOp,
-} from "../recent-rooms-sync";
 
 export interface RecentRoomsEnvironment {
   getLocalStorage: () => StorageLike | null;
@@ -60,27 +46,74 @@ function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
 }
 
+function isDurableOp(op: RecentRoomOp): boolean {
+  return op.kind === "clear-all" || op.kind === "set-disabled" || op.kind === "remove";
+}
+
+function shouldReconcileDemote(
+  code: string,
+  persistedEntries: readonly RecentRoomEntry[],
+  memEntries: readonly RecentRoomEntry[],
+): boolean {
+  const onDisk = persistedEntries.some((e) => e.code === code);
+  const inMemAsGuest = memEntries.some((r) => r.code === code && r.role === "guest");
+  const inMem = memEntries.some((r) => r.code === code);
+  return onDisk ? !inMemAsGuest : inMem;
+}
+
+function shouldReconcileRemove(
+  storage: StorageLike | null,
+  now: number,
+  op: Extract<RecentRoomOp, { kind: "remove" }>,
+  persistedEntries: readonly RecentRoomEntry[],
+  memEntries: readonly RecentRoomEntry[],
+  hasCreator: (code: string) => boolean,
+): boolean {
+  if (op.demoteIfPassworded === true && shouldReconcileDemote(op.code, persistedEntries, memEntries)) {
+    return true;
+  }
+  return hasCreator(op.code) && listPersistedHostRooms(storage, now).some((hr) => hr.code === op.code);
+}
+
+function shouldApplyCarriedPatch(patch: RecentRoomPatchOp, joinOp: RecentRoomJoinOp): boolean {
+  if (patch.field === "password" && joinOp.password !== undefined) return false;
+  if (patch.field === "peerNames" && joinOp.peerNames !== undefined && joinOp.peerNames.length > 0) return false;
+  if (patch.field === "role") return false;
+  return true;
+}
+
+function applyCarriedPatches(
+  snapshot: RecentRoomsSnapshot,
+  joinOp: RecentRoomJoinOp,
+  carried: readonly RecentRoomPatchOp[] | undefined,
+  now: number,
+  hasSavedCreatorHostFor: (code: string) => boolean,
+): RecentRoomsSnapshot {
+  if (!carried || carried.length === 0) return snapshot;
+  let current = snapshot;
+  for (const patch of carried) {
+    if (!shouldApplyCarriedPatch(patch, joinOp)) continue;
+    current = applyRecentRoomOp(current, patch, now, [], hasSavedCreatorHostFor).snapshot;
+  }
+  return current;
+}
+
 /**
  * Pure, DOM-free controller for recent rooms state, legacy `host-rooms` synthesis,
- * Web Lock race guards, search/filter, inline rename, and error cleanup.
+ * single-flight FIFO persistence under Web Locks, search/filter, and error recovery.
  */
 export class RecentRoomsController {
   private readonly env: RecentRoomsEnvironment;
-  private readonly syncState = createRecentRoomsSyncState();
   private rooms: RecentRoomEntry[] = [];
+  private persistedRooms: RecentRoomEntry[] = [];
   private disabled = false;
   private searchQuery = "";
   private editingCode: string | null = null;
-  private mutationGen = 0;
-  private disabledGen = 0;
-  private persistedDisabledGen = 0;
-  private clearAllGen = 0;
-  private persistedClearAllGen = 0;
-  private writeCutoffGen = 0;
-  private pendingClearAll = 0;
-  private pendingDisabledSync = 0;
+  private queue: RecentRoomOp[] = [];
+  private flushing = false;
+  private flushRequested = false;
   private pendingPurge = false;
-  private pendingRecoverySync = false;
+  private readonly failedJoinCodes = new Set<string>();
 
   constructor(env: RecentRoomsEnvironment) {
     this.env = env;
@@ -91,149 +124,206 @@ export class RecentRoomsController {
     return this.env.now ? this.env.now() : Date.now();
   }
 
-  private clearPersistedIfCurrent(storage: StorageLike | null, gen: number): boolean {
-    if (this.clearAllGen !== gen || this.persistedClearAllGen >= gen) return false;
-    if (!clearAllPersistedRecentRooms(storage)) return false;
-    this.persistedClearAllGen = gen;
-    return true;
-  }
-
-  private handleFailedWriteOp(op: RecentRoomWriteOp, gen: number): void {
-    if (dropFailedWriteOp(this.syncState, op, gen)) this.syncFromStorage(true);
-  }
-
-  private applyExternalOptOut(storage: StorageLike | null): void {
-    const gen = ++this.mutationGen;
-    this.writeCutoffGen = gen;
-    if (isRecentRoomsKeyAbsent(storage)) {
-      this.clearAllGen = gen;
-      this.persistedClearAllGen = gen;
-    } else if (this.persistedClearAllGen === this.clearAllGen) {
-      this.clearAllGen = gen;
-    }
-    resetRecentRoomsSyncMaps(this.syncState);
-    this.disabled = true;
-    this.persistedDisabledGen = this.disabledGen;
-  }
-
-  private ensureWritePreconditions(
-    storage: StorageLike | null,
-    op: RecentRoomWriteOp,
-    gen: number,
-    removedGen: number | undefined,
-    now: number,
-  ): boolean {
-    if (this.clearAllGen > this.persistedClearAllGen) {
-      if (!clearAllPersistedRecentRooms(storage)) {
-        this.handleFailedWriteOp(op, gen);
-        return false;
-      }
-      this.persistedClearAllGen = this.clearAllGen;
-    }
-    if (!this.disabled && this.disabledGen > this.persistedDisabledGen) {
-      if (!setRecentRoomsDisabled(storage, false)) {
-        this.handleFailedWriteOp(op, gen);
-        return false;
-      }
-      this.persistedDisabledGen = this.disabledGen;
-    }
-    if (isRecentRoomsDisabled(storage)) {
-      this.applyExternalOptOut(storage);
-      this.syncFromStorage(true);
-      return false;
-    }
-    if (!flushPendingRemovalForWrite(storage, this.syncState, op.code, removedGen, this.persistedClearAllGen, now)) {
-      this.handleFailedWriteOp(op, gen);
-      return false;
-    }
-    return true;
-  }
-
-  private enqueueWrite(gen: number, op: RecentRoomWriteOp): void {
-    const code = op.code;
-    this.syncState.lastWriteGen.set(code, gen);
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        const removedGen = this.syncState.lastRemovalGen.get(code);
-        if (shouldSkipWriteOp(this.syncState, op, gen, removedGen, this.disabled, this.writeCutoffGen)) return;
-        const storage = this.env.getLocalStorage();
-        const now = this.now();
-        if (!this.ensureWritePreconditions(storage, op, gen, removedGen, now)) return;
-        const res = executeRecentRoomWriteOp(storage, this.syncState, op, gen, now, (c) =>
-          this.env.hasSavedCreatorHostFor(c),
-        );
-        if (res === "missing-on-disk") {
-          clearPendingStateOnExternalDelete(this.syncState, code, gen);
-          this.syncFromStorage(true);
-        } else if (res === "failed") {
-          this.handleFailedWriteOp(op, gen);
-        }
-      }),
-    );
-  }
-
   private normalizeUiState(): void {
     if (this.editingCode !== null && !this.rooms.some((r) => r.code === this.editingCode)) this.editingCode = null;
     if (this.rooms.length < 3) this.searchQuery = "";
   }
 
-  private applyMetadataUpdate(upper: string, updated: RecentRoomEntry, gen: number): void {
-    if (this.syncState.synthesizedCodes.delete(upper)) {
-      this.syncState.lastJoinGen.set(upper, gen);
-      this.syncState.pendingSynthPromotions.set(upper, gen);
-      this.rooms = sortAndBoundEntries([updated, ...this.rooms.filter((r) => r.code !== upper)]);
-      return;
+  private recomputeView(storage: StorageLike | null, now: number): void {
+    const loaded = tryLoadRecentRooms(storage, now);
+    if (loaded.ok) {
+      this.persistedRooms = loaded.entries;
     }
-    this.rooms = this.rooms.map((r) => (r.code === upper ? updated : r));
+    const entries = [...(loaded.ok ? loaded.entries : this.persistedRooms)];
+    const hostRooms = this.disabled ? [] : listPersistedHostRooms(storage, now);
+    const view = computeRecentRoomsView(
+      { entries, disabled: this.disabled },
+      this.queue,
+      now,
+      hostRooms,
+      (code) => this.env.hasSavedCreatorHostFor(code),
+    );
+    this.rooms = view.entries;
   }
 
-  private loadMergedRooms(storage: StorageLike | null, now: number): RecentRoomEntry[] {
-    pruneFailedPendingJoins(this.syncState);
-    if (this.disabled) {
-      this.syncState.synthesizedCodes.clear();
-      return [];
+  private enqueueOp(op: RecentRoomOp): void {
+    this.queue.push(op);
+    this.recomputeView(this.env.getLocalStorage(), this.now());
+    this.normalizeUiState();
+    this.scheduleFlush();
+    this.env.onChange();
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushing) {
+      this.flushRequested = true;
+      return;
     }
-    if (this.persistedClearAllGen < this.clearAllGen) {
-      return sortAndBoundEntries(
-        this.rooms.filter(
-          (entry) =>
-            !isCodeLocallyRemoved(this.syncState, entry.code, this.persistedClearAllGen) &&
-            (this.syncState.lastWriteGen.get(entry.code) ?? 0) > this.writeCutoffGen,
-        ),
-      );
-    }
-    return buildMergedRecentRoomsView(
-      storage,
-      this.syncState,
-      this.rooms,
-      this.writeCutoffGen,
-      this.persistedClearAllGen,
-      now,
-      (c) => this.env.hasSavedCreatorHostFor(c),
+    if (this.queue.length === 0 && !this.pendingPurge) return;
+    this.flushing = true;
+    this.env.runBackground(
+      runWithRecentRoomsLock(this.env.getLocks(), () => this.drainQueueUnderLock()),
     );
+  }
+
+  private applyExternalOptOut(storage: StorageLike | null): void {
+    this.disabled = true;
+    this.failedJoinCodes.clear();
+    const keepClearAll = !isRecentRoomsKeyAbsent(storage);
+    this.queue = this.queue.filter((op) => keepClearAll && op.kind === "clear-all");
+    if (keepClearAll && this.queue.length === 0) {
+      this.queue.push({ kind: "clear-all" });
+    }
+  }
+
+  private handleMissingPatch(
+    op: RecentRoomPatchOp,
+    carryPatches: Map<string, RecentRoomPatchOp[]>,
+  ): "ok" | "reconcile" {
+    const hasJoin = this.queue.some((queued) => queued.kind === "join" && queued.code === op.code);
+    if (this.failedJoinCodes.has(op.code) && hasJoin) {
+      const list = carryPatches.get(op.code) ?? [];
+      list.push(op);
+      carryPatches.set(op.code, list);
+      return "ok";
+    }
+    this.failedJoinCodes.delete(op.code);
+    return "reconcile";
+  }
+
+  private persistEntryOp(
+    storage: StorageLike | null,
+    op: Exclude<RecentRoomOp, { kind: "clear-all" } | { kind: "set-disabled" }>,
+    carryPatches: Map<string, RecentRoomPatchOp[]>,
+  ): "ok" | "reconcile" | "storage-error" {
+    const now = this.now();
+    const loaded = tryLoadRecentRooms(storage, now);
+    if (!loaded.ok) return "storage-error";
+    this.persistedRooms = loaded.entries;
+    const hostRooms = op.kind === "patch" ? listPersistedHostRooms(storage, now) : [];
+    const hasCreator = (code: string): boolean => this.env.hasSavedCreatorHostFor(code);
+    let outcome = applyRecentRoomOp({ entries: loaded.entries, disabled: false }, op, now, hostRooms, hasCreator);
+
+    if (op.kind === "patch" && outcome.missing) return this.handleMissingPatch(op, carryPatches);
+    if (op.kind === "join" && outcome.changed) {
+      const carried = carryPatches.get(op.code);
+      outcome = { ...outcome, snapshot: applyCarriedPatches(outcome.snapshot, op, carried, now, hasCreator) };
+    }
+    if (outcome.changed && !writePersistedRecentRooms(storage, outcome.snapshot.entries)) return "storage-error";
+    this.persistedRooms = outcome.snapshot.entries;
+    if (op.kind === "join") {
+      carryPatches.delete(op.code);
+      if (this.failedJoinCodes.delete(op.code)) return "reconcile";
+    }
+    if (op.kind === "remove") {
+      this.failedJoinCodes.delete(op.code);
+      carryPatches.delete(op.code);
+      if (shouldReconcileRemove(storage, now, op, outcome.snapshot.entries, this.rooms, hasCreator)) {
+        return "reconcile";
+      }
+    }
+    return "ok";
+  }
+
+  private persistStorageOp(
+    storage: StorageLike | null,
+    op: RecentRoomOp,
+    carryPatches: Map<string, RecentRoomPatchOp[]>,
+  ): "ok" | "reconcile" | "external-opt-out" | "storage-error" {
+    if (op.kind === "clear-all") {
+      if (!clearAllPersistedRecentRooms(storage)) return "storage-error";
+      this.persistedRooms = [];
+      this.failedJoinCodes.clear();
+      carryPatches.clear();
+      return "ok";
+    }
+    if (op.kind === "set-disabled") {
+      if (!setRecentRoomsDisabled(storage, op.disabled)) return "storage-error";
+      if (op.disabled) {
+        this.failedJoinCodes.clear();
+        carryPatches.clear();
+      }
+      return "ok";
+    }
+    const disabledState = tryIsRecentRoomsDisabled(storage);
+    if (!disabledState.ok) return "storage-error";
+    if (disabledState.disabled) return "external-opt-out";
+    return this.persistEntryOp(storage, op, carryPatches);
+  }
+
+  private abortQueueOnStorageError(
+    failedOp: RecentRoomOp,
+    carryPatches: ReadonlyMap<string, RecentRoomPatchOp[]>,
+  ): boolean {
+    const droppedPatchCodes = new Set<string>(carryPatches.keys());
+    const droppedJoinCodes = new Set<string>();
+    for (const op of [failedOp, ...this.queue]) {
+      if (op.kind === "patch") droppedPatchCodes.add(op.code);
+      else if (op.kind === "join") droppedJoinCodes.add(op.code);
+    }
+    for (const code of droppedPatchCodes) this.failedJoinCodes.delete(code);
+    for (const code of droppedJoinCodes) {
+      if (!droppedPatchCodes.has(code) && !this.persistedRooms.some((r) => r.code === code)) {
+        this.failedJoinCodes.add(code);
+      }
+    }
+    const remainingDurable = this.queue.filter(isDurableOp);
+    this.queue = isDurableOp(failedOp) ? [failedOp, ...remainingDurable] : remainingDurable;
+    return true;
+  }
+
+  private runPendingPurge(storage: StorageLike | null): void {
+    this.pendingPurge = false;
+    const disabledState = tryIsRecentRoomsDisabled(storage);
+    if (!this.disabled && disabledState.ok && !disabledState.disabled) {
+      pruneExpiredRecentRooms(storage, this.now());
+    }
+  }
+
+  private drainQueueUnderLock(): void {
+    this.flushRequested = false;
+    let reconcile = false;
+    let hadStorageError = false;
+    const carryPatches = new Map<string, RecentRoomPatchOp[]>();
+    try {
+      const storage = this.env.getLocalStorage();
+      while (this.queue.length > 0) {
+        const op = this.queue.shift();
+        if (!op) break;
+        const result = this.persistStorageOp(storage, op, carryPatches);
+        if (result === "external-opt-out") {
+          this.applyExternalOptOut(storage);
+          carryPatches.clear();
+          reconcile = true;
+        } else if (result === "reconcile") {
+          reconcile = true;
+        } else if (result === "storage-error") {
+          reconcile = this.abortQueueOnStorageError(op, carryPatches) || reconcile;
+          hadStorageError = true;
+          break;
+        }
+      }
+      if (!hadStorageError && this.pendingPurge) this.runPendingPurge(storage);
+      if (reconcile) {
+        this.recomputeView(storage, this.now());
+        this.normalizeUiState();
+        this.env.onChange();
+      }
+    } finally {
+      this.flushing = false;
+      this.pendingPurge = false;
+      const shouldReschedule = !hadStorageError && (this.flushRequested || this.queue.length > 0);
+      this.flushRequested = false;
+      if (shouldReschedule) this.scheduleFlush();
+    }
   }
 
   private maybeScheduleExpiredPurge(storage: StorageLike | null, now: number): void {
-    if (
-      this.pendingPurge ||
-      this.disabled ||
-      this.pendingClearAll > 0 ||
-      this.persistedClearAllGen < this.clearAllGen ||
-      !hasStaleRecentRooms(storage, now)
-    ) {
+    if (this.pendingPurge || this.disabled || this.queue.length > 0 || !hasStaleRecentRooms(storage, now)) {
       return;
     }
     this.pendingPurge = true;
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        try {
-          if (this.disabled || this.clearAllGen > this.persistedClearAllGen) return;
-          pruneExpiredRecentRooms(this.env.getLocalStorage(), this.now());
-        } finally {
-          this.pendingPurge = false;
-        }
-      }),
-    );
+    this.scheduleFlush();
   }
 
   getRooms(): readonly RecentRoomEntry[] {
@@ -276,34 +366,17 @@ export class RecentRoomsController {
 
     const now = this.now();
     const role = this.env.hasSavedCreatorHostFor(code) ? "host" : "guest";
-    this.syncState.pendingRemovals.delete(code);
-    this.syncState.synthesizedCodes.delete(code);
-    const gen = ++this.mutationGen;
-    this.syncState.lastJoinGen.set(code, gen);
-
-    const existing = this.rooms.find((r) => r.code === code);
-    const nextEntry = buildJoinedRoomEntry(code, role, now, existing, params.password, params.peerNames);
-    this.rooms = sortAndBoundEntries([nextEntry, ...this.rooms.filter((r) => r.code !== code)]);
-    this.normalizeUiState();
-
-    const op = buildQueuedJoinOp(
-      this.syncState,
+    const cleanPw = sanitizePassword(params.password);
+    const cleanPeers = sanitizePeerNames(params.peerNames);
+    const op: RecentRoomJoinOp = {
+      kind: "join",
       code,
       role,
-      now,
-      gen,
-      sanitizePassword(params.password),
-      sanitizePeerNames(params.peerNames),
-    );
-    this.enqueueWrite(gen, op);
-    this.env.onChange();
-  }
-
-  private enqueuePatch(upper: string, updated: RecentRoomEntry, op: RecentRoomPatchOp): void {
-    const gen = ++this.mutationGen;
-    this.applyMetadataUpdate(upper, updated, gen);
-    setPendingPatchInMap(this.syncState.pendingPatches, upper, gen, op);
-    this.enqueueWrite(gen, op);
+      lastJoinedAt: now,
+      ...(cleanPw !== undefined ? { password: cleanPw } : {}),
+      ...(cleanPeers.length > 0 ? { peerNames: cleanPeers } : {}),
+    };
+    this.enqueueOp(op);
   }
 
   updatePassword(code: string, password: string | undefined, locked: boolean): void {
@@ -311,9 +384,8 @@ export class RecentRoomsController {
     const clean = sanitizePassword(password);
     if (locked || clean === undefined || !isValidRoomCode(upper)) return;
     const existing = this.rooms.find((r) => r.code === upper);
-    if (!existing || existing.password === clean) return;
-    this.enqueuePatch(upper, { ...existing, password: clean }, { kind: "patch", code: upper, field: "password", password: clean });
-    this.env.onChange();
+    if ((!existing && !this.failedJoinCodes.has(upper)) || existing?.password === clean) return;
+    this.enqueueOp({ kind: "patch", code: upper, field: "password", password: clean });
   }
 
   updatePeers(code: string, peerNames: readonly string[]): void {
@@ -322,9 +394,10 @@ export class RecentRoomsController {
     const sanitized = sanitizePeerNames(peerNames);
     if (sanitized.length === 0) return;
     const existing = this.rooms.find((r) => r.code === upper);
-    if (!existing || sameStringArray(existing.peerNames, sanitized)) return;
-    this.enqueuePatch(upper, { ...existing, peerNames: sanitized }, { kind: "patch", code: upper, field: "peerNames", peerNames: sanitized });
-    this.env.onChange();
+    if ((!existing && !this.failedJoinCodes.has(upper)) || (existing && sameStringArray(existing.peerNames, sanitized))) {
+      return;
+    }
+    this.enqueueOp({ kind: "patch", code: upper, field: "peerNames", peerNames: sanitized });
   }
 
   rename(code: string, label: string): void {
@@ -332,98 +405,54 @@ export class RecentRoomsController {
     if (!isValidRoomCode(upper)) return;
     const existing = this.rooms.find((r) => r.code === upper);
     this.editingCode = null;
-    if (!existing) {
+    if (!existing && !this.failedJoinCodes.has(upper)) {
       this.env.onChange();
       return;
     }
     const nextLabel = sanitizeRecentRoomLabel(label);
-    const { label: _prevLabel, ...withoutLabel } = existing;
-    const updated: RecentRoomEntry = nextLabel !== undefined ? { ...withoutLabel, label: nextLabel } : withoutLabel;
-    this.enqueuePatch(upper, updated, {
+    this.enqueueOp({
       kind: "patch",
       code: upper,
       field: "label",
       ...(nextLabel !== undefined ? { label: nextLabel } : { clearLabel: true }),
     });
-    this.env.onChange();
   }
 
-  private removeFromRecentsOnly(upper: string, demoteIfPassworded = false): boolean {
+  private removeEntry(upper: string, demoteIfPassworded: boolean, cleanupToken?: () => void): boolean {
     const existed = this.rooms.some((r) => r.code === upper);
-    const gen = ++this.mutationGen;
-    this.syncState.lastRemovalGen.set(upper, gen);
-    this.syncState.pendingRemovals.set(upper, gen);
-    clearCodeFromSyncMaps(this.syncState, upper);
-    if (demoteIfPassworded) this.syncState.hostForgetGen.set(upper, gen);
-    this.rooms = this.rooms.filter((r) => r.code !== upper);
-    this.normalizeUiState();
-
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        let demoted = false;
-        try {
-          demoted =
-            executePendingRemoval(
-              this.env.getLocalStorage(),
-              this.syncState,
-              upper,
-              gen,
-              this.persistedClearAllGen,
-              this.now(),
-            ) === "demoted";
-        } finally {
-          if (this.syncState.pendingRemovals.get(upper) === gen) this.syncState.pendingRemovals.delete(upper);
-        }
-        if (demoted) this.syncFromStorage(true);
-      }),
+    this.failedJoinCodes.delete(upper);
+    this.queue.push(
+      demoteIfPassworded ? { kind: "remove", code: upper, demoteIfPassworded: true } : { kind: "remove", code: upper },
     );
+    this.recomputeView(this.env.getLocalStorage(), this.now());
+    this.normalizeUiState();
+    cleanupToken?.();
+    this.scheduleFlush();
+    this.env.onChange();
     return existed;
   }
 
   remove(code: string): void {
     const upper = code.trim().toUpperCase();
     if (!isValidRoomCode(upper)) return;
-    this.removeFromRecentsOnly(upper);
-    this.env.onRemoveHostToken(upper);
-    this.env.onChange();
+    this.removeEntry(upper, false, () => this.env.onRemoveHostToken(upper));
   }
 
   handleCreatorHostForgotten(code: string): void {
     const upper = code.trim().toUpperCase();
-    if (!isValidRoomCode(upper)) return;
-    const existing = this.rooms.find((r) => r.code === upper);
-    if (!existing) return;
-
-    if (existing.password !== undefined) {
-      this.enqueuePatch(upper, { ...existing, role: "guest" }, { kind: "patch", code: upper, field: "role", role: "guest" });
-    } else {
-      this.removeFromRecentsOnly(upper, true);
-    }
-    this.normalizeUiState();
-    this.env.onChange();
+    if (!isValidRoomCode(upper) || !this.rooms.some((r) => r.code === upper)) return;
+    this.removeEntry(upper, true);
   }
 
   handleFatalError(code: string, errCode: string, expectedHostToken?: string): boolean {
     if (errCode !== "kicked" && errCode !== "bad-password") return false;
     const upper = code.trim().toUpperCase();
     if (!isValidRoomCode(upper)) return false;
-    const existed = this.removeFromRecentsOnly(upper);
-    if (expectedHostToken !== undefined) this.env.onRemoveHostToken(upper, expectedHostToken);
-    this.env.onChange();
-    return existed;
-  }
-
-  private beginClearAll(): number {
-    const gen = ++this.mutationGen;
-    this.clearAllGen = gen;
-    this.writeCutoffGen = gen;
-    this.pendingClearAll++;
-    resetRecentRoomsSyncMaps(this.syncState);
-    this.rooms = [];
-    this.searchQuery = "";
-    this.editingCode = null;
-    this.env.onForgetAllHostTokens();
-    return gen;
+    return this.removeEntry(
+      upper,
+      false,
+      expectedHostToken !== undefined ? () => this.env.onRemoveHostToken(upper, expectedHostToken) : undefined,
+    );
   }
 
   setDisabled(disabled: boolean): void {
@@ -431,99 +460,60 @@ export class RecentRoomsController {
     this.disabled = disabled;
     this.searchQuery = "";
     this.editingCode = null;
-    this.pendingDisabledSync++;
-    const dGen = ++this.disabledGen;
-    let clearGen: number | undefined;
+    this.pendingPurge = false;
+    this.failedJoinCodes.clear();
     if (disabled) {
-      clearGen = this.beginClearAll();
+      this.queue = [{ kind: "set-disabled", disabled: true }, { kind: "clear-all" }];
+      this.rooms = [];
+      this.env.onForgetAllHostTokens();
     } else {
-      this.rooms = this.loadMergedRooms(this.env.getLocalStorage(), this.now());
+      this.queue.push({ kind: "set-disabled", disabled: false });
+      this.recomputeView(this.env.getLocalStorage(), this.now());
       this.normalizeUiState();
     }
-
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        try {
-          const storage = this.env.getLocalStorage();
-          if (this.disabledGen === dGen && this.persistedDisabledGen < dGen) {
-            const clearReady =
-              disabled ||
-              this.clearPersistedIfCurrent(storage, this.clearAllGen) ||
-              this.persistedClearAllGen >= this.clearAllGen;
-            if (clearReady && setRecentRoomsDisabled(storage, disabled)) {
-              this.persistedDisabledGen = dGen;
-            }
-          }
-          if (clearGen !== undefined) this.clearPersistedIfCurrent(storage, clearGen);
-        } finally {
-          if (clearGen !== undefined) this.pendingClearAll = Math.max(0, this.pendingClearAll - 1);
-          this.pendingDisabledSync = Math.max(0, this.pendingDisabledSync - 1);
-        }
-      }),
-    );
+    this.scheduleFlush();
     this.env.onChange();
   }
 
   clearAll(): void {
-    const gen = this.beginClearAll();
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        try {
-          this.clearPersistedIfCurrent(this.env.getLocalStorage(), gen);
-        } finally {
-          this.pendingClearAll = Math.max(0, this.pendingClearAll - 1);
-        }
-      }),
-    );
+    this.pendingPurge = false;
+    this.failedJoinCodes.clear();
+    this.queue = this.queue.filter((op) => op.kind === "set-disabled" || op.kind === "clear-all");
+    const lastOp = this.queue[this.queue.length - 1];
+    if (lastOp?.kind !== "clear-all") {
+      this.queue.push({ kind: "clear-all" });
+    }
+    this.rooms = [];
+    this.searchQuery = "";
+    this.editingCode = null;
+    this.env.onForgetAllHostTokens();
+    this.scheduleFlush();
     this.env.onChange();
-  }
-
-  private maybeScheduleRecoverySync(): void {
-    const needDis = this.pendingDisabledSync === 0 && this.persistedDisabledGen < this.disabledGen;
-    const needClr = this.pendingClearAll === 0 && this.persistedClearAllGen < this.clearAllGen;
-    const needRem = hasPendingRecoveryRemovals(this.syncState, this.persistedClearAllGen);
-    if (this.pendingRecoverySync || (!needDis && !needClr && !needRem)) return;
-    this.pendingRecoverySync = true;
-    this.env.runBackground(
-      runWithRecentRoomsLock(this.env.getLocks(), () => {
-        let changed = false;
-        try {
-          const storage = this.env.getLocalStorage();
-          if (this.pendingClearAll === 0) changed = this.clearPersistedIfCurrent(storage, this.clearAllGen) || changed;
-          const dGen = this.disabledGen;
-          if (
-            (this.disabled || this.persistedClearAllGen >= this.clearAllGen) &&
-            this.pendingDisabledSync === 0 &&
-            this.persistedDisabledGen < dGen &&
-            setRecentRoomsDisabled(storage, this.disabled)
-          ) {
-            if (this.disabledGen === dGen) this.persistedDisabledGen = dGen;
-            if (this.disabled) clearAllPersistedRecentRooms(storage);
-            changed = true;
-          }
-          if (flushPendingRemovalsForRecovery(storage, this.syncState, this.persistedClearAllGen, this.now())) {
-            changed = true;
-          }
-        } finally {
-          this.pendingRecoverySync = false;
-        }
-        if (changed) this.syncFromStorage(true);
-      }),
-    );
   }
 
   syncFromStorage(notify: boolean = true): void {
     const storage = this.env.getLocalStorage();
     const now = this.now();
-    if (this.persistedDisabledGen === this.disabledGen) {
-      const storageDisabled = isRecentRoomsDisabled(storage);
-      if (storageDisabled && !this.disabled) this.applyExternalOptOut(storage);
-      else this.disabled = storageDisabled;
+    for (const code of this.failedJoinCodes) {
+      if (!this.queue.some((op) => (op.kind === "patch" || op.kind === "join") && op.code === code)) {
+        this.failedJoinCodes.delete(code);
+      }
     }
-    this.rooms = this.loadMergedRooms(storage, now);
+    if (!this.queue.some((op) => op.kind === "set-disabled")) {
+      const disabledState = tryIsRecentRoomsDisabled(storage);
+      if (disabledState.ok && disabledState.disabled) {
+        this.applyExternalOptOut(storage);
+      } else if (disabledState.ok) {
+        this.disabled = false;
+      }
+    }
+    this.recomputeView(storage, now);
     this.normalizeUiState();
-    this.maybeScheduleRecoverySync();
-    this.maybeScheduleExpiredPurge(storage, now);
+    if (this.queue.length > 0) {
+      this.scheduleFlush();
+    } else {
+      this.maybeScheduleExpiredPurge(storage, now);
+    }
     if (notify) this.env.onChange();
   }
 }

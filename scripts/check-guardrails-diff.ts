@@ -24,6 +24,7 @@ const EXACT_GUARDRAIL_FILES = new Set<string>([
   "shared/protocol.ts",
   "worker/index.ts",
   "scripts/check-guardrails-diff.ts",
+  "scripts/run-stryker-ci.ts",
 ]);
 
 const GUARDRAIL_PREFIXES: readonly string[] = ["test/formal/", ".github/"];

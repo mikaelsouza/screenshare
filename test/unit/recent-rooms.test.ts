@@ -32,7 +32,15 @@ import {
   type LockManagerLike,
   type StorageLike,
 } from "@src/recent-rooms";
-import { applyPatchToEntry, type RecentRoomEntry } from "@src/recent-rooms-model";
+import {
+  applyPatchToEntry,
+  applyRecentRoomOp,
+  computeRecentRoomsView,
+  insertEntryOrdered,
+  replayRecentRoomOps,
+  type RecentRoomEntry,
+  type RecentRoomsSnapshot,
+} from "@src/recent-rooms-model";
 
 function makeMemoryStorage(initial: Record<string, string> = {}): StorageLike & { store: Map<string, string> } {
   const store = new Map<string, string>(Object.entries(initial));
@@ -671,5 +679,295 @@ describe("recent-rooms localStorage persistence", () => {
     });
     expect(removePersistedRecentRoom(staleOther, "ZZZZ2345", t0)).toBe(true);
     expect(staleOther.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+  });
+
+  it("enforces exact boundary rules for trimCodeUnits, formatRelativeTime, filterRecentRooms, insertEntryOrdered, and mergeSynthesizedHostRooms", () => {
+    const t0 = 1_700_000_000_000;
+
+    // Exact 40-char label is kept untouched; index-39 trailing space and surrogate boundaries are trimmed cleanly
+    expect(sanitizeRecentRoomLabel("a".repeat(MAX_RECENT_ROOM_LABEL_LEN))).toBe("a".repeat(MAX_RECENT_ROOM_LABEL_LEN));
+    expect(sanitizeRecentRoomLabel(`${"a".repeat(39)} bc`)).toBe("a".repeat(39));
+    expect(sanitizeRecentRoomLabel(`${"a".repeat(39)}\uD800\uDC00`)).toBe("a".repeat(39));
+    expect(sanitizeRecentRoomLabel(`${"a".repeat(39)}\uDBFF\uDFFF`)).toBe("a".repeat(39));
+    expect(sanitizeRecentRoomLabel(`${"a".repeat(39)}\uD7FFz`)).toBe(`${"a".repeat(39)}\uD7FF`);
+    expect(sanitizeRecentRoomLabel(`${"a".repeat(39)}\uDC00z`)).toBe(`${"a".repeat(39)}\uDC00`);
+
+    // Exact unit rollover boundaries for formatRelativeTime
+    expect(formatRelativeTime(t0 - 59_999, t0)).toBe("Just now");
+    expect(formatRelativeTime(t0 - 60_000, t0)).toBe("1m ago");
+    expect(formatRelativeTime(t0 - 59 * 60_000, t0)).toBe("59m ago");
+    expect(formatRelativeTime(t0 - 60 * 60_000, t0)).toBe("1h ago");
+    expect(formatRelativeTime(t0 - 23 * 3_600_000, t0)).toBe("23h ago");
+    expect(formatRelativeTime(t0 - 24 * 3_600_000, t0)).toBe("1d ago");
+
+    // filterRecentRooms matches any peer in peerNames (not every peer) and handles empty query
+    const filterEntries: RecentRoomEntry[] = [
+      { code: "AAAA2345", role: "guest", lastJoinedAt: t0, peerNames: ["Alice", "Bob"] },
+      { code: "BBBB2345", role: "host", lastJoinedAt: t0 - 10, peerNames: ["Carol"] },
+    ];
+    expect(filterRecentRooms(filterEntries, "")).toEqual(filterEntries);
+    expect(filterRecentRooms(filterEntries, "bob").map((e) => e.code)).toEqual(["AAAA2345"]);
+
+    // insertEntryOrdered handles empty/undefined insertAfterCodes and ignores mismatched timestamps
+    const rest: RecentRoomEntry[] = [
+      { code: "AAAA2345", role: "guest", lastJoinedAt: t0 - 100, peerNames: [] },
+      { code: "BBBB2345", role: "guest", lastJoinedAt: t0, peerNames: [] },
+    ];
+    const nextEntry: RecentRoomEntry = { code: "CCCC2345", role: "guest", lastJoinedAt: t0, peerNames: [] };
+    expect(insertEntryOrdered(rest, nextEntry, undefined).map((e) => e.code)).toEqual([
+      "CCCC2345",
+      "AAAA2345",
+      "BBBB2345",
+    ]);
+    expect(insertEntryOrdered(rest, nextEntry, []).map((e) => e.code)).toEqual(["CCCC2345", "AAAA2345", "BBBB2345"]);
+    expect(insertEntryOrdered(rest, nextEntry, ["AAAA2345"]).map((e) => e.code)).toEqual([
+      "CCCC2345",
+      "AAAA2345",
+      "BBBB2345",
+    ]);
+
+    // mergeSynthesizedHostRooms deduplicates repeated codes in hostRooms
+    const synthesized: string[] = [];
+    const dedupMerged = mergeSynthesizedHostRooms(
+      [],
+      [
+        { code: "CCCC2345", updatedAt: t0 },
+        { code: "CCCC2345", updatedAt: t0 + 10 },
+      ],
+      () => true,
+      (code) => synthesized.push(code),
+    );
+    expect(synthesized).toEqual(["CCCC2345"]);
+    expect(dedupMerged).toHaveLength(1);
+    expect(dedupMerged[0]?.lastJoinedAt).toBe(t0);
+
+    // applyPatchToEntry preserves all fields for role patch
+    const rolePatched = applyPatchToEntry(
+      { code: "AAAA2345", role: "host", lastJoinedAt: t0, peerNames: ["Alice"], password: "PW", label: "Team" },
+      { kind: "patch", code: "AAAA2345", field: "role", role: "guest" },
+    );
+    expect(rolePatched).toEqual({
+      code: "AAAA2345",
+      role: "guest",
+      lastJoinedAt: t0,
+      peerNames: ["Alice"],
+      password: "PW",
+      label: "Team",
+    });
+  });
+
+  it("evaluates applyRecentRoomOp, replayRecentRoomOps, and computeRecentRoomsView outcomes accurately", () => {
+    const t0 = 1_700_000_000_000;
+    const emptySnap: RecentRoomsSnapshot = { entries: [], disabled: false };
+    const noHost = () => false;
+
+    // Invalid timestamp or disabled snapshot makes join a no-op
+    expect(
+      applyRecentRoomOp(
+        { entries: [], disabled: true },
+        { kind: "join", code: "AAAA2345", role: "guest", lastJoinedAt: t0 },
+        t0,
+        [],
+        noHost,
+      ),
+    ).toEqual({ snapshot: { entries: [], disabled: true }, changed: false, missing: false });
+    expect(
+      applyRecentRoomOp(
+        emptySnap,
+        { kind: "join", code: "AAAA2345", role: "guest", lastJoinedAt: t0 - RECENT_ROOM_TTL_MS },
+        t0,
+        [],
+        noHost,
+      ),
+    ).toEqual({ snapshot: emptySnap, changed: false, missing: false });
+
+    // Join adds entry with exact outcome flags
+    const joined = applyRecentRoomOp(
+      emptySnap,
+      { kind: "join", code: "AAAA2345", role: "host", lastJoinedAt: t0, password: "PW1" },
+      t0,
+      [],
+      noHost,
+    );
+    expect(joined.changed).toBe(true);
+    expect(joined.missing).toBe(false);
+    expect(joined.snapshot.entries).toHaveLength(1);
+
+    // Patch no-op when identical (role, password, label, peerNames) vs changed
+    const sameRolePatch = applyRecentRoomOp(
+      joined.snapshot,
+      { kind: "patch", code: "AAAA2345", field: "role", role: "host" },
+      t0,
+      [],
+      noHost,
+    );
+    expect(sameRolePatch).toEqual({ snapshot: joined.snapshot, changed: false, missing: false });
+
+    const diffRolePatch = applyRecentRoomOp(
+      joined.snapshot,
+      { kind: "patch", code: "AAAA2345", field: "role", role: "guest" },
+      t0,
+      [],
+      noHost,
+    );
+    expect(diffRolePatch.changed).toBe(true);
+    expect(diffRolePatch.missing).toBe(false);
+    expect(diffRolePatch.snapshot.entries[0]?.role).toBe("guest");
+
+    // Patch on missing entry with unowned/expired hostRoom returns missing: true, changed: false
+    const missingPatch = applyRecentRoomOp(
+      emptySnap,
+      { kind: "patch", code: "HOST2345", field: "label", label: "Named" },
+      t0,
+      [{ code: "OTHR2345", updatedAt: t0 }],
+      noHost,
+    );
+    expect(missingPatch).toEqual({ snapshot: emptySnap, changed: false, missing: true });
+
+    // Patch on missing entry with valid creator hostRoom synthesizes with empty peerNames
+    const synthPatch = applyRecentRoomOp(
+      emptySnap,
+      { kind: "patch", code: "HOST2345", field: "label", label: "Named" },
+      t0,
+      [
+        { code: "OTHR2345", updatedAt: t0 },
+        { code: "HOST2345", updatedAt: t0 - 500 },
+      ],
+      (c) => c === "HOST2345",
+    );
+    expect(synthPatch.changed).toBe(true);
+    expect(synthPatch.missing).toBe(false);
+    expect(synthPatch.snapshot.entries).toEqual([
+      { code: "HOST2345", role: "host", lastJoinedAt: t0 - 500, peerNames: [], label: "Named" },
+    ]);
+
+    // Remove outcomes: missing, demoteIfPassworded on guest (no-op), demoteIfPassworded on host (only target demoted), full remove
+    expect(applyRecentRoomOp(emptySnap, { kind: "remove", code: "AAAA2345" }, t0, [], noHost)).toEqual({
+      snapshot: emptySnap,
+      changed: false,
+      missing: false,
+    });
+    const twoHosts: RecentRoomsSnapshot = {
+      entries: [
+        { code: "AAAA2345", role: "host", lastJoinedAt: t0, peerNames: [], password: "PW1" },
+        { code: "BBBB2345", role: "host", lastJoinedAt: t0 - 10, peerNames: [], password: "PW2" },
+      ],
+      disabled: false,
+    };
+    const demoted = applyRecentRoomOp(
+      twoHosts,
+      { kind: "remove", code: "AAAA2345", demoteIfPassworded: true },
+      t0,
+      [],
+      noHost,
+    );
+    expect(demoted.changed).toBe(true);
+    expect(demoted.missing).toBe(false);
+    expect(demoted.snapshot.entries.map((e) => ({ code: e.code, role: e.role }))).toEqual([
+      { code: "AAAA2345", role: "guest" },
+      { code: "BBBB2345", role: "host" },
+    ]);
+    const demoteGuestNoop = applyRecentRoomOp(
+      demoted.snapshot,
+      { kind: "remove", code: "AAAA2345", demoteIfPassworded: true },
+      t0,
+      [],
+      noHost,
+    );
+    expect(demoteGuestNoop.changed).toBe(false);
+    expect(demoteGuestNoop.missing).toBe(false);
+
+    const removed = applyRecentRoomOp(twoHosts, { kind: "remove", code: "AAAA2345" }, t0, [], noHost);
+    expect(removed.changed).toBe(true);
+    expect(removed.missing).toBe(false);
+    expect(removed.snapshot.entries.map((e) => e.code)).toEqual(["BBBB2345"]);
+
+    // clear-all and set-disabled outcomes
+    expect(applyRecentRoomOp(emptySnap, { kind: "clear-all" }, t0, [], noHost)).toEqual({
+      snapshot: emptySnap,
+      changed: false,
+      missing: false,
+    });
+    expect(applyRecentRoomOp(twoHosts, { kind: "clear-all" }, t0, [], noHost)).toEqual({
+      snapshot: emptySnap,
+      changed: true,
+      missing: false,
+    });
+    expect(
+      applyRecentRoomOp({ entries: [], disabled: true }, { kind: "set-disabled", disabled: true }, t0, [], noHost),
+    ).toEqual({ snapshot: { entries: [], disabled: true }, changed: false, missing: false });
+    expect(
+      applyRecentRoomOp(twoHosts, { kind: "set-disabled", disabled: true }, t0, [], noHost),
+    ).toEqual({ snapshot: { entries: [], disabled: true }, changed: true, missing: false });
+
+    // replayRecentRoomOps & computeRecentRoomsView: demoteIfPassworded on passworded entry does NOT suppress host synthesis,
+    // while removing passwordless entry suppresses synthesis until clear-all / set-disabled(true) / join
+    const hostRooms = [{ code: "HOST2345", updatedAt: t0 - 100 }];
+    const hasHost = (c: string) => c === "HOST2345";
+    const passwordedHostSnap: RecentRoomsSnapshot = {
+      entries: [{ code: "HOST2345", role: "host", lastJoinedAt: t0, peerNames: [], password: "PW1" }],
+      disabled: false,
+    };
+    const afterDemoteView = computeRecentRoomsView(
+      passwordedHostSnap,
+      [{ kind: "remove", code: "HOST2345", demoteIfPassworded: true }],
+      t0,
+      hostRooms,
+      hasHost,
+    );
+    expect(afterDemoteView.entries[0]?.role).toBe("guest");
+
+    const plainHostSnap: RecentRoomsSnapshot = {
+      entries: [{ code: "HOST2345", role: "host", lastJoinedAt: t0, peerNames: [] }],
+      disabled: false,
+    };
+    const suppressedAfterRemove = replayRecentRoomOps(
+      plainHostSnap,
+      [
+        { kind: "remove", code: "HOST2345", demoteIfPassworded: true },
+        { kind: "patch", code: "HOST2345", field: "label", label: "Ghost" },
+      ],
+      t0,
+      hostRooms,
+      hasHost,
+    );
+    expect(suppressedAfterRemove.entries).toEqual([]);
+
+    const clearedThenSynthesized = computeRecentRoomsView(
+      plainHostSnap,
+      [
+        { kind: "remove", code: "HOST2345" },
+        { kind: "clear-all" },
+      ],
+      t0,
+      hostRooms,
+      hasHost,
+    );
+    expect(clearedThenSynthesized.entries.map((e) => e.code)).toEqual(["HOST2345"]);
+
+    const disabledThenReenabledView = computeRecentRoomsView(
+      plainHostSnap,
+      [
+        { kind: "remove", code: "HOST2345" },
+        { kind: "set-disabled", disabled: true },
+        { kind: "set-disabled", disabled: false },
+      ],
+      t0,
+      hostRooms,
+      hasHost,
+    );
+    expect(disabledThenReenabledView.entries.map((e) => e.code)).toEqual(["HOST2345"]);
+
+    const rejoinedAfterRemoveView = computeRecentRoomsView(
+      plainHostSnap,
+      [
+        { kind: "remove", code: "HOST2345" },
+        { kind: "join", code: "HOST2345", role: "host", lastJoinedAt: t0 + 10 },
+      ],
+      t0 + 10,
+      hostRooms,
+      hasHost,
+    );
+    expect(rejoinedAfterRemoveView.entries.map((e) => e.code)).toEqual(["HOST2345"]);
   });
 });

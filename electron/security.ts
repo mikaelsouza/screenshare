@@ -26,18 +26,26 @@ function hasControlChar(value: string): boolean {
 }
 
 /**
+ * Validates and normalizes an external URL (`https:`, `http:`, or `mailto:`),
+ * returning its canonical `parsed.href` when safe and `null` otherwise.
+ */
+export function normalizeExternalUrl(url: string | undefined): string | null {
+  if (!url || url !== url.trim() || hasControlChar(url)) return null;
+  try {
+    const parsed = new URL(url);
+    return ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol) ? parsed.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Returns true only when `url` parses cleanly as an `https:`, `http:`, or
  * `mailto:` URL (case-insensitive per WHATWG URL parsing) without ASCII
  * control characters.
  */
 export function isAllowedExternalUrl(url: string | undefined): boolean {
-  if (!url || url !== url.trim() || hasControlChar(url)) return false;
-  try {
-    const parsed = new URL(url);
-    return ALLOWED_EXTERNAL_PROTOCOLS.has(parsed.protocol);
-  } catch {
-    return false;
-  }
+  return normalizeExternalUrl(url) !== null;
 }
 
 /**
@@ -75,7 +83,7 @@ export function evaluateNavigation(
   url: string,
   trustedOrigin: string | null,
 ): NavigationDecision {
-  if (!url || !trustedOrigin || trustedOrigin === "null" || hasControlChar(url)) {
+  if (!url || url !== url.trim() || !trustedOrigin || trustedOrigin === "null" || hasControlChar(url)) {
     return "block";
   }
   let parsed: URL;
