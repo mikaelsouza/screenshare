@@ -23,6 +23,7 @@ describe("check-guardrails-diff", () => {
         "shared/protocol.ts",
         "worker/index.ts",
         "scripts/check-guardrails-diff.ts",
+        "scripts/run-stryker-ci.ts",
       ];
       for (const file of exactFiles) {
         expect(isGuardrailFile(file)).toBe(true);

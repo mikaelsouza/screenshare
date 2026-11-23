@@ -10,6 +10,7 @@
     "electron/**/*.ts",
     "worker/**/*.ts",
     "scripts/check-guardrails-diff.ts",
+    "scripts/run-stryker-ci.ts",
     "!**/*.d.ts",
     "!src/main.ts",
     "!src/views/**/*.ts",

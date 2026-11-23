@@ -2,6 +2,7 @@ import { generateRoomCode, isValidRoomCode } from "@shared/protocol";
 import { ipKey } from "./ipkey";
 import { RateLimiter } from "./ratelimit";
 import { RoomDO } from "./room";
+import { evaluateUpgradeOrigin } from "./room-policy";
 import { TRY_AGAIN_LATER, isUpgrade, rejectUpgrade } from "./upgrade";
 
 export interface Env {
@@ -154,12 +155,13 @@ async function handleWebSocketRoute(request: Request, env: Env, url: URL): Promi
   if (!isUpgrade(request)) {
     return new Response("Expected Upgrade: websocket", { status: 426 });
   }
-  const originVerdict = checkSameOriginHeaders(request, url);
-  if (originVerdict !== "ok") {
-    return rejectUpgrade(
-      "forbidden-origin",
-      originVerdict === "malformed-origin" ? "Malformed Origin header" : "Connections from this origin are not allowed",
-    );
+  const secFetchSite = request.headers.get("Sec-Fetch-Site");
+  if (secFetchSite !== null && secFetchSite !== "same-origin" && secFetchSite !== "none") {
+    return rejectUpgrade("forbidden-origin", "Connections from this origin are not allowed");
+  }
+  const originVerdict = evaluateUpgradeOrigin(url, request.headers.get("Origin"));
+  if (!originVerdict.allowed) {
+    return rejectUpgrade(originVerdict.code, originVerdict.message);
   }
   const rateKey = ipKey(request.headers.get("CF-Connecting-IP") ?? "unknown");
   if (!(await allowed(env.WS_LIMITER, wsUpgradeLimit, rateKey))) {

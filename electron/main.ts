@@ -20,9 +20,9 @@ import { resolveProcessElectronConfig } from "./config.js";
 import {
   buildOfflinePageUrl,
   evaluateNavigation,
-  isAllowedExternalUrl,
   isAllowedPermission,
   isTrustedFrameUrl,
+  normalizeExternalUrl,
 } from "./security.js";
 import koffi from "koffi";
 import loopback from "loopback-capture";
@@ -302,8 +302,9 @@ async function initApplication(): Promise<void> {
 
   // External links routing to default system browser
   win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedExternalUrl(url)) {
-      runBackground(shell.openExternal(url), "openExternal");
+    const safeUrl = normalizeExternalUrl(url);
+    if (safeUrl) {
+      runBackground(shell.openExternal(safeUrl), "openExternal");
     }
     return { action: "deny" };
   });
@@ -313,7 +314,10 @@ async function initApplication(): Promise<void> {
     if (decision === "allow") return;
     event.preventDefault();
     if (decision === "open-external") {
-      runBackground(shell.openExternal(url), "will-navigate openExternal");
+      const safeUrl = normalizeExternalUrl(url);
+      if (safeUrl) {
+        runBackground(shell.openExternal(safeUrl), "will-navigate openExternal");
+      }
     }
   });
 

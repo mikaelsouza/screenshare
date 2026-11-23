@@ -10,3 +10,4 @@
 /test/formal/ @mikaelsouza
 /.github/ @mikaelsouza
 /scripts/check-guardrails-diff.ts @mikaelsouza
+/scripts/run-stryker-ci.ts @mikaelsouza

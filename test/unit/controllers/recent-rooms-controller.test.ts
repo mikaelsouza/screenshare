@@ -20,10 +20,18 @@ import {
   isRecentRoomsDisabled,
   loadRecentRooms,
   mergeSynthesizedHostRooms,
+  tryIsRecentRoomsDisabled,
   upsertRecentRoom,
+  writePersistedRecentRooms,
   type LockManagerLike,
   type StorageLike,
 } from "@src/recent-rooms";
+import {
+  applyRecentRoomOp,
+  computeRecentRoomsView,
+  replayRecentRoomOps,
+  type RecentRoomsSnapshot,
+} from "@src/recent-rooms-model";
 
 function createFullMemoryStorage(): Storage {
   const store = new Map<string, string>();
@@ -491,11 +499,11 @@ describe("RecentRoomsController", () => {
     expect(loadRecentRooms(fullStorage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
   });
 
-  it("guards removeFromRecentsOnly against rejected out-of-order lock fallback after a newer recordJoin", async () => {
+  it("guards remove + subsequent recordJoin under single-flight and rejected lock fallback", async () => {
     const now = 1_700_000_000_000;
     const storage = makeMemoryStorage();
     const tasks: Promise<unknown>[] = [];
-    const rejectHolder: { fn?: (err: Error) => void } = {};
+    const rejectHolders: Array<(err: Error) => void> = [];
     let lockCall = 0;
 
     const locks: LockManagerLike = {
@@ -503,7 +511,7 @@ describe("RecentRoomsController", () => {
         lockCall += 1;
         if (lockCall === 1) {
           return new Promise<void>((_resolve, reject) => {
-            rejectHolder.fn = reject;
+            rejectHolders.push(reject);
           });
         }
         return Promise.resolve(cb());
@@ -526,9 +534,10 @@ describe("RecentRoomsController", () => {
     ctrl.remove("AAAA2345");
     ctrl.recordJoin({ code: "AAAA2345", password: "NEWPASS123456789" });
     await Promise.resolve();
-    expect(loadRecentRooms(storage, now).map((r) => r.code)).toEqual(["AAAA2345"]);
+    expect(lockCall).toBe(1);
+    expect(loadRecentRooms(storage, now)).toEqual([]);
 
-    rejectHolder.fn?.(new Error("AbortError"));
+    rejectHolders[0]?.(new Error("AbortError"));
     await Promise.all(tasks);
 
     expect(ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
@@ -588,11 +597,9 @@ describe("RecentRoomsController", () => {
     h.ctrl.updatePassword("PASS8234", "D".repeat(129), false);
     expect(h.ctrl.getRooms().find((r) => r.code === "PASS8234")?.password).toBe("A".repeat(80));
 
-    // Overlapping writes (pendingWrites > 1) for PASS8234: syncFromStorage between locks preserves in-memory entry
+    // Single-flight queued writes for PASS8234: mid-flight syncFromStorage preserves pending in-memory entry
     h.ctrl.updatePeers("PASS8234", ["PeerOne"]);
-    const firstLock = h.pendingLockReleases.shift();
-    firstLock?.();
-    await Promise.resolve();
+    expect(h.pendingLockReleases).toHaveLength(1);
     h.ctrl.syncFromStorage();
     expect(h.ctrl.getRooms().find((r) => r.code === "PASS8234")?.peerNames).toEqual(["PeerOne"]);
 
@@ -644,7 +651,7 @@ describe("RecentRoomsController", () => {
       return { ctrl, storage, tasks, pending };
     };
 
-    // 1. clearAll() whose locks.request rejects after a subsequent recordJoin("BBBB2345") succeeded
+    // 1. clearAll() + recordJoin("BBBB2345") under single-flight lock + AbortError fallback
     {
       const h = createControllableHarness();
       h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
@@ -652,20 +659,18 @@ describe("RecentRoomsController", () => {
       await Promise.all(h.tasks.splice(0));
 
       h.ctrl.clearAll();
-      const clearLock = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345", password: "NEWPASS123456789" });
-      const joinLock = h.pending.shift();
-      joinLock?.resolve();
-      await Promise.resolve();
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
 
-      clearLock?.reject(new Error("AbortError"));
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
       expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
     }
 
-    // 2A. setDisabled(true) whose locks.request rejects after setDisabled(false) + recordJoin("CCCC2345") succeeded
+    // 2A. setDisabled(true) -> setDisabled(false) -> recordJoin("CCCC2345") under single-flight + AbortError fallback
     {
       const h = createControllableHarness();
       h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
@@ -673,19 +678,14 @@ describe("RecentRoomsController", () => {
       await Promise.all(h.tasks.splice(0));
 
       h.ctrl.setDisabled(true);
-      const disableLock = h.pending.shift();
       h.ctrl.setDisabled(false);
-      const enableLock = h.pending.shift();
       h.ctrl.recordJoin({ code: "CCCC2345", password: "NEWPASS123456789" });
-      const joinLock = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.isDisabled()).toBe(false);
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
 
-      enableLock?.resolve();
-      joinLock?.resolve();
-      await Promise.resolve();
-      expect(isRecentRoomsDisabled(h.storage)).toBe(false);
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["CCCC2345"]);
-
-      disableLock?.reject(new Error("AbortError"));
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
       expect(h.ctrl.isDisabled()).toBe(false);
       expect(isRecentRoomsDisabled(h.storage)).toBe(false);
@@ -693,7 +693,7 @@ describe("RecentRoomsController", () => {
       expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["CCCC2345"]);
     }
 
-    // 2B. setDisabled(false) whose locks.request rejects after setDisabled(true) succeeded
+    // 2B. setDisabled(false) -> setDisabled(true) under single-flight + AbortError fallback
     {
       const h = createControllableHarness();
       h.ctrl.setDisabled(true);
@@ -701,38 +701,27 @@ describe("RecentRoomsController", () => {
       await Promise.all(h.tasks.splice(0));
 
       h.ctrl.setDisabled(false);
-      const enableLock = h.pending.shift();
       h.ctrl.setDisabled(true);
-      const disableLock = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.isDisabled()).toBe(true);
 
-      disableLock?.resolve();
-      await Promise.resolve();
-      expect(isRecentRoomsDisabled(h.storage)).toBe(true);
-
-      enableLock?.reject(new Error("AbortError"));
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
       expect(h.ctrl.isDisabled()).toBe(true);
       expect(isRecentRoomsDisabled(h.storage)).toBe(true);
     }
 
-    // 3. Superseded recordJoin whose locks.request rejects after updatePassword/updatePeers/rename succeeded
+    // 3. recordJoin + updatePassword + updatePeers + rename("") under single-flight + AbortError fallback
     {
       const h = createControllableHarness();
       h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      const joinLock = h.pending.shift();
       h.ctrl.updatePassword("AAAA2345", "NEW_PASSWORD_2222", false);
-      const pwLock = h.pending.shift();
       h.ctrl.updatePeers("AAAA2345", ["NewPeer"]);
-      const peersLock = h.pending.shift();
       h.ctrl.rename("AAAA2345", "");
-      const renameLock = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
 
-      pwLock?.resolve();
-      peersLock?.resolve();
-      renameLock?.resolve();
-      await Promise.resolve();
-
-      joinLock?.reject(new Error("AbortError"));
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       const mem = h.ctrl.getRooms().find((r) => r.code === "AAAA2345");
@@ -858,7 +847,7 @@ describe("RecentRoomsController", () => {
       expect(persistedRejoined?.password).toBe("NEW_PASS_9999999");
     }
 
-    // 3. Rejected out-of-order locks.request fallbacks for remove, handleFatalError("kicked"), and rename("") -> remove -> recordJoin
+    // 3. Single-flight + rejected lock (AbortError) fallback for remove, handleFatalError("kicked"), and rename("") -> remove -> recordJoin
     {
       const storage = makeMemoryStorage();
       const tasks: Promise<unknown>[] = [];
@@ -893,39 +882,23 @@ describe("RecentRoomsController", () => {
       ctrl.rename("KCCK2345", "Kicked Room");
       ctrl.recordJoin({ code: "XTHR2345", password: "OLD_SECRET_99999" });
       ctrl.rename("XTHR2345", "Secret Project");
-      while (pending.length > 0) {
-        pending.shift()?.resolve();
-        await Promise.resolve();
-      }
+      expect(pending).toHaveLength(1);
+      pending.shift()?.resolve();
       await Promise.all(tasks.splice(0));
 
       ctrl.remove("XANE2345");
-      const removeLock = pending.shift();
       ctrl.recordJoin({ code: "XANE2345" });
-      const joinX1Lock = pending.shift();
 
       ctrl.handleFatalError("KCCK2345", "kicked");
-      const kickedLock = pending.shift();
       ctrl.recordJoin({ code: "KCCK2345" });
-      const joinX2Lock = pending.shift();
 
       ctrl.rename("XTHR2345", "");
-      const renameClearLock = pending.shift();
       ctrl.remove("XTHR2345");
-      const removeX3Lock = pending.shift();
       ctrl.recordJoin({ code: "XTHR2345", password: "NEW_PASS_9999999" });
-      const joinX3Lock = pending.shift();
 
-      // New joins resolve BEFORE older removal/rename locks reject
-      joinX1Lock?.resolve();
-      joinX2Lock?.resolve();
-      joinX3Lock?.resolve();
-      await Promise.resolve();
-
-      removeLock?.reject(new Error("AbortError"));
-      kickedLock?.reject(new Error("AbortError"));
-      renameClearLock?.reject(new Error("AbortError"));
-      removeX3Lock?.reject(new Error("AbortError"));
+      expect(pending).toHaveLength(1);
+      ctrl.syncFromStorage();
+      pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(tasks.splice(0));
 
       for (const code of ["XANE2345", "KCCK2345"]) {
@@ -1245,22 +1218,22 @@ describe("RecentRoomsController", () => {
       return { ctrl, storage, tasks, pending };
     };
 
-    // 1. join(B, dt=0) -> join(A, dt=0) where Lock 1 rejects before Lock 0 grants
+    // 1. join(B, dt=0) -> join(A, dt=0) under single-flight + AbortError fallback
     {
       const h = makeLockHarness();
       h.ctrl.recordJoin({ code: "BBBB2345" });
-      const lockB = h.pending.shift();
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const lockA = h.pending.shift();
-      lockA?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockB?.resolve();
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
+
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
       expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
     }
 
-    // 2. Edge 2: [C, A] seeded; join(A) -> rename(A) -> join(B) with reverse lock rejection
+    // 2. Edge 2: [C, A] seeded; join(A) -> rename(A) -> join(B) under single-flight + AbortError fallback
     {
       const h = makeLockHarness();
       upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
@@ -1268,24 +1241,18 @@ describe("RecentRoomsController", () => {
       h.ctrl.syncFromStorage();
 
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const lockJoinA = h.pending.shift();
       h.ctrl.rename("AAAA2345", "RenamedA");
-      const lockRenameA = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345" });
-      const lockJoinB = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
 
-      lockJoinB?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockRenameA?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockJoinA?.resolve();
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
     }
 
-    // 3. Edge 3: [C, A] seeded; join(A) -> join(B) -> rename(A) with out-of-order lock rejections
+    // 3. Edge 3: [C, A] seeded; join(A) -> join(B) -> rename(A) under single-flight + AbortError fallback
     {
       const h = makeLockHarness();
       upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
@@ -1293,24 +1260,20 @@ describe("RecentRoomsController", () => {
       h.ctrl.syncFromStorage();
 
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const lockJoinA = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345" });
-      const lockJoinB = h.pending.shift();
       h.ctrl.rename("AAAA2345", "RenamedA");
-      const lockRenameA = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
 
-      lockJoinB?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockRenameA?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockJoinA?.resolve();
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
     }
 
-    // 4. Edge 10: [C, A] seeded; join(A) -> join(B) -> remove(B) -> rename(A)
+    // 4. Edge 10: [C, A] seeded; join(A) -> join(B) -> remove(B) -> rename(A) under single-flight + AbortError fallback
     {
       const h = makeLockHarness();
       upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
@@ -1318,41 +1281,29 @@ describe("RecentRoomsController", () => {
       h.ctrl.syncFromStorage();
 
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const lockJoinA = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345" });
-      const lockJoinB = h.pending.shift();
       h.ctrl.remove("BBBB2345");
-      const lockRemoveB = h.pending.shift();
       h.ctrl.rename("AAAA2345", "RenamedA");
-      const lockRenameA = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "CCCC2345"]);
 
-      lockJoinB?.reject(new Error("AbortError"));
-      lockRemoveB?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockRenameA?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockJoinA?.resolve();
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "CCCC2345"]);
     }
 
-    // 5. join(A) -> join(B) -> updatePassword(A) with out-of-order lock rejections
+    // 5. join(A) -> join(B) -> updatePassword(A) under single-flight + AbortError fallback
     {
       const h = makeLockHarness();
       h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      const lockJoinA = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345", password: "BBB_PASSWORD_2222" });
-      const lockJoinB = h.pending.shift();
       h.ctrl.updatePassword("AAAA2345", "NEW_PASSWORD_3333", false);
-      const lockPwA = h.pending.shift();
+      expect(h.pending).toHaveLength(1);
 
-      lockJoinB?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockPwA?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockJoinA?.resolve();
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
@@ -1360,7 +1311,7 @@ describe("RecentRoomsController", () => {
       expect(h.ctrl.getRooms()[1]?.password).toBe("NEW_PASSWORD_3333");
     }
 
-    // 6. 21-room same-ms join when C1's lock rejects last -> C1 stays evicted
+    // 6. 21-room same-ms join under single-flight + AbortError fallback -> C1 stays evicted
     {
       const h = makeLockHarness();
       const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -1368,12 +1319,8 @@ describe("RecentRoomsController", () => {
       for (const code of codes) {
         h.ctrl.recordJoin({ code });
       }
-      const lockC1 = h.pending.shift();
-      while (h.pending.length > 0) {
-        h.pending.shift()?.resolve();
-        await Promise.resolve();
-      }
-      lockC1?.reject(new Error("AbortError"));
+      expect(h.pending).toHaveLength(1);
+      h.pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(h.tasks.splice(0));
 
       const memCodes = h.ctrl.getRooms().map((r) => r.code);
@@ -1403,18 +1350,16 @@ describe("RecentRoomsController", () => {
       await Promise.all(h.tasks.splice(0));
       expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["XTB22345", "PERS2345", "XTAB2345"]);
 
-      // Unpersisted older join(AAAA) behind already-persisted newer join(BBBB) preserves [BBBB, AAAA] on syncFromStorage
+      // Queued joins [AAAA, BBBB] under single-flight while Tab B writes CCCC2345 to storage mid-flight
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const lockJoinA = h.pending.shift();
       h.ctrl.recordJoin({ code: "BBBB2345" });
-      const lockJoinB = h.pending.shift();
-      lockJoinB?.resolve();
-      await Promise.resolve();
+      expect(h.pending).toHaveLength(1);
+      upsertRecentRoom(h.storage, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
       h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code).slice(0, 2)).toEqual(["BBBB2345", "AAAA2345"]);
-      lockJoinA?.resolve();
+      expect(h.ctrl.getRooms().map((r) => r.code).slice(0, 3)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
+      h.pending.shift()?.resolve();
       await Promise.all(h.tasks.splice(0));
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code).slice(0, 2)).toEqual(["BBBB2345", "AAAA2345"]);
+      expect(loadRecentRooms(h.storage, now).map((r) => r.code).slice(0, 3)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
     }
   });
 
@@ -1466,12 +1411,7 @@ describe("RecentRoomsController", () => {
       h.ctrl.updatePeers("SYNA2345", ["PeerOne"]);
       h.ctrl.rename("SYNA2345", "");
 
-      // Flush lock 1 (skipped updatePassword) and lock 2 (NEWC2345) while SYNA2345 updates remain pending
-      h.pendingLockReleases.shift()?.();
-      await Promise.resolve();
-      h.pendingLockReleases.shift()?.();
-      await Promise.resolve();
-
+      expect(h.pendingLockReleases).toHaveLength(1);
       h.ctrl.syncFromStorage();
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["NEWC2345", "SYNA2345", "PERS2345"]);
 
@@ -1519,18 +1459,12 @@ describe("RecentRoomsController", () => {
       ctrl.syncFromStorage();
 
       ctrl.rename("SYNA2345", "First");
-      const lockFirst = pending.shift();
       ctrl.recordJoin({ code: "NEWC2345" });
-      const lockJoin = pending.shift();
       ctrl.rename("SYNA2345", "Second");
-      const lockSecond = pending.shift();
+      expect(pending).toHaveLength(1);
 
-      // Second rename resolves first, then First rejects (AbortError), then recordJoin resolves last
-      lockSecond?.resolve();
-      await Promise.resolve();
-      lockFirst?.reject(new Error("AbortError"));
-      await Promise.resolve();
-      lockJoin?.resolve();
+      ctrl.syncFromStorage();
+      pending.shift()?.reject(new Error("AbortError"));
       await Promise.all(tasks.splice(0));
 
       expect(ctrl.getRooms().map((r) => r.code)).toEqual(["NEWC2345", "SYNA2345", "PERS2345"]);
@@ -1637,21 +1571,15 @@ describe("RecentRoomsController", () => {
       });
 
       ctrl.clearAll();
-      const clearLock = pending.shift();
       ctrl.recordJoin({ code: "BBBB2345" });
-      const lockB = pending.shift();
       ctrl.recordJoin({ code: "CCCC2345" });
-      const lockC = pending.shift();
-
-      if (rejectLockC) lockC?.reject(new Error("AbortError"));
-      else lockC?.resolve();
-      await Promise.resolve();
+      expect(pending).toHaveLength(1);
 
       ctrl.syncFromStorage();
       expect(ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345", "BBBB2345"]);
 
-      lockB?.resolve();
-      clearLock?.resolve();
+      if (rejectLockC) pending.shift()?.reject(new Error("AbortError"));
+      else pending.shift()?.resolve();
       await Promise.all(tasks.splice(0));
 
       expect(ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345", "BBBB2345"]);
@@ -1778,7 +1706,7 @@ describe("RecentRoomsController", () => {
       expect(h.ctrl.getRooms()).toEqual([]);
     }
 
-    // 2. Tab A starts disabled, calls setDisabled(false) -> recordJoin(...) -> works in both FIFO and out-of-order lock execution
+    // 2. Tab A starts disabled, calls setDisabled(false) -> recordJoin(...) under single-flight + cross-tab opt-out race
     {
       const storage = makeMemoryStorage({ [RECENT_ROOMS_OPT_OUT_KEY]: "1" });
       const tasks: Promise<unknown>[] = [];
@@ -1809,21 +1737,21 @@ describe("RecentRoomsController", () => {
       expect(ctrl.isDisabled()).toBe(true);
 
       ctrl.setDisabled(false);
-      const enableLock = pending.shift();
       ctrl.recordJoin({ code: "CCCC2345", password: "NEW_PASS_1234567" });
-      const joinLock = pending.shift();
-
-      // Out-of-order: joinLock runs first and flushes opt-out removal before saving
-      joinLock?.resolve();
-      await Promise.resolve();
+      expect(pending).toHaveLength(1);
+      pending.shift()?.resolve();
+      await Promise.all(tasks.splice(0));
       expect(isRecentRoomsDisabled(storage)).toBe(false);
       expect(loadRecentRooms(storage, now).map((r) => r.code)).toEqual(["CCCC2345"]);
 
-      // Tab B sets opt-out after Tab A's enable already flushed; stale enableLock must NOT clobber Tab B's opt-out
+      // Tab B sets opt-out after Tab A's enable already flushed; Tab A's next join observes opt-out without overwriting it
       storage.setItem(RECENT_ROOMS_OPT_OUT_KEY, "1");
-      enableLock?.resolve();
+      ctrl.recordJoin({ code: "DDDD2345", password: "NEW_PASS_2345678" });
+      expect(pending).toHaveLength(1);
+      pending.shift()?.resolve();
       await Promise.all(tasks.splice(0));
       expect(isRecentRoomsDisabled(storage)).toBe(true);
+      expect(ctrl.isDisabled()).toBe(true);
     }
 
     // 3. Tab A calls setDisabled(false), flushes; Tab B sets opt-out; Tab A calls recordJoin before storage event -> blocked
@@ -1869,7 +1797,7 @@ describe("RecentRoomsController", () => {
       expect(h.ctrl.getRooms()).toEqual([]);
     }
 
-    // 1b. Out-of-order patches after external delete: newer gen 3 runs first -> sets lastExternalDeleteGen -> older gen 2 skips
+    // 1b. Queued patches under single-flight lock observe external delete, scrub memory, and do not taint subsequent Tab B re-add
     {
       const storage = makeMemoryStorage();
       const tasks: Promise<unknown>[] = [];
@@ -1903,20 +1831,21 @@ describe("RecentRoomsController", () => {
 
       storage.removeItem(RECENT_ROOMS_STORAGE_KEY);
       ctrl.updatePeers("AAAA2345", ["PeerOne"]);
-      const peersLock = pending.shift();
       ctrl.rename("AAAA2345", "GhostLabel");
-      const renameLock = pending.shift();
+      expect(pending).toHaveLength(1);
+      const changesBeforeFlush = onChange.mock.calls.length;
 
-      renameLock?.resolve();
-      await Promise.resolve();
-      const changesAfterRename = onChange.mock.calls.length;
-
-      // Re-add AAAA2345 externally; older pre-delete peersLock MUST be skipped by lastExternalDeleteGen >= gen
-      upsertRecentRoom(storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
-      peersLock?.resolve();
+      pending.shift()?.resolve();
       await Promise.all(tasks.splice(0));
-      expect(onChange).toHaveBeenCalledTimes(changesAfterRename);
+      expect(onChange.mock.calls.length).toBeGreaterThan(changesBeforeFlush);
+      expect(ctrl.getRooms()).toEqual([]);
+
+      // Tab B re-adds AAAA2345 externally; Tab A syncs cleanly with empty peerNames and no GhostLabel
+      upsertRecentRoom(storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
+      ctrl.syncFromStorage();
       expect(loadRecentRooms(storage, now)[0]?.peerNames).toEqual([]);
+      expect(ctrl.getRooms()[0]?.peerNames).toEqual([]);
+      expect(ctrl.getRooms()[0]?.label).toBeUndefined();
     }
 
     // 2. Pre-delete updatePeers followed by a brand-new recordJoin after Tab B deleted -> pre-delete patch does not attach to new join
@@ -2014,7 +1943,7 @@ describe("RecentRoomsController", () => {
     ctrl.syncFromStorage(false);
     expect(lockCalls).toHaveLength(1);
 
-    // If clearAll() or setDisabled(true) runs while purge lock is pending, purge skips writing
+    // If clearAll() or setDisabled(true) runs while purge lock is pending, single-flight reuses the pending lock and skips purge
     storage.setItem(
       RECENT_ROOMS_STORAGE_KEY,
       JSON.stringify([{ code: "EXPD2345", role: "guest", lastJoinedAt: now - RECENT_ROOM_TTL_MS }]),
@@ -2022,34 +1951,25 @@ describe("RecentRoomsController", () => {
     ctrl.syncFromStorage(false);
     expect(lockCalls).toHaveLength(2);
     ctrl.clearAll();
-    const purgeLock = pending.shift();
-    const clearLock = pending.shift();
-    // While pendingClearAll > 0, syncFromStorage does not schedule another purge
     ctrl.syncFromStorage(false);
-    expect(lockCalls).toHaveLength(3);
-    purgeLock?.();
-    await Promise.resolve();
-    expect(storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(true); // purge skipped because clearAllGen > persistedClearAllGen
-    clearLock?.();
+    expect(lockCalls).toHaveLength(2);
+    pending.shift()?.();
     await Promise.all(tasks.splice(0));
     expect(storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
 
-    // If setDisabled(true) runs while purge lock is pending, purge skips writing
+    // If setDisabled(true) runs while purge lock is pending, single-flight reuses the pending lock and skips purge
     storage.setItem(
       RECENT_ROOMS_STORAGE_KEY,
       JSON.stringify([{ code: "EXPD2345", role: "guest", lastJoinedAt: now - RECENT_ROOM_TTL_MS }]),
     );
     ctrl.syncFromStorage(false);
-    expect(lockCalls).toHaveLength(4);
+    expect(lockCalls).toHaveLength(3);
     ctrl.setDisabled(true);
-    const purgeLock2 = pending.shift();
-    const disableLock2 = pending.shift();
-    purgeLock2?.();
-    await Promise.resolve();
-    expect(storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(true);
-    disableLock2?.();
+    expect(lockCalls).toHaveLength(3);
+    pending.shift()?.();
     await Promise.all(tasks.splice(0));
     expect(storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+    expect(isRecentRoomsDisabled(storage)).toBe(true);
   });
 
   it("retains local deletions, clearAll, and opt-out across storage errors and retries when recovered (Finding #9)", async () => {
@@ -2313,33 +2233,31 @@ describe("RecentRoomsController", () => {
       expect(ctrl.getSearchQuery()).toBe("");
     }
 
-    // 3. Double pending setDisabled & pendingClearAll edge cases (Explorer M3-3 killers)
+    // 3. Double pending setDisabled & pendingClearAll edge cases under single-flight queue
     {
       const h = makeHarness({ deferredLocks: true, now: () => now });
       h.ctrl.recordJoin({ code: "AAAA2345" });
       await h.flush();
 
-      // setDisabled(true) -> setDisabled(false) -> flush lock 1 only -> syncFromStorage keeps isDisabled === false
+      // setDisabled(true) -> setDisabled(false) -> mid-flight syncFromStorage keeps isDisabled === false
       h.ctrl.setDisabled(true);
       h.ctrl.setDisabled(false);
-      h.pendingLockReleases.shift()?.();
-      await Promise.resolve();
+      expect(h.pendingLockReleases).toHaveLength(1);
       h.ctrl.syncFromStorage();
       expect(h.ctrl.isDisabled()).toBe(false);
       await h.flush();
 
-      // setDisabled(true) -> setDisabled(false) -> setDisabled(true) -> flush lock 1 only -> Tab 2 writes XTAB -> syncFromStorage keeps []
+      // setDisabled(true) -> setDisabled(false) -> setDisabled(true) -> Tab 2 writes XTAB -> mid-flight syncFromStorage keeps []
       h.ctrl.setDisabled(true);
       h.ctrl.setDisabled(false);
       h.ctrl.setDisabled(true);
-      h.pendingLockReleases.shift()?.();
-      await Promise.resolve();
+      expect(h.pendingLockReleases).toHaveLength(1);
       upsertRecentRoom(h.storage, { code: "XTAB2345", role: "guest", lastJoinedAt: now }, now);
       h.ctrl.syncFromStorage();
       expect(h.ctrl.getRooms()).toEqual([]);
       await h.flush();
 
-      // clearAll -> recordJoin(BBBB) -> remove(BBBB) while clearAll lock is pending -> syncFromStorage keeps BBBB removed
+      // clearAll -> recordJoin(BBBB) -> remove(BBBB) while lock is pending -> syncFromStorage keeps BBBB removed
       h.ctrl.setDisabled(false);
       await h.flush();
       h.ctrl.clearAll();
@@ -2349,64 +2267,83 @@ describe("RecentRoomsController", () => {
       expect(h.ctrl.getRooms()).toEqual([]);
       await h.flush();
 
-      // remove(A) lock 1 pending -> recordJoin(A) -> remove(A) lock 2 pending -> resolve lock 1 only -> syncFromStorage keeps A absent
+      // remove(A) -> recordJoin(A) -> remove(A) while single-flight lock is pending -> syncFromStorage keeps A absent
       h.ctrl.recordJoin({ code: "AAAA2345" });
       await h.flush();
       h.ctrl.remove("AAAA2345");
-      const rem1 = h.pendingLockReleases.shift();
       h.ctrl.recordJoin({ code: "AAAA2345" });
-      const join2 = h.pendingLockReleases.shift();
       h.ctrl.remove("AAAA2345");
-      rem1?.();
-      join2?.();
-      await Promise.resolve();
+      expect(h.pendingLockReleases).toHaveLength(1);
       h.ctrl.syncFromStorage();
       expect(h.ctrl.getRooms()).toEqual([]);
       await h.flush();
+      expect(loadRecentRooms(h.storage, now)).toEqual([]);
     }
   });
 
   it("preserves synthesized host metadata edits across recordJoin (FIFO & reverse) and Tab B concurrent joins (Probes 1B & Reviewer 2)", async () => {
     const now = 1_700_000_000_000;
 
-    // 1. Synthesized host-rooms rename / updatePeers / updatePassword -> recordJoin under FIFO and reverse lock order
-    for (const reverseOrder of [false, true]) {
-      const h = makeHarness({ creatorCodes: new Set(["SYNA2345", "SYNB2345", "SYNC2345"]), deferredLocks: true, now: () => now });
-      writePersistedHostToken(h.storage, "SYNA2345", "tok-a", now - 1000);
-      writePersistedHostToken(h.storage, "SYNB2345", "tok-b", now - 2000);
-      writePersistedHostToken(h.storage, "SYNC2345", "tok-c", now - 3000);
-      h.ctrl.syncFromStorage(false);
+    // 1. Synthesized host-rooms rename / updatePeers / updatePassword -> recordJoin under single-flight + AbortError fallback
+    for (const rejectLock of [false, true]) {
+      const storage = makeMemoryStorage();
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve, reject) => {
+            pending.push({
+              resolve: () => {
+                void Promise.resolve(cb()).finally(resolve);
+              },
+              reject,
+            });
+          }),
+      };
+      const creatorCodes = new Set(["SYNA2345", "SYNB2345", "SYNC2345"]);
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: (c) => creatorCodes.has(c),
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      writePersistedHostToken(storage, "SYNA2345", "tok-a", now - 1000);
+      writePersistedHostToken(storage, "SYNB2345", "tok-b", now - 2000);
+      writePersistedHostToken(storage, "SYNC2345", "tok-c", now - 3000);
+      ctrl.syncFromStorage(false);
 
-      h.ctrl.rename("SYNA2345", "Work Sync");
-      h.ctrl.recordJoin({ code: "SYNA2345", password: "JOIN_PASS_A_1234" });
+      ctrl.rename("SYNA2345", "Work Sync");
+      ctrl.recordJoin({ code: "SYNA2345", password: "JOIN_PASS_A_1234" });
 
-      h.ctrl.updatePeers("SYNB2345", ["Bob"]);
-      h.ctrl.recordJoin({ code: "SYNB2345", password: "JOIN_PASS_B_1234" });
+      ctrl.updatePeers("SYNB2345", ["Bob"]);
+      ctrl.recordJoin({ code: "SYNB2345", password: "JOIN_PASS_B_1234" });
 
-      h.ctrl.updatePassword("SYNC2345", "PATCH_PASS_C_123", false);
-      h.ctrl.recordJoin({ code: "SYNC2345" });
+      ctrl.updatePassword("SYNC2345", "PATCH_PASS_C_123", false);
+      ctrl.recordJoin({ code: "SYNC2345" });
 
-      if (reverseOrder) {
-        const locks = h.pendingLockReleases.splice(0).reverse();
-        for (const release of locks) {
-          release();
-          await Promise.resolve();
-        }
-      }
-      await h.flush();
+      expect(pending).toHaveLength(1);
+      if (rejectLock) pending.shift()?.reject(new Error("AbortError"));
+      else pending.shift()?.resolve();
+      await Promise.all(tasks.splice(0));
 
-      const synaMem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
-      const synaDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
+      const synaMem = ctrl.getRooms().find((r) => r.code === "SYNA2345");
+      const synaDisk = loadRecentRooms(storage, now).find((r) => r.code === "SYNA2345");
       expect(synaMem?.label).toBe("Work Sync");
       expect(synaMem?.password).toBe("JOIN_PASS_A_1234");
       expect(synaDisk?.label).toBe("Work Sync");
       expect(synaDisk?.password).toBe("JOIN_PASS_A_1234");
 
-      const synbDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNB2345");
+      const synbDisk = loadRecentRooms(storage, now).find((r) => r.code === "SYNB2345");
       expect(synbDisk?.peerNames).toEqual(["Bob"]);
       expect(synbDisk?.password).toBe("JOIN_PASS_B_1234");
 
-      const syncDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNC2345");
+      const syncDisk = loadRecentRooms(storage, now).find((r) => r.code === "SYNC2345");
       expect(syncDisk?.password).toBe("PATCH_PASS_C_123");
     }
 
@@ -2506,49 +2443,64 @@ describe("RecentRoomsController", () => {
       expect(disk?.password).toBe("PASS2_1234567890");
     }
 
-    // 1C-v2 & field precedence: recordJoin -> rename / updatePassword / updatePeers -> recordJoin with out-of-order locks
-    {
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-      h.ctrl.recordJoin({ code: "ABCD2345", password: "PASS1_1234567890" });
-      h.ctrl.rename("ABCD2345", "Keep My Label");
-      h.ctrl.recordJoin({ code: "ABCD2345", password: "PASS2_1234567890" });
+    // 1C-v2 & field precedence: recordJoin -> rename / updatePassword / updatePeers -> recordJoin under single-flight + AbortError fallback
+    for (const rejectLock of [false, true]) {
+      const storage = makeMemoryStorage();
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve, reject) => {
+            pending.push({
+              resolve: () => {
+                void Promise.resolve(cb()).finally(resolve);
+              },
+              reject,
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
 
-      // Resolve rename lock (lock 2) BEFORE join1 (lock 1) and join2 (lock 3)
-      const join1 = h.pendingLockReleases.shift();
-      const renameLock = h.pendingLockReleases.shift();
-      const join2 = h.pendingLockReleases.shift();
-      renameLock?.();
-      await Promise.resolve();
-      join1?.();
-      join2?.();
-      await h.flush();
+      ctrl.recordJoin({ code: "ABCD2345", password: "PASS1_1234567890" });
+      ctrl.rename("ABCD2345", "Keep My Label");
+      ctrl.recordJoin({ code: "ABCD2345", password: "PASS2_1234567890" });
+      expect(pending).toHaveLength(1);
+      ctrl.syncFromStorage();
 
-      const mem = h.ctrl.getRooms().find((r) => r.code === "ABCD2345");
-      const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "ABCD2345");
+      if (rejectLock) pending.shift()?.reject(new Error("AbortError"));
+      else pending.shift()?.resolve();
+      await Promise.all(tasks.splice(0));
+
+      const mem = ctrl.getRooms().find((r) => r.code === "ABCD2345");
+      const disk = loadRecentRooms(storage, now).find((r) => r.code === "ABCD2345");
       expect(mem?.label).toBe("Keep My Label");
       expect(mem?.password).toBe("PASS2_1234567890");
       expect(disk?.label).toBe("Keep My Label");
       expect(disk?.password).toBe("PASS2_1234567890");
 
-      // Newer recordJoin password overrides older updatePassword even when updatePassword lock resolves first;
-      // omitted peerNames in newer recordJoin retains earlier updatePeers
-      h.ctrl.recordJoin({ code: "EFGH2345", password: "INIT_PASS_123456" });
-      h.ctrl.updatePassword("EFGH2345", "OLD_PATCH_PASS12", false);
-      h.ctrl.updatePeers("EFGH2345", ["Alice"]);
-      h.ctrl.recordJoin({ code: "EFGH2345", password: "NEW_JOIN_PASS123" });
-      const eJoin1 = h.pendingLockReleases.shift();
-      const ePwPatch = h.pendingLockReleases.shift();
-      const ePeersPatch = h.pendingLockReleases.shift();
-      const eJoin2 = h.pendingLockReleases.shift();
-      ePwPatch?.();
-      await Promise.resolve();
-      ePeersPatch?.();
-      await Promise.resolve();
-      eJoin1?.();
-      eJoin2?.();
-      await h.flush();
+      // Newer recordJoin password overrides older updatePassword; omitted peerNames in newer recordJoin retains earlier updatePeers
+      ctrl.recordJoin({ code: "EFGH2345", password: "INIT_PASS_123456" });
+      ctrl.updatePassword("EFGH2345", "OLD_PATCH_PASS12", false);
+      ctrl.updatePeers("EFGH2345", ["Alice"]);
+      ctrl.recordJoin({ code: "EFGH2345", password: "NEW_JOIN_PASS123" });
+      expect(pending).toHaveLength(1);
 
-      const efghDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "EFGH2345");
+      if (rejectLock) pending.shift()?.reject(new Error("AbortError"));
+      else pending.shift()?.resolve();
+      await Promise.all(tasks.splice(0));
+
+      const efghDisk = loadRecentRooms(storage, now).find((r) => r.code === "EFGH2345");
       expect(efghDisk?.password).toBe("NEW_JOIN_PASS123");
       expect(efghDisk?.peerNames).toEqual(["Alice"]);
     }
@@ -2665,13 +2617,13 @@ describe("RecentRoomsController", () => {
       await Promise.all(h.tasks.splice(0));
       expect(loadRecentRooms(h.inner, now + 1000).some((r) => r.code === "ABCD2345")).toBe(false);
 
-      // Subsequent cross-tab write is visible because persistedClearAllGen caught up to clearAllGen
+      // Subsequent cross-tab write is visible because queued clear-all drained to disk
       upsertRecentRoom(h.inner, { code: "JKMN2345", role: "guest", lastJoinedAt: now + 2000 }, now + 2000);
       h.ctrl.syncFromStorage();
       expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["JKMN2345"]);
     }
 
-    // 4. Synthesized room failed rename reverts cleanly, and newer queued rename survives earlier failed rename
+    // 4. Synthesized room failed rename reverts cleanly, and single-flight batch failure drops queued renames cleanly before recovery
     {
       const inner = makeMemoryStorage();
       let failSet = false;
@@ -2724,13 +2676,17 @@ describe("RecentRoomsController", () => {
 
       failSet = true;
       ctrl.rename("ABCD2345", "Label 1 Fail");
-      const lockFail = pending.shift();
-      ctrl.rename("ABCD2345", "Label 2 Keep");
-      const lockKeep = pending.shift();
-      lockFail?.();
-      await Promise.resolve();
+      ctrl.rename("ABCD2345", "Label 2 Fail");
+      expect(pending).toHaveLength(1);
+      pending.shift()?.();
+      await Promise.all(tasks.splice(0));
+      expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBeUndefined();
+      expect(loadRecentRooms(inner, now).find((r) => r.code === "ABCD2345")?.label).toBeUndefined();
+
       failSet = false;
-      lockKeep?.();
+      ctrl.rename("ABCD2345", "Label 2 Keep");
+      expect(pending).toHaveLength(1);
+      pending.shift()?.();
       await Promise.all(tasks.splice(0));
       expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBe("Label 2 Keep");
       expect(loadRecentRooms(inner, now).find((r) => r.code === "ABCD2345")?.label).toBe("Label 2 Keep");
@@ -2741,46 +2697,34 @@ describe("RecentRoomsController", () => {
     const now = 1_700_000_000_000;
 
     for (const runSyncBeforeJoin of [true, false]) {
-      for (const reverseOrder of [false, true]) {
-        const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
-        writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 1000);
+      const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
+      writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 1000);
+      h.ctrl.syncFromStorage(false);
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNA2345"]);
+
+      h.ctrl.rename("SYNA2345", "Stale Pre-Delete Label");
+      expect(h.pendingLockReleases).toHaveLength(1);
+
+      // External Tab B deletes SYNA2345 from host-rooms and creator tokens
+      h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
+      h.creatorCodes.delete("SYNA2345");
+      if (runSyncBeforeJoin) {
         h.ctrl.syncFromStorage(false);
-        expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNA2345"]);
-
-        h.ctrl.rename("SYNA2345", "Stale Pre-Delete Label");
-        const renameLock = h.pendingLockReleases.shift();
-
-        // External Tab B deletes SYNA2345 from host-rooms and creator tokens
-        h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
-        h.creatorCodes.delete("SYNA2345");
-        if (runSyncBeforeJoin) {
-          h.ctrl.syncFromStorage(false);
-          expect(h.ctrl.getRooms()).toEqual([]);
-        }
-
-        h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_GUEST_PW12" });
-        const joinLock = h.pendingLockReleases.shift();
-
-        if (reverseOrder) {
-          joinLock?.();
-          await Promise.resolve();
-          renameLock?.();
-        } else {
-          renameLock?.();
-          await Promise.resolve();
-          joinLock?.();
-        }
-        await h.flush();
-
-        const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
-        const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
-        expect(mem).toBeDefined();
-        expect(mem?.password).toBe("FRESH_GUEST_PW12");
-        expect(mem?.label).toBeUndefined();
-        expect(disk).toBeDefined();
-        expect(disk?.password).toBe("FRESH_GUEST_PW12");
-        expect(disk?.label).toBeUndefined();
+        expect(h.ctrl.getRooms()).toEqual([]);
       }
+
+      h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_GUEST_PW12" });
+      expect(h.pendingLockReleases).toHaveLength(1);
+      await h.flush();
+
+      const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
+      const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
+      expect(mem).toBeDefined();
+      expect(mem?.password).toBe("FRESH_GUEST_PW12");
+      expect(mem?.label).toBeUndefined();
+      expect(disk).toBeDefined();
+      expect(disk?.password).toBe("FRESH_GUEST_PW12");
+      expect(disk?.label).toBeUndefined();
     }
   });
 
@@ -2789,69 +2733,84 @@ describe("RecentRoomsController", () => {
 
     // 1H: pendingJoin + failed rename -> failed label scrubbed from memory & disk; prior saved label restored
     for (const withPriorLabel of [false, true]) {
-      const inner = makeMemoryStorage();
-      let failSet = false;
-      const storage: StorageLike = {
-        getItem: (k) => inner.getItem(k),
-        setItem: (k, v) => {
-          if (failSet) throw new Error("QuotaExceededError");
-          inner.setItem(k, v);
-        },
-        removeItem: (k) => inner.removeItem(k),
-      };
-      const tasks: Promise<unknown>[] = [];
-      const pending: Array<() => void> = [];
-      const locks: LockManagerLike = {
-        request: async (_name, cb) => {
-          await new Promise<void>((resolve) => {
-            pending.push(() => {
-              void Promise.resolve(cb()).finally(resolve);
+      for (const batchMode of [false, true]) {
+        const inner = makeMemoryStorage();
+        let failSet = false;
+        let failWriteNum = 0;
+        let writeCount = 0;
+        const storage: StorageLike = {
+          getItem: (k) => inner.getItem(k),
+          setItem: (k, v) => {
+            writeCount += 1;
+            if (failSet || (failWriteNum > 0 && writeCount === failWriteNum)) {
+              throw new Error("QuotaExceededError");
+            }
+            inner.setItem(k, v);
+          },
+          removeItem: (k) => inner.removeItem(k),
+        };
+        const tasks: Promise<unknown>[] = [];
+        const pending: Array<() => void> = [];
+        const locks: LockManagerLike = {
+          request: async (_name, cb) => {
+            await new Promise<void>((resolve) => {
+              pending.push(() => {
+                void Promise.resolve(cb()).finally(resolve);
+              });
             });
-          });
-        },
-      };
-      const ctrl = new RecentRoomsController({
-        getLocalStorage: () => storage,
-        getLocks: () => locks,
-        runBackground: (t) => {
-          tasks.push(t);
-        },
-        hasSavedCreatorHostFor: () => false,
-        onRemoveHostToken: vi.fn(),
-        onForgetAllHostTokens: vi.fn(),
-        onChange: vi.fn(),
-        now: () => now,
-      });
+          },
+        };
+        const ctrl = new RecentRoomsController({
+          getLocalStorage: () => storage,
+          getLocks: () => locks,
+          runBackground: (t) => {
+            tasks.push(t);
+          },
+          hasSavedCreatorHostFor: () => false,
+          onRemoveHostToken: vi.fn(),
+          onForgetAllHostTokens: vi.fn(),
+          onChange: vi.fn(),
+          now: () => now,
+        });
 
-      ctrl.recordJoin({ code: "ABCD2345", password: "PW1_123456789012" });
-      if (withPriorLabel) ctrl.rename("ABCD2345", "Saved Label");
-      while (pending.length > 0) pending.shift()?.();
-      await Promise.all(tasks.splice(0));
+        ctrl.recordJoin({ code: "ABCD2345", password: "PW1_123456789012" });
+        if (withPriorLabel) ctrl.rename("ABCD2345", "Saved Label");
+        expect(pending).toHaveLength(1);
+        pending.shift()?.();
+        await Promise.all(tasks.splice(0));
 
-      ctrl.recordJoin({ code: "ABCD2345", password: "PW2_123456789012" });
-      const joinLock = pending.shift();
-      ctrl.rename("ABCD2345", withPriorLabel ? "" : "Failed Ghost Label");
-      const renameLock = pending.shift();
+        if (batchMode) {
+          writeCount = 0;
+          failWriteNum = 2; // write #1 (recordJoin PW2) succeeds, write #2 (rename) fails
+          ctrl.recordJoin({ code: "ABCD2345", password: "PW2_123456789012" });
+          ctrl.rename("ABCD2345", withPriorLabel ? "" : "Failed Ghost Label");
+          expect(pending).toHaveLength(1);
+          pending.shift()?.();
+          await Promise.all(tasks.splice(0));
+        } else {
+          ctrl.recordJoin({ code: "ABCD2345", password: "PW2_123456789012" });
+          pending.shift()?.();
+          await Promise.all(tasks.splice(0));
 
-      failSet = true;
-      renameLock?.();
-      await Promise.resolve();
-      failSet = false;
-      joinLock?.();
-      await Promise.all(tasks.splice(0));
+          failSet = true;
+          ctrl.rename("ABCD2345", withPriorLabel ? "" : "Failed Ghost Label");
+          pending.shift()?.();
+          await Promise.all(tasks.splice(0));
+        }
 
-      const mem = ctrl.getRooms().find((r) => r.code === "ABCD2345");
-      const disk = loadRecentRooms(inner, now).find((r) => r.code === "ABCD2345");
-      expect(mem).toBeDefined();
-      expect(mem?.password).toBe("PW2_123456789012");
-      expect(mem?.label).toBe(withPriorLabel ? "Saved Label" : undefined);
-      expect(disk).toBeDefined();
-      expect(disk?.password).toBe("PW2_123456789012");
-      expect(disk?.label).toBe(withPriorLabel ? "Saved Label" : undefined);
+        const mem = ctrl.getRooms().find((r) => r.code === "ABCD2345");
+        const disk = loadRecentRooms(inner, now).find((r) => r.code === "ABCD2345");
+        expect(mem).toBeDefined();
+        expect(mem?.password).toBe("PW2_123456789012");
+        expect(mem?.label).toBe(withPriorLabel ? "Saved Label" : undefined);
+        expect(disk).toBeDefined();
+        expect(disk?.password).toBe("PW2_123456789012");
+        expect(disk?.label).toBe(withPriorLabel ? "Saved Label" : undefined);
+      }
     }
 
-    // 1L: synthesized host room failed rename + sibling updatePeers (both FIFO and reverse lock orders)
-    for (const reverseOrder of [false, true]) {
+    // 1L: synthesized host room failed rename + sibling updatePeers (sequential recovery & batch failure)
+    for (const batchFailure of [false, true]) {
       const inner = makeMemoryStorage();
       let failSet = false;
       const storage: StorageLike = {
@@ -2889,25 +2848,20 @@ describe("RecentRoomsController", () => {
       writePersistedHostToken(inner, "SYNA2345", "tok-syna", now - 1000);
       ctrl.syncFromStorage(false);
 
+      failSet = true;
       ctrl.rename("SYNA2345", "Failed Synth Label");
-      const renameLock = pending.shift();
-      ctrl.updatePeers("SYNA2345", ["Alice"]);
-      const peersLock = pending.shift();
+      if (batchFailure) ctrl.updatePeers("SYNA2345", ["DroppedPeer"]);
+      expect(pending).toHaveLength(1);
+      pending.shift()?.();
+      await Promise.all(tasks.splice(0));
 
-      if (reverseOrder) {
-        peersLock?.();
-        await Promise.resolve();
-        failSet = true;
-        renameLock?.();
-        await Promise.resolve();
-        failSet = false;
-      } else {
-        failSet = true;
-        renameLock?.();
-        await Promise.resolve();
-        failSet = false;
-        peersLock?.();
-      }
+      expect(ctrl.getRooms().find((r) => r.code === "SYNA2345")?.label).toBeUndefined();
+      expect(ctrl.getRooms().find((r) => r.code === "SYNA2345")?.peerNames).toEqual([]);
+
+      failSet = false;
+      ctrl.updatePeers("SYNA2345", ["Alice"]);
+      expect(pending).toHaveLength(1);
+      pending.shift()?.();
       await Promise.all(tasks.splice(0));
 
       const mem = ctrl.getRooms().find((r) => r.code === "SYNA2345");
@@ -3157,34 +3111,54 @@ describe("RecentRoomsController", () => {
     }
   });
 
-  it("drops all multi-patch pre-delete edits on externally deleted synthesized rooms across lock permutations (Multi-Patch 1E-ExternalDelete-NoSync)", async () => {
+  it("drops all multi-patch pre-delete edits on externally deleted synthesized rooms under single-flight and AbortError fallback (Multi-Patch 1E-ExternalDelete-NoSync)", async () => {
     const now = 1_700_000_000_000;
-    const permutations: Array<readonly [number, number, number]> = [
-      [0, 1, 2],
-      [2, 1, 0],
-      [0, 2, 1],
-      [1, 2, 0],
-      [2, 0, 1],
-    ];
+    const makeLockCtrl = () => {
+      const storage = makeMemoryStorage();
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+      const creatorCodes = new Set(["SYNA2345"]);
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve, reject) => {
+            pending.push({
+              resolve: () => {
+                void Promise.resolve(cb()).finally(resolve);
+              },
+              reject,
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: (c) => creatorCodes.has(c),
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      writePersistedHostToken(storage, "SYNA2345", "tok-syna", now - 1000);
+      ctrl.syncFromStorage(false);
+      return { ctrl, storage, tasks, pending, creatorCodes };
+    };
 
-    // 1. rename + updatePeers before external delete -> recordJoin
-    for (const order of permutations) {
-      const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
-      writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 1000);
-      h.ctrl.syncFromStorage(false);
-
+    // 1. rename + updatePeers before external delete -> recordJoin (normal resolve & AbortError fallback)
+    for (const rejectLock of [false, true]) {
+      const h = makeLockCtrl();
       h.ctrl.rename("SYNA2345", "Stale Multi Label");
       h.ctrl.updatePeers("SYNA2345", ["StalePeer"]);
       h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
       h.creatorCodes.delete("SYNA2345");
       h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_MULTI_PW12" });
 
-      const locks = h.pendingLockReleases.splice(0);
-      for (const idx of order) {
-        locks[idx]?.();
-        await Promise.resolve();
-      }
-      await h.flush();
+      expect(h.pending).toHaveLength(1);
+      if (rejectLock) h.pending.shift()?.reject(new Error("AbortError"));
+      else h.pending.shift()?.resolve();
+      await Promise.all(h.tasks.splice(0));
 
       const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
       const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
@@ -3198,56 +3172,39 @@ describe("RecentRoomsController", () => {
       expect(disk?.label).toBeUndefined();
     }
 
-    // 2. updatePeers + rename AND rename1 + rename2 before external delete -> recordJoin under [3,2,1] and [1,3,2]
+    // 2. updatePeers + rename AND rename1 + rename2 before external delete -> recordJoin
     for (const variant of ["peers-then-rename", "rename-twice"] as const) {
-      for (const order of [
-        [2, 1, 0],
-        [0, 2, 1],
-      ] as const) {
-        const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
-        writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 1000);
-        h.ctrl.syncFromStorage(false);
-
-        if (variant === "peers-then-rename") {
-          h.ctrl.updatePeers("SYNA2345", ["StalePeer"]);
-          h.ctrl.rename("SYNA2345", "Stale Ghost Label");
-        } else {
-          h.ctrl.rename("SYNA2345", "Old1");
-          h.ctrl.rename("SYNA2345", "Old2");
-        }
-        h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
-        h.creatorCodes.delete("SYNA2345");
-        h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_GUEST_PW12" });
-
-        const locks = h.pendingLockReleases.splice(0);
-        for (const idx of order) {
-          locks[idx]?.();
-          await Promise.resolve();
-        }
-        await h.flush();
-
-        const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
-        const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
-        expect(mem).toBeDefined();
-        expect(mem?.password).toBe("FRESH_GUEST_PW12");
-        expect(mem?.peerNames).toEqual([]);
-        expect(mem?.label).toBeUndefined();
-        expect(disk).toBeDefined();
-        expect(disk?.password).toBe("FRESH_GUEST_PW12");
-        expect(disk?.peerNames).toEqual([]);
-        expect(disk?.label).toBeUndefined();
+      const h = makeLockCtrl();
+      if (variant === "peers-then-rename") {
+        h.ctrl.updatePeers("SYNA2345", ["StalePeer"]);
+        h.ctrl.rename("SYNA2345", "Stale Ghost Label");
+      } else {
+        h.ctrl.rename("SYNA2345", "Old1");
+        h.ctrl.rename("SYNA2345", "Old2");
       }
+      h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
+      h.creatorCodes.delete("SYNA2345");
+      h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_GUEST_PW12" });
+
+      expect(h.pending).toHaveLength(1);
+      h.pending.shift()?.resolve();
+      await Promise.all(h.tasks.splice(0));
+
+      const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
+      const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
+      expect(mem).toBeDefined();
+      expect(mem?.password).toBe("FRESH_GUEST_PW12");
+      expect(mem?.peerNames).toEqual([]);
+      expect(mem?.label).toBeUndefined();
+      expect(disk).toBeDefined();
+      expect(disk?.password).toBe("FRESH_GUEST_PW12");
+      expect(disk?.peerNames).toEqual([]);
+      expect(disk?.label).toBeUndefined();
     }
 
-    // 3. Post-join patch after recordJoin survives while pre-join synth patches are dropped under [3,2,1] and [1,3,2]
-    for (const order of [
-      [2, 3, 1, 0],
-      [0, 2, 3, 1],
-    ] as const) {
-      const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
-      writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 1000);
-      h.ctrl.syncFromStorage(false);
-
+    // 3. Post-join patch after recordJoin survives while pre-join synth patches are dropped
+    for (const rejectLock of [false, true]) {
+      const h = makeLockCtrl();
       h.ctrl.rename("SYNA2345", "PreJoinStale");
       h.ctrl.updatePeers("SYNA2345", ["StalePeer"]);
       h.storage.removeItem(HOST_ROOMS_STORAGE_KEY);
@@ -3255,12 +3212,10 @@ describe("RecentRoomsController", () => {
       h.ctrl.recordJoin({ code: "SYNA2345", password: "FRESH_MULTI_PW12" });
       h.ctrl.rename("SYNA2345", "KeepAfterJoin");
 
-      const locks = h.pendingLockReleases.splice(0);
-      for (const idx of order) {
-        locks[idx]?.();
-        await Promise.resolve();
-      }
-      await h.flush();
+      expect(h.pending).toHaveLength(1);
+      if (rejectLock) h.pending.shift()?.reject(new Error("AbortError"));
+      else h.pending.shift()?.resolve();
+      await Promise.all(h.tasks.splice(0));
 
       const mem = h.ctrl.getRooms().find((r) => r.code === "SYNA2345");
       const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "SYNA2345");
@@ -3342,12 +3297,10 @@ describe("RecentRoomsController", () => {
       );
 
       h.ctrl.setDisabled(false);
-      const enableLock = h.pendingLockReleases.shift();
+      expect(h.pendingLockReleases).toHaveLength(0);
 
-      // Flush deferred pre-opt-out join lock before and after enableLock
+      // Flush deferred lock (which now picks up flushRequested -> setDisabled(false))
       deferredOldJoinLock?.();
-      await Promise.resolve();
-      enableLock?.();
       await h.flush();
 
       const mem = h.ctrl.getRooms().find((r) => r.code === "ABCD2345");
@@ -3358,7 +3311,7 @@ describe("RecentRoomsController", () => {
       expect(disk?.password).toBe("NEW_SECRET_12345");
     }
 
-    // Scenario C: clearAll() fails with SecurityError -> Tab A opts out -> Tab B observes opt-out without falsely advancing persistedClearAllGen
+    // Scenario C: clearAll() fails with SecurityError -> external opt-out arrives -> queued clear-all is preserved and flushes on recovery
     {
       const inner = makeMemoryStorage();
       let failRemove = false;
@@ -3632,15 +3585,9 @@ describe("RecentRoomsController", () => {
       h.ctrl.syncFromStorage();
 
       h.ctrl.recordJoin({ code: "JKMN2345", password: "STALE_PW_1234567" });
-      const deferredJoinLock = h.pendingLockReleases.shift();
-      expect(deferredJoinLock).toBeDefined();
       h.ctrl.clearAll();
-      const deferredClearLock = h.pendingLockReleases.shift();
-      expect(deferredClearLock).toBeDefined();
+      expect(h.pendingLockReleases).toHaveLength(1);
 
-      deferredJoinLock?.();
-      await Promise.resolve();
-      deferredClearLock?.();
       await h.flush();
 
       expect(h.ctrl.getRooms()).toEqual([]);
@@ -3838,14 +3785,7 @@ describe("RecentRoomsController", () => {
       h.ctrl.rename("EXPP2345", "Too Late");
 
       now += RECENT_ROOM_TTL_MS;
-      // Release EXPP2345 rename lock first so patch materialization hits invalid timestamp check too
-      const joinJ = h.pendingLockReleases.shift();
-      const joinP = h.pendingLockReleases.shift();
-      const patchP = h.pendingLockReleases.shift();
-      patchP?.();
-      await Promise.resolve();
-      joinJ?.();
-      joinP?.();
+      expect(h.pendingLockReleases).toHaveLength(1);
       await h.flush();
 
       expect(h.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
@@ -3860,24 +3800,46 @@ describe("RecentRoomsController", () => {
       expect(h2.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
     }
 
-    // CR #7: recordJoin carries forward unpersisted password/peerNames when a patch materializes a second join first
-    {
+    // CR #7: recordJoin carries forward omitted password/peerNames under single-flight + AbortError fallback
+    for (const rejectLock of [false, true]) {
       const now = 1_700_000_000_000;
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-      h.ctrl.recordJoin({ code: "CARR2345", password: "INIT_SECRET_1234", peerNames: ["Alice"] });
-      h.ctrl.rename("CARR2345", "Carry Label");
-      h.ctrl.recordJoin({ code: "CARR2345" });
+      const storage = makeMemoryStorage();
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve, reject) => {
+            pending.push({
+              resolve: () => {
+                void Promise.resolve(cb()).finally(resolve);
+              },
+              reject,
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
 
-      const locks = h.pendingLockReleases.splice(0);
-      expect(locks).toHaveLength(3);
-      // Release rename lock (index 1) before either join lock
-      locks[1]?.();
-      await Promise.resolve();
-      locks[0]?.();
-      locks[2]?.();
-      await h.flush();
+      ctrl.recordJoin({ code: "CARR2345", password: "INIT_SECRET_1234", peerNames: ["Alice"] });
+      ctrl.rename("CARR2345", "Carry Label");
+      ctrl.recordJoin({ code: "CARR2345" });
 
-      const disk = loadRecentRooms(h.storage, now).find((r) => r.code === "CARR2345");
+      expect(pending).toHaveLength(1);
+      if (rejectLock) pending.shift()?.reject(new Error("AbortError"));
+      else pending.shift()?.resolve();
+      await Promise.all(tasks.splice(0));
+
+      const disk = loadRecentRooms(storage, now).find((r) => r.code === "CARR2345");
       expect(disk).toBeDefined();
       expect(disk?.password).toBe("INIT_SECRET_1234");
       expect(disk?.peerNames).toEqual(["Alice"]);
@@ -3918,6 +3880,1432 @@ describe("RecentRoomsController", () => {
       expect(disk?.password).toBeUndefined();
       expect(disk?.label).toBeUndefined();
       expect(disk?.peerNames).toEqual([]);
+    }
+  });
+
+  it("covers pure reducer branches and immutability via applyRecentRoomOp, replayRecentRoomOps, and computeRecentRoomsView", () => {
+    const now = 1_700_000_000_000;
+    const initial: RecentRoomsSnapshot = {
+      entries: [
+        { code: "GUES2345", role: "guest", lastJoinedAt: now, peerNames: ["Alice"], password: "SECRET_PASS_1234" },
+      ],
+      disabled: false,
+    };
+
+    // No-op patch returns changed=false without mutating input
+    const samePw = applyRecentRoomOp(
+      initial,
+      { kind: "patch", code: "GUES2345", field: "password", password: "SECRET_PASS_1234" },
+      now,
+      [],
+      () => false,
+    );
+    expect(samePw.changed).toBe(false);
+    expect(samePw.missing).toBe(false);
+    expect(samePw.snapshot.entries).not.toBe(initial.entries);
+
+    // remove with demoteIfPassworded=true when already guest returns changed=false
+    const demoteGuest = applyRecentRoomOp(
+      initial,
+      { kind: "remove", code: "GUES2345", demoteIfPassworded: true },
+      now,
+      [],
+      () => false,
+    );
+    expect(demoteGuest.changed).toBe(false);
+    expect(demoteGuest.snapshot.entries[0]?.role).toBe("guest");
+
+    // remove on absent room returns changed=false
+    const removeAbsent = applyRecentRoomOp(
+      initial,
+      { kind: "remove", code: "NONE2345" },
+      now,
+      [],
+      () => false,
+    );
+    expect(removeAbsent.changed).toBe(false);
+
+    // patch on absent non-synth room returns missing=true
+    const missingPatch = applyRecentRoomOp(
+      initial,
+      { kind: "patch", code: "NONE2345", field: "label", label: "Nope" },
+      now,
+      [],
+      () => false,
+    );
+    expect(missingPatch.changed).toBe(false);
+    expect(missingPatch.missing).toBe(true);
+
+    // disabled snapshot rejects join and patch without changing state
+    const disabledSnap: RecentRoomsSnapshot = { entries: [], disabled: true };
+    expect(
+      applyRecentRoomOp(
+        disabledSnap,
+        { kind: "join", code: "ABCD2345", role: "guest", lastJoinedAt: now },
+        now,
+        [],
+        () => false,
+      ),
+    ).toEqual({ snapshot: { entries: [], disabled: true }, changed: false, missing: false });
+    expect(
+      applyRecentRoomOp(
+        disabledSnap,
+        { kind: "patch", code: "ABCD2345", field: "label", label: "Nope" },
+        now,
+        [],
+        () => false,
+      ),
+    ).toEqual({ snapshot: { entries: [], disabled: true }, changed: false, missing: false });
+
+    // clear-all idempotency and set-disabled idempotency
+    expect(applyRecentRoomOp(disabledSnap, { kind: "clear-all" }, now, [], () => false).changed).toBe(false);
+    expect(applyRecentRoomOp(initial, { kind: "clear-all" }, now, [], () => false).changed).toBe(true);
+    expect(applyRecentRoomOp(initial, { kind: "set-disabled", disabled: false }, now, [], () => false).changed).toBe(false);
+    expect(applyRecentRoomOp(disabledSnap, { kind: "set-disabled", disabled: true }, now, [], () => false).changed).toBe(false);
+    expect(applyRecentRoomOp(initial, { kind: "set-disabled", disabled: true }, now, [], () => false)).toEqual({
+      snapshot: { entries: [], disabled: true },
+      changed: true,
+      missing: false,
+    });
+
+    // replayRecentRoomOps folds left-to-right cleanly without mutating initial
+    const replayed = replayRecentRoomOps(
+      initial,
+      [
+        { kind: "join", code: "NEWW2345", role: "host", lastJoinedAt: now + 100 },
+        { kind: "patch", code: "NEWW2345", field: "label", label: "Host" },
+        { kind: "remove", code: "GUES2345" },
+      ],
+      now + 100,
+      [],
+      () => false,
+    );
+    expect(replayed.entries.map((e) => e.code)).toEqual(["NEWW2345"]);
+    expect(replayed.entries[0]?.label).toBe("Host");
+    expect(initial.entries).toHaveLength(1);
+
+    // computeRecentRoomsView suppresses locally removed host-rooms and returns [] when disabled
+    const viewWithRemovedSynth = computeRecentRoomsView(
+      { entries: [], disabled: false },
+      [{ kind: "remove", code: "SYNA2345" }],
+      now,
+      [{ code: "SYNA2345", updatedAt: now }],
+      (code) => code === "SYNA2345",
+    );
+    expect(viewWithRemovedSynth.entries).toEqual([]);
+    const viewDisabled = computeRecentRoomsView(
+      initial,
+      [{ kind: "set-disabled", disabled: true }],
+      now,
+      [{ code: "SYNA2345", updatedAt: now }],
+      () => true,
+    );
+    expect(viewDisabled).toEqual({ entries: [], disabled: true });
+  });
+
+  it("re-schedules single-flight flush when onChange enqueues a follow-up op during drainQueueUnderLock (flushRequested)", async () => {
+    const now = 1_700_000_000_000;
+    const storage = makeMemoryStorage();
+    const tasks: Promise<unknown>[] = [];
+    const pending: Array<() => void> = [];
+    const locks: LockManagerLike = {
+      request: (_name, cb) =>
+        new Promise<void>((resolve) => {
+          pending.push(() => {
+            void Promise.resolve(cb()).finally(resolve);
+          });
+        }),
+    };
+    let triggerFollowUp = false;
+    let ctrl!: RecentRoomsController;
+    ctrl = new RecentRoomsController({
+      getLocalStorage: () => storage,
+      getLocks: () => locks,
+      runBackground: (t) => {
+        tasks.push(t);
+      },
+      hasSavedCreatorHostFor: () => false,
+      onRemoveHostToken: vi.fn(),
+      onForgetAllHostTokens: vi.fn(),
+      onChange: () => {
+        if (triggerFollowUp) {
+          triggerFollowUp = false;
+          ctrl.rename("BBBB2345", "Follow Up Label");
+        }
+      },
+      now: () => now,
+    });
+
+    ctrl.recordJoin({ code: "AAAA2345" });
+    ctrl.recordJoin({ code: "BBBB2345" });
+    pending.shift()?.();
+    await Promise.all(tasks.splice(0));
+
+    // Delete AAAA2345 externally so rename("AAAA2345") triggers reconcile -> onChange -> re-entrant rename("BBBB2345")
+    storage.setItem(
+      RECENT_ROOMS_STORAGE_KEY,
+      JSON.stringify([{ code: "BBBB2345", role: "guest", lastJoinedAt: now, peerNames: [] }]),
+    );
+    ctrl.rename("AAAA2345", "Ghost");
+    triggerFollowUp = true;
+    expect(pending).toHaveLength(1);
+    pending.shift()?.();
+    await Promise.resolve();
+
+    // A 2nd single-flight lock was scheduled by finally because flushRequested === true
+    expect(pending).toHaveLength(1);
+    pending.shift()?.();
+    await Promise.all(tasks.splice(0));
+
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
+    expect(loadRecentRooms(storage, now).find((r) => r.code === "BBBB2345")?.label).toBe("Follow Up Label");
+  });
+
+  it("drops transient joins while retaining durable removes on getItem storage fault inside drainQueueUnderLock", async () => {
+    const now = 1_700_000_000_000;
+    const inner = makeMemoryStorage();
+    upsertRecentRoom(inner, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
+    let failGet = false;
+    const storage: StorageLike = {
+      getItem: (k) => {
+        if (failGet) throw new Error("SecurityError");
+        return inner.getItem(k);
+      },
+      setItem: (k, v) => inner.setItem(k, v),
+      removeItem: (k) => inner.removeItem(k),
+    };
+    const tasks: Promise<unknown>[] = [];
+    const pending: Array<() => void> = [];
+    const locks: LockManagerLike = {
+      request: (_name, cb) =>
+        new Promise<void>((resolve) => {
+          pending.push(() => {
+            void Promise.resolve(cb()).finally(resolve);
+          });
+        }),
+    };
+    const ctrl = new RecentRoomsController({
+      getLocalStorage: () => storage,
+      getLocks: () => locks,
+      runBackground: (t) => {
+        tasks.push(t);
+      },
+      hasSavedCreatorHostFor: () => false,
+      onRemoveHostToken: vi.fn(),
+      onForgetAllHostTokens: vi.fn(),
+      onChange: vi.fn(),
+      now: () => now,
+    });
+
+    ctrl.recordJoin({ code: "BBBB2345" });
+    ctrl.remove("AAAA2345");
+    expect(pending).toHaveLength(1);
+
+    failGet = true;
+    pending.shift()?.();
+    await Promise.all(tasks.splice(0));
+    // Must not spin-retry when hadStorageError === true
+    expect(pending).toHaveLength(0);
+
+    // On recovery syncFromStorage, dropped transient join is gone while durable remove flushes to disk
+    failGet = false;
+    ctrl.syncFromStorage();
+    expect(pending).toHaveLength(1);
+    pending.shift()?.();
+    await Promise.all(tasks.splice(0));
+
+    expect(loadRecentRooms(inner, now)).toEqual([]);
+    expect(ctrl.getRooms()).toEqual([]);
+  });
+
+  it("prevents host-room resurrection on remove -> rejected join and remove -> patch (Challenger 1)", async () => {
+    let now = 1_700_000_000_000;
+    const hostRooms = [{ code: "SYNA2345", updatedAt: now - 5000 }];
+
+    // 1. remove -> expired/skewed join must not resurrect synthesized host room
+    const viewAfterRejectedJoin = computeRecentRoomsView(
+      { entries: [], disabled: false },
+      [
+        { kind: "remove", code: "SYNA2345" },
+        { kind: "join", code: "SYNA2345", role: "host", lastJoinedAt: now - RECENT_ROOM_TTL_MS },
+      ],
+      now,
+      hostRooms,
+      () => true,
+    );
+    expect(viewAfterRejectedJoin.entries).toEqual([]);
+
+    // 2. remove -> patch and remove -> join -> remove -> patch must not resurrect synthesized host room
+    const opsRemovePatch = [
+      { kind: "remove" as const, code: "SYNA2345" },
+      { kind: "patch" as const, code: "SYNA2345", field: "label" as const, label: "Renamed" },
+    ];
+    expect(replayRecentRoomOps({ entries: [], disabled: false }, opsRemovePatch, now, hostRooms, () => true).entries).toEqual([]);
+    expect(computeRecentRoomsView({ entries: [], disabled: false }, opsRemovePatch, now, hostRooms, () => true).entries).toEqual([]);
+
+    const opsRemoveJoinRemovePatch = [
+      { kind: "remove" as const, code: "SYNA2345" },
+      { kind: "join" as const, code: "SYNA2345", role: "host" as const, lastJoinedAt: now },
+      { kind: "remove" as const, code: "SYNA2345" },
+      { kind: "patch" as const, code: "SYNA2345", field: "label" as const, label: "Ghost" },
+    ];
+    expect(computeRecentRoomsView({ entries: [], disabled: false }, opsRemoveJoinRemovePatch, now, hostRooms, () => true).entries).toEqual([]);
+
+    // 3. Controller end-to-end: kicked host room + backward clock skew on deferred join must not resurrect
+    const h = makeHarness({ creatorCodes: new Set(["SYNA2345"]), deferredLocks: true, now: () => now });
+    writePersistedHostToken(h.storage, "SYNA2345", "tok-syna", now - 20 * 60 * 1000);
+    h.ctrl.syncFromStorage(false);
+    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNA2345"]);
+
+    h.ctrl.handleFatalError("SYNA2345", "kicked", "tok-syna");
+    expect(h.ctrl.getRooms()).toEqual([]);
+
+    h.ctrl.recordJoin({ code: "SYNA2345" });
+    now -= MAX_CLOCK_SKEW_MS + 5 * 60 * 1000;
+    h.ctrl.syncFromStorage();
+    expect(h.ctrl.getRooms()).toEqual([]);
+    await h.flush();
+    expect(h.ctrl.getRooms()).toEqual([]);
+  });
+
+  it("handles cross-tab sync, double QuotaExceededError, join2 convergence, getItem faults, and demote reconcile (Probes 3B, 3C, 3D, 4B, 3E, 2C-2)", async () => {
+    let now = 1_700_000_000_000;
+
+    const createFaultHarness = (opts: { deferredLocks?: boolean } = {}) => {
+      const inner = makeMemoryStorage();
+      let failGet = false;
+      let failSet = false;
+      const storage: StorageLike = {
+        getItem: (k) => {
+          if (failGet) throw new Error("SecurityError");
+          return inner.getItem(k);
+        },
+        setItem: (k, v) => {
+          if (failSet) throw new Error("QuotaExceededError");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike | null = opts.deferredLocks
+        ? {
+            request: (_name, cb) =>
+              new Promise<void>((resolve) => {
+                pending.push(() => {
+                  void Promise.resolve(cb()).finally(resolve);
+                });
+              }),
+          }
+        : null;
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+      return {
+        inner,
+        ctrl,
+        flushAll,
+        setFailGet: (v: boolean) => {
+          failGet = v;
+        },
+        setFailSet: (v: boolean) => {
+          failSet = v;
+        },
+      };
+    };
+
+    // Probe 3B: syncFromStorage mid-flight must not drop failedJoinCodes needed by queued [patch, join2]
+    {
+      const h = createFaultHarness({ deferredLocks: true });
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW1_123456789012" });
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.rename("ABCD2345", "Important");
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW2_123456789012" });
+      upsertRecentRoom(h.inner, { code: "EFGH2345", role: "guest", lastJoinedAt: now }, now);
+      h.ctrl.syncFromStorage();
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBe("Important");
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "ABCD2345")?.label).toBe("Important");
+      expect(h.ctrl.getRooms().some((r) => r.code === "EFGH2345")).toBe(true);
+    }
+
+    // Probe 3C: second QuotaExceededError on join2 must drop carried patches without mem/disk split-brain
+    {
+      const h = createFaultHarness({ deferredLocks: true });
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW1_123456789012" });
+      await h.flushAll();
+
+      h.ctrl.rename("ABCD2345", "Important");
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW2_123456789012" });
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW3_123456789012" });
+      await h.flushAll();
+
+      const mem = h.ctrl.getRooms().find((r) => r.code === "ABCD2345");
+      const disk = loadRecentRooms(h.inner, now).find((r) => r.code === "ABCD2345");
+      expect(mem).toEqual(disk);
+      expect(mem?.label).toBeUndefined();
+      expect(mem?.password).toBe("PW3_123456789012");
+    }
+
+    // Probe 3D & 3D-second-order: join2 without failed join1 fields converges mem to disk and allows subsequent updates
+    {
+      const h = createFaultHarness();
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "ABCD2345", password: "PW1_123456789012", peerNames: ["Alice"] });
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.recordJoin({ code: "ABCD2345" });
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.inner, now));
+      expect(h.ctrl.getRooms()[0]?.password).toBeUndefined();
+      expect(h.ctrl.getRooms()[0]?.peerNames).toEqual([]);
+
+      h.ctrl.updatePassword("ABCD2345", "PW1_123456789012", false);
+      h.ctrl.updatePeers("ABCD2345", ["Alice"]);
+      await h.flushAll();
+      const disk = loadRecentRooms(h.inner, now).find((r) => r.code === "ABCD2345");
+      expect(disk?.password).toBe("PW1_123456789012");
+      expect(disk?.peerNames).toEqual(["Alice"]);
+    }
+
+    // Probe 4B: failed join on existing or absent room without join2/syncFromStorage must match disk
+    {
+      const h = createFaultHarness();
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+      const ts1 = now;
+
+      now += 5;
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      h.ctrl.recordJoin({ code: "NEWR2345" });
+      await h.flushAll();
+      h.setFailSet(false);
+
+      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.inner, now));
+      expect(h.ctrl.getRooms()[0]?.lastJoinedAt).toBe(ts1);
+    }
+
+    // Probe 3E: getItem SecurityError drops failed patch without leaving ghost label from this.rooms fallback
+    {
+      const h = createFaultHarness({ deferredLocks: true });
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.setFailGet(true);
+      h.ctrl.rename("AAAA2345", "GhostLabelDuringGetError");
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms().find((r) => r.code === "AAAA2345")?.label).toBeUndefined();
+    }
+
+    // Probe 2C-2 & symmetric demote: handleCreatorHostForgotten reconciles when Tab B deleted or added password
+    {
+      const h = createFaultHarness({ deferredLocks: true });
+      h.ctrl.recordJoin({ code: "AAAA2345", password: "PW_A_12345678901" });
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      h.ctrl.handleCreatorHostForgotten("AAAA2345");
+      h.ctrl.handleCreatorHostForgotten("BBBB2345");
+      // Tab B deletes AAAA2345 and adds a password to BBBB2345 before Tab A's lock executes
+      const rest = loadRecentRooms(h.inner, now).filter((r) => r.code !== "AAAA2345");
+      writePersistedRecentRooms(
+        h.inner,
+        rest.map((r) => (r.code === "BBBB2345" ? { ...r, password: "TABB_PW_12345678" } : r)),
+      );
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms()).toEqual([
+        expect.objectContaining({ code: "BBBB2345", role: "guest", password: "TABB_PW_12345678" }),
+      ]);
+    }
+  });
+
+  it("preserves opt-out disabled state during getItem SecurityError in syncFromStorage (Probe 5B)", async () => {
+    const now = 1_700_000_000_000;
+    const createFaultHarness = () => {
+      const inner = makeMemoryStorage();
+      let failGet = false;
+      let failRemove = false;
+      const storage: StorageLike = {
+        getItem: (k) => {
+          if (failGet) throw new Error("SecurityError");
+          return inner.getItem(k);
+        },
+        setItem: (k, v) => inner.setItem(k, v),
+        removeItem: (k) => {
+          if (failRemove) throw new Error("SecurityError");
+          inner.removeItem(k);
+        },
+      };
+      const tasks: Promise<unknown>[] = [];
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => null,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      return {
+        inner,
+        storage,
+        ctrl,
+        flushAll: () => Promise.all(tasks.splice(0)).then(() => undefined),
+        setFailGet: (v: boolean) => {
+          failGet = v;
+        },
+        setFailRemove: (v: boolean) => {
+          failRemove = v;
+        },
+      };
+    };
+
+    expect(tryIsRecentRoomsDisabled(null)).toEqual({ ok: false, disabled: false });
+
+    // Variant 1: clear-all succeeded, then getItem throws SecurityError during syncFromStorage
+    {
+      const h = createFaultHarness();
+      expect(tryIsRecentRoomsDisabled(h.storage)).toEqual({ ok: true, disabled: false });
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.ctrl.setDisabled(true);
+      await h.flushAll();
+      expect(tryIsRecentRoomsDisabled(h.storage)).toEqual({ ok: true, disabled: true });
+
+      h.setFailGet(true);
+      expect(tryIsRecentRoomsDisabled(h.storage)).toEqual({ ok: false, disabled: false });
+      h.ctrl.syncFromStorage();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(h.ctrl.getRooms()).toEqual([]);
+
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+      expect(h.ctrl.getRooms()).toEqual([]);
+
+      h.setFailGet(false);
+      h.ctrl.syncFromStorage();
+      await h.flushAll();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(loadRecentRooms(h.inner, now)).toEqual([]);
+    }
+
+    // Variant 2: set-disabled succeeded while clear-all failed removeItem, then getItem throws SecurityError
+    {
+      const h = createFaultHarness();
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.setFailRemove(true);
+      h.ctrl.setDisabled(true);
+      await h.flushAll();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(loadRecentRooms(h.inner, now).map((r) => r.code)).toEqual(["AAAA2345"]);
+
+      h.setFailGet(true);
+      h.ctrl.syncFromStorage();
+      await h.flushAll();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(h.ctrl.getRooms()).toEqual([]);
+
+      h.setFailGet(false);
+      h.setFailRemove(false);
+      h.ctrl.syncFromStorage();
+      await h.flushAll();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(loadRecentRooms(h.inner, now)).toEqual([]);
+    }
+  });
+
+  it("scopes failedJoinCodes pruning on storage error to affected room codes only (Probes 5C, 5C-2)", async () => {
+    const now = 1_700_000_000_000;
+    const createSetFaultHarness = () => {
+      const inner = makeMemoryStorage();
+      let failSet = false;
+      const storage: StorageLike = {
+        getItem: (k) => inner.getItem(k),
+        setItem: (k, v) => {
+          if (failSet) throw new Error("QuotaExceededError");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+      return {
+        inner,
+        ctrl,
+        flushAll,
+        setFailSet: (v: boolean) => {
+          failSet = v;
+        },
+      };
+    };
+
+    // Probe 5C: carried patch drop on AAAA2345 must not wipe failedJoinCodes for unrelated BBBB2345 (separate flushes)
+    {
+      const h = createSetFaultHarness();
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      h.ctrl.rename("AAAA2345", "LabelA");
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.rename("BBBB2345", "LabelB");
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms().find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+      expect(h.ctrl.getRooms().find((r) => r.code === "AAAA2345")?.label).toBeUndefined();
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "AAAA2345")?.label).toBeUndefined();
+    }
+
+    // Probe 5C (same-batch failed joins): dropped join for BBBB2345 behind failing AAAA2345 also keeps recovery
+    {
+      const h = createSetFaultHarness();
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      h.ctrl.rename("AAAA2345", "LabelA");
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.rename("BBBB2345", "LabelB");
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms().find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+    }
+
+    // Probe 5C-2: failed patch on persisted AAAA2345 must not wipe failedJoinCodes for unrelated BBBB2345
+    {
+      const h = createSetFaultHarness();
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      await h.flushAll();
+
+      h.setFailSet(true);
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      h.ctrl.rename("AAAA2345", "LabelA");
+      await h.flushAll();
+
+      h.setFailSet(false);
+      h.ctrl.rename("BBBB2345", "LabelB");
+      h.ctrl.recordJoin({ code: "BBBB2345" });
+      await h.flushAll();
+
+      expect(h.ctrl.getRooms().find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "BBBB2345")?.label).toBe("LabelB");
+      expect(loadRecentRooms(h.inner, now).find((r) => r.code === "AAAA2345")?.label).toBeUndefined();
+    }
+  });
+
+  it("reconciles remove ops when host-rooms retains a valid creator entry (Probes 6E, 6F)", async () => {
+    const now = 1_700_000_000_000;
+
+    // Probe 6F (host-rooms only + recent-rooms + host-rooms): handleFatalError without matching expectedHostToken
+    for (const seedRecent of [false, true]) {
+      const inner = makeMemoryStorage();
+      let failHostGet = false;
+      const storage: StorageLike = {
+        getItem: (k) => {
+          if (failHostGet && k === HOST_ROOMS_STORAGE_KEY) throw new Error("SecurityError");
+          return inner.getItem(k);
+        },
+        setItem: (k, v) => inner.setItem(k, v),
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => null,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: (code) => readPersistedHostToken(storage, code, now) !== undefined,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+
+      writePersistedHostToken(inner, "AAAA2345", "creator-tok", now);
+      if (seedRecent) {
+        upsertRecentRoom(inner, { code: "AAAA2345", role: "host", lastJoinedAt: now }, now);
+      }
+      ctrl.syncFromStorage(false);
+      await Promise.all(tasks.splice(0));
+      expect(ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+
+      // Mismatched or undefined expectedHostToken leaves creator token in host-rooms
+      expect(ctrl.handleFatalError("AAAA2345", "kicked", seedRecent ? "stale-tok" : undefined)).toBe(true);
+      await Promise.all(tasks.splice(0));
+
+      const afterDrain = ctrl.getRooms().map((r) => ({ code: r.code, role: r.role }));
+      ctrl.syncFromStorage(false);
+      const afterSync = ctrl.getRooms().map((r) => ({ code: r.code, role: r.role }));
+      expect(afterDrain).toEqual([{ code: "AAAA2345", role: "host" }]);
+      expect(afterDrain).toEqual(afterSync);
+
+      // SecurityError on host-rooms must not crash remove drain and falls back cleanly
+      failHostGet = true;
+      ctrl.handleFatalError("AAAA2345", "kicked");
+      await Promise.all(tasks.splice(0));
+      expect(ctrl.getRooms()).toEqual([]);
+
+      failHostGet = false;
+      ctrl.syncFromStorage(false);
+      expect(ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+    }
+
+    // Probe 6E: Cross-tab race where Tab A queues remove(code), Tab B writes creator host token and Tab A syncs before lock drains
+    {
+      const storage = makeMemoryStorage();
+      const tasksA: Promise<unknown>[] = [];
+      const pendingA: Array<() => void> = [];
+      const locksA: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pendingA.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const tasksB: Promise<unknown>[] = [];
+      const makeEnv = (locks: LockManagerLike | null, tasks: Promise<unknown>[]) => ({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t: Promise<unknown>) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: (code: string) => readPersistedHostToken(storage, code, now) !== undefined,
+        onRemoveHostToken: (code: string, onlyIfMatching?: string) => {
+          if (onlyIfMatching === undefined) {
+            writePersistedHostToken(storage, code, undefined, now);
+          }
+        },
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+
+      upsertRecentRoom(storage, { code: "AAAA2345", role: "host", lastJoinedAt: now }, now);
+      writePersistedHostToken(storage, "AAAA2345", "tok-init", now);
+      const tabA = new RecentRoomsController(makeEnv(locksA, tasksA));
+      const tabB = new RecentRoomsController(makeEnv(null, tasksB));
+      expect(tabA.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+
+      tabB.remove("AAAA2345");
+      await Promise.all(tasksB.splice(0));
+      expect(tabB.getRooms()).toEqual([]);
+
+      tabA.remove("AAAA2345");
+      expect(tabA.getRooms()).toEqual([]);
+
+      // Tab B writes creator host token and both tabs sync before Tab A's lock drains
+      writePersistedHostToken(storage, "AAAA2345", "tok-new", now);
+      tabB.syncFromStorage();
+      tabA.syncFromStorage();
+      expect(tabB.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+      expect(tabA.getRooms()).toEqual([]);
+
+      // Drain Tab A's queued remove(AAAA2345): must reconcile and converge to Tab B
+      while (pendingA.length > 0 || tasksA.length > 0) {
+        while (pendingA.length > 0) {
+          pendingA.shift()?.();
+          await Promise.resolve();
+        }
+        if (tasksA.length > 0) await Promise.all(tasksA.splice(0));
+      }
+
+      expect(tabA.getRooms().map((r) => ({ code: r.code, role: r.role }))).toEqual(
+        tabB.getRooms().map((r) => ({ code: r.code, role: r.role })),
+      );
+      expect(tabA.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+    }
+
+    // Edge cases: demoteIfPassworded with concurrent host-rooms re-add, and expired host-rooms entry does not reconcile
+    {
+      const storage = makeMemoryStorage();
+      let currentNow = now;
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: (code) => readPersistedHostToken(storage, code, currentNow) !== undefined,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => currentNow,
+      });
+
+      writePersistedHostToken(storage, "BBBB2345", "tok-b", currentNow);
+      ctrl.syncFromStorage(false);
+      expect(ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
+
+      // Creator host forgotten queues demoteIfPassworded remove; concurrent Tab B re-adds host-rooms before drain
+      writePersistedHostToken(storage, "BBBB2345", undefined, currentNow);
+      ctrl.handleCreatorHostForgotten("BBBB2345");
+      expect(ctrl.getRooms()).toEqual([]);
+
+      writePersistedHostToken(storage, "BBBB2345", "tok-readded", currentNow);
+      while (pending.length > 0 || tasks.length > 0) {
+        while (pending.length > 0) {
+          pending.shift()?.();
+          await Promise.resolve();
+        }
+        if (tasks.length > 0) await Promise.all(tasks.splice(0));
+      }
+      expect(ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
+
+      // Expired host-rooms entry is ignored on remove drain
+      currentNow = now + RECENT_ROOM_TTL_MS + 1000;
+      ctrl.remove("BBBB2345");
+      while (pending.length > 0 || tasks.length > 0) {
+        while (pending.length > 0) {
+          pending.shift()?.();
+          await Promise.resolve();
+        }
+        if (tasks.length > 0) await Promise.all(tasks.splice(0));
+      }
+      expect(ctrl.getRooms()).toEqual([]);
+    }
+  });
+
+  it("handles carried patch precedence, targeted storage failures, external opt-out variants, re-entrant flush, and stale purge", async () => {
+    const now = 1_700_000_000_000;
+
+    // 1. Carried patch precedence on join2: join2 password & non-empty peerNames override carried patches, while label carries;
+    //    join2 with empty peerNames allows carried peerNames patch to apply.
+    {
+      const inner = makeMemoryStorage();
+      let failRecentSet = true;
+      let failRecentGet = false;
+      const storage: StorageLike = {
+        getItem: (k) => {
+          if (failRecentGet && k === RECENT_ROOMS_STORAGE_KEY) throw new Error("SecurityError");
+          return inner.getItem(k);
+        },
+        setItem: (k, v) => {
+          if (failRecentSet && k === RECENT_ROOMS_STORAGE_KEY) throw new Error("QuotaExceededError");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+
+      expect(ctrl.isDisabled()).toBe(false);
+      expect(ctrl.getRooms()).toEqual([]);
+
+      ctrl.recordJoin({ code: "AAAA2345", password: "PW1_123456789012" });
+      await flushAll();
+      ctrl.recordJoin({ code: "BBBB2345", password: "PWB1_12345678901" });
+      await flushAll();
+
+      failRecentSet = false;
+      ctrl.updatePassword("AAAA2345", "PW_PATCH_1234567", false);
+      ctrl.updatePeers("AAAA2345", ["PatchPeer"]);
+      ctrl.rename("AAAA2345", "CarriedLabel");
+      ctrl.recordJoin({ code: "AAAA2345", password: "PW_JOIN2_1234567", peerNames: ["Join2Peer"] });
+
+      ctrl.updatePeers("BBBB2345", ["CarriedB"]);
+      ctrl.recordJoin({ code: "BBBB2345", peerNames: [] });
+      await flushAll();
+
+      const diskA = loadRecentRooms(inner, now).find((r) => r.code === "AAAA2345");
+      expect(diskA?.password).toBe("PW_JOIN2_1234567");
+      expect(diskA?.peerNames).toEqual(["Join2Peer"]);
+      expect(diskA?.label).toBe("CarriedLabel");
+
+      const diskB = loadRecentRooms(inner, now).find((r) => r.code === "BBBB2345");
+      expect(diskB?.peerNames).toEqual(["CarriedB"]);
+
+      // 2. getItem throwing ONLY on RECENT_ROOMS_STORAGE_KEY hits !loaded.ok in persistEntryOp without dropping durable ops
+      failRecentGet = true;
+      ctrl.rename("AAAA2345", "ShouldFailRead");
+      await flushAll();
+      failRecentGet = false;
+      expect(loadRecentRooms(inner, now).find((r) => r.code === "AAAA2345")?.label).toBe("CarriedLabel");
+    }
+
+    // 3. Durable op storage failures (setDisabled & clearAll) + clearing failedJoinCodes on setDisabled(true) & clearAll()
+    {
+      const inner = makeMemoryStorage();
+      let failOptSet = false;
+      let failRecentSet = false;
+      let failRemove = false;
+      const storage: StorageLike = {
+        getItem: (k) => inner.getItem(k),
+        setItem: (k, v) => {
+          if (failOptSet && k === RECENT_ROOMS_OPT_OUT_KEY) throw new Error("Quota");
+          if (failRecentSet && k === RECENT_ROOMS_STORAGE_KEY) throw new Error("Quota");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => {
+          if (failRemove) throw new Error("Denied");
+          inner.removeItem(k);
+        },
+      };
+      const tasks: Promise<unknown>[] = [];
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => null,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = () => Promise.all(tasks.splice(0)).then(() => undefined);
+
+      // Failed join then setDisabled(true) when opt-out write fails -> durable ops remain queued and flush on recovery
+      failRecentSet = true;
+      ctrl.recordJoin({ code: "FA234567" });
+      await flushAll();
+      failRecentSet = false;
+
+      failOptSet = true;
+      ctrl.setDisabled(true);
+      await flushAll();
+      expect(isRecentRoomsDisabled(inner)).toBe(false);
+
+      failOptSet = false;
+      ctrl.syncFromStorage();
+      await flushAll();
+      expect(isRecentRoomsDisabled(inner)).toBe(true);
+
+      // Re-enable and confirm failedJoinCodes for FA234567 was cleared by setDisabled(true)
+      ctrl.setDisabled(false);
+      await flushAll();
+      ctrl.updatePassword("FA234567", "SHOULD_NOT_APPLY", false);
+      await flushAll();
+      expect(loadRecentRooms(inner, now)).toEqual([]);
+
+      // clearAll failure on removeItem preserves clear-all op in queue and succeeds when recovered;
+      // duplicate clearAll() keeps only one trailing clear-all and retains set-disabled op
+      ctrl.recordJoin({ code: "KEEP2345" });
+      await flushAll();
+      failRemove = true;
+      ctrl.clearAll();
+      ctrl.clearAll();
+      await flushAll();
+      expect(loadRecentRooms(inner, now).map((r) => r.code)).toEqual(["KEEP2345"]);
+
+      failRemove = false;
+      ctrl.syncFromStorage();
+      await flushAll();
+      expect(loadRecentRooms(inner, now)).toEqual([]);
+    }
+
+    // 4. applyExternalOptOut when RECENT_ROOMS_STORAGE_KEY is already absent vs present
+    {
+      const h = makeHarness({ deferredLocks: true, now: () => now });
+      h.ctrl.recordJoin({ code: "AAAA2345" });
+      // External tab sets opt-out and has no recent-rooms key at all
+      h.storage.setItem(RECENT_ROOMS_OPT_OUT_KEY, "1");
+      await h.flush();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(h.ctrl.getRooms()).toEqual([]);
+      expect(h.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+      // Reset, seed storage, queue join + clear-all while external opt-out arrives -> keeps clear-all and removes key
+      h.ctrl.setDisabled(false);
+      await h.flush();
+      upsertRecentRoom(h.storage, { code: "BBBB2345", role: "guest", lastJoinedAt: now }, now);
+      h.ctrl.syncFromStorage();
+      h.ctrl.recordJoin({ code: "CCCC2345" });
+      h.storage.setItem(RECENT_ROOMS_OPT_OUT_KEY, "1");
+      await h.flush();
+      expect(h.ctrl.isDisabled()).toBe(true);
+      expect(h.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+    }
+
+    // 5. maybeScheduleExpiredPurge + runPendingPurge + re-entrant flushRequested during drain
+    {
+      const inner = makeMemoryStorage({
+        [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+          { code: "EXPD2345", role: "guest", lastJoinedAt: now - RECENT_ROOM_TTL_MS },
+          { code: "K7M9P2QR", role: "guest", lastJoinedAt: now - 1000 },
+        ]),
+      });
+      const tasks: Promise<unknown>[] = [];
+      let triggerReentrantOnChange = false;
+      let ctrlRef: RecentRoomsController | null = null;
+      ctrlRef = new RecentRoomsController({
+        getLocalStorage: () => inner,
+        getLocks: () => null,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: () => {
+          if (triggerReentrantOnChange) {
+            triggerReentrantOnChange = false;
+            ctrlRef?.recordJoin({ code: "REEN2345" });
+          }
+        },
+        now: () => now,
+      });
+      await Promise.all(tasks.splice(0));
+      const rawAfterPurge = JSON.parse(inner.store.get(RECENT_ROOMS_STORAGE_KEY) ?? "[]") as Array<{ code: string }>;
+      expect(rawAfterPurge.map((r) => r.code)).toEqual(["K7M9P2QR"]);
+
+      // Re-entrant enqueue triggered during drainQueueUnderLock (via onChange on reconcile) reschedules and flushes
+      ctrlRef.updatePassword("UNKN2345", "NOT_USED_1234567", false); // no-op
+      upsertRecentRoom(inner, { code: "XTAB2345", role: "guest", lastJoinedAt: now }, now);
+      ctrlRef.syncFromStorage(false);
+      ctrlRef.setEditingCode("K7M9P2QR");
+      expect(ctrlRef.getEditingCode()).toBe("K7M9P2QR");
+      ctrlRef.remove("K7M9P2QR");
+      expect(ctrlRef.getEditingCode()).toBeNull();
+      await Promise.all(tasks.splice(0));
+
+      // Trigger reconcile path via missing patch (tab B removed XTAB2345 before tab A's rename ran)
+      inner.removeItem(RECENT_ROOMS_STORAGE_KEY);
+      triggerReentrantOnChange = true;
+      ctrlRef.rename("XTAB2345", "TriggersReconcile");
+      while (tasks.length > 0) {
+        await Promise.all(tasks.splice(0));
+      }
+      expect(loadRecentRooms(inner, now).map((r) => r.code)).toEqual(["REEN2345"]);
+    }
+
+    // 6. shouldReconcileRemove with multiple hostRooms + UI/validation guards
+    {
+      const h = makeHarness({
+        creatorCodes: new Set(["H2345678"]),
+        now: () => now,
+      });
+      writePersistedHostToken(h.storage, "M2345678", "tok-other", now);
+      writePersistedHostToken(h.storage, "H2345678", "tok-host", now);
+      h.ctrl.syncFromStorage(false);
+
+      // Remove M2345678 (not in creatorCodes, though M2345678 is in host-rooms) -> stays removed without resurrecting
+      h.ctrl.remove("M2345678");
+      await h.flush();
+      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["H2345678"]);
+
+      // Guard checks: invalid codes, blank peers, same editingCode / searchQuery, rename unknown clears editingCode & calls onChange
+      const beforeCalls = h.onChange.mock.calls.length;
+      h.ctrl.setSearchQuery("");
+      h.ctrl.setEditingCode("BAD");
+      h.ctrl.setEditingCode(null);
+      h.ctrl.updatePassword("BAD", "PASS123456789012", false);
+      h.ctrl.updatePeers("BAD", ["Alice"]);
+      h.ctrl.updatePeers("H2345678", ["   "]);
+      h.ctrl.updatePeers("UNKN2345", ["Alice"]);
+      h.ctrl.remove("BAD");
+      expect(h.onChange).toHaveBeenCalledTimes(beforeCalls);
+
+      h.ctrl.setEditingCode("H2345678");
+      h.ctrl.setEditingCode("H2345678");
+      expect(h.ctrl.getEditingCode()).toBe("H2345678");
+      h.ctrl.rename("UNKN2345", "Unknown");
+      expect(h.ctrl.getEditingCode()).toBeNull();
+      expect(h.onChange).toHaveBeenCalledTimes(beforeCalls + 2);
+    }
+  });
+
+  it("kills subtle controller mutants: syncFromStorage failedJoinCodes pruning, clearAll/externalOptOut dedup, purge-vs-error, and property presence", async () => {
+    const now = 1_700_000_000_000;
+
+    // 1. syncFromStorage prunes failedJoinCodes only when neither patch nor join for that code is in queue
+    {
+      const inner = makeMemoryStorage();
+      let failSet = true;
+      const storage: StorageLike = {
+        getItem: (k) => inner.getItem(k),
+        setItem: (k, v) => {
+          if (failSet) throw new Error("Quota");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const onChange = vi.fn();
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange,
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+
+      // Fail joins for AAAA2345, BBBB2345, CCCC2345
+      ctrl.recordJoin({ code: "AAAA2345" });
+      await flushAll();
+      ctrl.recordJoin({ code: "BBBB2345" });
+      await flushAll();
+      ctrl.recordJoin({ code: "CCCC2345" });
+      await flushAll();
+
+      // Queue patch for AAAA2345, join for BBBB2345, remove for CCCC2345; then syncFromStorage before lock runs
+      failSet = false;
+      ctrl.rename("AAAA2345", "KeepFailedPatch");
+      ctrl.recordJoin({ code: "BBBB2345" });
+      ctrl.remove("CCCC2345");
+      ctrl.syncFromStorage();
+      // AAAA2345 still has queued patch -> adding join2 for AAAA2345 must carry KeepFailedPatch!
+      ctrl.recordJoin({ code: "AAAA2345" });
+      await flushAll();
+      expect(loadRecentRooms(inner, now).find((r) => r.code === "AAAA2345")?.label).toBe("KeepFailedPatch");
+
+      // Fail DDDD2345, syncFromStorage with empty queue -> failedJoinCodes for DDDD2345 is pruned so updatePassword is a no-op
+      failSet = true;
+      ctrl.recordJoin({ code: "DDDD2345" });
+      await flushAll();
+      failSet = false;
+      ctrl.syncFromStorage();
+      const callsBefore = onChange.mock.calls.length;
+      ctrl.updatePassword("DDDD2345", "SHOULD_BE_NOOP_123", false);
+      expect(onChange).toHaveBeenCalledTimes(callsBefore);
+    }
+
+    // 2. clearAll() dedup, set-disabled retention in queue, and external opt-out removeItem call counts
+    {
+      const inner = makeMemoryStorage();
+      const removeCalls: string[] = [];
+      const setCalls: string[] = [];
+      const storage: StorageLike = {
+        getItem: (k) => inner.getItem(k),
+        setItem: (k, v) => {
+          setCalls.push(k);
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => {
+          removeCalls.push(k);
+          inner.removeItem(k);
+        },
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+
+      ctrl.setDisabled(true);
+      await flushAll();
+      removeCalls.length = 0;
+      setCalls.length = 0;
+
+      // Queue setDisabled(false) -> recordJoin -> clearAll -> clearAll under single lock
+      ctrl.setDisabled(false);
+      ctrl.recordJoin({ code: "AAAA2345" });
+      ctrl.clearAll();
+      ctrl.clearAll();
+      await flushAll();
+      expect(removeCalls).toEqual([RECENT_ROOMS_OPT_OUT_KEY, RECENT_ROOMS_STORAGE_KEY]);
+      expect(setCalls).toEqual([]);
+
+      // External opt-out when RECENT_ROOMS_STORAGE_KEY is already absent + queued join -> removeItem NOT called
+      removeCalls.length = 0;
+      ctrl.recordJoin({ code: "BBBB2345" });
+      inner.setItem(RECENT_ROOMS_OPT_OUT_KEY, "1");
+      await flushAll();
+      expect(removeCalls).toEqual([]);
+      expect(ctrl.isDisabled()).toBe(true);
+
+      // Reset, seed storage, queue clearAll while external opt-out arrives -> removeItem called once
+      ctrl.setDisabled(false);
+      await flushAll();
+      upsertRecentRoom(inner, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
+      ctrl.syncFromStorage(false);
+      removeCalls.length = 0;
+      ctrl.recordJoin({ code: "DDDD2345" });
+      ctrl.clearAll();
+      inner.setItem(RECENT_ROOMS_OPT_OUT_KEY, "1");
+      await flushAll();
+      expect(removeCalls).toEqual([RECENT_ROOMS_STORAGE_KEY]);
+    }
+
+    // 3. abortQueueOnStorageError droppedPatchCodes vs droppedJoinCodes + pendingPurge skipped on storage error + property presence
+    {
+      const inner = makeMemoryStorage({
+        [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+          { code: "EXPD2345", role: "guest", lastJoinedAt: now - RECENT_ROOM_TTL_MS },
+        ]),
+      });
+      let failSet = false;
+      const storage: StorageLike = {
+        getItem: (k) => inner.getItem(k),
+        setItem: (k, v) => {
+          if (failSet) throw new Error("Quota");
+          inner.setItem(k, v);
+        },
+        removeItem: (k) => inner.removeItem(k),
+      };
+      const tasks: Promise<unknown>[] = [];
+      const pending: Array<() => void> = [];
+      const locks: LockManagerLike = {
+        request: (_name, cb) =>
+          new Promise<void>((resolve) => {
+            pending.push(() => {
+              void Promise.resolve(cb()).finally(resolve);
+            });
+          }),
+      };
+      const ctrl = new RecentRoomsController({
+        getLocalStorage: () => storage,
+        getLocks: () => locks,
+        runBackground: (t) => {
+          tasks.push(t);
+        },
+        hasSavedCreatorHostFor: () => false,
+        onRemoveHostToken: vi.fn(),
+        onForgetAllHostTokens: vi.fn(),
+        onChange: vi.fn(),
+        now: () => now,
+      });
+      const flushAll = async () => {
+        while (pending.length > 0 || tasks.length > 0) {
+          while (pending.length > 0) {
+            pending.shift()?.();
+            await Promise.resolve();
+          }
+          if (tasks.length > 0) await Promise.all(tasks.splice(0));
+        }
+      };
+
+      // Constructor scheduled pendingPurge under deferred lock; enqueue failing join -> pendingPurge MUST NOT prune on error
+      failSet = true;
+      ctrl.recordJoin({ code: "AAAA2345" });
+      await flushAll();
+      expect(inner.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(true);
+
+      // Now purge cleanly
+      failSet = false;
+      ctrl.syncFromStorage(false);
+      await flushAll();
+      expect(inner.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+      // recordJoin without password omits "password" property; blank rename omits "label" property
+      ctrl.recordJoin({ code: "AAAA2345" });
+      await flushAll();
+      const joinedEntry = ctrl.getRooms()[0];
+      expect(joinedEntry).toBeDefined();
+      expect("password" in (joinedEntry ?? {})).toBe(false);
+
+      ctrl.rename("AAAA2345", "TempLabel");
+      expect(ctrl.getRooms()[0]?.label).toBe("TempLabel");
+      ctrl.rename("AAAA2345", "   ");
+      expect("label" in (ctrl.getRooms()[0] ?? {})).toBe(false);
+      await flushAll();
+
+      // Failed patch on AAAA2345 followed by join(AAAA2345) & join(BBBB2345) -> AAAA2345 dropped from failedJoinCodes, BBBB2345 added
+      failSet = true;
+      ctrl.rename("AAAA2345", "FailPatch");
+      ctrl.recordJoin({ code: "AAAA2345" });
+      ctrl.recordJoin({ code: "BBBB2345" });
+      await flushAll();
+
+      failSet = false;
+      ctrl.rename("BBBB2345", "CarryB");
+      ctrl.recordJoin({ code: "BBBB2345" });
+      await flushAll();
+      expect(loadRecentRooms(inner, now).find((r) => r.code === "BBBB2345")?.label).toBe("CarryB");
+    }
+
+    // 4. shouldReconcileDemote & shouldReconcileRemove onChange call counts + handleCreatorHostForgotten guards
+    {
+      const h = makeHarness({
+        creatorCodes: new Set(["AAAA2345", "BBBB2345"]),
+        now: () => now,
+      });
+      writePersistedHostToken(h.storage, "AAAA2345", "tok-a", now);
+      writePersistedHostToken(h.storage, "BBBB2345", "tok-b", now);
+      h.ctrl.recordJoin({ code: "AAAA2345", password: "PWA_123456789012" });
+      h.ctrl.recordJoin({ code: "BBBB2345", password: "PWB_123456789012" });
+      await h.flush();
+
+      // handleCreatorHostForgotten on invalid/unknown code is no-op
+      const beforeGuard = h.onChange.mock.calls.length;
+      h.ctrl.handleCreatorHostForgotten("BAD");
+      h.ctrl.handleCreatorHostForgotten("UNKN2345");
+      expect(h.onChange).toHaveBeenCalledTimes(beforeGuard);
+
+      // Forget AAAA2345 while BBBB2345 stays host: must NOT trigger extra reconcile onChange
+      h.creatorCodes.delete("AAAA2345");
+      const beforeForget = h.onChange.mock.calls.length;
+      h.ctrl.handleCreatorHostForgotten("AAAA2345");
+      await h.flush();
+      expect(h.onChange).toHaveBeenCalledTimes(beforeForget + 1);
+
+      // Remove AAAA2345 while BBBB2345 is in host-rooms (and AAAA2345 is NOT in creatorCodes) -> must NOT reconcile
+      const beforeRemove = h.onChange.mock.calls.length;
+      h.ctrl.remove("AAAA2345");
+      await h.flush();
+      expect(h.onChange).toHaveBeenCalledTimes(beforeRemove + 1);
     }
   });
 });

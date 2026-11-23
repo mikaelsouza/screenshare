@@ -6,11 +6,66 @@ import {
   isAllowedExternalUrl,
   isAllowedPermission,
   isTrustedFrameUrl,
+  normalizeExternalUrl,
 } from "@electron/security";
 
 const TRUSTED_ORIGIN = "https://screenshare.webmikas.com";
 
 describe("electron/security", () => {
+  describe("normalizeExternalUrl", () => {
+    it("returns canonical parsed.href for allowed https, http, and mailto URLs", () => {
+      const cases: Array<[string, string]> = [
+        ["https://example.com", "https://example.com/"],
+        ["https://example.com/path?q=1#hash", "https://example.com/path?q=1#hash"],
+        ["HTTPS://EXAMPLE.COM/UPPER", "https://example.com/UPPER"],
+        ["HtTpS://mixed.example/a/../b?q=1#hash", "https://mixed.example/b?q=1#hash"],
+        ["https://example.com:443/default-port", "https://example.com/default-port"],
+        ["http://example.com:8080/page", "http://example.com:8080/page"],
+        ["HTTP://LOCALHOST:5173", "http://localhost:5173/"],
+        ["mailto:support@example.com", "mailto:support@example.com"],
+        ["MAILTO:Support@Example.com?subject=Help", "mailto:Support@Example.com?subject=Help"],
+      ];
+      for (const [input, expected] of cases) {
+        expect({ input, normalized: normalizeExternalUrl(input) }).toEqual({
+          input,
+          normalized: expected,
+        });
+      }
+    });
+
+    it("returns null on undefined, empty, whitespace, control chars, disallowed schemes, and malformed URLs", () => {
+      const invalid: Array<string | undefined> = [
+        undefined,
+        "",
+        "   ",
+        "not a url",
+        "://missing-scheme",
+        "https://[::1",
+        " https://example.com",
+        "https://example.com ",
+        "\thttps://example.com",
+        "https://example.com\n",
+        "ht\ttps://example.com",
+        "https://example.com/\r\nX-Injected: 1",
+        "https://example.com/\0null",
+        "file:///C:/Windows/System32/cmd.exe",
+        "smb://attacker.example/share/payload.exe",
+        "ms-msdt:/id PCWDiagnostic /skip force",
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "about:blank",
+        "blob:https://screenshare.webmikas.com/550e8400-e29b-41d4-a716-446655440000",
+        "ftp://files.example.com/archive.zip",
+      ];
+      for (const input of invalid) {
+        expect({ input, normalized: normalizeExternalUrl(input) }).toEqual({
+          input,
+          normalized: null,
+        });
+      }
+    });
+  });
+
   describe("isAllowedExternalUrl", () => {
     it("allows https, http, and mailto URLs including mixed/uppercase schemes", () => {
       const allowed = [
@@ -118,6 +173,27 @@ describe("electron/security", () => {
       expect(evaluateNavigation("https://screenshare.webmikas.com/", null)).toBe("block");
       expect(evaluateNavigation("https://screenshare.webmikas.com/", "")).toBe("block");
       expect(evaluateNavigation("data:text/html,hi", "null")).toBe("block");
+    });
+
+    it("blocks leading or trailing ASCII whitespace on both trusted-origin and external URLs", () => {
+      const padded = [
+        " https://screenshare.webmikas.com/",
+        "https://screenshare.webmikas.com/ ",
+        "\thttps://screenshare.webmikas.com/room",
+        "https://screenshare.webmikas.com/room\n",
+        " https://other.example/docs",
+        "https://other.example/docs ",
+        "\thttps://other.example/docs",
+        "https://other.example/docs\r",
+        " mailto:help@webmikas.com",
+        "mailto:help@webmikas.com ",
+      ];
+      for (const url of padded) {
+        expect({ url, decision: evaluateNavigation(url, TRUSTED_ORIGIN) }).toEqual({
+          url,
+          decision: "block",
+        });
+      }
     });
   });
 

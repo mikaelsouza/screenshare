@@ -105,12 +105,17 @@ Peer A ═════════ SRTP media + control DC, peer-to-peer ══�
   8-character room code and a 16-character random invite secret (`CODE-SECRET`). Invite links
   place `#CODE-SECRET` solely in the URL fragment (never sent to HTTP servers or referrer
   logs), and the client immediately scrubs the address bar back to `/` while caching temporary
-  rejoin state in `sessionStorage`. Raw `#CODE-SECRET` strings are kept in memory only, while
-  room creation stores a bounded creator `hostToken` (up to 20 rooms, 90-day local expiry) in
-  `localStorage` so creators keep host controls across sessions—note that a `hostToken` is a
-  room-entry credential that can admit the creator and retrieve the current invite link, and can
-  be cleared anytime via **Forget host on this device** (or **Forget saved host rooms on this
-  device** in the lobby).
+  rejoin state in `sessionStorage`. Room creation stores a bounded creator `hostToken`
+  (`host-rooms`, up to 20 rooms, 90-day local expiry) in `localStorage` so creators keep host
+  controls across sessions—note that a `hostToken` is a room-entry credential that can admit the
+  creator and retrieve the current invite link, and can be cleared per room via **Forget host on
+  this device** in the Invite menu. For one-click passwordless rejoin, the client also stores up
+  to 20 recent rooms in `localStorage` (`recent-rooms`, 90-day local expiry) with the room code,
+  role, last-visited timestamp, latest invite secret for unlocked or hosted rooms, optional local
+  nickname, and up to 4 last-seen participant display names. In the lobby, you can remove
+  individual entries, wipe both `recent-rooms` and `host-rooms` via **Clear saved rooms**, or
+  disable saving on shared devices via **Don't save rooms on this device**
+  (`recent-rooms-disabled`).
 - **Host controls & moderation:** The room creator holds a cryptographic `hostToken`. The host
   can rotate the invite secret at any time, lock the room to new joins, or remove participants.
   Removing a participant revokes all pre-issued disconnected `rejoinToken` tickets across the

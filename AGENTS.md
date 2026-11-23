@@ -29,6 +29,7 @@ This repository is a P2P screen-sharing web & Windows Electron app backed by a C
   - **Reusable credentials cap:** Retain room credentials for `EMPTY_ROOM_TTL_MS` (**90 days**) anchored to `LAST_HOST_ACTIVE_KEY` (creator activity), enforced even while occupied by promoted guests (`OCCUPIED_FALLBACK_ALARM_MS` + `creatorActivityCap`). Pre-deploy rooms lacking `CREATOR_HOST_KEY` stay on their non-sliding 12-hour TTL.
   - **Lazy pre-admit reconciliation:** `reconcileEmptyTimersBeforeAdmit()` must expire overdue rooms (closing sibling sockets with `1001`) before `admit()` without charging `passwordFailures`.
 - **Host Token Provenance (Client):** Persist creator `hostToken`s only in `localStorage` (`host-rooms` via `src/host-tokens.ts`, bounded to 20 rooms, 90d TTL, 5m clock-skew guard, Web Locks `screenshare:host-rooms` + cross-tab `storage` sync). Keep mid-session promoted guest tokens strictly in memory (`sessionHostTokens`), never overwriting creator provenance.
+- **Recent Rooms Persistence (Client):** Persist recent room rejoin state only in `localStorage` (`recent-rooms` and opt-out flag `recent-rooms-disabled` via `src/recent-rooms.ts`, `src/recent-rooms-model.ts`, and `src/controllers/recent-rooms-controller.ts`), bounded to `20` rooms, `90d` TTL, `5m` clock-skew guard, `4` peer names, `40`-char local label, and `128`-char invite secret. Serialize updates across tabs via Web Lock `screenshare:recent-rooms` + `storage` sync, driven by a single-flight FIFO queue and pure replay reducer (`applyRecentRoomOp`, `replayRecentRoomOps`). Opt-out (`recent-rooms-disabled`) suppresses persistence and clears stored rooms.
 
 ---
 
@@ -61,7 +62,7 @@ This repository is a P2P screen-sharing web & Windows Electron app backed by a C
 - **Static & Test Gates:**
   - `npm run check`, `npm run lint:knip` (zero unused files/exports/cycles), `npm run lint:deadcode` (`oxlint --type-aware --deny-warnings`, `max-lines <= 500`, `complexity <= 15`, zero `as unknown as T` outside `test/**`).
   - `npm test` (`check` + `lint:all` + `test:unit` + `test:worker`) and Vitest coverage (`statements >= 93%`, `branches >= 88%`, `functions >= 92%`, `lines >= 94%`).
-- **Protected Guardrail Files:** Edits to `AGENTS.md`, `.oxlintrc.json`, `stryker.config.json`, `vitest.config.ts`, `vitest.workers.config.ts`, `electron-builder.json`, `shared/protocol.ts`, `worker/index.ts`, `test/formal/**`, `.github/**`, or `scripts/check-guardrails-diff.ts` require explicit maintainer review (`CODEOWNERS` + `approved-guardrail-change` label on PRs).
+- **Protected Guardrail Files:** Edits to `AGENTS.md`, `.oxlintrc.json`, `stryker.config.json`, `vitest.config.ts`, `vitest.workers.config.ts`, `electron-builder.json`, `shared/protocol.ts`, `worker/index.ts`, `test/formal/**`, `.github/**`, `scripts/check-guardrails-diff.ts`, or `scripts/run-stryker-ci.ts` require explicit maintainer review (`CODEOWNERS` + `approved-guardrail-change` label on PRs).
 
 ---
 
