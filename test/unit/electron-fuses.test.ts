@@ -52,7 +52,9 @@ describe("Electron packaged fuse & ASAR integrity verification", () => {
       };
       const res = verifyFuseWire(flipped);
       expect(res.ok).toBe(false);
-      expect(res.failures.some((f) => f.includes(spec.name))).toBe(true);
+      expect(res.failures.some((f) => f.includes(spec.name) && f.includes(spec.expected ? "ENABLE" : "DISABLE"))).toBe(
+        true,
+      );
 
       const inherited = { ...baseWire, [spec.option]: FUSE_STATE_INHERIT };
       expect(verifyFuseWire(inherited).ok).toBe(false);
@@ -61,7 +63,9 @@ describe("Electron packaged fuse & ASAR integrity verification", () => {
       expect(verifyFuseWire(removed).ok).toBe(false);
     }
 
-    expect(verifyFuseWire({ ...baseWire, version: "2" }).ok).toBe(false);
+    const wrongVer = verifyFuseWire({ ...baseWire, version: "2" });
+    expect(wrongVer.ok).toBe(false);
+    expect(wrongVer.failures[0]).toContain("Expected fuse wire version");
     const { version: _omitted, ...withoutVersion } = baseWire;
     expect(verifyFuseWire(withoutVersion).ok).toBe(false);
     expect(verifyFuseWire({}).ok).toBe(false);
@@ -72,8 +76,12 @@ describe("Electron packaged fuse & ASAR integrity verification", () => {
       ok: true,
       failures: [],
     });
-    expect(verifyPackagedResourceEntries(["app-update.yml"]).ok).toBe(false);
-    expect(verifyPackagedResourceEntries(["app.asar", "app"]).ok).toBe(false);
+    const missingAsar = verifyPackagedResourceEntries(["app-update.yml"]);
+    expect(missingAsar.ok).toBe(false);
+    expect(missingAsar.failures[0]).toContain("app.asar");
+    const looseApp = verifyPackagedResourceEntries(["app.asar", "app"]);
+    expect(looseApp.ok).toBe(false);
+    expect(looseApp.failures[0]).toContain("resources/app");
   });
 
   it("validates electron-builder.json enables asar and burns all 6 security fuses", () => {
@@ -81,33 +89,39 @@ describe("Electron packaged fuse & ASAR integrity verification", () => {
     const parsed: unknown = JSON.parse(fs.readFileSync(builderPath, "utf8"));
     expect(verifyElectronBuilderFuseConfig(parsed)).toEqual({ ok: true, failures: [] });
 
-    expect(verifyElectronBuilderFuseConfig(null).ok).toBe(false);
-    expect(verifyElectronBuilderFuseConfig({}).ok).toBe(false);
-    expect(
-      verifyElectronBuilderFuseConfig({
-        asar: false,
-        electronFuses: {
-          runAsNode: false,
-          enableCookieEncryption: true,
-          enableNodeOptionsEnvironmentVariable: false,
-          enableNodeCliInspectArguments: false,
-          enableEmbeddedAsarIntegrityValidation: true,
-          onlyLoadAppFromAsar: true,
-        },
-      }).ok,
-    ).toBe(false);
-    expect(
-      verifyElectronBuilderFuseConfig({
-        asar: true,
-        electronFuses: {
-          runAsNode: true,
-          enableCookieEncryption: true,
-          enableNodeOptionsEnvironmentVariable: false,
-          enableNodeCliInspectArguments: false,
-          enableEmbeddedAsarIntegrityValidation: true,
-          onlyLoadAppFromAsar: true,
-        },
-      }).ok,
-    ).toBe(false);
+    const nullRoot = verifyElectronBuilderFuseConfig(null);
+    expect(nullRoot.ok).toBe(false);
+    expect(nullRoot.failures[0]).toContain("root must be an object");
+    expect(verifyElectronBuilderFuseConfig("not-an-object").ok).toBe(false);
+    const missingFuses = verifyElectronBuilderFuseConfig({});
+    expect(missingFuses.ok).toBe(false);
+    expect(missingFuses.failures[0]).toContain("missing electronFuses");
+    expect(verifyElectronBuilderFuseConfig({ electronFuses: null }).ok).toBe(false);
+    const noAsar = verifyElectronBuilderFuseConfig({
+      asar: false,
+      electronFuses: {
+        runAsNode: false,
+        enableCookieEncryption: true,
+        enableNodeOptionsEnvironmentVariable: false,
+        enableNodeCliInspectArguments: false,
+        enableEmbeddedAsarIntegrityValidation: true,
+        onlyLoadAppFromAsar: true,
+      },
+    });
+    expect(noAsar.ok).toBe(false);
+    expect(noAsar.failures[0]).toContain("asar: true");
+    const badFuse = verifyElectronBuilderFuseConfig({
+      asar: true,
+      electronFuses: {
+        runAsNode: true,
+        enableCookieEncryption: true,
+        enableNodeOptionsEnvironmentVariable: false,
+        enableNodeCliInspectArguments: false,
+        enableEmbeddedAsarIntegrityValidation: true,
+        onlyLoadAppFromAsar: true,
+      },
+    });
+    expect(badFuse.ok).toBe(false);
+    expect(badFuse.failures[0]).toContain("electronFuses.runAsNode");
   });
 });

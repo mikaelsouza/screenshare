@@ -24,6 +24,7 @@ describe("check-guardrails-diff", () => {
         "worker/index.ts",
         "scripts/check-guardrails-diff.ts",
         "scripts/run-stryker-ci.ts",
+        "scripts/smoke-test-packaged.ts",
       ];
       for (const file of exactFiles) {
         expect(isGuardrailFile(file)).toBe(true);

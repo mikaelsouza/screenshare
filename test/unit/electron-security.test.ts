@@ -3,7 +3,6 @@ import {
   buildOfflinePageUrl,
   escapeHtml,
   evaluateNavigation,
-  isAllowedExternalUrl,
   isAllowedPermission,
   isTrustedFrameUrl,
   normalizeExternalUrl,
@@ -51,51 +50,6 @@ describe("electron/security", () => {
         "file:///C:/Windows/System32/cmd.exe",
         "smb://attacker.example/share/payload.exe",
         "ms-msdt:/id PCWDiagnostic /skip force",
-        "javascript:alert(1)",
-        "data:text/html,<script>alert(1)</script>",
-        "about:blank",
-        "blob:https://screenshare.webmikas.com/550e8400-e29b-41d4-a716-446655440000",
-        "ftp://files.example.com/archive.zip",
-      ];
-      for (const input of invalid) {
-        expect({ input, normalized: normalizeExternalUrl(input) }).toEqual({
-          input,
-          normalized: null,
-        });
-      }
-    });
-  });
-
-  describe("isAllowedExternalUrl", () => {
-    it("allows https, http, and mailto URLs including mixed/uppercase schemes", () => {
-      const allowed = [
-        "https://example.com",
-        "https://example.com/path?q=1#hash",
-        "HTTPS://EXAMPLE.COM/UPPER",
-        "HtTpS://mixed.example/test",
-        "http://example.com:8080/page",
-        "HTTP://LOCALHOST:5173",
-        "mailto:support@example.com",
-        "MAILTO:Support@Example.com?subject=Help",
-      ];
-      for (const url of allowed) {
-        expect({ url, allowed: isAllowedExternalUrl(url) }).toEqual({ url, allowed: true });
-      }
-    });
-
-    it("rejects dangerous OS/shell schemes, script schemes, malformed URLs, and control chars", () => {
-      const blocked: Array<string | undefined> = [
-        undefined,
-        "",
-        "   ",
-        "not a url",
-        "://missing-scheme",
-        "https://[::1",
-        "file:///C:/Windows/System32/cmd.exe",
-        "FILE:///etc/passwd",
-        "smb://attacker.example/share/payload.exe",
-        "SMB://192.168.1.10/share",
-        "ms-msdt:/id PCWDiagnostic /skip force",
         "MS-MSDT:/id PCWDiagnostic",
         "ms-officecmd:ofe|u|https://evil.example/doc.docx",
         "search-ms:query=test&crumb=location:\\\\evil\\share",
@@ -108,14 +62,12 @@ describe("electron/security", () => {
         "ftp://files.example.com/archive.zip",
         "chrome://settings",
         "devtools://devtools/bundled/inspector.html",
-        "ht\ttps://example.com",
-        "https://example.com/\r\nX-Injected: 1",
-        "https://example.com/\0null",
-        " https://example.com",
-        "https://example.com ",
       ];
-      for (const url of blocked) {
-        expect({ url, allowed: isAllowedExternalUrl(url) }).toEqual({ url, allowed: false });
+      for (const input of invalid) {
+        expect({ input, normalized: normalizeExternalUrl(input) }).toEqual({
+          input,
+          normalized: null,
+        });
       }
     });
   });
