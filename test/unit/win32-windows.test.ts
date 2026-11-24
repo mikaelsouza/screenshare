@@ -88,7 +88,9 @@ describe("classifyWin32Candidate", () => {
       hwnd: 88,
       name: "Discord",
       state: "normal",
+      fromExeFallback: true,
     });
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 89, title: "Real Title", exeName: "Ignored" }), responsive)?.fromExeFallback).toBeUndefined();
   });
 
   it("marks ERROR_ACCESS_DENIED (5) windows as elevated", () => {
@@ -183,11 +185,11 @@ describe("mergePickerSources", () => {
     const merged = mergePickerSources(dc, api, 99);
     expect(merged).toEqual([
       { id: "window:10:1", name: "Already In DC" },
-      { id: "window:20:0", name: "FramelessApp" },
+      { id: "window:20:0", name: "FramelessApp", fromExeFallback: true },
       { id: "window:99:0", name: "   " },
       { id: "screen:0:0", name: "Screen 1" },
       { id: "window:30:0", hwnd: 30, name: "Minimized Game", state: "minimized" },
-      { id: "window:35:0", hwnd: 35, name: "FramelessApp", state: "normal" },
+      { id: "window:35:0", hwnd: 35, name: "FramelessApp", state: "normal", fromExeFallback: true },
     ]);
     // Probe is only called for eligible missing windows (30 and 35), not 10 or Progman 40
     expect(probe).toHaveBeenCalledTimes(2);
@@ -256,7 +258,7 @@ describe("resolveRestoredVideoSource", () => {
     ).toEqual({ id: "window:777:0", name: "Game" });
   });
 
-  it("stops polling at maxWaitMs when window stays minimized and falls back cleanly", async () => {
+  it("returns null when window stays minimized after maxWaitMs and falls back to { id, name } only when unminimized", async () => {
     const api = { restoreWindow: vi.fn(() => true), isMinimized: () => true };
     const sleep = vi.fn(async () => {});
     const res = await resolveRestoredVideoSource(
@@ -267,7 +269,7 @@ describe("resolveRestoredVideoSource", () => {
     );
     expect(sleep).toHaveBeenCalledTimes(3);
     expect(sleep).toHaveBeenCalledWith(25);
-    expect(res).toEqual({ id: "window:888:0", name: "Stubborn" });
+    expect(res).toBeNull();
   });
 });
 
@@ -290,6 +292,23 @@ describe("createWin32WindowApi", () => {
     } as unknown as KoffiModule;
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(createWin32WindowApi(brokenKoffi, "win32").available).toBe(false);
+
+    // Partial failure: user32 PID lookup binds, dwmapi fails -> lookupPid still works!
+    const partialKoffi = {
+      load: (dll: string) => {
+        if (dll === "dwmapi.dll") throw new Error("dwmapi missing");
+        return {
+          func: <T>() =>
+            ((_hwnd: number, outPid: [number]) => {
+              outPid[0] = 5678;
+              return 1;
+            }) as T,
+        };
+      },
+    } as unknown as KoffiModule<{ name: string }>;
+    const partialApi = createWin32WindowApi(partialKoffi, "win32");
+    expect(partialApi.available).toBe(false);
+    expect(partialApi.lookupPid(42)).toBe(5678);
     warnSpy.mockRestore();
   });
 
@@ -302,8 +321,11 @@ describe("createWin32WindowApi", () => {
     let registeredProc: ((hwnd: number, lParam: number) => boolean) | null = null;
     const unregister = vi.fn();
     const closeHandle = vi.fn(() => true);
-    const showWindow = vi.fn(() => true);
-    let lastError = 0;
+    const showWindowAsync = vi.fn(() => true);
+    const setLastError = vi.fn((code: number) => {
+      lastError = code;
+    });
+    let lastError = 5;
     let sendMsgRet: number | bigint = 1;
 
     const fns: Record<string, unknown> = {
@@ -332,7 +354,7 @@ describe("createWin32WindowApi", () => {
         return 1;
       },
       SendMessageTimeoutW: () => sendMsgRet,
-      ShowWindow: showWindow,
+      ShowWindowAsync: showWindowAsync,
       DwmGetWindowAttribute: (_hwnd: number, _attr: number, outVal: [number]) => {
         outVal[0] = 0;
         return 0;
@@ -344,6 +366,7 @@ describe("createWin32WindowApi", () => {
       },
       CloseHandle: closeHandle,
       GetLastError: () => lastError,
+      SetLastError: setLastError,
     };
 
     const mockKoffi: KoffiModule<{ name: string }> = {
@@ -372,12 +395,14 @@ describe("createWin32WindowApi", () => {
 
     expect(api.isMinimized(40)).toBe(true);
     expect(api.restoreWindow(40)).toBe(true);
-    expect(showWindow).toHaveBeenCalledWith(40, 9);
+    expect(showWindowAsync).toHaveBeenCalledWith(40, 9);
 
     expect(api.probeResponsiveness(30)).toEqual({ responsive: true, errorCode: 0 });
+    expect(setLastError).toHaveBeenCalledWith(0);
+    // Stale ERROR_ACCESS_DENIED (5) is cleared by SetLastError(0) before probe
+    lastError = 5;
     sendMsgRet = 0;
-    lastError = 1460;
-    expect(api.probeResponsiveness(30)).toEqual({ responsive: false, errorCode: 1460 });
+    expect(api.probeResponsiveness(30)).toEqual({ responsive: false, errorCode: 0 });
 
     const rows = api.enumerateRawWindows(10);
     expect(unregister).toHaveBeenCalledWith(77n);

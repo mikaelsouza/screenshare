@@ -354,9 +354,16 @@ describe("captureScreen and track helpers", () => {
 
 describe("describeCaptureError", () => {
   it("returns null for user cancellations and descriptive warnings for capture failures", () => {
-    expect(describeCaptureError(new DOMException("cancelled", "NotAllowedError"))).toBeNull();
-    expect(describeCaptureError(new DOMException("aborted", "AbortError"))).toBeNull();
-    expect(describeCaptureError(new Error("Capture stopped before starting"))).toBeNull();
+    expect(describeCaptureError(new DOMException("cancelled", "NotAllowedError"), "web")).toBeNull();
+    expect(describeCaptureError(new DOMException("Permission denied by system", "NotAllowedError"), "web")).toContain(
+      "system settings",
+    );
+    expect(describeCaptureError(new DOMException("aborted", "AbortError"), "electron")).toBeNull();
+    expect(describeCaptureError(new DOMException("aborted", "AbortError"), "web")).toContain("interrupted");
+    expect(describeCaptureError(new Error("Capture stopped before starting"), "electron")).toBeNull();
+    expect(describeCaptureError(new Error("Could not list windows or screens to share."), "electron")).toContain(
+      "load available windows",
+    );
 
     expect(describeCaptureError(new DOMException("failed", "NotReadableError"))).toContain(
       "Couldn't capture that window",

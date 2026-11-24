@@ -190,19 +190,35 @@ export function stopCapture(result: CaptureResult): void {
   result.stream.getTracks().forEach((t) => t.stop());
 }
 
+function readErrorFields(err: unknown): { name: string; message: string } {
+  if (!err || typeof err !== "object") return { name: "", message: "" };
+  const name = "name" in err && typeof err.name === "string" ? err.name : "";
+  const message = "message" in err && typeof err.message === "string" ? err.message : "";
+  return { name, message };
+}
+
 /**
  * Map a getDisplayMedia / capture startup error into a user-facing warning,
  * or null when the user simply cancelled the picker or stopped before starting.
  */
-export function describeCaptureError(err: unknown): string | null {
-  let name = "";
-  let message = "";
-  if (err && typeof err === "object") {
-    if ("name" in err && typeof err.name === "string") name = err.name;
-    if ("message" in err && typeof err.message === "string") message = err.message;
-  }
-  if (name === "NotAllowedError" || name === "AbortError" || message === "Capture stopped before starting") {
+export function describeCaptureError(
+  err: unknown,
+  kind: "web" | "electron" = "web",
+): string | null {
+  const { name, message } = readErrorFields(err);
+  if (message === "Capture stopped before starting") {
     return null;
+  }
+  if (message === "Could not list windows or screens to share.") {
+    return "Couldn't load available windows or screens. Try again.";
+  }
+  if (name === "NotAllowedError") {
+    return /by system/i.test(message)
+      ? "Screen recording permission is blocked by your operating system. Allow screen capture in system settings and try again."
+      : null;
+  }
+  if (name === "AbortError") {
+    return kind === "electron" ? null : "Screen capture was interrupted before it could start. Try again.";
   }
   if (name === "NotReadableError") {
     return "Couldn't capture that window. Make sure it's open and not protected, or share a screen instead.";

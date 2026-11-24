@@ -30,6 +30,9 @@ export interface FollowState {
   title: string | null;
 }
 
+/** Why the Electron main process rejected a display-media request. */
+export type CaptureFailureReason = "sources-failed" | "restore-failed";
+
 /**
  * Exposed by electron/preload.cts. Every method beyond the flags is optional: the
  * desktop app loads the hosted site, so an older app can meet a newer page.
@@ -44,6 +47,7 @@ export interface ElectronAPI {
   startSystemAudio?: () => Promise<boolean>;
   stopAudio?: () => void;
   onAudioPcm?: (cb: (pcm: Uint8Array) => void) => () => void;
+  onCaptureError?: (cb: (reason: CaptureFailureReason) => void) => () => void;
 }
 
 declare global {

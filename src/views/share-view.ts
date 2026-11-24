@@ -32,6 +32,7 @@ export class ShareLifecycle {
   private activeCapture: CaptureResult | null = null;
   private pending = false;
   private stopPromise: Promise<void> | null = null;
+  private activeCaptureWarning: string | null = null;
 
   constructor(ctx: ShareLifecycleContext) {
     this.ctx = ctx;
@@ -94,8 +95,14 @@ export class ShareLifecycle {
       return result;
     } catch (err) {
       console.warn("[main] capture cancelled or failed", err);
-      const message = describeCaptureError(err);
-      if (message !== null) this.ctx.setStatus(message, "warn");
+      if (shareGen !== this.ctx.session.joinGeneration || !this.ctx.getMesh()) {
+        return null;
+      }
+      const message = describeCaptureError(err, this.ctx.captureController.kind);
+      if (message !== null) {
+        this.activeCaptureWarning = message;
+        this.ctx.setStatus(message, "warn");
+      }
       return null;
     }
   }
@@ -123,6 +130,13 @@ export class ShareLifecycle {
       await this.stop();
       return;
     }
+    if (this.activeCaptureWarning !== null) {
+      if (this.ctx.ui.status.textContent === this.activeCaptureWarning) {
+        const code = this.ctx.session.lastJoinCode;
+        this.ctx.setStatus(code !== null ? this.ctx.session.connectedRoomStatusText(code) : "", "info");
+      }
+      this.activeCaptureWarning = null;
+    }
     syncMuteAudioButton(this.ctx.ui, this.activeCapture);
     this.ctx.syncViewState();
     this.ctx.renderRoster();
@@ -147,6 +161,7 @@ export class ShareLifecycle {
       } finally {
         this.ctx.captureController.stop();
         this.activeCapture = null;
+        this.activeCaptureWarning = null;
       }
       this.ctx.health.clearOutbound();
       this.ctx.tileCtrl.clearOutboundStats();

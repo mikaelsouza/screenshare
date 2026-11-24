@@ -1368,6 +1368,97 @@ describe("negotiation recovery", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it("ignores capture warnings from a previous room and clears capture warning on retry success", async () => {
+    vi.stubGlobal("navigator", {
+      mediaDevices: { getDisplayMedia: vi.fn() },
+    });
+    const makeNode = () => ({
+      setAttribute: vi.fn(),
+      append: vi.fn(),
+    });
+    vi.stubGlobal("document", {
+      createElement: () => makeNode(),
+      createElementNS: () => makeNode(),
+      createTextNode: (t: string) => ({ textContent: t }),
+    });
+    const statusEl = { textContent: "" };
+    const setStatus = vi.fn((text: string) => {
+      statusEl.textContent = text;
+    });
+    let activeMesh: Mesh | null = {} as unknown as Mesh;
+    (activeMesh as unknown as { setCapture: () => Promise<void> }).setCapture = async () => {};
+    const session = new SessionController({
+      getLocalStorage: () => null,
+      getSessionStorage: () => null,
+      getLocks: () => null,
+      runBackground: vi.fn(),
+      onForgetHostUiChange: vi.fn(),
+    });
+    session.lastJoinCode = "ABCD1234";
+    let rejectFirst!: (err: unknown) => void;
+    let mode: "reject-stale" | "reject-current" | "succeed" = "reject-stale";
+    const share = new ShareLifecycle({
+      ui: {
+        status: statusEl,
+        muteAudioBtn: { hidden: true, setAttribute: vi.fn(), classList: { toggle: vi.fn() }, replaceChildren: vi.fn() },
+      } as unknown as UiElements,
+      session,
+      invite: new InviteController({ onChange: vi.fn() }),
+      tileCtrl: new TileController(),
+      tileView: { renderSelfPreview: vi.fn() } as unknown as TileView,
+      health: { clearOutbound: vi.fn() } as unknown as HealthPoller,
+      captureController: {
+        kind: "electron",
+        start: async () => {
+          if (mode === "reject-stale") {
+            return await new Promise((_, reject) => {
+              rejectFirst = reject;
+            });
+          }
+          if (mode === "reject-current") {
+            throw new DOMException("cannot capture", "NotReadableError");
+          }
+          return {
+            stream: { getTracks: () => [] } as unknown as MediaStream,
+            video: { addEventListener: vi.fn(), removeEventListener: vi.fn() } as unknown as MediaStreamTrack,
+            audio: null,
+          };
+        },
+        setPreset: vi.fn(),
+        stop: vi.fn(),
+      },
+      getClient: () => null,
+      getMesh: () => activeMesh,
+      closeAllPopovers: vi.fn(),
+      setStatus,
+      syncViewState: vi.fn(),
+      renderRoster: vi.fn(),
+      runBackground: vi.fn(),
+    });
+
+    try {
+      // 1. Stale room failure is ignored when joinGeneration changes before rejection
+      const staleStart = share.start();
+      await Promise.resolve();
+      session.joinGeneration++;
+      rejectFirst(new DOMException("cannot capture", "NotReadableError"));
+      await staleStart;
+      expect(setStatus).not.toHaveBeenCalled();
+
+      // 2. Current room failure displays warning, and retry success clears it
+      mode = "reject-current";
+      await share.start();
+      expect(setStatus).toHaveBeenCalledTimes(1);
+      expect(statusEl.textContent).toContain("Couldn't capture that window");
+
+      mode = "succeed";
+      await share.start();
+      expect(statusEl.textContent).toBe(session.connectedRoomStatusText("ABCD1234"));
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });
 
 describe("persistent sendonly transceivers", () => {

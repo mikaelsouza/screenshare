@@ -64,9 +64,12 @@ export interface SupplementalWindow extends PickerSource {
   readonly hwnd: number;
   readonly name: string;
   readonly state: PickerWindowState;
+  readonly fromExeFallback?: boolean;
 }
 
-export type MergedPickerSource<S extends PickerSource = PickerSource> = S | SupplementalWindow;
+export type MergedPickerSource<S extends PickerSource = PickerSource> =
+  | (S & { readonly fromExeFallback?: boolean })
+  | SupplementalWindow;
 
 export interface Win32WindowApi {
   readonly available: boolean;
@@ -159,6 +162,7 @@ export function classifyWin32Candidate(
     hwnd: win.hwnd,
     name,
     state,
+    ...(trimmedTitle ? {} : { fromExeFallback: true }),
   };
 }
 
@@ -185,7 +189,7 @@ export function mergePickerSources<S extends PickerSource>(
       if (source.name.trim() === "" && hwnd !== excludeHwnd) {
         const fallback = api.getExeNameForHwnd(hwnd);
         if (fallback) {
-          merged.push({ ...source, name: fallback });
+          merged.push({ ...source, name: fallback, fromExeFallback: true });
           continue;
         }
       }
@@ -216,15 +220,16 @@ const defaultSleep = (ms: number): Promise<void> =>
   });
 
 /**
- * Restore a minimized window via SW_RESTORE, wait briefly for DWM to unminimize
- * it, and re-query desktopCapturer for the live source object.
+ * Restore a minimized window via ShowWindowAsync(SW_RESTORE), wait briefly for DWM
+ * to unminimize it, and re-query desktopCapturer for the live source object.
+ * Returns null if the window remained minimized and was omitted from both refreshes.
  */
 export async function resolveRestoredVideoSource<T extends { id: string; name: string }>(
   source: { id: string; name: string },
   api: Pick<Win32WindowApi, "restoreWindow" | "isMinimized">,
   queryWindows: () => Promise<readonly T[]>,
   deps: RestoreSourceDeps = {},
-): Promise<T | { id: string; name: string }> {
+): Promise<T | { id: string; name: string } | null> {
   const hwnd = parseWindowHandle(source.id);
   if (hwnd === null) {
     return { id: source.id, name: source.name };
@@ -252,7 +257,10 @@ export async function resolveRestoredVideoSource<T extends { id: string; name: s
     const retryMatch = retried.find((entry) => entry.id.startsWith(prefix));
     if (retryMatch) return retryMatch;
   } catch {
-    // Fall back to explicit { id, name } when desktopCapturer re-query fails.
+    // Fall through to minimized check below.
+  }
+  if (api.isMinimized(hwnd)) {
+    return null;
   }
   return { id: source.id, name: source.name };
 }
@@ -300,6 +308,7 @@ type QueryFullProcessImageNameWFn = (
 ) => boolean;
 type CloseHandleFn = (handle: number | bigint) => boolean;
 type GetLastErrorFn = () => number;
+type SetLastErrorFn = (code: number) => void;
 
 function decodeUtf16(buf: Uint16Array, length: number): string {
   if (length <= 0) return "";
@@ -317,8 +326,24 @@ export function createWin32WindowApi<TType extends { name: string }>(
 ): Win32WindowApi {
   if (platform !== "win32") return NOOP_API;
 
+  let lookupPid: (hwnd: number) => number = NOOP_API.lookupPid;
+  let user32: { func: <T>(definition: string) => T };
   try {
-    const user32 = koffiMod.load("user32.dll");
+    user32 = koffiMod.load("user32.dll");
+    const GetWindowThreadProcessId = user32.func<GetWindowThreadProcessIdFn>(
+      "uint32 __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32 *lpdwProcessId)",
+    );
+    lookupPid = (hwnd: number): number => {
+      const out: [number] = [0];
+      GetWindowThreadProcessId(hwnd, out);
+      return out[0];
+    };
+  } catch (err) {
+    console.warn("[win32-windows] failed to bind user32 PID lookup via koffi:", err);
+    return NOOP_API;
+  }
+
+  try {
     const dwmapi = koffiMod.load("dwmapi.dll");
     const kernel32 = koffiMod.load("kernel32.dll");
 
@@ -341,13 +366,10 @@ export function createWin32WindowApi<TType extends { name: string }>(
     const GetWindowRect = user32.func<GetWindowRectFn>(
       "bool __stdcall GetWindowRect(uintptr_t hWnd, _Out_ int32 *lpRect)",
     );
-    const GetWindowThreadProcessId = user32.func<GetWindowThreadProcessIdFn>(
-      "uint32 __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32 *lpdwProcessId)",
-    );
     const SendMessageTimeoutW = user32.func<SendMessageTimeoutWFn>(
       "uintptr_t __stdcall SendMessageTimeoutW(uintptr_t hWnd, uint32 Msg, uintptr_t wParam, intptr_t lParam, uint32 fuFlags, uint32 uTimeout, _Out_ uintptr_t *lpdwResult)",
     );
-    const ShowWindow = user32.func<ShowWindowFn>("bool __stdcall ShowWindow(uintptr_t hWnd, int nCmdShow)");
+    const ShowWindowAsync = user32.func<ShowWindowFn>("bool __stdcall ShowWindowAsync(uintptr_t hWnd, int nCmdShow)");
     const DwmGetWindowAttribute = dwmapi.func<DwmGetWindowAttributeFn>(
       "int32 __stdcall DwmGetWindowAttribute(uintptr_t hwnd, uint32 dwAttribute, _Out_ uint32 *pvAttribute, uint32 cbAttribute)",
     );
@@ -359,12 +381,7 @@ export function createWin32WindowApi<TType extends { name: string }>(
     );
     const CloseHandle = kernel32.func<CloseHandleFn>("bool __stdcall CloseHandle(uintptr_t hObject)");
     const GetLastError = kernel32.func<GetLastErrorFn>("uint32 __stdcall GetLastError()");
-
-    const lookupPid = (hwnd: number): number => {
-      const out: [number] = [0];
-      GetWindowThreadProcessId(hwnd, out);
-      return out[0];
-    };
+    const SetLastError = kernel32.func<SetLastErrorFn>("void __stdcall SetLastError(uint32 dwErrCode)");
 
     const getExeNameForPid = (pid: number): string | null => {
       if (pid <= 0) return null;
@@ -384,6 +401,7 @@ export function createWin32WindowApi<TType extends { name: string }>(
 
     const probeResponsiveness = (hwnd: number): ResponsivenessProbe => {
       const out: [number] = [0];
+      SetLastError(0);
       const ok = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, PROBE_TIMEOUT_MS, out);
       if (ok !== 0 && ok !== 0n) {
         return { responsive: true, errorCode: 0 };
@@ -440,10 +458,10 @@ export function createWin32WindowApi<TType extends { name: string }>(
       probeResponsiveness,
       getExeNameForHwnd,
       isMinimized: (hwnd: number): boolean => IsIconic(hwnd),
-      restoreWindow: (hwnd: number): boolean => ShowWindow(hwnd, SW_RESTORE),
+      restoreWindow: (hwnd: number): boolean => ShowWindowAsync(hwnd, SW_RESTORE),
     };
   } catch (err) {
-    console.warn("[win32-windows] failed to initialize Win32 API via koffi:", err);
-    return NOOP_API;
+    console.warn("[win32-windows] failed to initialize Win32 picker supplement via koffi:", err);
+    return { ...NOOP_API, lookupPid };
   }
 }

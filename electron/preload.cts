@@ -11,6 +11,8 @@ interface FollowUpdatePayload {
   profile: string;
 }
 
+type CaptureFailureReason = "sources-failed" | "restore-failed";
+
 contextBridge.exposeInMainWorld("electronAPI", {
   isElectron: true,
   platform: process.platform,
@@ -43,6 +45,15 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("audio:pcm", handler);
     return (): void => {
       ipcRenderer.removeListener("audio:pcm", handler);
+    };
+  },
+  onCaptureError: (callback: (reason: CaptureFailureReason) => void): (() => void) => {
+    const handler = (_event: IpcRendererEvent, reason: CaptureFailureReason): void => {
+      callback(reason);
+    };
+    ipcRenderer.on("capture:error", handler);
+    return (): void => {
+      ipcRenderer.removeListener("capture:error", handler);
     };
   },
 });

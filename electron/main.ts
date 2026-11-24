@@ -99,19 +99,28 @@ function sendFollowUpdate(profile: FollowProfile, status: FollowStatus): void {
   mainWindow.webContents.send("follow:update", { ...status, profile: profile.label });
 }
 
+let followStopGen = 0;
+
 function stopFollow(): void {
+  followStopGen++;
   if (follow?.timer) clearInterval(follow.timer);
   follow = null;
 }
 
 async function pollFollowState(profile: FollowProfile, state: FollowSessionState): Promise<void> {
   try {
-    const windows = await desktopCapturer.getSources({
+    const dcWindows = await desktopCapturer.getSources({
       types: ["window"],
       thumbnailSize: { width: 0, height: 0 },
     });
     if (follow !== state) return;
-    const status = state.follower.evaluate(windows);
+    const excludeId = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null;
+    const excludeHwnd = excludeId ? parseWindowHandle(excludeId) : null;
+    const merged = mergePickerSources(dcWindows, win32Windows, excludeHwnd);
+    const followWindows: WindowSource[] = merged.filter(
+      (w) => w.fromExeFallback !== true && (!("state" in w) || w.state === "normal"),
+    );
+    const status = state.follower.evaluate(followWindows);
     if (!status) return;
     if (status.sourceId) audioSession.switchWindow(status.sourceId);
     sendFollowUpdate(profile, status);
@@ -143,6 +152,21 @@ function startFollow(profile: FollowProfile, source: WindowSource): void {
 
 let displayMediaRequestGen = 0;
 
+function sendCaptureError(reason: "sources-failed" | "restore-failed"): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("capture:error", reason);
+  }
+}
+
+function resolveFollowTitle(
+  source: { name: string; fromExeFallback?: boolean },
+  resolvedName?: string,
+): string {
+  if (source.fromExeFallback === true) return "";
+  const refreshed = resolvedName?.trim() ?? "";
+  return refreshed || source.name.trim();
+}
+
 function rejectDisplayMedia(callback: (streams: { video?: Video }) => void): void {
   // Electron's callback({}) rejects getDisplayMedia in the page, and also
   // throws synchronously on the main-process stack.
@@ -155,7 +179,7 @@ function rejectDisplayMedia(callback: (streams: { video?: Video }) => void): voi
 
 function grantDisplayMedia(
   video: Video,
-  matchName: string,
+  followTitle: string,
   callback: (streams: { video?: Video }) => void,
 ): void {
   stopFollow();
@@ -169,16 +193,22 @@ function grantDisplayMedia(
   }
   // The exception to "share what was picked": a game's lobby or game window is
   // followed between the two. See electron/follow.
-  const match = matchProfile(matchName);
-  if (match) startFollow(match.profile, { id: video.id, name: matchName });
+  const match = followTitle ? matchProfile(followTitle) : null;
+  if (match) startFollow(match.profile, { id: video.id, name: followTitle });
 }
 
 async function restoreAndGrant(
   source: MergedPickerSource<DesktopCapturerSource>,
   callback: (streams: { video?: Video }) => void,
   requestGen: number,
+  startFollowStopGen: number,
 ): Promise<void> {
-  if (requestGen !== displayMediaRequestGen || !mainWindow || mainWindow.isDestroyed()) {
+  if (
+    requestGen !== displayMediaRequestGen ||
+    followStopGen !== startFollowStopGen ||
+    !mainWindow ||
+    mainWindow.isDestroyed()
+  ) {
     rejectDisplayMedia(callback);
     return;
   }
@@ -186,13 +216,24 @@ async function restoreAndGrant(
     const resolved = await resolveRestoredVideoSource(source, win32Windows, () =>
       desktopCapturer.getSources({ types: ["window"], thumbnailSize: { width: 0, height: 0 } }),
     );
-    if (requestGen !== displayMediaRequestGen || !mainWindow || mainWindow.isDestroyed()) {
+    if (
+      requestGen !== displayMediaRequestGen ||
+      followStopGen !== startFollowStopGen ||
+      !mainWindow ||
+      mainWindow.isDestroyed()
+    ) {
       rejectDisplayMedia(callback);
       return;
     }
-    grantDisplayMedia(resolved, source.name, callback);
+    if (!resolved) {
+      sendCaptureError("restore-failed");
+      rejectDisplayMedia(callback);
+      return;
+    }
+    grantDisplayMedia(resolved, resolveFollowTitle(source, resolved.name), callback);
   } catch (err) {
     console.error("[main] failed to restore minimized window:", err);
+    sendCaptureError("restore-failed");
     rejectDisplayMedia(callback);
   }
 }
@@ -210,6 +251,7 @@ async function handleDisplayMediaRequest(
     });
   } catch (err) {
     console.error("[main] desktopCapturer.getSources failed:", err);
+    sendCaptureError("sources-failed");
     rejectDisplayMedia(callback);
     return;
   }
@@ -222,15 +264,19 @@ async function handleDisplayMediaRequest(
   const finish = (source: MergedPickerSource<DesktopCapturerSource> | null): void => {
     if (settled) return;
     settled = true;
-    if (!source) {
+    if (!source || requestGen !== displayMediaRequestGen || !mainWindow || mainWindow.isDestroyed()) {
       rejectDisplayMedia(callback);
       return;
     }
     if ("state" in source && source.state === "minimized") {
-      runBackground(restoreAndGrant(source, callback, requestGen), "restore minimized window");
+      const startFollowStopGen = followStopGen;
+      runBackground(
+        restoreAndGrant(source, callback, requestGen, startFollowStopGen),
+        "restore minimized window",
+      );
       return;
     }
-    grantDisplayMedia(source, source.name, callback);
+    grantDisplayMedia(source, resolveFollowTitle(source), callback);
   };
 
   const excludeId = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null;
