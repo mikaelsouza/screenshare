@@ -32,7 +32,7 @@ function makeMockApi(overrides: Partial<Win32WindowApi> = {}): Win32WindowApi {
     available: true,
     lookupPid: () => 0,
     enumerateRawWindows: () => [],
-    probeResponsiveness: () => ({ responsive: true, errorCode: 0 }),
+    isWindowElevated: () => false,
     getExeNameForHwnd: () => null,
     isMinimized: () => false,
     restoreWindow: () => true,
@@ -44,7 +44,10 @@ describe("extractExeBaseName", () => {
   it("extracts base executable names from Windows and POSIX paths", () => {
     expect(extractExeBaseName("C:\\Program Files\\App\\Game.exe")).toBe("Game");
     expect(extractExeBaseName("C:/Games/Client.EXE")).toBe("Client");
+    expect(extractExeBaseName("  C:\\Apps\\Trimmed.exe  ")).toBe("Trimmed");
+    expect(extractExeBaseName("C:\\Apps\\SpaceAfter .exe")).toBe("SpaceAfter");
     expect(extractExeBaseName("notepad")).toBe("notepad");
+    expect(extractExeBaseName("")).toBeNull();
     expect(extractExeBaseName("   ")).toBeNull();
     expect(extractExeBaseName("C:\\folder\\")).toBeNull();
     expect(extractExeBaseName(".exe")).toBeNull();
@@ -52,10 +55,10 @@ describe("extractExeBaseName", () => {
 });
 
 describe("classifyWin32Candidate", () => {
-  const responsive = () => ({ responsive: true, errorCode: 0 });
+  const notElevated = () => false;
 
   it("classifies minimized, busy, owned, and untitled windows properly", () => {
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 42, isIconic: true, title: "League of Legends" }), responsive)).toEqual({
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 42, isIconic: true, title: "League of Legends" }), notElevated)).toEqual({
       id: "window:42:0",
       hwnd: 42,
       name: "League of Legends",
@@ -63,10 +66,7 @@ describe("classifyWin32Candidate", () => {
     });
 
     expect(
-      classifyWin32Candidate(makeRaw({ hwnd: 55, title: "Cyberpunk 2077" }), () => ({
-        responsive: false,
-        errorCode: 1460,
-      })),
+      classifyWin32Candidate(makeRaw({ hwnd: 55, title: "Cyberpunk 2077" }), notElevated),
     ).toEqual({
       id: "window:55:0",
       hwnd: 55,
@@ -75,7 +75,7 @@ describe("classifyWin32Candidate", () => {
     });
 
     expect(
-      classifyWin32Candidate(makeRaw({ hwnd: 77, ownerHwnd: 99, width: 320, height: 240, title: "Secondary" }), responsive),
+      classifyWin32Candidate(makeRaw({ hwnd: 77, ownerHwnd: 99, width: 320, height: 240, title: "Secondary" }), notElevated),
     ).toEqual({
       id: "window:77:0",
       hwnd: 77,
@@ -83,22 +83,19 @@ describe("classifyWin32Candidate", () => {
       state: "normal",
     });
 
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 88, title: "   ", exeName: "Discord" }), responsive)).toEqual({
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 88, title: "   ", exeName: "Discord" }), notElevated)).toEqual({
       id: "window:88:0",
       hwnd: 88,
       name: "Discord",
       state: "normal",
       fromExeFallback: true,
     });
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 89, title: "Real Title", exeName: "Ignored" }), responsive)?.fromExeFallback).toBeUndefined();
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 89, title: "Real Title", exeName: "Ignored" }), notElevated)?.fromExeFallback).toBeUndefined();
   });
 
-  it("marks ERROR_ACCESS_DENIED (5) windows as elevated", () => {
+  it("marks elevated windows as elevated independently of minimized state", () => {
     expect(
-      classifyWin32Candidate(makeRaw({ hwnd: 90, title: "Task Manager" }), () => ({
-        responsive: false,
-        errorCode: 5,
-      })),
+      classifyWin32Candidate(makeRaw({ hwnd: 90, title: "Task Manager", isIconic: true }), () => true),
     ).toEqual({
       id: "window:90:0",
       hwnd: 90,
@@ -111,7 +108,7 @@ describe("classifyWin32Candidate", () => {
     expect(
       classifyWin32Candidate(
         makeRaw({ hwnd: 101, className: "ApplicationFrameWindow", cloaked: 2, title: "Calculator" }),
-        responsive,
+        notElevated,
       ),
     ).toEqual({
       id: "window:101:0",
@@ -120,38 +117,38 @@ describe("classifyWin32Candidate", () => {
       state: "minimized",
     });
 
-    expect(classifyWin32Candidate(makeRaw({ cloaked: 2, title: "Other Desktop" }), responsive)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ className: "ApplicationFrameWindow", cloaked: 1 }), responsive)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ cloaked: 2, title: "Other Desktop" }), notElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ className: "ApplicationFrameWindow", cloaked: 1 }), notElevated)).toBeNull();
   });
 
-  it("filters invisible, shell, tool, small owned, dialog, tiny, and nameless windows without probing", () => {
-    const probe = vi.fn(responsive);
-    expect(classifyWin32Candidate(makeRaw({ isVisible: false }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 0 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ className: "Shell_TrayWnd" }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ exStyle: 0x80 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ exStyle: 0x08000000 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, className: "#32770", width: 500, height: 400 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, width: 199, height: 150 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, width: 200, height: 149 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, isIconic: true, width: 500, height: 400 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ width: 59, height: 40 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ width: 60, height: 39 }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ title: "  ", exeName: null }), probe)).toBeNull();
-    expect(classifyWin32Candidate(makeRaw({ title: "  ", exeName: "   " }), probe)).toBeNull();
-    expect(probe).not.toHaveBeenCalled();
+  it("filters invisible, shell, tool, small owned, dialog, tiny, and nameless windows without checking elevation", () => {
+    const isElevated = vi.fn(notElevated);
+    expect(classifyWin32Candidate(makeRaw({ isVisible: false }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 0 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ className: "Shell_TrayWnd" }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ exStyle: 0x80 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ exStyle: 0x08000000 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, className: "#32770", width: 500, height: 400 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, width: 199, height: 150 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, width: 200, height: 149 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ ownerHwnd: 10, isIconic: true, width: 500, height: 400 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ width: 59, height: 40 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ width: 60, height: 39 }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ title: "  ", exeName: null }), isElevated)).toBeNull();
+    expect(classifyWin32Candidate(makeRaw({ title: "  ", exeName: "   " }), isElevated)).toBeNull();
+    expect(isElevated).not.toHaveBeenCalled();
 
     // Exact boundary thresholds pass
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 103, ownerHwnd: 10, width: 200, height: 150 }), probe)?.state).toBe("normal");
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 104, width: 60, height: 40 }), probe)?.state).toBe("normal");
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 103, ownerHwnd: 10, width: 200, height: 150 }), isElevated)?.state).toBe("normal");
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 104, width: 60, height: 40 }), isElevated)?.state).toBe("normal");
     // WS_EX_APPWINDOW overrides tool/noactivate/owned exclusions
-    expect(classifyWin32Candidate(makeRaw({ hwnd: 102, ownerHwnd: 10, exStyle: 0x40080, width: 120, height: 80 }), probe)).toEqual({
+    expect(classifyWin32Candidate(makeRaw({ hwnd: 102, ownerHwnd: 10, exStyle: 0x40080, width: 120, height: 80 }), isElevated)).toEqual({
       id: "window:102:0",
       hwnd: 102,
       name: "Sample App",
       state: "normal",
     });
-    expect(probe).toHaveBeenCalledTimes(3);
+    expect(isElevated).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -162,11 +159,11 @@ describe("mergePickerSources", () => {
   });
 
   it("deduplicates by HWND, enriches blank desktopCapturer titles, and appends supplemental windows", () => {
-    const probe = vi.fn(() => ({ responsive: true, errorCode: 0 }));
+    const isElevated = vi.fn(() => false);
     const exeLookup = vi.fn((hwnd: number) => (hwnd === 20 || hwnd === 35 ? "FramelessApp" : null));
     const api = makeMockApi({
       getExeNameForHwnd: exeLookup,
-      probeResponsiveness: probe,
+      isWindowElevated: isElevated,
       enumerateRawWindows: () => [
         makeRaw({ hwnd: 10, title: "Already In DC", exeName: null }),
         makeRaw({ hwnd: 30, title: "Minimized Game", isIconic: true }),
@@ -191,8 +188,8 @@ describe("mergePickerSources", () => {
       { id: "window:30:0", hwnd: 30, name: "Minimized Game", state: "minimized" },
       { id: "window:35:0", hwnd: 35, name: "FramelessApp", state: "normal", fromExeFallback: true },
     ]);
-    // Probe is only called for eligible missing windows (30 and 35), not 10 or Progman 40
-    expect(probe).toHaveBeenCalledTimes(2);
+    // Elevation check is only called for eligible missing windows (30 and 35), not 10 or Progman 40
+    expect(isElevated).toHaveBeenCalledTimes(2);
     expect(exeLookup).toHaveBeenCalledWith(20);
     expect(exeLookup).toHaveBeenCalledWith(35);
     expect(exeLookup).not.toHaveBeenCalledWith(40);
@@ -280,7 +277,7 @@ describe("createWin32WindowApi", () => {
     expect(linuxApi.available).toBe(false);
     expect(linuxApi.lookupPid(100)).toBe(0);
     expect(linuxApi.enumerateRawWindows(null)).toEqual([]);
-    expect(linuxApi.probeResponsiveness(100)).toEqual({ responsive: true, errorCode: 0 });
+    expect(linuxApi.isWindowElevated(100)).toBe(false);
     expect(linuxApi.getExeNameForHwnd(100)).toBeNull();
     expect(linuxApi.isMinimized(100)).toBe(false);
     expect(linuxApi.restoreWindow(100)).toBe(false);
@@ -326,7 +323,10 @@ describe("createWin32WindowApi", () => {
       lastError = code;
     });
     let lastError = 5;
-    let sendMsgRet: number | bigint = 1;
+    let openProcessResult: number | bigint | null = null;
+    let openProcessErr: number | null = null;
+    const openProcessCalls: Array<[number, boolean, number]> = [];
+    const protoSpy = vi.fn(() => ({ name: "anon_proto" }));
 
     const fns: Record<string, unknown> = {
       EnumWindows: () => {
@@ -350,16 +350,20 @@ describe("createWin32WindowApi", () => {
         return true;
       },
       GetWindowThreadProcessId: (hwnd: number, outPid: [number]) => {
-        outPid[0] = hwnd === 40 ? 4444 : 3333;
+        outPid[0] = hwnd === 40 ? 4444 : hwnd === 50 ? 0 : 3333;
         return 1;
       },
-      SendMessageTimeoutW: () => sendMsgRet,
       ShowWindowAsync: showWindowAsync,
       DwmGetWindowAttribute: (_hwnd: number, _attr: number, outVal: [number]) => {
         outVal[0] = 0;
         return 0;
       },
-      OpenProcess: (_access: number, _inherit: boolean, pid: number) => (pid === 4444 ? 999 : 0),
+      OpenProcess: (access: number, inherit: boolean, pid: number) => {
+        openProcessCalls.push([access, inherit, pid]);
+        if (openProcessErr !== null) lastError = openProcessErr;
+        if (openProcessResult !== null) return openProcessResult;
+        return pid === 4444 ? 999 : 0;
+      },
       QueryFullProcessImageNameW: (_h: number, _flags: number, buf: Uint16Array, size: [number]) => {
         size[0] = writeUtf16(buf, "C:\\Apps\\CustomApp.exe");
         return true;
@@ -377,7 +381,7 @@ describe("createWin32WindowApi", () => {
           return fns[name] as T;
         },
       }),
-      proto: () => ({ name: "anon_proto" }),
+      proto: protoSpy,
       pointer: (ref) => ref,
       register: (cb) => {
         registeredProc = cb;
@@ -388,8 +392,12 @@ describe("createWin32WindowApi", () => {
 
     const api = createWin32WindowApi(mockKoffi, "win32");
     expect(api.available).toBe(true);
+    expect(protoSpy).toHaveBeenCalledWith("__stdcall", "bool", ["uintptr_t", "intptr_t"]);
     expect(api.lookupPid(40)).toBe(4444);
+    expect(api.getExeNameForHwnd(50)).toBeNull();
+    expect(openProcessCalls).toHaveLength(0);
     expect(api.getExeNameForHwnd(40)).toBe("CustomApp");
+    expect(openProcessCalls).toContainEqual([0x1000, false, 4444]);
     expect(api.getExeNameForHwnd(30)).toBeNull();
     expect(closeHandle).toHaveBeenCalledWith(999);
 
@@ -397,12 +405,19 @@ describe("createWin32WindowApi", () => {
     expect(api.restoreWindow(40)).toBe(true);
     expect(showWindowAsync).toHaveBeenCalledWith(40, 9);
 
-    expect(api.probeResponsiveness(30)).toEqual({ responsive: true, errorCode: 0 });
+    // Elevation check via OpenProcess(PROCESS_QUERY_INFORMATION)
+    expect(api.isWindowElevated(50)).toBe(false); // pid === 0
+    expect(api.isWindowElevated(40)).toBe(false); // OpenProcess succeeded and closed handle
     expect(setLastError).toHaveBeenCalledWith(0);
-    // Stale ERROR_ACCESS_DENIED (5) is cleared by SetLastError(0) before probe
-    lastError = 5;
-    sendMsgRet = 0;
-    expect(api.probeResponsiveness(30)).toEqual({ responsive: false, errorCode: 0 });
+    // OpenProcess returns 0 and SetLastError(0) clears stale error -> not elevated
+    expect(api.isWindowElevated(30)).toBe(false);
+    // Genuine ERROR_ACCESS_DENIED (5) after SetLastError(0)
+    openProcessResult = 0;
+    openProcessErr = 5;
+    expect(api.isWindowElevated(30)).toBe(true);
+    openProcessResult = 0n;
+    openProcessErr = 87;
+    expect(api.isWindowElevated(30)).toBe(false);
 
     const rows = api.enumerateRawWindows(10);
     expect(unregister).toHaveBeenCalledWith(77n);

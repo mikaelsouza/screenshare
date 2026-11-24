@@ -17,11 +17,9 @@ const GWL_EXSTYLE = -20;
 const GW_OWNER = 4;
 const DWMWA_CLOAKED = 14;
 const DWM_CLOAKED_SHELL = 2;
+const PROCESS_QUERY_INFORMATION = 0x0400;
 const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-const SMTO_ABORTIFHUNG = 0x0002;
-const WM_NULL = 0x0000;
 const SW_RESTORE = 9;
-const PROBE_TIMEOUT_MS = 25;
 const ERROR_ACCESS_DENIED = 5;
 
 const MIN_UNOWNED_WIDTH = 60;
@@ -54,11 +52,6 @@ export interface RawWin32Window {
   readonly height: number;
 }
 
-export interface ResponsivenessProbe {
-  readonly responsive: boolean;
-  readonly errorCode: number;
-}
-
 export interface SupplementalWindow extends PickerSource {
   readonly id: string;
   readonly hwnd: number;
@@ -75,7 +68,7 @@ export interface Win32WindowApi {
   readonly available: boolean;
   readonly lookupPid: (hwnd: number) => number;
   readonly enumerateRawWindows: (excludeHwnd: number | null) => RawWin32Window[];
-  readonly probeResponsiveness: (hwnd: number) => ResponsivenessProbe;
+  readonly isWindowElevated: (hwnd: number) => boolean;
   readonly getExeNameForHwnd: (hwnd: number) => string | null;
   readonly isMinimized: (hwnd: number) => boolean;
   readonly restoreWindow: (hwnd: number) => boolean;
@@ -133,11 +126,11 @@ function isEligibleGeometry(win: RawWin32Window): boolean {
 
 /**
  * Filter and classify a Win32 top-level window missing from desktopCapturer.
- * Runs cheap visibility/style/geometry checks before probing responsiveness.
+ * Runs cheap visibility/style/geometry checks before checking process elevation.
  */
 export function classifyWin32Candidate(
   win: RawWin32Window,
-  probe: (hwnd: number) => ResponsivenessProbe,
+  isElevated: (hwnd: number) => boolean,
   resolveExeName?: (hwnd: number) => string | null,
 ): SupplementalWindow | null {
   if (!isEligibleStyleAndCloak(win) || !isEligibleGeometry(win)) {
@@ -149,9 +142,8 @@ export function classifyWin32Candidate(
   const name = trimmedTitle || (resolvedExe ? resolvedExe.trim() : "");
   if (!name) return null;
 
-  const probed = probe(win.hwnd);
   let state: PickerWindowState = "normal";
-  if (!probed.responsive && probed.errorCode === ERROR_ACCESS_DENIED) {
+  if (isElevated(win.hwnd)) {
     state = "elevated";
   } else if (win.isIconic || isUwpShellCloaked(win)) {
     state = "minimized";
@@ -199,7 +191,7 @@ export function mergePickerSources<S extends PickerSource>(
 
   for (const raw of api.enumerateRawWindows(excludeHwnd)) {
     if (seenHwnds.has(raw.hwnd)) continue;
-    const candidate = classifyWin32Candidate(raw, api.probeResponsiveness, api.getExeNameForHwnd);
+    const candidate = classifyWin32Candidate(raw, api.isWindowElevated, api.getExeNameForHwnd);
     if (!candidate) continue;
     seenHwnds.add(raw.hwnd);
     merged.push(candidate);
@@ -269,7 +261,7 @@ const NOOP_API: Win32WindowApi = {
   available: false,
   lookupPid: () => 0,
   enumerateRawWindows: () => [],
-  probeResponsiveness: () => ({ responsive: true, errorCode: 0 }),
+  isWindowElevated: () => false,
   getExeNameForHwnd: () => null,
   isMinimized: () => false,
   restoreWindow: () => false,
@@ -283,15 +275,6 @@ type GetWindowLongPtrWFn = (hwnd: number, index: number) => number | bigint;
 type GetWindowFn = (hwnd: number, cmd: number) => number | bigint;
 type GetWindowRectFn = (hwnd: number, rect: Int32Array) => boolean;
 type GetWindowThreadProcessIdFn = (hwnd: number, outPid: [number]) => number;
-type SendMessageTimeoutWFn = (
-  hwnd: number,
-  msg: number,
-  wParam: number,
-  lParam: number,
-  flags: number,
-  timeout: number,
-  outResult: [number],
-) => number | bigint;
 type ShowWindowFn = (hwnd: number, cmdShow: number) => boolean;
 type DwmGetWindowAttributeFn = (
   hwnd: number,
@@ -366,9 +349,6 @@ export function createWin32WindowApi<TType extends { name: string }>(
     const GetWindowRect = user32.func<GetWindowRectFn>(
       "bool __stdcall GetWindowRect(uintptr_t hWnd, _Out_ int32 *lpRect)",
     );
-    const SendMessageTimeoutW = user32.func<SendMessageTimeoutWFn>(
-      "uintptr_t __stdcall SendMessageTimeoutW(uintptr_t hWnd, uint32 Msg, uintptr_t wParam, intptr_t lParam, uint32 fuFlags, uint32 uTimeout, _Out_ uintptr_t *lpdwResult)",
-    );
     const ShowWindowAsync = user32.func<ShowWindowFn>("bool __stdcall ShowWindowAsync(uintptr_t hWnd, int nCmdShow)");
     const DwmGetWindowAttribute = dwmapi.func<DwmGetWindowAttributeFn>(
       "int32 __stdcall DwmGetWindowAttribute(uintptr_t hwnd, uint32 dwAttribute, _Out_ uint32 *pvAttribute, uint32 cbAttribute)",
@@ -399,14 +379,16 @@ export function createWin32WindowApi<TType extends { name: string }>(
 
     const getExeNameForHwnd = (hwnd: number): string | null => getExeNameForPid(lookupPid(hwnd));
 
-    const probeResponsiveness = (hwnd: number): ResponsivenessProbe => {
-      const out: [number] = [0];
+    const isWindowElevated = (hwnd: number): boolean => {
+      const pid = lookupPid(hwnd);
+      if (pid <= 0) return false;
       SetLastError(0);
-      const ok = SendMessageTimeoutW(hwnd, WM_NULL, 0, 0, SMTO_ABORTIFHUNG, PROBE_TIMEOUT_MS, out);
-      if (ok !== 0 && ok !== 0n) {
-        return { responsive: true, errorCode: 0 };
+      const handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
+      if (handle && handle !== 0n) {
+        CloseHandle(handle);
+        return false;
       }
-      return { responsive: false, errorCode: GetLastError() };
+      return GetLastError() === ERROR_ACCESS_DENIED;
     };
 
     const readRawWindow = (hwnd: number): RawWin32Window => {
@@ -455,7 +437,7 @@ export function createWin32WindowApi<TType extends { name: string }>(
       available: true,
       lookupPid,
       enumerateRawWindows,
-      probeResponsiveness,
+      isWindowElevated,
       getExeNameForHwnd,
       isMinimized: (hwnd: number): boolean => IsIconic(hwnd),
       restoreWindow: (hwnd: number): boolean => ShowWindowAsync(hwnd, SW_RESTORE),
