@@ -15,6 +15,24 @@ const config: ViteUserConfig = defineConfig({
   ],
   test: {
     include: ["test/worker/**/*.test.ts"],
+    testTimeout: 15_000,
+    coverage: {
+      provider: "v8",
+      include: [
+        "worker/index.ts",
+        "worker/room.ts",
+        "worker/room-actions.ts",
+        "worker/room-lifecycle.ts",
+        "worker/room-membership.ts",
+      ],
+      reporter: ["text", "json-summary"],
+      thresholds: {
+        statements: 92,
+        branches: 86,
+        functions: 95,
+        lines: 94,
+      },
+    },
   },
   resolve: {
     alias: {
