@@ -233,7 +233,9 @@ async function restoreAndGrant(
     grantDisplayMedia(resolved, resolveFollowTitle(source, resolved.name), callback);
   } catch (err) {
     console.error("[main] failed to restore minimized window:", err);
-    sendCaptureError("restore-failed");
+    if (requestGen === displayMediaRequestGen && followStopGen === startFollowStopGen) {
+      sendCaptureError("restore-failed");
+    }
     rejectDisplayMedia(callback);
   }
 }
@@ -251,7 +253,9 @@ async function handleDisplayMediaRequest(
     });
   } catch (err) {
     console.error("[main] desktopCapturer.getSources failed:", err);
-    sendCaptureError("sources-failed");
+    if (requestGen === displayMediaRequestGen) {
+      sendCaptureError("sources-failed");
+    }
     rejectDisplayMedia(callback);
     return;
   }
