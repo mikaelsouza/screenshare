@@ -3,6 +3,7 @@ import {
   DEFAULT_PRESET,
   QUALITY_PRESETS,
   captureScreen,
+  describeCaptureError,
   onCaptureEnded,
   stopCapture,
   systemAudioSupport,
@@ -348,5 +349,29 @@ describe("captureScreen and track helpers", () => {
 
     stubGetDisplayMedia(makeStream(makeTrack("video", {}), null));
     expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("unknown");
+  });
+});
+
+describe("describeCaptureError", () => {
+  it("returns null for user cancellations and descriptive warnings for capture failures", () => {
+    expect(describeCaptureError(new DOMException("cancelled", "NotAllowedError"), "web")).toBeNull();
+    expect(describeCaptureError(new DOMException("Permission denied by system", "NotAllowedError"), "web")).toContain(
+      "system settings",
+    );
+    expect(describeCaptureError(new DOMException("aborted", "AbortError"), "electron")).toBeNull();
+    expect(describeCaptureError(new DOMException("aborted", "AbortError"), "web")).toContain("interrupted");
+    expect(describeCaptureError(new Error("Capture stopped before starting"), "electron")).toBeNull();
+    expect(describeCaptureError(new Error("Could not list windows or screens to share."), "electron")).toContain(
+      "load available windows",
+    );
+
+    expect(describeCaptureError(new DOMException("failed", "NotReadableError"))).toContain(
+      "Couldn't capture that window",
+    );
+    expect(describeCaptureError(new DOMException("gone", "NotFoundError"))).toContain(
+      "no longer available",
+    );
+    expect(describeCaptureError(new Error("unexpected"))).toContain("Couldn't start screen capture");
+    expect(describeCaptureError("raw string")).toContain("Couldn't start screen capture");
   });
 });

@@ -20,6 +20,7 @@ import type {
   AudioSourceProvider,
   CaptureCallbacks,
   CaptureController,
+  CaptureFailureReason,
   ElectronAPI,
   FollowUpdate,
 } from "./types";
@@ -28,7 +29,7 @@ import type {
 export type FollowAPI = Required<Pick<ElectronAPI, "onFollowUpdate" | "stopFollow">> &
   Pick<
     ElectronAPI,
-    "startWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm"
+    "startWindowAudio" | "startSystemAudio" | "stopAudio" | "onAudioPcm" | "onCaptureError"
   >;
 
 export interface ElectronCaptureDeps {
@@ -112,6 +113,7 @@ function buildDefaultAudioProvider(
 interface PendingStart {
   readonly gen: number;
   canceled: boolean;
+  captureErrorReason: CaptureFailureReason | null;
   result: CaptureResult | null;
   cancel: () => void;
   unsub: () => void;
@@ -213,10 +215,13 @@ export function createElectronCaptureController(
     // picked, which can be before getDisplayMedia resolves here.
     const rawUnsub = api.onFollowUpdate(handle);
     let unsubscribed = false;
+    let captureErrorUnsub: (() => void) | null = null;
     const unsub = (): void => {
       if (unsubscribed) return;
       unsubscribed = true;
       rawUnsub();
+      captureErrorUnsub?.();
+      captureErrorUnsub = null;
       if (unsubscribe === unsub) unsubscribe = null;
     };
     unsubscribe = unsub;
@@ -224,6 +229,7 @@ export function createElectronCaptureController(
     const state: PendingStart = {
       gen,
       canceled: false,
+      captureErrorReason: null,
       result: null,
       unsub,
       cancel() {
@@ -241,6 +247,11 @@ export function createElectronCaptureController(
         }
       },
     };
+    captureErrorUnsub = api.onCaptureError?.((reason) => {
+      if (!state.canceled && state.gen === generation) {
+        state.captureErrorReason = reason;
+      }
+    }) ?? null;
     pendingStart = state;
     return state;
   }
@@ -310,7 +321,17 @@ export function createElectronCaptureController(
       let result: CaptureResult | null = null;
       let chosenAudio: MediaStreamTrack | null = null;
       try {
-        result = await deps.captureScreen(p);
+        try {
+          result = await deps.captureScreen(p);
+        } catch (captureErr) {
+          if (state.captureErrorReason === "restore-failed") {
+            throw new DOMException("Could not restore minimized window", "NotReadableError");
+          }
+          if (state.captureErrorReason === "sources-failed") {
+            throw new Error("Could not list windows or screens to share.");
+          }
+          throw captureErr;
+        }
         state.result = result;
         assertStartActive(state);
         chosenAudio = await provideAudioForStart(state, result);

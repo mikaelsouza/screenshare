@@ -873,5 +873,32 @@ describe("desktop WASAPI audio integration", () => {
     expect(bridge.stopAudio).toHaveBeenCalledTimes(1);
     expect(bridge.stopFollow).toHaveBeenCalledTimes(1);
   });
+
+  it("translates capture:error IPC reasons into specific errors when captureScreen aborts", async () => {
+    let emitCaptureError: ((reason: "sources-failed" | "restore-failed") => void) | null = null;
+    const unsubError = vi.fn();
+    const bridge = {
+      ...makeAudioBridge(),
+      onCaptureError: (cb: (reason: "sources-failed" | "restore-failed") => void) => {
+        emitCaptureError = cb;
+        return unsubError;
+      },
+    };
+    const { deps } = makeDeps("window", false);
+    deps.captureScreen = vi.fn(async () => {
+      emitCaptureError?.("restore-failed");
+      throw new DOMException("Invalid capture constraints", "AbortError");
+    });
+
+    const c = createElectronCaptureController(bridge, callbacks(), deps);
+    await expect(c.start(preset)).rejects.toMatchObject({ name: "NotReadableError" });
+    expect(unsubError).toHaveBeenCalledTimes(1);
+
+    deps.captureScreen = vi.fn(async () => {
+      emitCaptureError?.("sources-failed");
+      throw new DOMException("Invalid capture constraints", "AbortError");
+    });
+    await expect(c.start(preset)).rejects.toThrow("Could not list windows or screens to share.");
+  });
 });
 

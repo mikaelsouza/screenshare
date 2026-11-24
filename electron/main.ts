@@ -8,12 +8,19 @@ import {
   ipcMain,
   shell,
   type DesktopCapturerSource,
+  type Video,
 } from "electron";
 import { NsisUpdater } from "electron-updater";
 import { matchProfile, type FollowProfile } from "./follow/profiles.js";
 import { createFollower, type Follower, type FollowStatus, type WindowSource } from "./follow/follower.js";
 import { buildPickerTemplate } from "./picker.js";
-import { createPidResolver } from "./audio/pid.js";
+import { createPidResolver, parseWindowHandle } from "./audio/pid.js";
+import {
+  createWin32WindowApi,
+  mergePickerSources,
+  resolveRestoredVideoSource,
+  type MergedPickerSource,
+} from "./win32-windows.js";
 import { createAudioSessionController } from "./audio/capture.js";
 import { createAutoUpdateController } from "./updater.js";
 import { resolveProcessElectronConfig } from "./config.js";
@@ -59,30 +66,12 @@ function resolveTargetUrl(): string {
 
 // ---- audio capture ---------------------------------------------------------
 
-let lastPickedSource: DesktopCapturerSource | null = null;
-
-type GetWindowThreadProcessIdFn = (hwnd: number, outPid: [number]) => unknown;
-
-let lookupWin32Pid: (hwnd: number) => number = () => 0;
-if (process.platform === "win32") {
-  try {
-    const user32 = koffi.load("user32.dll");
-    const GetWindowThreadProcessId: GetWindowThreadProcessIdFn = user32.func(
-      "uint32 __stdcall GetWindowThreadProcessId(uintptr_t hWnd, _Out_ uint32 *lpdwProcessId)",
-    );
-    lookupWin32Pid = (hwnd: number): number => {
-      const out: [number] = [0];
-      GetWindowThreadProcessId(hwnd, out);
-      return out[0];
-    };
-  } catch (err) {
-    console.warn("[main] could not load user32.dll via koffi:", err);
-  }
-}
+let lastPickedSource: Video | null = null;
+const win32Windows = createWin32WindowApi(koffi, process.platform);
 
 const audioSession = createAudioSessionController({
   createCapture: () => new loopback.LoopbackCapture(),
-  resolvePid: createPidResolver(lookupWin32Pid),
+  resolvePid: createPidResolver(win32Windows.lookupPid),
   selfPid: process.pid,
   sendPcm: (chunk: Uint8Array) => {
     if (mainWindow && !mainWindow.isDestroyed()) {
@@ -110,19 +99,28 @@ function sendFollowUpdate(profile: FollowProfile, status: FollowStatus): void {
   mainWindow.webContents.send("follow:update", { ...status, profile: profile.label });
 }
 
+let followStopGen = 0;
+
 function stopFollow(): void {
+  followStopGen++;
   if (follow?.timer) clearInterval(follow.timer);
   follow = null;
 }
 
 async function pollFollowState(profile: FollowProfile, state: FollowSessionState): Promise<void> {
   try {
-    const windows = await desktopCapturer.getSources({
+    const dcWindows = await desktopCapturer.getSources({
       types: ["window"],
       thumbnailSize: { width: 0, height: 0 },
     });
     if (follow !== state) return;
-    const status = state.follower.evaluate(windows);
+    const excludeId = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null;
+    const excludeHwnd = excludeId ? parseWindowHandle(excludeId) : null;
+    const merged = mergePickerSources(dcWindows, win32Windows, excludeHwnd);
+    const followWindows: WindowSource[] = merged.filter(
+      (w) => w.fromExeFallback !== true && (!("state" in w) || w.state === "normal"),
+    );
+    const status = state.follower.evaluate(followWindows);
     if (!status) return;
     if (status.sourceId) audioSession.switchWindow(status.sourceId);
     sendFollowUpdate(profile, status);
@@ -152,9 +150,100 @@ function startFollow(profile: FollowProfile, source: WindowSource): void {
 
 // ---- media & IPC handlers --------------------------------------------------
 
-async function handleDisplayMediaRequest(
-  callback: (streams: { video?: DesktopCapturerSource }) => void,
+let displayMediaRequestGen = 0;
+
+function sendCaptureError(reason: "sources-failed" | "restore-failed"): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("capture:error", reason);
+  }
+}
+
+function resolveFollowTitle(
+  source: { name: string; fromExeFallback?: boolean },
+  resolvedName?: string,
+): string {
+  if (source.fromExeFallback === true) return "";
+  const refreshed = resolvedName?.trim() ?? "";
+  return refreshed || source.name.trim();
+}
+
+function rejectDisplayMedia(callback: (streams: { video?: Video }) => void): void {
+  // Electron's callback({}) rejects getDisplayMedia in the page, and also
+  // throws synchronously on the main-process stack.
+  try {
+    callback({});
+  } catch {
+    // Ignore synchronous rejection error from Electron
+  }
+}
+
+function grantDisplayMedia(
+  video: Video,
+  followTitle: string,
+  callback: (streams: { video?: Video }) => void,
+): void {
+  stopFollow();
+  audioSession.stop();
+  try {
+    callback({ video });
+    lastPickedSource = video;
+  } catch (err) {
+    console.error("[main] setDisplayMediaRequestHandler callback failed:", err);
+    return;
+  }
+  // The exception to "share what was picked": a game's lobby or game window is
+  // followed between the two. See electron/follow.
+  const match = followTitle ? matchProfile(followTitle) : null;
+  if (match) startFollow(match.profile, { id: video.id, name: followTitle });
+}
+
+async function restoreAndGrant(
+  source: MergedPickerSource<DesktopCapturerSource>,
+  callback: (streams: { video?: Video }) => void,
+  requestGen: number,
+  startFollowStopGen: number,
 ): Promise<void> {
+  if (
+    requestGen !== displayMediaRequestGen ||
+    followStopGen !== startFollowStopGen ||
+    !mainWindow ||
+    mainWindow.isDestroyed()
+  ) {
+    rejectDisplayMedia(callback);
+    return;
+  }
+  try {
+    const resolved = await resolveRestoredVideoSource(source, win32Windows, () =>
+      desktopCapturer.getSources({ types: ["window"], thumbnailSize: { width: 0, height: 0 } }),
+    );
+    if (
+      requestGen !== displayMediaRequestGen ||
+      followStopGen !== startFollowStopGen ||
+      !mainWindow ||
+      mainWindow.isDestroyed()
+    ) {
+      rejectDisplayMedia(callback);
+      return;
+    }
+    if (!resolved) {
+      sendCaptureError("restore-failed");
+      rejectDisplayMedia(callback);
+      return;
+    }
+    grantDisplayMedia(resolved, resolveFollowTitle(source, resolved.name), callback);
+  } catch (err) {
+    console.error("[main] failed to restore minimized window:", err);
+    if (requestGen === displayMediaRequestGen && followStopGen === startFollowStopGen) {
+      sendCaptureError("restore-failed");
+    }
+    rejectDisplayMedia(callback);
+  }
+}
+
+async function handleDisplayMediaRequest(
+  callback: (streams: { video?: Video }) => void,
+): Promise<void> {
+  const requestGen = ++displayMediaRequestGen;
   let sources: DesktopCapturerSource[];
   try {
     sources = await desktopCapturer.getSources({
@@ -164,49 +253,40 @@ async function handleDisplayMediaRequest(
     });
   } catch (err) {
     console.error("[main] desktopCapturer.getSources failed:", err);
-    // Electron's callback({}) rejects getDisplayMedia in the page, and also
-    // throws synchronously on the main-process stack.
-    try {
-      callback({});
-    } catch {
-      // Ignore synchronous rejection error from Electron
+    if (requestGen === displayMediaRequestGen) {
+      sendCaptureError("sources-failed");
     }
+    rejectDisplayMedia(callback);
+    return;
+  }
+  if (requestGen !== displayMediaRequestGen) {
+    rejectDisplayMedia(callback);
     return;
   }
 
   let settled = false;
-  const finish = (source: DesktopCapturerSource | null): void => {
+  const finish = (source: MergedPickerSource<DesktopCapturerSource> | null): void => {
     if (settled) return;
     settled = true;
-    if (!source) {
-      // Rejects getDisplayMedia, which the page treats as a cancelled pick.
-      // Electron also throws "Video was requested, but no video stream was
-      // provided" synchronously here; inside setTimeout that would be uncaught.
-      try {
-        callback({});
-      } catch {
-        // Ignore synchronous rejection error from Electron
-      }
+    if (!source || requestGen !== displayMediaRequestGen || !mainWindow || mainWindow.isDestroyed()) {
+      rejectDisplayMedia(callback);
       return;
     }
-    stopFollow();
-    audioSession.stop();
-    lastPickedSource = source;
-    try {
-      callback({ video: source });
-    } catch (err) {
-      console.error("[main] setDisplayMediaRequestHandler callback failed:", err);
+    if ("state" in source && source.state === "minimized") {
+      const startFollowStopGen = followStopGen;
+      runBackground(
+        restoreAndGrant(source, callback, requestGen, startFollowStopGen),
+        "restore minimized window",
+      );
       return;
     }
-    // The exception to "share what was picked": a game's lobby or game window is
-    // followed between the two. See electron/follow.
-    const match = matchProfile(source.name);
-    if (match) startFollow(match.profile, source);
+    grantDisplayMedia(source, resolveFollowTitle(source), callback);
   };
 
-  const template = buildPickerTemplate(sources, finish, {
-    excludeId: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null,
-  });
+  const excludeId = mainWindow && !mainWindow.isDestroyed() ? mainWindow.getMediaSourceId() : null;
+  const excludeHwnd = excludeId ? parseWindowHandle(excludeId) : null;
+  const mergedSources = mergePickerSources(sources, win32Windows, excludeHwnd);
+  const template = buildPickerTemplate(mergedSources, finish, { excludeId });
   if (template.length === 0 || !mainWindow || mainWindow.isDestroyed()) {
     finish(null);
     return;
