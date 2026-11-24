@@ -328,4 +328,73 @@ describe("RecentRoomsController", () => {
     ctrl.syncFromStorage();
     expect(ctrl.isDisabled()).toBe(true);
   });
+
+  it("shields opt-out, re-enable, clearAll, and remove from re-entrant syncFromStorage under async locks", async () => {
+    const now = 1_700_000_000_000;
+    const storage = makeMemoryStorage();
+    const hostCodes = new Set(["ABCD2345", "WXYZ2345"]);
+    const bgTasks: Promise<unknown>[] = [];
+    const locks: LockManagerLike = {
+      request: async (_name, cb) => {
+        await Promise.resolve();
+        await cb();
+      },
+    };
+    let ctrl: RecentRoomsController;
+    const onChange = vi.fn();
+    ctrl = new RecentRoomsController({
+      getLocalStorage: () => storage,
+      getLocks: () => locks,
+      runBackground: (p) => bgTasks.push(p),
+      hasSavedCreatorHostFor: (c) => hostCodes.has(c),
+      onRemoveHostToken: (code) => {
+        hostCodes.delete(code);
+        ctrl.syncFromStorage();
+      },
+      onForgetAllHostTokens: () => {
+        hostCodes.clear();
+        ctrl.syncFromStorage();
+        bgTasks.push(Promise.resolve().then(() => ctrl.syncFromStorage()));
+      },
+      onChange,
+      now: () => now,
+    });
+    const flush = async () => {
+      while (bgTasks.length > 0) await Promise.all(bgTasks.splice(0));
+    };
+
+    ctrl.recordJoin({ code: "ABCD2345", password: "PASS_ABCD_123456" });
+    ctrl.recordJoin({ code: "WXYZ2345", password: "PASS_WXYZ_123456" });
+    await flush();
+    expect(ctrl.getRooms()).toHaveLength(2);
+
+    ctrl.remove("ABCD2345");
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["WXYZ2345"]);
+    await flush();
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["WXYZ2345"]);
+
+    ctrl.clearAll();
+    expect(ctrl.getRooms()).toEqual([]);
+    await flush();
+    expect(ctrl.getRooms()).toEqual([]);
+
+    ctrl.recordJoin({ code: "MNPQ2345", password: "PASS_MNPQ_123456" });
+    await flush();
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["MNPQ2345"]);
+
+    ctrl.setDisabled(true);
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
+    await flush();
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
+    expect(storage.store.get(RECENT_ROOMS_OPT_OUT_KEY)).toBe("1");
+
+    storage.store.set(HOST_ROOMS_STORAGE_KEY, JSON.stringify([{ code: "HTRM2345", token: "tok", updatedAt: now }]));
+    hostCodes.add("HTRM2345");
+    ctrl.setDisabled(false);
+    await flush();
+    expect(ctrl.isDisabled()).toBe(false);
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["HTRM2345"]);
+  });
 });

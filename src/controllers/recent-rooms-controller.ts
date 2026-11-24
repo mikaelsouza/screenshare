@@ -56,6 +56,7 @@ export class RecentRoomsController {
   private searchQuery = "";
   private editingCode: string | null = null;
   private lockChain: Promise<void> = Promise.resolve();
+  private pendingMutations = 0;
 
   constructor(env: RecentRoomsEnvironment) {
     this.env = env;
@@ -69,6 +70,15 @@ export class RecentRoomsController {
   private normalizeUiState(): void {
     if (this.editingCode !== null && !this.rooms.some((r) => r.code === this.editingCode)) this.editingCode = null;
     if (this.rooms.length < 3) this.searchQuery = "";
+  }
+
+  private runWithoutSync(fn: () => void): void {
+    this.pendingMutations++;
+    try {
+      fn();
+    } finally {
+      this.pendingMutations--;
+    }
   }
 
   private refreshFromDisk(storage: StorageLike | null, now: number, loadedEntries?: readonly RecentRoomEntry[]): void {
@@ -92,7 +102,16 @@ export class RecentRoomsController {
       task();
       return;
     }
-    this.lockChain = this.lockChain.then(() => runWithRecentRoomsLock(locks, task));
+    this.pendingMutations++;
+    this.lockChain = this.lockChain.then(() =>
+      runWithRecentRoomsLock(locks, () => {
+        try {
+          task();
+        } finally {
+          this.pendingMutations--;
+        }
+      }),
+    );
     this.env.runBackground(this.lockChain);
   }
 
@@ -230,7 +249,7 @@ export class RecentRoomsController {
       this.rooms = optimistic;
       this.normalizeUiState();
     }
-    cleanupToken?.();
+    if (cleanupToken) this.runWithoutSync(cleanupToken);
     this.env.onChange();
 
     this.applyLockedMutation((storage, now) => {
@@ -274,12 +293,15 @@ export class RecentRoomsController {
     this.editingCode = null;
     if (disabled) {
       this.rooms = [];
-      this.env.onForgetAllHostTokens();
+      this.runWithoutSync(() => this.env.onForgetAllHostTokens());
     }
     this.env.onChange();
 
     this.applyLockedMutation((storage, now) => {
       if (!setRecentRoomsDisabled(storage, disabled)) return;
+      this.disabled = disabled;
+      this.searchQuery = "";
+      this.editingCode = null;
       if (disabled) {
         clearAllPersistedRecentRooms(storage);
         this.rooms = [];
@@ -293,7 +315,7 @@ export class RecentRoomsController {
     this.rooms = [];
     this.searchQuery = "";
     this.editingCode = null;
-    this.env.onForgetAllHostTokens();
+    this.runWithoutSync(() => this.env.onForgetAllHostTokens());
     this.env.onChange();
 
     this.applyLockedMutation((storage) => {
@@ -303,6 +325,7 @@ export class RecentRoomsController {
   }
 
   syncFromStorage(notify: boolean = true): void {
+    if (this.pendingMutations > 0) return;
     const storage = this.env.getLocalStorage();
     const now = this.now();
     const disabledState = tryIsRecentRoomsDisabled(storage);
