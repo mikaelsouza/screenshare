@@ -304,7 +304,8 @@ describe("RoomDO stateful model (real workerd execution)", () => {
                 });
                 const candidate = state.guests.find((g) => g.id === promotedId);
                 expect(candidate).toBeDefined();
-                const promo = await candidate!.client.nextOf("host-promoted");
+                let promo = await candidate!.client.nextOf("host-promoted");
+                while (promo.hostToken === undefined) promo = await candidate!.client.nextOf("host-promoted");
                 expect(promo.hostId).toBe(candidate!.id);
                 candidate!.host = true;
                 state.hostPromoted = true;
@@ -360,6 +361,52 @@ describe("RoomDO stateful model (real workerd execution)", () => {
     creator.send({ t: "join", room: code, displayName: "creator", hostToken: created.hostToken });
     expect((await creator.nextOf("welcome")).host).toBe(true);
     creator.close();
+    await waitSocketCount(stub, 0);
+  });
+
+  it("ignores queued peer host-promoted broadcasts when a second guest is promoted after the first disconnects", async () => {
+    const code = nextModelRoomCode();
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+    const initRes = await stub.fetch("https://internal/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const created = await initRes.json<{ code: string; password: string }>();
+
+    const g1 = await LiveClient.connect(code, "198.51.101.211");
+    g1.send({ t: "join", room: code, displayName: "g1", password: created.password });
+    const w1 = await g1.nextOf("welcome");
+
+    const g2 = await LiveClient.connect(code, "198.51.101.212");
+    g2.send({ t: "join", room: code, displayName: "g2", password: created.password });
+    const w2 = await g2.nextOf("welcome");
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    await runDurableObjectAlarm(stub);
+
+    const firstHostId = await runInDurableObject(stub, (_i, s) => {
+      for (const ws of s.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { id?: string; joined?: boolean; host?: boolean } | null;
+        if (att?.joined && att.host) return att.id;
+      }
+      return undefined;
+    });
+    const first = firstHostId === w1.selfId ? { id: w1.selfId, client: g1 } : { id: w2.selfId, client: g2 };
+    const second = firstHostId === w1.selfId ? { id: w2.selfId, client: g2 } : { id: w1.selfId, client: g1 };
+    expect((await first.client.nextOf("host-promoted")).hostToken).toBeTruthy();
+
+    first.client.close();
+    await waitSocketCount(stub, 1);
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    await runDurableObjectAlarm(stub);
+
+    let promo = await second.client.nextOf("host-promoted");
+    while (promo.hostToken === undefined) promo = await second.client.nextOf("host-promoted");
+    expect(promo.hostId).toBe(second.id);
+
+    second.client.close();
     await waitSocketCount(stub, 0);
   });
 });
