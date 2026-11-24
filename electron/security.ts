@@ -17,7 +17,8 @@ const ALLOWED_PERMISSIONS: ReadonlySet<string> = new Set([
   "clipboard-sanitized-write",
 ]);
 
-function hasControlChar(value: string): boolean {
+/** Return true if `value` contains ASCII C0/DEL control characters. */
+export function hasControlChar(value: string): boolean {
   for (let i = 0; i < value.length; i++) {
     const code = value.charCodeAt(i);
     if (code <= 0x1f || code === 0x7f) return true;

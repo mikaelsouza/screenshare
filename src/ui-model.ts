@@ -1,5 +1,15 @@
 import { ROOM_PASSWORD_LENGTH, type InviteParseFailureReason, type PeerId } from "@shared/protocol";
 
+/** Truncate trimmed `value` to at most `maxUnits` UTF-16 code units without splitting a surrogate pair. */
+export function trimCodeUnits(value: string, maxUnits: number): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxUnits) return trimmed;
+  let end = maxUnits;
+  const unit = trimmed.charCodeAt(end - 1);
+  if (unit >= 0xd800 && unit <= 0xdbff) end -= 1;
+  return trimmed.slice(0, end).trimEnd();
+}
+
 export interface ViewState {
   lobbyHidden: boolean;
   roomBarHidden: boolean;

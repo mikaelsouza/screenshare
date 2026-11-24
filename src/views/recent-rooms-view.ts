@@ -4,6 +4,7 @@ import {
   formatRelativeTime,
   type RecentRoomEntry,
 } from "../recent-rooms";
+import { createEl as el } from "./dom";
 import "./recent-rooms.css";
 
 export interface RecentRoomsViewCallbacks {
@@ -57,17 +58,6 @@ function isFocusInsideRenameRow(active: {
   if (typeof document === "undefined") return false;
   const activeEl = document.activeElement;
   return activeEl === active.input || activeEl === active.saveBtn || activeEl === active.cancelBtn;
-}
-
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
 }
 
 function buildRenameRow(

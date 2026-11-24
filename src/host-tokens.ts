@@ -213,8 +213,9 @@ export function clearLegacySessionHostTokens(storage: SessionStorageLike | null 
 /**
  * Serialize a storage read-modify-write callback across tabs via the Web Locks API when available.
  */
-export async function runWithHostRoomsLock(
+export async function runWithStorageLock(
   locks: LockManagerLike | null | undefined,
+  lockName: string,
   fn: () => void,
 ): Promise<void> {
   if (!locks) {
@@ -223,11 +224,21 @@ export async function runWithHostRoomsLock(
   }
   let ran = false;
   try {
-    await locks.request(HOST_ROOMS_LOCK_NAME, () => {
+    await locks.request(lockName, () => {
       ran = true;
       fn();
     });
   } catch {
     if (!ran) fn();
   }
+}
+
+/**
+ * Serialize a `host-rooms` read-modify-write callback across tabs via the Web Locks API when available.
+ */
+export function runWithHostRoomsLock(
+  locks: LockManagerLike | null | undefined,
+  fn: () => void,
+): Promise<void> {
+  return runWithStorageLock(locks, HOST_ROOMS_LOCK_NAME, fn);
 }
