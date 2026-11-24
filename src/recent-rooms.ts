@@ -86,34 +86,6 @@ function scanRecentRooms(
   return scanRawRecentRooms(raw, now);
 }
 
-function persistEntriesResult(
-  storage: StorageLike,
-  entries: RecentRoomEntry[],
-): { entries: RecentRoomEntry[]; persisted: boolean } {
-  const bounded = sortAndBoundEntries(entries);
-  try {
-    if (bounded.length === 0) {
-      storage.removeItem(RECENT_ROOMS_STORAGE_KEY);
-    } else {
-      storage.setItem(RECENT_ROOMS_STORAGE_KEY, JSON.stringify(bounded));
-    }
-    return { entries: bounded, persisted: true };
-  } catch {
-    return { entries: bounded, persisted: false };
-  }
-}
-
-/** Return true if `storage` is accessible and has no persisted `recent-rooms` key. */
-export function isRecentRoomsKeyAbsent(storage: StorageLike | null | undefined): boolean {
-  if (!storage) return false;
-  try {
-    const raw = storage.getItem(RECENT_ROOMS_STORAGE_KEY);
-    return raw === null || raw === "";
-  } catch {
-    return false;
-  }
-}
-
 /** Read the opt-out flag (`recent-rooms-disabled`) from `storage`, returning `{ ok, disabled }` where `ok` is false if storage read failed. */
 export function tryIsRecentRoomsDisabled(
   storage: StorageLike | null | undefined,
@@ -166,10 +138,20 @@ export function hasStaleRecentRooms(
 /** Write sorted, bounded `entries` to `storage`, returning whether the storage write succeeded. */
 export function writePersistedRecentRooms(
   storage: StorageLike | null | undefined,
-  entries: RecentRoomEntry[],
+  entries: readonly RecentRoomEntry[],
 ): boolean {
   if (!storage) return false;
-  return persistEntriesResult(storage, entries).persisted;
+  const bounded = sortAndBoundEntries(entries);
+  try {
+    if (bounded.length === 0) {
+      storage.removeItem(RECENT_ROOMS_STORAGE_KEY);
+    } else {
+      storage.setItem(RECENT_ROOMS_STORAGE_KEY, JSON.stringify(bounded));
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Prune expired, invalid, or duplicate records from `recent-rooms` in `storage` if any exist. */
