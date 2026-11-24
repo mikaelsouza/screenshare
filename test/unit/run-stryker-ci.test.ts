@@ -3,11 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  formatExcludedSummary,
   parseNullDelimitedPaths,
   readMutatePatterns,
   resolveBaseRef,
   resolveMutateFiles,
   selectChangedMutateFiles,
+  selectExcludedMutateFiles,
 } from "../../scripts/run-stryker-ci";
 
 describe("run-stryker-ci", () => {
@@ -154,5 +156,59 @@ describe("run-stryker-ci", () => {
       "electron/security.ts",
       "src/café.ts",
     ]);
+  });
+
+  describe("selectExcludedMutateFiles", () => {
+    it("returns unique sorted runtime files excluded from mutate scope and ignores non-runtime or declaration files", () => {
+      const eligible = ["electron\\security.ts", "src/mesh.ts"];
+      const changed = [
+        "src/mesh.ts",
+        "src\\main.ts",
+        "src/main.ts",
+        "src/views/Badge.tsx",
+        "worker/room.ts",
+        "shared/protocol.ts",
+        "electron/main.ts",
+        "scripts/custom.ts",
+        "src/vite-env.d.ts",
+        "test/unit/mesh.test.ts",
+        "README.md",
+        ".github/workflows/ci.yml",
+        "src/not-ts.css",
+      ];
+
+      expect(selectExcludedMutateFiles(eligible, changed)).toEqual([
+        "electron/main.ts",
+        "scripts/custom.ts",
+        "shared/protocol.ts",
+        "src/main.ts",
+        "src/views/Badge.tsx",
+        "worker/room.ts",
+      ]);
+      expect(selectExcludedMutateFiles(eligible, ["test/unit/foo.test.ts", "src/vite-env.d.ts"])).toEqual([]);
+    });
+  });
+
+  describe("formatExcludedSummary", () => {
+    it("formats step summaries with and without skipped excluded runtime files", () => {
+      const withExcluded = formatExcludedSummary(["src/mesh.ts"], ["worker/room.ts", "src/main.ts"], "origin/main");
+      expect(withExcluded).toBe(
+        [
+          "### Mutation Testing (Stryker vs `origin/main`)",
+          "- Mutated eligible files (1): `src/mesh.ts`",
+          "- Skipped excluded runtime files (2): `worker/room.ts`, `src/main.ts`",
+          "",
+        ].join("\n"),
+      );
+
+      const withoutExcluded = formatExcludedSummary([], [], "origin/release");
+      expect(withoutExcluded).toBe(
+        [
+          "### Mutation Testing (Stryker vs `origin/release`)",
+          "- Mutated eligible files (0): _none_",
+          "",
+        ].join("\n"),
+      );
+    });
   });
 });

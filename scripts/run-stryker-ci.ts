@@ -1,9 +1,10 @@
 import { spawnSync } from "node:child_process";
-import { globSync, readFileSync } from "node:fs";
+import { appendFileSync, globSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ZERO_SHA = /^0+$/;
+const RUNTIME_SOURCE_PATTERN = /^(src|worker|shared|electron|scripts)\/.*\.tsx?$/;
 
 export function readMutatePatterns(configPath: string): string[] {
   const raw: unknown = JSON.parse(readFileSync(configPath, "utf8"));
@@ -72,6 +73,48 @@ export function resolveBaseRef(): string {
   return "origin/main";
 }
 
+/**
+ * Return changed runtime `.ts`/`.tsx` files excluded from Stryker's `mutate` scope (sorted, unique).
+ */
+export function selectExcludedMutateFiles(
+  eligibleFiles: readonly string[],
+  changedFiles: readonly string[],
+): string[] {
+  const eligible = new Set(eligibleFiles.map(toPosix));
+  const excluded = new Set<string>();
+  for (const file of changedFiles) {
+    const normalized = toPosix(file);
+    if (
+      RUNTIME_SOURCE_PATTERN.test(normalized) &&
+      !normalized.endsWith(".d.ts") &&
+      !eligible.has(normalized)
+    ) {
+      excluded.add(normalized);
+    }
+  }
+  return [...excluded].sort();
+}
+
+/**
+ * Format a Markdown step summary of Stryker-mutated and excluded changed runtime files.
+ */
+export function formatExcludedSummary(
+  selected: readonly string[],
+  excluded: readonly string[],
+  baseRef: string,
+): string {
+  const lines = [
+    `### Mutation Testing (Stryker vs \`${baseRef}\`)`,
+    `- Mutated eligible files (${selected.length}): ${selected.length > 0 ? selected.map((f) => `\`${f}\``).join(", ") : "_none_"}`,
+  ];
+  if (excluded.length > 0) {
+    lines.push(
+      `- Skipped excluded runtime files (${excluded.length}): ${excluded.map((f) => `\`${f}\``).join(", ")}`,
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 // Stryker disable all: CLI git/stryker process entrypoint
 /* v8 ignore start */
 function getChangedFiles(baseRef: string, cwd: string = process.cwd()): string[] {
@@ -105,6 +148,17 @@ function main(): void {
   const baseRef = resolveBaseRef();
   const changedFiles = getChangedFiles(baseRef);
   const selected = selectChangedMutateFiles(eligibleFiles, changedFiles);
+  const excluded = selectExcludedMutateFiles(eligibleFiles, changedFiles);
+
+  if (excluded.length > 0) {
+    console.log(
+      `::notice title=Stryker skipped excluded files::${excluded.length} changed runtime file(s) outside stryker.config.json mutate scope: ${excluded.join(", ")}`,
+    );
+  }
+  const summaryPath = process.env["GITHUB_STEP_SUMMARY"];
+  if (summaryPath) {
+    appendFileSync(summaryPath, formatExcludedSummary(selected, excluded, baseRef), "utf8");
+  }
 
   if (selected.length === 0) {
     console.log(`[stryker-ci] No eligible mutate files changed vs ${baseRef}; skipping mutation testing.`);
