@@ -3,6 +3,7 @@ import {
   DEFAULT_PRESET,
   QUALITY_PRESETS,
   captureScreen,
+  describeCaptureError,
   onCaptureEnded,
   stopCapture,
   systemAudioSupport,
@@ -348,5 +349,22 @@ describe("captureScreen and track helpers", () => {
 
     stubGetDisplayMedia(makeStream(makeTrack("video", {}), null));
     expect((await captureScreen(QUALITY_PRESETS["1080p60"])).surface).toBe("unknown");
+  });
+});
+
+describe("describeCaptureError", () => {
+  it("returns null for user cancellations and descriptive warnings for capture failures", () => {
+    expect(describeCaptureError(new DOMException("cancelled", "NotAllowedError"))).toBeNull();
+    expect(describeCaptureError(new DOMException("aborted", "AbortError"))).toBeNull();
+    expect(describeCaptureError(new Error("Capture stopped before starting"))).toBeNull();
+
+    expect(describeCaptureError(new DOMException("failed", "NotReadableError"))).toContain(
+      "Couldn't capture that window",
+    );
+    expect(describeCaptureError(new DOMException("gone", "NotFoundError"))).toContain(
+      "no longer available",
+    );
+    expect(describeCaptureError(new Error("unexpected"))).toContain("Couldn't start screen capture");
+    expect(describeCaptureError("raw string")).toContain("Couldn't start screen capture");
   });
 });

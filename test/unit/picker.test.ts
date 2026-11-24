@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildPickerTemplate, menuLabel } from "@electron/picker.js";
+import { buildPickerTemplate, formatWindowLabel, menuLabel, type PickerSource } from "@electron/picker.js";
 
 function icon(empty = false) {
   return { isEmpty: () => empty, resize: vi.fn(() => "resized-icon") };
@@ -61,5 +61,39 @@ describe("buildPickerTemplate", () => {
     expect(buildPickerTemplate([screen1], () => {}).map((i) => i.label)).toEqual(["Screens", "Entire screen"]);
     expect(buildPickerTemplate([lol], () => {}).map((i) => i.label)).toEqual(["Windows", "League of Legends"]);
     expect(buildPickerTemplate([], () => {})).toEqual([]);
+  });
+
+  it("orders active, minimized, and disabled elevated windows before screens", () => {
+    const elevated: PickerSource = { id: "window:10:0", name: "Task Manager", state: "elevated" };
+    const minimized: PickerSource = { id: "window:11:0", name: "League of Legends", state: "minimized", appIcon: icon() };
+    const active: PickerSource = { id: "window:12:0", name: "Discord", state: "normal" };
+    const onPick = vi.fn();
+
+    const items = buildPickerTemplate([elevated, screen1, minimized, active], onPick);
+    expect(items.map((i) => i.type ?? i.label)).toEqual([
+      "Windows",
+      "Discord",
+      "League of Legends (minimized)",
+      "Task Manager (Run as Admin to share)",
+      "separator",
+      "Screens",
+      "Entire screen",
+    ]);
+
+    const minItem = items.find((i) => i.label === "League of Legends (minimized)")!;
+    minItem.click!();
+    expect(onPick).toHaveBeenCalledWith(minimized);
+
+    const elevItem = items.find((i) => i.label === "Task Manager (Run as Admin to share)")!;
+    expect(elevItem.enabled).toBe(false);
+    expect(elevItem.click).toBeUndefined();
+    expect(elevItem.icon).toBeUndefined();
+  });
+
+  it("truncates long titles before appending suffixes and escapes ampersands", () => {
+    const label = formatWindowLabel("A & B " + "x".repeat(80), " (minimized)");
+    expect(label.endsWith(" (minimized)")).toBe(true);
+    expect(label.startsWith("A && B ")).toBe(true);
+    expect(label.length).toBeLessThanOrEqual(61);
   });
 });

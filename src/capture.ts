@@ -189,3 +189,26 @@ export function onCaptureEnded(result: CaptureResult, cb: () => void): () => voi
 export function stopCapture(result: CaptureResult): void {
   result.stream.getTracks().forEach((t) => t.stop());
 }
+
+/**
+ * Map a getDisplayMedia / capture startup error into a user-facing warning,
+ * or null when the user simply cancelled the picker or stopped before starting.
+ */
+export function describeCaptureError(err: unknown): string | null {
+  let name = "";
+  let message = "";
+  if (err && typeof err === "object") {
+    if ("name" in err && typeof err.name === "string") name = err.name;
+    if ("message" in err && typeof err.message === "string") message = err.message;
+  }
+  if (name === "NotAllowedError" || name === "AbortError" || message === "Capture stopped before starting") {
+    return null;
+  }
+  if (name === "NotReadableError") {
+    return "Couldn't capture that window. Make sure it's open and not protected, or share a screen instead.";
+  }
+  if (name === "NotFoundError") {
+    return "That window is no longer available to share.";
+  }
+  return "Couldn't start screen capture. Try again or share a screen instead.";
+}

@@ -1,4 +1,4 @@
-import { QUALITY_PRESETS, windowAudioSupport, type CaptureResult } from "../capture";
+import { QUALITY_PRESETS, describeCaptureError, windowAudioSupport, type CaptureResult } from "../capture";
 import type { InviteController } from "../controllers/invite-controller";
 import type { SessionController } from "../controllers/session-controller";
 import type { TileController } from "../controllers/tile-controller";
@@ -94,6 +94,8 @@ export class ShareLifecycle {
       return result;
     } catch (err) {
       console.warn("[main] capture cancelled or failed", err);
+      const message = describeCaptureError(err);
+      if (message !== null) this.ctx.setStatus(message, "warn");
       return null;
     }
   }
