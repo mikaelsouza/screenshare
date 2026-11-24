@@ -156,7 +156,7 @@ class VirtualRoomHarness {
   private earliestUnjoinedDeadline(): number | null {
     let earliest: number | null = null;
     for (const s of this.unjoinedSockets) {
-      const d = s.openedAt + 10_000;
+      const d = Math.max(this.now + 1000, s.openedAt + 10_000);
       if (earliest === null || d < earliest) earliest = d;
     }
     return earliest;
@@ -170,14 +170,15 @@ class VirtualRoomHarness {
     }
   }
 
-  private checkPasswordFailureRate(ip: string, now: number): boolean {
+  private isPasswordFailureRateLimited(ip: string, now: number): boolean {
     const recent = (this.passwordFailures.get(ip) ?? []).filter((t) => now - t < 60_000);
-    if (recent.length >= 20) {
-      this.passwordFailures.set(ip, recent);
-      return false;
-    }
-    recent.push(now);
     this.passwordFailures.set(ip, recent);
+    return recent.length >= 15;
+  }
+
+  private checkPasswordFailureRate(ip: string, now: number): boolean {
+    if (this.isPasswordFailureRateLimited(ip, now)) return false;
+    this.passwordFailures.get(ip)!.push(now);
     return true;
   }
 
@@ -313,6 +314,15 @@ class VirtualRoomHarness {
     return true;
   }
 
+  private isMissingEmptySinceExpired(): boolean {
+    const capTtl = this.hasCreatorHostKey() ? EMPTY_ROOM_TTL_MS : UNUSED_ROOM_TTL_MS;
+    return (
+      this.lastHostActiveAt !== undefined &&
+      this.now >= this.lastHostActiveAt + capTtl &&
+      (!this.hasCreatorHostKey() || this.everJoined)
+    );
+  }
+
   private reconcileBeforeAdmit(): "expired" | "ok" {
     if (!this.claimed) return "ok";
     if (this.peers.size > 0) {
@@ -324,6 +334,10 @@ class VirtualRoomHarness {
       return "ok";
     }
     if (this.emptySince === undefined) {
+      if (this.isMissingEmptySinceExpired()) {
+        this.expireRoom();
+        return "expired";
+      }
       this.emptySince = this.now;
       return "ok";
     }
@@ -374,6 +388,7 @@ class VirtualRoomHarness {
     const activeMatch =
       offeredRejoinHash !== null &&
       [...this.peers.values()].some((p) => p.rejoinHash === offeredRejoinHash);
+    const passwordFailureRateLimited = this.isPasswordFailureRateLimited(req.ip, this.now);
 
     const decision = evaluateAdmission({
       claimed: this.claimed,
@@ -390,6 +405,7 @@ class VirtualRoomHarness {
       offeredPasswordHash,
       offeredHostHash,
       hasActiveSocketMatch: activeMatch,
+      passwordFailureRateLimited,
       checkPasswordFailureRate: () => this.checkPasswordFailureRate(req.ip, this.now),
     });
     if (!decision.ok) return { ok: false, code: decision.code };
@@ -419,13 +435,14 @@ class VirtualRoomHarness {
     if (promo.markHostPromoted) this.hostPromoted = true;
 
     const currentId = this.nextUuid("peer");
+    const supersededIds = new Set(superseded.map((p) => p.id));
     const resumed = isResume
       ? resolveResumeAttachment({
           currentId,
           clientSharing: req.sharing,
           superseded: sup,
           memberTicket: decision.memberTicket,
-          activePeerIds: new Set<string>(),
+          activePeerIds: new Set([...this.peers.keys()].filter((id) => !supersededIds.has(id))),
         })
       : { id: currentId, sharing: false };
 
@@ -594,6 +611,36 @@ class VirtualRoomHarness {
     return evaluateSignalRelay(from, to, "offer");
   }
 
+  private runEmptyAlarm(): void {
+    if (this.emptySince === undefined) {
+      if (this.isMissingEmptySinceExpired()) {
+        this.expireRoom();
+        return;
+      }
+      this.emptySince = this.now;
+    }
+    const expiry = computeCredentialExpiry(
+      this.emptySince,
+      this.everJoined,
+      this.lastHostActiveAt,
+      this.hasCreatorHostKey(),
+    );
+    if (this.now >= expiry) {
+      this.expireRoom();
+      return;
+    }
+    if (!this.hasCreatorHostKey()) {
+      const backfilled = this.backfillUnjoinedLegacyCreatorHash();
+      if (!backfilled && this.lastHostActiveAt === undefined) {
+        this.lastHostActiveAt = this.emptySince;
+      }
+    }
+    if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
+      this.resetEmptySession();
+    }
+    this.syncAlarm();
+  }
+
   advanceTimeAndRunAlarm(deltaMs: number): void {
     this.now += deltaMs;
     if (!this.claimed) {
@@ -602,27 +649,7 @@ class VirtualRoomHarness {
     }
     this.sweepStaleUnjoined();
     if (this.peers.size === 0) {
-      if (this.emptySince === undefined) this.emptySince = this.now;
-      const expiry = computeCredentialExpiry(
-        this.emptySince,
-        this.everJoined,
-        this.lastHostActiveAt,
-        this.hasCreatorHostKey(),
-      );
-      if (this.now >= expiry) {
-        this.expireRoom();
-        return;
-      }
-      if (!this.hasCreatorHostKey()) {
-        const backfilled = this.backfillUnjoinedLegacyCreatorHash();
-        if (!backfilled && this.lastHostActiveAt === undefined) {
-          this.lastHostActiveAt = this.emptySince;
-        }
-      }
-      if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
-        this.resetEmptySession();
-      }
-      this.syncAlarm();
+      this.runEmptyAlarm();
       return;
     }
 
