@@ -17,9 +17,14 @@ function nextModelRoomCode(): string {
   return out;
 }
 
+interface Waiter {
+  resolve: (m: ServerMessage) => void;
+  reject: (err: Error) => void;
+}
+
 class LiveClient {
   private readonly queue: ServerMessage[] = [];
-  private readonly waiters: Array<(m: ServerMessage) => void> = [];
+  private readonly waiters: Waiter[] = [];
   readonly ws: WebSocket;
   closed = false;
 
@@ -30,11 +35,12 @@ class LiveClient {
       if (raw === "ping" || raw === "pong") return;
       const msg = JSON.parse(raw) as ServerMessage;
       const w = this.waiters.shift();
-      if (w) w(msg);
+      if (w) w.resolve(msg);
       else this.queue.push(msg);
     });
     ws.addEventListener("close", () => {
       this.closed = true;
+      for (const w of this.waiters.splice(0)) w.reject(new Error("DO websocket closed"));
     });
   }
 
@@ -54,10 +60,17 @@ class LiveClient {
   next(timeoutMs = 2000): Promise<ServerMessage> {
     const queued = this.queue.shift();
     if (queued) return Promise.resolve(queued);
+    if (this.closed) return Promise.reject(new Error("DO websocket closed"));
     return new Promise((resolve, reject) => {
-      const waiter = (m: ServerMessage): void => {
-        clearTimeout(timer);
-        resolve(m);
+      const waiter: Waiter = {
+        resolve: (m) => {
+          clearTimeout(timer);
+          resolve(m);
+        },
+        reject: (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
       };
       const timer = setTimeout(() => {
         const idx = this.waiters.indexOf(waiter);
@@ -79,6 +92,7 @@ class LiveClient {
   close(): void {
     if (!this.closed) {
       this.closed = true;
+      for (const w of this.waiters.splice(0)) w.reject(new Error("DO websocket closed"));
       try { this.ws.close(1000, "done"); } catch { /* ignore */ }
     }
   }
@@ -100,6 +114,7 @@ interface RoomModelState {
   creatorToken: string;
   locked: boolean;
   expired: boolean;
+  hostPromoted: boolean;
   creator: PeerSlot | null;
   guests: PeerSlot[];
   disconnectedTicket: { id: string; ip: string; rejoinToken: string; host: boolean } | null;
@@ -160,6 +175,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
           creatorToken: created.hostToken,
           locked: false,
           expired: false,
+          hostPromoted: false,
           creator: null,
           guests: [],
           disconnectedTicket: null,
@@ -173,22 +189,24 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               const ip = `198.51.101.${state.ipSeq++}`;
               const c = await LiveClient.connect(code, ip);
               c.send({ t: "join", room: code, displayName: "creator", hostToken: state.creatorToken });
-              const w = await c.nextOf("welcome");
-              expect(w.host).toBe(true);
-              if (w.password) state.password = w.password;
-              for (const g of state.guests) {
-                if (g.host) g.client.close();
+              if (state.hostPromoted) {
+                expect((await c.nextOf("error")).code).toBe("bad-password");
+                c.close();
+                await waitSocketCount(stub, activeCount(state));
+              } else {
+                const w = await c.nextOf("welcome");
+                expect(w.host).toBe(true);
+                if (w.password) state.password = w.password;
+                if (state.disconnectedTicket?.host) state.disconnectedTicket = null;
+                state.creator = {
+                  client: c,
+                  id: w.selfId,
+                  ip,
+                  rejoinToken: w.rejoinToken ?? "",
+                  sharing: false,
+                  host: true,
+                };
               }
-              state.guests = state.guests.filter((g) => !g.host);
-              if (state.disconnectedTicket?.host) state.disconnectedTicket = null;
-              state.creator = {
-                client: c,
-                id: w.selfId,
-                ip,
-                rejoinToken: w.rejoinToken ?? "",
-                sharing: false,
-                host: true,
-              };
             } else if (op.kind === "join-guest" && state.guests.length < 3) {
               const ip = `198.51.101.${state.ipSeq++}`;
               const c = await LiveClient.connect(code, ip);
@@ -276,13 +294,24 @@ describe("RoomDO stateful model (real workerd execution)", () => {
                 state.expired = true;
                 for (const g of state.guests) g.client.close();
                 state.guests = [];
-              } else if (wasHostlessOccupied && op.ageMs >= 5 * 60_000 && state.guests[0]) {
-                const promo = await state.guests[0].client.nextOf("host-promoted");
-                expect(promo.hostId).toBe(state.guests[0].id);
-                state.guests[0].host = true;
+              } else if (wasHostlessOccupied && op.ageMs >= 5 * 60_000 && state.guests.length > 0) {
+                const promotedId = await runInDurableObject(stub, (_i, s) => {
+                  for (const ws of s.getWebSockets()) {
+                    const att = ws.deserializeAttachment() as { id?: string; joined?: boolean; host?: boolean } | null;
+                    if (att?.joined && att.host) return att.id;
+                  }
+                  return undefined;
+                });
+                const candidate = state.guests.find((g) => g.id === promotedId);
+                expect(candidate).toBeDefined();
+                const promo = await candidate!.client.nextOf("host-promoted");
+                expect(promo.hostId).toBe(candidate!.id);
+                candidate!.host = true;
+                state.hostPromoted = true;
               } else if (empty && op.ageMs >= 16 * 60_000) {
                 state.disconnectedTicket = null;
                 state.locked = false;
+                state.hostPromoted = false;
                 const persistedPw = await runInDurableObject(stub, (_i, s) => s.storage.get<string>("roomPassword"));
                 if (persistedPw) state.password = persistedPw;
               }
@@ -297,4 +326,40 @@ describe("RoomDO stateful model (real workerd execution)", () => {
       { numRuns: 15 },
     );
   }, 15_000);
+
+  it("blocks creator token while guest is promoted host until 15m empty cleanup restores creator authority", async () => {
+    const code = nextModelRoomCode();
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+    const initRes = await stub.fetch("https://internal/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const created = await initRes.json<{ code: string; password: string; hostToken: string }>();
+
+    const guest = await LiveClient.connect(code, "198.51.101.201");
+    guest.send({ t: "join", room: code, displayName: "guest", password: created.password });
+    const gw = await guest.nextOf("welcome");
+    expect(gw.host).toBe(false);
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    await runDurableObjectAlarm(stub);
+    expect((await guest.nextOf("host-promoted")).hostId).toBe(gw.selfId);
+
+    const refusedCreator = await LiveClient.connect(code, "198.51.101.202");
+    refusedCreator.send({ t: "join", room: code, displayName: "creator", hostToken: created.hostToken });
+    expect((await refusedCreator.nextOf("error")).code).toBe("bad-password");
+    refusedCreator.close();
+    guest.close();
+    await waitSocketCount(stub, 0);
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("emptySince", Date.now() - 16 * 60_000));
+    await runDurableObjectAlarm(stub);
+
+    const creator = await LiveClient.connect(code, "198.51.101.203");
+    creator.send({ t: "join", room: code, displayName: "creator", hostToken: created.hostToken });
+    expect((await creator.nextOf("welcome")).host).toBe(true);
+    creator.close();
+    await waitSocketCount(stub, 0);
+  });
 });
