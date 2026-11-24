@@ -3253,3 +3253,260 @@ describe("RoomDO security & PR 1 flows", () => {
   });
 });
 
+describe("Worker and RoomDO uncovered branch coverage", () => {
+  it("handles rate-limiter bindings failing open, denying, malformed Origin, and DO fetch errors in worker/index.ts", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const mockAssets = { fetch: async () => new Response("ok") } as unknown as Fetcher;
+    const makeStub = (handler: () => Promise<Response>): Env["ROOMS"] =>
+      ({
+        idFromName: () => "id-1",
+        get: () => ({ fetch: handler }),
+      }) as unknown as Env["ROOMS"];
+
+    // 1. ROOM_LIMITER throws -> fails open; /api/room DO throws twice then succeeds
+    let attempts = 0;
+    const retryEnv: Env = {
+      ASSETS: mockAssets,
+      ROOMS: makeStub(async () => {
+        attempts++;
+        if (attempts < 3) throw new Error("transient DO failure");
+        return new Response(JSON.stringify({ code: CODE, password: "P", hostToken: "H" }), { status: 200 });
+      }),
+      ROOM_LIMITER: { limit: async () => { throw new Error("limiter down"); } },
+    };
+    const okRes = await worker.fetch(
+      new Request("https://example.com/api/room", { method: "POST", headers: { "CF-Connecting-IP": "198.51.100.240" } }),
+      retryEnv,
+    );
+    expect(okRes.status).toBe(200);
+    expect(attempts).toBe(3);
+
+    // 2. ROOM_LIMITER returns { success: false } -> 429
+    const deniedCreate = await worker.fetch(
+      new Request("https://example.com/api/room", { method: "POST", headers: { "CF-Connecting-IP": "198.51.100.241" } }),
+      { ...retryEnv, ROOM_LIMITER: { limit: async () => ({ success: false }) } },
+    );
+    expect(deniedCreate.status).toBe(429);
+
+    // 3. Malformed Origin on POST /api/room -> 403
+    const badOriginRes = await worker.fetch(
+      new Request("https://example.com/api/room", {
+        method: "POST",
+        headers: { Origin: "http://[invalid", "CF-Connecting-IP": "198.51.100.242" },
+      }),
+      retryEnv,
+    );
+    expect(badOriginRes.status).toBe(403);
+
+    // 4. /api/room DO 409 retry exhaustion -> 503 and non-409 status -> 503
+    const conflictEnv: Env = {
+      ASSETS: mockAssets,
+      ROOMS: makeStub(async () => new Response("conflict", { status: 409 })),
+    };
+    expect(
+      (
+        await worker.fetch(
+          new Request("https://example.com/api/room", { method: "POST", headers: { "CF-Connecting-IP": "198.51.100.243" } }),
+          conflictEnv,
+        )
+      ).status,
+    ).toBe(503);
+
+    const errEnv: Env = {
+      ASSETS: mockAssets,
+      ROOMS: makeStub(async () => new Response("boom", { status: 500 })),
+    };
+    expect(
+      (
+        await worker.fetch(
+          new Request("https://example.com/api/room", { method: "POST", headers: { "CF-Connecting-IP": "198.51.100.244" } }),
+          errEnv,
+        )
+      ).status,
+    ).toBe(503);
+
+    // 5. /ws/:code WS_LIMITER { success: false } and stub.fetch throw -> 1013 refusal
+    const wsDenied = await worker.fetch(
+      new Request(`https://example.com/ws/${CODE}`, {
+        headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "198.51.100.245" },
+      }),
+      {
+        ASSETS: mockAssets,
+        ROOMS: makeStub(async () => new Response("unused")),
+        WS_LIMITER: { limit: async () => ({ success: false }) },
+      },
+    );
+    expect((await refusal(wsDenied)).code).toBe("rate-limited");
+
+    const wsDoThrow = await worker.fetch(
+      new Request(`https://example.com/ws/${CODE}`, {
+        headers: { Upgrade: "websocket", Origin: "https://example.com", "CF-Connecting-IP": "198.51.100.246" },
+      }),
+      {
+        ASSETS: mockAssets,
+        ROOMS: makeStub(async () => { throw new Error("DO unreachable"); }),
+      },
+    );
+    expect((await refusal(wsDoThrow)).code).toBe("rate-limited");
+    warnSpy.mockRestore();
+  });
+
+  it("handles /init validation, bad-room-code on join, late join-timeout, and webSocketError in RoomDO", async () => {
+    const unclaimed = freshRoom();
+    const unclaimedStub = env.ROOMS.get(env.ROOMS.idFromName(unclaimed));
+
+    // /init invalid JSON, invalid code schema, and duplicate claim 409
+    expect(
+      (await unclaimedStub.fetch("https://internal/init", { method: "POST", body: "{bad-json" })).status,
+    ).toBe(400);
+    expect(
+      (
+        await unclaimedStub.fetch("https://internal/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: "bad" }),
+        })
+      ).status,
+    ).toBe(400);
+
+    const claimedStub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    expect(
+      (
+        await claimedStub.fetch("https://internal/init", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ code: CODE }),
+        })
+      ).status,
+    ).toBe(409);
+
+    // Join message with wrong room code -> bad-room-code
+    const wrongRoom = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.120" });
+    wrongRoom.send({ t: "join", room: CODE2, displayName: "alice", password: PASSWORD });
+    expect((await wrongRoom.nextOf("error")).code).toBe("bad-room-code");
+    wrongRoom.close();
+
+    // Unjoined socket past JOIN_DEADLINE_MS -> join-timeout
+    const late = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.121" });
+    await runInDurableObject(claimedStub, (_i, state) => {
+      for (const ws of state.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { joined?: boolean; openedAt?: number };
+        if (!att.joined) ws.serializeAttachment({ ...att, openedAt: Date.now() - 15_000 });
+      }
+    });
+    late.send({ t: "join", room: CODE, displayName: "late", password: PASSWORD });
+    expect((await late.nextOf("error")).code).toBe("join-timeout");
+    late.close();
+
+    // webSocketError removes peer cleanly and notifies remaining peer
+    const host = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.122" });
+    await host.joinAsHost("host");
+    const guest = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.123" });
+    const wGuest = await guest.join("guest");
+    await host.nextOf("peer-joined");
+
+    const guestClosed = closeCodeOf(guest.ws);
+    await runInDurableObject(claimedStub, async (instance, state) => {
+      const target = state.getWebSockets().find((s) => (s.deserializeAttachment() as { id?: string }).id === wGuest.selfId);
+      if (target) await instance.webSocketError(target, new Error("socket reset"));
+    });
+    expect((await host.nextOf("peer-left")).id).toBe(wGuest.selfId);
+    expect(await guestClosed).toBe(1011);
+    host.close();
+  });
+
+  it("handles host/action edge cases and alarm lifecycle edge cases", async () => {
+    const h = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.130" });
+    const wh = await h.joinAsHost("host");
+    const g = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.131" });
+    await g.join("guest");
+    await h.nextOf("peer-joined");
+
+    // Self-kick no-op, unknown-peer kick, non-host rotate-password, identical-name rename no-op
+    h.send({ t: "kick", id: wh.selfId });
+    expect(await h.peekError(120)).toBeNull();
+    h.send({ t: "kick", id: UNKNOWN_PEER });
+    expect((await h.nextOf("error")).code).toBe("unknown-peer");
+    g.send({ t: "rotate-password" });
+    expect((await g.nextOf("error")).code).toBe("not-host");
+    h.send({ t: "rename", displayName: "host" });
+    expect(await g.silentFor(120)).toBe(true);
+
+    // Occupied alarm with missing hostGoneAt sets hostGoneAt; before HOST_GRACE_MS keeps guest non-host
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(CODE));
+    h.close();
+    await g.nextOf("peer-left");
+    await runInDurableObject(stub, (_i, state) => state.storage.delete("hostGoneAt"));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.get<number>("hostGoneAt"))).toBeTypeOf("number");
+
+    await runInDurableObject(stub, (_i, state) => state.storage.put("hostGoneAt", Date.now() - 60_000));
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await g.silentFor(120)).toBe(true);
+    g.close();
+    await waitForRoomEmpty(stub);
+
+    // Missing emptySince with expired lastHostActiveAt expires room on alarm
+    await runInDurableObject(stub, async (_i, state) => {
+      await state.storage.delete("emptySince");
+      await state.storage.put("lastHostActiveAt", Date.now() - 91 * 86_400_000);
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(await runInDurableObject(stub, async (_i, state) => (await state.storage.list()).size)).toBe(0);
+    expect(await runInDurableObject(stub, (_i, state) => state.storage.getAlarm())).toBeNull();
+
+    // Unclaimed room alarm deletes alarm with zero writes
+    const unclaimed = freshRoom();
+    const unclaimedStub = env.ROOMS.get(env.ROOMS.idFromName(unclaimed));
+    await runInDurableObject(unclaimedStub, (_i, state) => state.storage.setAlarm(Date.now() + 1000));
+    expect(await runDurableObjectAlarm(unclaimedStub)).toBe(true);
+    expect(await runInDurableObject(unclaimedStub, async (_i, state) => (await state.storage.list()).size)).toBe(0);
+    expect(await runInDurableObject(unclaimedStub, (_i, state) => state.storage.getAlarm())).toBeNull();
+  });
+
+  it("handles in-place resume broadcasts (peer-state, host-promoted) and multi-socket eviction", async () => {
+    const observer = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.140" });
+    await observer.join("observer");
+
+    const host = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.141" });
+    const wHost = await host.joinAsHost("host");
+    await observer.nextOf("peer-joined");
+
+    const guest = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.142" });
+    const wGuest = await guest.join("guest");
+    await observer.nextOf("peer-joined");
+    await host.nextOf("peer-joined");
+
+    // Resume guest in-place while toggling sharing=true and supplying HOST_TOKEN (also evicts old host socket)
+    const resumed = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.142" });
+    const hostReplaced = closeCodeOf(host.ws);
+    const guestReplaced = closeCodeOf(guest.ws);
+    resumed.send({
+      t: "join",
+      room: CODE,
+      displayName: "guest",
+      hostToken: HOST_TOKEN,
+      rejoinToken: wGuest.rejoinToken,
+      resume: true,
+      sharing: true,
+    });
+    const wResumed = await resumed.nextOf("welcome");
+    expect(wResumed.host).toBe(true);
+
+    // Observer receives peer-left for the evicted non-matching socket + peer-state + host-promoted
+    const events: ServerMessage[] = [
+      await observer.next(),
+      await observer.next(),
+      await observer.next(),
+    ];
+    expect(events).toContainEqual({ t: "peer-left", id: wHost.selfId });
+    expect(events).toContainEqual({ t: "peer-state", id: wResumed.selfId, sharing: true });
+    expect(events).toContainEqual({ t: "host-promoted", hostId: wResumed.selfId });
+    expect(await hostReplaced).toBe(1008);
+    expect(await guestReplaced).toBe(1008);
+
+    observer.close();
+    resumed.close();
+  });
+});
+
