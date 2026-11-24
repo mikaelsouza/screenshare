@@ -800,6 +800,7 @@ describe("desktop WASAPI audio integration", () => {
     video2.end();
     resolvePcm2(pcm2);
     await expect(startPromise2).resolves.toMatchObject({ video: swapTrack, audio: pcm2 });
+    expect(video2.stopped).toBe(true);
     expect(cb2.onFollowState).toHaveBeenCalledWith({ role: "game", profile: "League", title: "Match" });
     expect(bridge2.stopFollow).not.toHaveBeenCalled();
 
@@ -891,7 +892,10 @@ describe("desktop WASAPI audio integration", () => {
     });
 
     const c = createElectronCaptureController(bridge, callbacks(), deps);
-    await expect(c.start(preset)).rejects.toMatchObject({ name: "NotReadableError" });
+    await expect(c.start(preset)).rejects.toMatchObject({
+      name: "NotReadableError",
+      message: "Could not restore minimized window",
+    });
     expect(unsubError).toHaveBeenCalledTimes(1);
 
     deps.captureScreen = vi.fn(async () => {
@@ -899,6 +903,77 @@ describe("desktop WASAPI audio integration", () => {
       throw new DOMException("Invalid capture constraints", "AbortError");
     });
     await expect(c.start(preset)).rejects.toThrow("Could not list windows or screens to share.");
+
+    // Ignores capture:error arriving after stop() canceled the pending start
+    let staleEmit: (reason: "sources-failed" | "restore-failed") => void = () => {};
+    let rejectCanceled: (err: unknown) => void = () => {};
+    const bridge2 = {
+      ...makeAudioBridge(),
+      onCaptureError: (cbFn: (reason: "sources-failed" | "restore-failed") => void) => {
+        staleEmit = cbFn;
+        return () => {};
+      },
+    };
+    const { deps: deps2 } = makeDeps("window", false);
+    deps2.captureScreen = vi.fn(
+      () => new Promise<CaptureResult>((_resolve, reject) => { rejectCanceled = reject; }),
+    );
+    const c2 = createElectronCaptureController(bridge2, callbacks(), deps2);
+    const canceledStart = c2.start(preset);
+    c2.stop();
+    staleEmit("restore-failed");
+    rejectCanceled(new DOMException("Aborted", "AbortError"));
+    await expect(canceledStart).rejects.toThrow("Aborted");
+  });
+
+  it("cleans up replacement track if stop() or follow-ended arrives during ensureLiveStartupVideo", async () => {
+    // 1. stop() during pending replacement captureSource
+    let emitFollow1: (u: FollowUpdate) => void = () => {};
+    const bridge1 = makeAudioBridge();
+    bridge1.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow1 = cbFn;
+      return () => {};
+    });
+    const { deps: deps1, video: video1 } = makeDeps("window", false);
+    deps1.audioSource = async () => null;
+    const replacement1 = track("video", "rep1");
+    let resolveSource1: (t: MediaStreamTrack) => void = () => {};
+    deps1.captureSource = vi.fn(
+      () => new Promise<MediaStreamTrack>((resolve) => { resolveSource1 = resolve; }),
+    );
+    const c1 = createElectronCaptureController(bridge1, callbacks(), deps1);
+    const p1 = c1.start(preset);
+    emitFollow1({ role: "game", profile: "League", title: "Match", sourceId: "win:1" });
+    video1.end();
+    await vi.waitFor(() => expect(deps1.captureSource).toHaveBeenCalledTimes(1));
+    c1.stop();
+    resolveSource1(replacement1);
+    await expect(p1).rejects.toThrow("Capture stopped before starting");
+    expect(replacement1.stopped).toBe(true);
+
+    // 2. follow-ended during pending replacement captureSource
+    let emitFollow2: (u: FollowUpdate) => void = () => {};
+    const bridge2 = makeAudioBridge();
+    bridge2.onFollowUpdate = vi.fn((cbFn: (u: FollowUpdate) => void) => {
+      emitFollow2 = cbFn;
+      return () => {};
+    });
+    const { deps: deps2, video: video2 } = makeDeps("window", false);
+    deps2.audioSource = async () => null;
+    const replacement2 = track("video", "rep2");
+    let resolveSource2: (t: MediaStreamTrack) => void = () => {};
+    deps2.captureSource = vi.fn(
+      () => new Promise<MediaStreamTrack>((resolve) => { resolveSource2 = resolve; }),
+    );
+    const c2 = createElectronCaptureController(bridge2, callbacks(), deps2);
+    const p2 = c2.start(preset);
+    emitFollow2({ role: "game", profile: "League", title: "Match", sourceId: "win:2" });
+    video2.end();
+    await vi.waitFor(() => expect(deps2.captureSource).toHaveBeenCalledTimes(1));
+    emitFollow2({ role: "ended", profile: "League", title: null, sourceId: null });
+    resolveSource2(replacement2);
+    await expect(p2).rejects.toThrow("Capture ended before starting");
+    expect(replacement2.stopped).toBe(true);
   });
 });
 

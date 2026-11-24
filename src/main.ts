@@ -269,8 +269,8 @@ function leaveRoom(): void {
   for (const timer of peerLeftTimers.values()) clearTimeout(timer);
   peerLeftTimers.clear();
   health.stop();
-  if (share.isPending && !share.capture) captureController.stop();
   if (share.capture) client?.setSharing(false);
+  share.forceStop();
   client?.close();
   client = null;
   mesh?.close();

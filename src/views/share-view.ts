@@ -152,17 +152,31 @@ export class ShareLifecycle {
     });
   }
 
+  forceStop(): void {
+    if (!this.activeCapture && !this.pending) return;
+    this.ctx.captureController.stop();
+    this.activeCapture = null;
+    this.activeCaptureWarning = null;
+    syncMuteAudioButton(this.ctx.ui, null);
+  }
+
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     if (!this.activeCapture) return Promise.resolve();
+    const cap = this.activeCapture;
     const run = (async () => {
+      let owned = false;
       try {
         await this.ctx.getMesh()?.setCapture(null);
       } finally {
-        this.ctx.captureController.stop();
-        this.activeCapture = null;
-        this.activeCaptureWarning = null;
+        if (this.activeCapture === cap) {
+          owned = true;
+          this.ctx.captureController.stop();
+          this.activeCapture = null;
+          this.activeCaptureWarning = null;
+        }
       }
+      if (!owned) return;
       this.ctx.health.clearOutbound();
       this.ctx.tileCtrl.clearOutboundStats();
       this.ctx.tileView.renderSelfPreview(null);

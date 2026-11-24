@@ -11,6 +11,8 @@
 
 import {
   captureScreen,
+  DEFAULT_PRESET,
+  QUALITY_PRESETS,
   stopCapture,
   type CaptureResult,
   type QualityPreset,
@@ -126,7 +128,7 @@ export function createElectronCaptureController(
   deps: ElectronCaptureDeps = defaultDeps,
 ): CaptureController {
   let capture: CaptureResult | null = null;
-  let preset: QualityPreset | null = null;
+  let preset: QualityPreset = QUALITY_PRESETS[DEFAULT_PRESET];
   /** An update that arrived while the picker result was still on its way. */
   let pending: FollowUpdate | null = null;
   let following = false;
@@ -181,7 +183,7 @@ export function createElectronCaptureController(
     const gen = ++generation;
     let track: MediaStreamTrack;
     try {
-      track = await deps.captureSource(id, preset!);
+      track = await deps.captureSource(id, preset);
     } catch (err) {
       console.warn(`[capture] could not capture window ${id}`, err);
       return;
