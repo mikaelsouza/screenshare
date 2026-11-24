@@ -1,5 +1,5 @@
 /**
- * Desktop capture. The picker lives in the Electron main process (electron/main.js),
+ * Desktop capture. The picker lives in the Electron main process (electron/main.ts),
  * and getDisplayMedia goes through it, so starting a share works as on the web.
  *
  * Audio rules in the desktop app (when the WASAPI audio bridge is present):

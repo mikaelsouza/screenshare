@@ -199,7 +199,7 @@ function formatInviteDisplayCode(
 }
 
 /**
- * Pure derivation of the 1C-2 invite menu's enabled actions, locked state, and displayed code string.
+ * Pure derivation of the invite menu's enabled actions, locked state, and displayed code string.
  */
 export function deriveInviteMenuState(params: InviteMenuParams): InviteMenuState {
   const { roomCode, roomPassword, roomLocked, isHost, revealed } = params;
@@ -241,7 +241,7 @@ export interface JoinChipArrival {
 }
 
 /**
- * Format coalesced arrival notifications for the 2AB-2 bottom-right join chip.
+ * Format coalesced arrival notifications for the bottom-right join chip.
  */
 export function formatJoinChipText(arrivals: ReadonlyArray<JoinChipArrival>): string {
   const fmt = (a: JoinChipArrival): string => `${a.name} #${a.shortId.replace(/^#/, "")}`;

@@ -188,7 +188,7 @@ function buildPrivacyFooter(
 }
 
 /**
- * Adaptive progressive-disclosure Recent Rooms view inside `.lobby-card` (Mock #12).
+ * Adaptive progressive-disclosure Recent Rooms view inside `.lobby-card`.
  * Built exclusively with createElement/textContent/replaceChildren for strict CSP & Trusted Types.
  */
 export class RecentRoomsView {
