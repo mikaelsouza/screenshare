@@ -2,7 +2,7 @@
  * App bootstrap: wires signalling -> mesh -> controllers -> thin DOM views.
  *
  * All state machines live in src/controllers/* and latency-critical paths live in
- * mesh.ts / quality.ts. This file is thin bootstrap glue (< 300 code lines).
+ * mesh.ts / quality.ts. This file is thin bootstrap glue.
  */
 
 import { isValidRoomCode, type PeerId } from "@shared/protocol";

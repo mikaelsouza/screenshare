@@ -303,8 +303,8 @@ async function handleDisplayMediaRequest(
 
 function setupMediaHandlers(): void {
   // 1. getDisplayMedia: let the user pick a window or screen from a native menu,
-  //    as Chrome's own picker does on the web. Audio is Electron's loopback, i.e.
-  //    everything the PC plays: Electron cannot capture a single window's audio.
+  //    matching Chrome's picker on the web; per-window/system audio exclusion is
+  //    handled separately via the native WASAPI bridge when present.
   session.defaultSession.setDisplayMediaRequestHandler((request, callback) => {
     if (!isTrustedFrameUrl(request.frame?.url, trustedOrigin)) {
       try {
