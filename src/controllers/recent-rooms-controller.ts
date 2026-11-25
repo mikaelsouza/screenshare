@@ -115,11 +115,19 @@ export class RecentRoomsController {
     this.env.runBackground(this.lockChain);
   }
 
+  private stateSnapshot(): string {
+    return JSON.stringify([this.disabled, this.searchQuery, this.editingCode, this.rooms]);
+  }
+
   private applyLockedMutation(mutate: (storage: StorageLike | null, now: number) => void): void {
+    const hasAsyncLock = this.env.getLocks() !== null;
     this.enqueueLocked(() => {
+      const prev = hasAsyncLock ? this.stateSnapshot() : null;
       const storage = this.env.getLocalStorage();
       mutate(storage, this.now());
-      this.env.onChange();
+      if (!hasAsyncLock || this.stateSnapshot() !== prev) {
+        this.env.onChange();
+      }
     });
   }
 
