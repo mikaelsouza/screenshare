@@ -38,30 +38,11 @@ export type RecentRoomPatchOp =
   | { kind: "patch"; code: string; field: "label"; label?: string };
 
 export interface RecentRoomJoinOp {
-  kind: "join";
   code: string;
   role: RecentRoomRole;
   lastJoinedAt: number;
   password?: string;
   peerNames?: string[];
-}
-
-export type RecentRoomOp =
-  | RecentRoomJoinOp
-  | RecentRoomPatchOp
-  | { kind: "remove"; code: string; demoteIfPassworded?: boolean }
-  | { kind: "clear-all" }
-  | { kind: "set-disabled"; disabled: boolean };
-
-export interface RecentRoomsSnapshot {
-  entries: RecentRoomEntry[];
-  disabled: boolean;
-}
-
-export interface RecentRoomOpOutcome {
-  snapshot: RecentRoomsSnapshot;
-  changed: boolean;
-  missing: boolean;
 }
 
 const RecentRoomRawSchema = z.object({
@@ -110,12 +91,8 @@ export function sanitizePassword(raw: string | undefined): string | undefined {
   return clean.length > 0 && clean.length <= MAX_RECENT_ROOM_PASSWORD_LEN ? clean : undefined;
 }
 
-/** Return true if a stored/input timestamp is finite and within TTL and forward clock skew bounds. */
 function isTimestampValid(ts: number, now: number): boolean {
-  if (!Number.isFinite(ts)) return false;
-  if (now - ts >= RECENT_ROOM_TTL_MS) return false;
-  if (ts > now + MAX_CLOCK_SKEW_MS) return false;
-  return true;
+  return Number.isFinite(ts) && now - ts < RECENT_ROOM_TTL_MS && ts <= now + MAX_CLOCK_SKEW_MS;
 }
 
 /** Validate and normalize a raw stored recent-room record against schema, room code, and TTL. */
@@ -123,8 +100,7 @@ export function parseRecentRoomItem(item: unknown, now: number): RecentRoomEntry
   const res = RecentRoomRawSchema.safeParse(item);
   if (!res.success) return null;
   const code = res.data.code.trim().toUpperCase();
-  if (!isValidRoomCode(code)) return null;
-  if (!isTimestampValid(res.data.lastJoinedAt, now)) return null;
+  if (!isValidRoomCode(code) || !isTimestampValid(res.data.lastJoinedAt, now)) return null;
 
   const password = sanitizePassword(res.data.password);
   const label = sanitizeRecentRoomLabel(res.data.label);
@@ -139,7 +115,7 @@ export function parseRecentRoomItem(item: unknown, now: number): RecentRoomEntry
 }
 
 /** Sort recent room entries newest-first and cap at `MAX_STORED_RECENT_ROOMS`. */
-export function sortAndBoundEntries(entries: RecentRoomEntry[]): RecentRoomEntry[] {
+export function sortAndBoundEntries(entries: readonly RecentRoomEntry[]): RecentRoomEntry[] {
   const sorted = [...entries].sort((a, b) => b.lastJoinedAt - a.lastJoinedAt);
   return sorted.length > MAX_STORED_RECENT_ROOMS ? sorted.slice(0, MAX_STORED_RECENT_ROOMS) : sorted;
 }
@@ -152,8 +128,7 @@ export function formatRelativeTime(lastJoinedAt: number, now: number = Date.now(
   if (mins < 60) return `${mins}m ago`;
   const hrs = Math.floor(mins / 60);
   if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days}d ago`;
+  return `${Math.floor(hrs / 24)}d ago`;
 }
 
 /** Filter recent room entries by substring match against code, label, or peer names. */
@@ -188,14 +163,12 @@ export function mergeSynthesizedHostRooms(
   baseEntries: readonly RecentRoomEntry[],
   hostRooms: readonly PersistedHostRoom[],
   shouldInclude: (code: string) => boolean,
-  onSynthesized?: (code: string) => void,
 ): RecentRoomEntry[] {
   const seen = new Set(baseEntries.map((entry) => entry.code));
   const merged = [...baseEntries];
   for (const hr of hostRooms) {
     if (seen.has(hr.code) || !shouldInclude(hr.code)) continue;
     seen.add(hr.code);
-    onSynthesized?.(hr.code);
     merged.push({
       code: hr.code,
       role: "host",
@@ -206,35 +179,24 @@ export function mergeSynthesizedHostRooms(
   return sortAndBoundEntries(merged);
 }
 
-function cloneEntry(entry: RecentRoomEntry): RecentRoomEntry {
-  return { ...entry, peerNames: [...entry.peerNames] };
-}
-
-function cloneSnapshot(snapshot: RecentRoomsSnapshot): RecentRoomsSnapshot {
-  return {
-    entries: snapshot.entries.map(cloneEntry),
-    disabled: snapshot.disabled,
-  };
-}
-
-function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
-  return a.length === b.length && a.every((v, i) => v === b[i]);
-}
-
 function isSameEntry(a: RecentRoomEntry, b: RecentRoomEntry): boolean {
   return (
     a.role === b.role &&
     a.password === b.password &&
     a.label === b.label &&
-    sameStringArray(a.peerNames, b.peerNames)
+    a.peerNames.length === b.peerNames.length &&
+    a.peerNames.every((v, i) => v === b.peerNames[i])
   );
 }
 
-function applyJoinOp(snapshot: RecentRoomsSnapshot, op: RecentRoomJoinOp, now: number): RecentRoomOpOutcome {
-  if (snapshot.disabled || !isTimestampValid(op.lastJoinedAt, now)) {
-    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
-  }
-  const existing = snapshot.entries.find((e) => e.code === op.code);
+/** Upsert a room join into `entries`, preserving omitted fields and returning null if timestamp is invalid. */
+export function upsertJoinEntry(
+  entries: readonly RecentRoomEntry[],
+  op: RecentRoomJoinOp,
+  now: number,
+): RecentRoomEntry[] | null {
+  if (!isTimestampValid(op.lastJoinedAt, now)) return null;
+  const existing = entries.find((e) => e.code === op.code);
   const cleanPw = sanitizePassword(op.password);
   const cleanPeers = sanitizePeerNames(op.peerNames);
   const password = cleanPw ?? existing?.password;
@@ -248,41 +210,27 @@ function applyJoinOp(snapshot: RecentRoomsSnapshot, op: RecentRoomJoinOp, now: n
     ...(password !== undefined ? { password } : {}),
     ...(existing?.label !== undefined ? { label: existing.label } : {}),
   };
-  const rest = snapshot.entries.filter((e) => e.code !== op.code).map(cloneEntry);
-  return {
-    snapshot: { entries: sortAndBoundEntries([nextEntry, ...rest]), disabled: false },
-    changed: true,
-    missing: false,
-  };
+  return sortAndBoundEntries([nextEntry, ...entries.filter((e) => e.code !== op.code)]);
 }
 
-function applyPatchOp(
-  snapshot: RecentRoomsSnapshot,
+/** Apply a field patch to `entries` (or synthesize from a valid `host-rooms` entry), returning null if unchanged. */
+export function patchEntryInList(
+  entries: readonly RecentRoomEntry[],
   op: RecentRoomPatchOp,
   now: number,
   hostRooms: readonly PersistedHostRoom[],
   hasSavedCreatorHostFor: (code: string) => boolean,
-  allowHostSynthesis: boolean = true,
-): RecentRoomOpOutcome {
-  if (snapshot.disabled) {
-    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
-  }
-  const idx = snapshot.entries.findIndex((e) => e.code === op.code);
-  const existing = idx !== -1 ? snapshot.entries[idx] : undefined;
+): RecentRoomEntry[] | null {
+  const idx = entries.findIndex((e) => e.code === op.code);
+  const existing = idx !== -1 ? entries[idx] : undefined;
   if (existing) {
     const patched = applyPatchToEntry(existing, op);
-    if (isSameEntry(existing, patched)) {
-      return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
-    }
-    const entries = snapshot.entries.map((e, i) => (i === idx ? patched : cloneEntry(e)));
-    return { snapshot: { entries, disabled: false }, changed: true, missing: false };
-  }
-  if (!allowHostSynthesis) {
-    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: true };
+    if (isSameEntry(existing, patched)) return null;
+    return entries.map((e, i) => (i === idx ? patched : e));
   }
   const hostRoom = hostRooms.find((hr) => hr.code === op.code);
   if (!hostRoom || !hasSavedCreatorHostFor(op.code) || !isTimestampValid(hostRoom.updatedAt, now)) {
-    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: true };
+    return null;
   }
   const base: RecentRoomEntry = {
     code: op.code,
@@ -290,150 +238,20 @@ function applyPatchOp(
     lastJoinedAt: hostRoom.updatedAt,
     peerNames: [],
   };
-  const patched = applyPatchToEntry(base, op);
-  return {
-    snapshot: { entries: sortAndBoundEntries([patched, ...snapshot.entries.map(cloneEntry)]), disabled: false },
-    changed: true,
-    missing: false,
-  };
+  return sortAndBoundEntries([applyPatchToEntry(base, op), ...entries]);
 }
 
-function applyRemoveOp(
-  snapshot: RecentRoomsSnapshot,
+/** Remove `code` from `entries` (or demote `"host"` to `"guest"` if `demoteIfPassworded`), returning null if unchanged. */
+export function removeEntryFromList(
+  entries: readonly RecentRoomEntry[],
   code: string,
   demoteIfPassworded: boolean,
-): RecentRoomOpOutcome {
-  const existing = snapshot.entries.find((e) => e.code === code);
-  if (!existing) {
-    return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
-  }
+): RecentRoomEntry[] | null {
+  const existing = entries.find((e) => e.code === code);
+  if (!existing) return null;
   if (demoteIfPassworded && existing.password !== undefined) {
-    if (existing.role === "guest") {
-      return { snapshot: cloneSnapshot(snapshot), changed: false, missing: false };
-    }
-    const entries = snapshot.entries.map((e) =>
-      e.code === code ? { ...cloneEntry(e), role: "guest" as const } : cloneEntry(e),
-    );
-    return { snapshot: { entries, disabled: snapshot.disabled }, changed: true, missing: false };
+    if (existing.role === "guest") return null;
+    return entries.map((e) => (e.code === code ? { ...e, peerNames: [...e.peerNames], role: "guest" as const } : e));
   }
-  return {
-    snapshot: {
-      entries: snapshot.entries.filter((e) => e.code !== code).map(cloneEntry),
-      disabled: snapshot.disabled,
-    },
-    changed: true,
-    missing: false,
-  };
-}
-
-function applyClearAllOp(snapshot: RecentRoomsSnapshot): RecentRoomOpOutcome {
-  return {
-    snapshot: { entries: [], disabled: snapshot.disabled },
-    changed: snapshot.entries.length > 0,
-    missing: false,
-  };
-}
-
-function applySetDisabledOp(snapshot: RecentRoomsSnapshot, disabled: boolean): RecentRoomOpOutcome {
-  const entries = disabled ? [] : snapshot.entries.map(cloneEntry);
-  const changed = snapshot.disabled !== disabled || (disabled && snapshot.entries.length > 0);
-  return {
-    snapshot: { entries, disabled },
-    changed,
-    missing: false,
-  };
-}
-
-function applyOpWithSynthesis(
-  snapshot: RecentRoomsSnapshot,
-  op: RecentRoomOp,
-  now: number,
-  hostRooms: readonly PersistedHostRoom[],
-  hasSavedCreatorHostFor: (code: string) => boolean,
-  allowHostSynthesis: boolean,
-): RecentRoomOpOutcome {
-  switch (op.kind) {
-    case "join":
-      return applyJoinOp(snapshot, op, now);
-    case "patch":
-      return applyPatchOp(snapshot, op, now, hostRooms, hasSavedCreatorHostFor, allowHostSynthesis);
-    case "remove":
-      return applyRemoveOp(snapshot, op.code, op.demoteIfPassworded === true);
-    case "clear-all":
-      return applyClearAllOp(snapshot);
-    case "set-disabled":
-      return applySetDisabledOp(snapshot, op.disabled);
-  }
-}
-
-/** Apply a single queued recent-room operation purely against `snapshot` without mutating inputs. */
-export function applyRecentRoomOp(
-  snapshot: RecentRoomsSnapshot,
-  op: RecentRoomOp,
-  now: number,
-  hostRooms: readonly PersistedHostRoom[],
-  hasSavedCreatorHostFor: (code: string) => boolean,
-): RecentRoomOpOutcome {
-  return applyOpWithSynthesis(snapshot, op, now, hostRooms, hasSavedCreatorHostFor, true);
-}
-
-function shouldSuppressAfterRemove(
-  current: RecentRoomsSnapshot,
-  code: string,
-  demoteIfPassworded: boolean,
-): boolean {
-  if (!demoteIfPassworded) return true;
-  return !current.entries.some((e) => e.code === code && e.password !== undefined);
-}
-
-function replayOpsWithTracking(
-  initial: RecentRoomsSnapshot,
-  ops: readonly RecentRoomOp[],
-  now: number,
-  hostRooms: readonly PersistedHostRoom[],
-  hasSavedCreatorHostFor: (code: string) => boolean,
-): { snapshot: RecentRoomsSnapshot; locallyRemoved: Set<string> } {
-  let current = cloneSnapshot(initial);
-  const locallyRemoved = new Set<string>();
-  for (const op of ops) {
-    if (op.kind === "clear-all" || (op.kind === "set-disabled" && op.disabled)) {
-      locallyRemoved.clear();
-    } else if (op.kind === "remove" && shouldSuppressAfterRemove(current, op.code, op.demoteIfPassworded === true)) {
-      locallyRemoved.add(op.code);
-    }
-    const allowHostSynthesis = op.kind !== "patch" || !locallyRemoved.has(op.code);
-    current = applyOpWithSynthesis(current, op, now, hostRooms, hasSavedCreatorHostFor, allowHostSynthesis).snapshot;
-    if (op.kind === "join" && current.entries.some((e) => e.code === op.code)) {
-      locallyRemoved.delete(op.code);
-    }
-  }
-  return { snapshot: current, locallyRemoved };
-}
-
-/** Compute the effective UI snapshot by replaying `queue` over `diskSnapshot` and merging legacy `host-rooms`. */
-export function computeRecentRoomsView(
-  diskSnapshot: RecentRoomsSnapshot,
-  queue: readonly RecentRoomOp[],
-  now: number,
-  hostRooms: readonly PersistedHostRoom[],
-  hasSavedCreatorHostFor: (code: string) => boolean,
-): RecentRoomsSnapshot {
-  const { snapshot: replayed, locallyRemoved } = replayOpsWithTracking(
-    diskSnapshot,
-    queue,
-    now,
-    hostRooms,
-    hasSavedCreatorHostFor,
-  );
-  if (replayed.disabled) {
-    return { entries: [], disabled: true };
-  }
-  return {
-    entries: mergeSynthesizedHostRooms(
-      replayed.entries,
-      hostRooms.filter((hr) => !locallyRemoved.has(hr.code)),
-      hasSavedCreatorHostFor,
-    ),
-    disabled: false,
-  };
+  return entries.filter((e) => e.code !== code);
 }

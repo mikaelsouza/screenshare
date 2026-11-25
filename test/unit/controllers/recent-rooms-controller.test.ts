@@ -1,1233 +1,452 @@
 import { describe, expect, it, vi } from "vitest";
-import { RecentRoomsController } from "@src/controllers/recent-rooms-controller";
-import { SessionController } from "@src/controllers/session-controller";
-import { HOST_ROOMS_LOCK_NAME, HOST_ROOMS_STORAGE_KEY, readPersistedHostToken, writePersistedHostToken } from "@src/host-tokens";
-import { MAX_STORED_RECENT_ROOMS, RECENT_ROOMS_LOCK_NAME, RECENT_ROOMS_OPT_OUT_KEY, RECENT_ROOMS_STORAGE_KEY, formatRelativeTime, type LockManagerLike } from "@src/recent-rooms";
-import { createFullMemoryStorage, isRecentRoomsDisabled, loadRecentRooms, makeHarness, makeMemoryStorage, upsertRecentRoom } from "./recent-rooms-harness";
+import { RecentRoomsController, type RecentRoomsEnvironment } from "@src/controllers/recent-rooms-controller";
+import { HOST_ROOMS_STORAGE_KEY, type LockManagerLike, type StorageLike } from "@src/host-tokens";
+import { RECENT_ROOMS_OPT_OUT_KEY, RECENT_ROOMS_STORAGE_KEY } from "@src/recent-rooms";
 
-describe("RecentRoomsController — core lifecycle, UI, and ordering", () => {
-  it("records joins with creator host provenance only, retains omitted password/peers, and updates password/peers", async () => {
+function makeMemoryStorage(initial: Record<string, string> = {}): StorageLike & { store: Map<string, string> } {
+  const store = new Map<string, string>(Object.entries(initial));
+  return {
+    store,
+    getItem: (key) => store.get(key) ?? null,
+    setItem: (key, value) => {
+      store.set(key, value);
+    },
+    removeItem: (key) => {
+      store.delete(key);
+    },
+  };
+}
+
+function makeControllerSetup(opts?: {
+  initialStorage?: Record<string, string>;
+  locks?: LockManagerLike | null;
+  hostCodes?: Set<string>;
+  now?: () => number;
+}) {
+  const storage = makeMemoryStorage(opts?.initialStorage);
+  const hostCodes = opts?.hostCodes ?? new Set<string>();
+  const bgTasks: Promise<unknown>[] = [];
+  const onRemoveHostToken = vi.fn((code: string) => {
+    hostCodes.delete(code);
+  });
+  const onForgetAllHostTokens = vi.fn(() => {
+    hostCodes.clear();
+  });
+  const onChange = vi.fn();
+
+  const env: RecentRoomsEnvironment = {
+    getLocalStorage: () => storage,
+    getLocks: () => (opts?.locks === undefined ? null : opts.locks),
+    runBackground: vi.fn((p: Promise<unknown>) => {
+      bgTasks.push(p);
+    }),
+    hasSavedCreatorHostFor: (code) => hostCodes.has(code),
+    onRemoveHostToken,
+    onForgetAllHostTokens,
+    onChange,
+    ...(opts?.now ? { now: opts.now } : {}),
+  };
+
+  const ctrl = new RecentRoomsController(env);
+  return {
+    ctrl,
+    storage,
+    hostCodes,
+    onRemoveHostToken,
+    onForgetAllHostTokens,
+    onChange,
+    flush: async () => {
+      while (bgTasks.length > 0) {
+        const pending = bgTasks.splice(0);
+        await Promise.all(pending);
+      }
+    },
+  };
+}
+
+describe("RecentRoomsController", () => {
+  it("records joins, patches password/peers/label, searches, and synthesizes legacy host-rooms", () => {
     let now = 1_700_000_000_000;
-    const h = makeHarness({
-      creatorCodes: new Set(["K7M9P2QR"]),
+    const hostCodes = new Set(["ABCD2345", "EFGH2345"]);
+    const s = makeControllerSetup({
+      hostCodes,
       now: () => now,
-    });
-
-    // Invalid code is ignored
-    h.ctrl.recordJoin({ code: "BAD", password: "SECRET1234567890" });
-    expect(h.ctrl.getRooms()).toEqual([]);
-
-    // Creator room gets "host" role
-    h.ctrl.recordJoin({
-      code: "k7m9p2qr",
-      password: "PASS1234HOST5678",
-      peerNames: ["Alice", "Bob", "Carol", "Dave", "Eve"],
-    });
-    expect(h.ctrl.getRooms()).toEqual([
-      {
-        code: "K7M9P2QR",
-        role: "host",
-        lastJoinedAt: now,
-        password: "PASS1234HOST5678",
-        peerNames: ["Alice", "Bob", "Carol", "Dave"],
+      initialStorage: {
+        [HOST_ROOMS_STORAGE_KEY]: JSON.stringify([{ code: "EFGH2345", token: "tok-legacy", updatedAt: now - 5_000 }]),
       },
+    });
+
+    // Constructor syncs silently (notify = false) and loads synthesized legacy host room
+    expect(s.onChange).not.toHaveBeenCalled();
+    expect(s.ctrl.getRooms().map((r) => r.code)).toEqual(["EFGH2345"]);
+
+    // Invalid codes are ignored without notifying
+    s.ctrl.recordJoin({ code: "bad" });
+    expect(s.ctrl.getRooms()).toHaveLength(1);
+    expect(s.onChange).not.toHaveBeenCalled();
+
+    // Join as host and guest, patch password/peers/rename (with whitespace trimming)
+    s.ctrl.recordJoin({ code: "  abcd2345  ", password: "  SECRET1234567890  ", peerNames: ["Alice"] });
+    now += 1000;
+    s.ctrl.recordJoin({ code: "GUST2345", password: "GUEST12345678901" });
+    expect(s.ctrl.getRooms().map((r) => [r.code, r.role])).toEqual([
+      ["GUST2345", "guest"],
+      ["ABCD2345", "host"],
+      ["EFGH2345", "host"],
     ]);
 
-    // Guest room (even if promoted in-memory elsewhere, creatorCodes does not have it) gets "guest"
-    now += 1000;
-    h.ctrl.recordJoin({
-      code: "GUES2345",
-      password: "PASS1234GUES5678",
-      peerNames: ["HostPeer"],
-    });
-    expect(h.ctrl.getRooms()[0]?.role).toBe("guest");
+    // Password updates respect lock, trim code, and skip identical password
+    s.ctrl.updatePassword("GUST2345", "ROTATED_LOCKED12", true);
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.password).toBe("GUEST12345678901");
+    s.onChange.mockClear();
+    s.ctrl.updatePassword("  gust2345  ", "ROTATED_NEW12345", false);
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.password).toBe("ROTATED_NEW12345");
+    expect(s.onChange).toHaveBeenCalledTimes(1);
+    s.ctrl.updatePassword("GUST2345", "ROTATED_NEW12345", false);
+    expect(s.onChange).toHaveBeenCalledTimes(1);
 
-    // Rejoining locked room without password or with empty peerNames retains existing password and peerNames
-    now += 1000;
-    h.ctrl.recordJoin({ code: "GUES2345", peerNames: [] });
-    const guestEntry = h.ctrl.getRooms().find((r) => r.code === "GUES2345");
-    expect(guestEntry?.password).toBe("PASS1234GUES5678");
-    expect(guestEntry?.peerNames).toEqual(["HostPeer"]);
+    // Peer updates validate code, filter blanks, and detect equal/length/element diffs
+    s.ctrl.updatePeers("bad", ["Bob"]);
+    s.ctrl.updatePeers("GUST2345", ["  ", ""]);
+    s.ctrl.updatePeers("  gust2345  ", ["Bob", "Carol"]);
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.peerNames).toEqual(["Bob", "Carol"]);
+    expect(s.onChange).toHaveBeenCalledTimes(2);
+    s.ctrl.updatePeers("GUST2345", ["Bob", "Carol"]);
+    expect(s.onChange).toHaveBeenCalledTimes(2);
+    s.ctrl.updatePeers("GUST2345", ["Bob", "Dave"]);
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.peerNames).toEqual(["Bob", "Dave"]);
+    expect(s.onChange).toHaveBeenCalledTimes(3);
+    s.ctrl.updatePeers("GUST2345", ["Bob"]);
+    expect(s.onChange).toHaveBeenCalledTimes(4);
 
-    // updatePassword retains last password when locked=true, updates when locked=false
-    h.ctrl.updatePassword("GUES2345", "SHOULDNOTOVERWRITE", true);
-    expect(h.ctrl.getRooms().find((r) => r.code === "GUES2345")?.password).toBe("PASS1234GUES5678");
+    // Search & editing state across 3 rooms (searchQuery preserved when count === 3)
+    s.ctrl.setEditingCode("  gust2345  ");
+    expect(s.ctrl.getEditingCode()).toBe("GUST2345");
+    s.ctrl.setEditingCode("GUST2345");
+    expect(s.onChange).toHaveBeenCalledTimes(5);
+    s.ctrl.setEditingCode("JKMN2345");
+    expect(s.ctrl.getEditingCode()).toBeNull();
+    s.ctrl.rename("  gust2345  ", "  Game Night  ");
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.label).toBe("Game Night");
+    s.ctrl.rename("GUST2345", "   ");
+    expect(s.ctrl.getRooms().find((r) => r.code === "GUST2345")?.label).toBeUndefined();
+    s.onChange.mockClear();
+    s.ctrl.rename("JKMN2345", "Missing");
+    expect(s.onChange).toHaveBeenCalledTimes(1);
+    s.ctrl.rename("bad", "Invalid");
+    expect(s.onChange).toHaveBeenCalledTimes(1);
 
-    h.ctrl.updatePassword("GUES2345", "ROTATED123456789", false);
-    expect(h.ctrl.getRooms().find((r) => r.code === "GUES2345")?.password).toBe("ROTATED123456789");
+    s.ctrl.setSearchQuery("bob");
+    expect(s.ctrl.getSearchQuery()).toBe("bob");
+    s.ctrl.setSearchQuery("bob");
+    expect(s.onChange).toHaveBeenCalledTimes(2);
+    expect(s.ctrl.getFilteredRooms().map((r) => r.code)).toEqual(["GUST2345"]);
 
-    // Same password or empty password or unknown room are no-ops
-    const changeCount = h.onChange.mock.calls.length;
-    h.ctrl.updatePassword("GUES2345", "ROTATED123456789", false);
-    h.ctrl.updatePassword("GUES2345", "   ", false);
-    h.ctrl.updatePassword("UNKN2345", "ABCD1234EFGH5678", false);
-    expect(h.onChange).toHaveBeenCalledTimes(changeCount);
+    // With 3 rooms, syncFromStorage keeps searchQuery; removing 3rd clears searchQuery and active editingCode
+    s.ctrl.setEditingCode("EFGH2345");
+    s.ctrl.syncFromStorage(false);
+    expect(s.ctrl.getSearchQuery()).toBe("bob");
+    expect(s.ctrl.getEditingCode()).toBe("EFGH2345");
 
-    // updatePeers ignores empty arrays (e.g. peer left) and updates up to 4 non-empty names
-    h.ctrl.updatePeers("GUES2345", []);
-    expect(h.ctrl.getRooms().find((r) => r.code === "GUES2345")?.peerNames).toEqual(["HostPeer"]);
-    h.ctrl.updatePeers("GUES2345", ["P1", "P2", "P3", "P4", "P5"]);
-    expect(h.ctrl.getRooms().find((r) => r.code === "GUES2345")?.peerNames).toEqual(["P1", "P2", "P3", "P4"]);
-    const afterPeers = h.onChange.mock.calls.length;
-    h.ctrl.updatePeers("GUES2345", ["P1", "P2", "P3", "P4"]);
-    expect(h.onChange).toHaveBeenCalledTimes(afterPeers);
-
-    await h.flush();
-    const persisted = loadRecentRooms(h.storage, now);
-    expect(persisted.find((r) => r.code === "GUES2345")?.password).toBe("ROTATED123456789");
-    expect(persisted.find((r) => r.code === "GUES2345")?.peerNames).toEqual(["P1", "P2", "P3", "P4"]);
+    s.ctrl.remove("  efgh2345  ");
+    expect(s.onRemoveHostToken).toHaveBeenCalledWith("EFGH2345");
+    expect(s.ctrl.getEditingCode()).toBeNull();
+    expect(s.ctrl.getSearchQuery()).toBe("");
+    s.ctrl.remove("bad");
   });
 
-  it("removes rooms immediately on kicked and bad-password, and retains on temporary errors", async () => {
+  it("handles creator-host forgetting, fatal errors, opt-out, re-enable reload, and clearAll", () => {
     const now = 1_700_000_000_000;
-    const h = makeHarness({ now: () => now });
-    h.ctrl.recordJoin({ code: "ABCD2345", password: "PASS1112WORD1112" });
-    h.ctrl.recordJoin({ code: "EFGH2345", password: "PASS2223WORD2223" });
-    h.ctrl.recordJoin({ code: "JKMN2345", password: "PASS3334WORD3334" });
+    const hostCodes = new Set(["ABCD2345", "PQRS2345"]);
+    const s = makeControllerSetup({ hostCodes, now: () => now });
 
-    for (const tempErr of [
-      "room-locked",
-      "room-full",
-      "rate-limited",
-      "join-timeout",
-      "connection-failed",
-      "session-replaced",
-    ]) {
-      expect(h.ctrl.handleFatalError("ABCD2345", tempErr)).toBe(false);
-    }
-    expect(h.ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS1112WORD1112");
+    s.ctrl.recordJoin({ code: "ABCD2345", password: "PASS_12345678901" });
+    s.ctrl.recordJoin({ code: "PQRS2345" });
 
-    expect(h.ctrl.handleFatalError("ABCD2345", "kicked")).toBe(true);
-    expect(h.ctrl.handleFatalError("EFGH2345", "bad-password")).toBe(true);
-    expect(h.ctrl.handleFatalError("UNKN9999", "kicked")).toBe(false);
-    expect(h.ctrl.handleFatalError("BAD", "kicked")).toBe(false);
+    // Forgetting creator host demotes passworded room to guest and deletes passwordless room
+    s.ctrl.handleCreatorHostForgotten("  abcd2345  ");
+    expect(s.ctrl.getRooms().find((r) => r.code === "ABCD2345")?.role).toBe("guest");
+    s.ctrl.handleCreatorHostForgotten("PQRS2345");
+    expect(s.ctrl.getRooms().find((r) => r.code === "PQRS2345")).toBeUndefined();
+    s.ctrl.handleCreatorHostForgotten("ZZZZ2345");
+    s.ctrl.handleCreatorHostForgotten("bad");
 
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["JKMN2345"]);
-    await h.flush();
-    expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["JKMN2345"]);
+    // Remove deletes even passworded entries (unlike handleCreatorHostForgotten)
+    s.ctrl.recordJoin({ code: "WXYZ2345", password: "PASS_WXYZ_123456" });
+    s.ctrl.remove("WXYZ2345");
+    expect(s.ctrl.getRooms().find((r) => r.code === "WXYZ2345")).toBeUndefined();
+
+    // Fatal errors remove matching room & pass expectedHostToken only on kicked/bad-password
+    expect(s.ctrl.handleFatalError("ABCD2345", "room-locked", "tok-1")).toBe(false);
+    expect(s.ctrl.handleFatalError("bad", "kicked")).toBe(false);
+    s.ctrl.recordJoin({ code: "EFGH2345", password: "PASS_EFGH_123456" });
+    expect(s.ctrl.handleFatalError("  efgh2345  ", "bad-password")).toBe(true);
+    expect(s.onRemoveHostToken).not.toHaveBeenCalledWith("EFGH2345", expect.anything());
+    expect(s.ctrl.handleFatalError("  abcd2345  ", "kicked", "tok-1")).toBe(true);
+    expect(s.onRemoveHostToken).toHaveBeenCalledWith("ABCD2345", "tok-1");
+    expect(s.ctrl.getRooms()).toEqual([]);
+
+    // Opt-out clears UI state/search/editing/rooms, wipes storage, forgets tokens, and suppresses writes
+    s.ctrl.recordJoin({ code: "AAAA2345", password: "PASS_12345678901" });
+    s.ctrl.setSearchQuery("aaaa");
+    s.ctrl.setEditingCode("AAAA2345");
+    s.onChange.mockClear();
+    s.ctrl.setDisabled(true);
+    expect(s.onChange).toHaveBeenCalled();
+    s.ctrl.setDisabled(true);
+    expect(s.ctrl.isDisabled()).toBe(true);
+    expect(s.ctrl.getSearchQuery()).toBe("");
+    expect(s.ctrl.getEditingCode()).toBeNull();
+    expect(s.onForgetAllHostTokens).toHaveBeenCalledTimes(1);
+    expect(s.storage.store.get(RECENT_ROOMS_OPT_OUT_KEY)).toBe("1");
+    expect(s.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+    s.ctrl.recordJoin({ code: "BBBB2345", password: "PASS_12345678901" });
+    s.ctrl.updatePassword("AAAA2345", "NEW_PASS_1234567", false);
+    s.ctrl.updatePeers("AAAA2345", ["Eve"]);
+    s.ctrl.rename("AAAA2345", "Ignored");
+    expect(s.ctrl.getRooms()).toEqual([]);
+
+    // Re-enabling reloads any rooms present on disk (e.g. legacy host-rooms)
+    s.hostCodes.add("AAAA2345");
+    s.storage.store.set(HOST_ROOMS_STORAGE_KEY, JSON.stringify([{ code: "AAAA2345", token: "t1", updatedAt: now }]));
+    s.ctrl.setDisabled(false);
+    expect(s.ctrl.isDisabled()).toBe(false);
+    expect(s.storage.store.has(RECENT_ROOMS_OPT_OUT_KEY)).toBe(false);
+    expect(s.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
+
+    // clearAll clears rooms, searchQuery, editingCode, and host tokens
+    s.ctrl.setSearchQuery("search");
+    s.ctrl.setEditingCode("AAAA2345");
+    s.onChange.mockClear();
+    s.ctrl.clearAll();
+    expect(s.ctrl.getRooms()).toEqual([]);
+    expect(s.ctrl.getSearchQuery()).toBe("");
+    expect(s.ctrl.getEditingCode()).toBeNull();
+    expect(s.onForgetAllHostTokens).toHaveBeenCalledTimes(2);
+    expect(s.onChange).toHaveBeenCalled();
+    expect(s.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
   });
 
-  it("synthesizes legacy host-rooms entries without duplicating recent-rooms and supports renaming them", async () => {
+  it("boots cleanly when already disabled on disk and avoids pruning while opted out", () => {
     const now = 1_700_000_000_000;
-    const h = makeHarness({
-      creatorCodes: new Set(["ABCD2345", "EFGH2345"]),
+    const s = makeControllerSetup({
       now: () => now,
-    });
-    writePersistedHostToken(h.storage, "ABCD2345", "tok-legacy", now - 5_000);
-    writePersistedHostToken(h.storage, "EFGH2345", "tok-both", now - 2_000);
-    upsertRecentRoom(
-      h.storage,
-      {
-        code: "EFGH2345",
-        role: "host",
-        password: "PASSBOTH12345678",
-        label: "Existing Label",
-        peerNames: ["PeerA"],
-        lastJoinedAt: now - 1_000,
-      },
-      now,
-    );
-
-    h.ctrl.syncFromStorage();
-    const rooms = h.ctrl.getRooms();
-    expect(rooms.map((r) => r.code)).toEqual(["EFGH2345", "ABCD2345"]);
-    expect(rooms[0]?.label).toBe("Existing Label");
-    expect(rooms[1]).toEqual({
-      code: "ABCD2345",
-      role: "host",
-      lastJoinedAt: now - 5_000,
-      peerNames: [],
-    });
-
-    // Renaming a synthesized host room persists it to recent-rooms
-    h.ctrl.setEditingCode("abcd2345");
-    expect(h.ctrl.getEditingCode()).toBe("ABCD2345");
-    h.ctrl.rename("ABCD2345", "  Legacy Host Room  ");
-    expect(h.ctrl.getEditingCode()).toBeNull();
-    expect(h.ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBe("Legacy Host Room");
-
-    // Rename on unknown or invalid code is handled safely
-    h.ctrl.rename("BAD", "Nope");
-    h.ctrl.rename("UNKN2345", "Nope");
-
-    await h.flush();
-    expect(loadRecentRooms(h.storage, now).find((r) => r.code === "ABCD2345")?.label).toBe("Legacy Host Room");
-  });
-
-  it("demotes or removes on handleCreatorHostForgotten depending on password presence", async () => {
-    const now = 1_700_000_000_000;
-    const h = makeHarness({ creatorCodes: new Set(["PQRS2345", "TUVW2345"]), now: () => now });
-    h.ctrl.recordJoin({ code: "PQRS2345", password: "SECRET1234567890" });
-    h.ctrl.recordJoin({ code: "TUVW2345" });
-
-    h.ctrl.handleCreatorHostForgotten("PQRS2345");
-    expect(h.ctrl.getRooms().find((r) => r.code === "PQRS2345")?.role).toBe("guest");
-
-    h.ctrl.handleCreatorHostForgotten("TUVW2345");
-    expect(h.ctrl.getRooms().some((r) => r.code === "TUVW2345")).toBe(false);
-
-    h.ctrl.handleCreatorHostForgotten("BAD");
-    h.ctrl.handleCreatorHostForgotten("UNKN2345");
-
-    await h.flush();
-    const stored = loadRecentRooms(h.storage, now);
-    expect(stored.find((r) => r.code === "PQRS2345")?.role).toBe("guest");
-    expect(stored.some((r) => r.code === "TUVW2345")).toBe(false);
-  });
-
-  it("supports search filtering across code, label, and peerNames and resets search when dropping below 3 rooms", () => {
-    const h = makeHarness();
-    h.ctrl.recordJoin({ code: "AAAA2345", peerNames: ["Zelda"] });
-    h.ctrl.recordJoin({ code: "BBBB2345", peerNames: ["Mario"] });
-    h.ctrl.recordJoin({ code: "CCCC2345", peerNames: ["Luigi"] });
-    h.ctrl.rename("AAAA2345", "Design Critique");
-
-    h.ctrl.setSearchQuery("design");
-    expect(h.ctrl.getFilteredRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
-
-    h.ctrl.setSearchQuery("bbbb");
-    expect(h.ctrl.getFilteredRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-
-    h.ctrl.setSearchQuery("luigi");
-    expect(h.ctrl.getFilteredRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
-
-    // Deleting a room drops count from 3 to 2 and resets searchQuery
-    h.ctrl.remove("CCCC2345");
-    expect(h.onRemoveHostToken).toHaveBeenCalledWith("CCCC2345");
-    expect(h.ctrl.getSearchQuery()).toBe("");
-    expect(h.ctrl.getFilteredRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345"]);
-  });
-
-  it("handles setDisabled, clearAll, cross-tab syncFromStorage, and deferred Web Lock race guards", async () => {
-    const now = 1_700_000_000_000;
-    const h = makeHarness({
-      creatorCodes: new Set(["K7M9P2QR"]),
-      now: () => now,
-      deferredLocks: true,
-    });
-    writePersistedHostToken(h.storage, "K7M9P2QR", "tok-1", now);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms()).toHaveLength(1);
-
-    // Record join and immediately remove before Web Lock runs; remove must win and syncFromStorage must not resurrect
-    h.ctrl.recordJoin({ code: "RACE2345", password: "RACEPASS12345678" });
-    h.ctrl.remove("RACE2345");
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms().some((r) => r.code === "RACE2345")).toBe(false);
-    await h.flush();
-    expect(loadRecentRooms(h.storage, now).some((r) => r.code === "RACE2345")).toBe(false);
-
-    // Demoting via handleCreatorHostForgotten while Web Lock is pending must not be clobbered by syncFromStorage
-    h.creatorCodes.add("DEMT2345");
-    h.ctrl.recordJoin({ code: "DEMT2345", password: "DEMTPASS12345678" });
-    await h.flush();
-    h.creatorCodes.delete("DEMT2345");
-    h.ctrl.handleCreatorHostForgotten("DEMT2345");
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms().find((r) => r.code === "DEMT2345")?.role).toBe("guest");
-    await h.flush();
-    expect(loadRecentRooms(h.storage, now).find((r) => r.code === "DEMT2345")?.role).toBe("guest");
-
-    // Clear all wipes both recent-rooms and host-rooms even while lock is pending
-    h.ctrl.recordJoin({ code: "KEEP2345", password: "KEEPPASS12345678" });
-    h.ctrl.clearAll();
-    expect(h.onForgetAllHostTokens).toHaveBeenCalledTimes(1);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms()).toEqual([]);
-    await h.flush();
-    expect(h.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
-
-    // Disable prevents saving and wipes existing rooms; syncFromStorage while lock pending preserves disabled=true
-    h.ctrl.recordJoin({ code: "TEMP2345", password: "TEMPPASS12345678" });
-    h.ctrl.setDisabled(true);
-    expect(h.ctrl.isDisabled()).toBe(true);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.isDisabled()).toBe(true);
-    expect(h.ctrl.getRooms()).toEqual([]);
-    h.ctrl.recordJoin({ code: "BVCX2345", password: "BLCKPASS12345678" });
-    expect(h.ctrl.getRooms()).toEqual([]);
-    await h.flush();
-    expect(h.storage.store.get(RECENT_ROOMS_OPT_OUT_KEY)).toBe("1");
-
-    // Re-enable restores ability to save and picks up cross-tab storage updates
-    h.ctrl.setDisabled(false);
-    await h.flush();
-    expect(h.ctrl.isDisabled()).toBe(false);
-    expect(h.storage.store.has(RECENT_ROOMS_OPT_OUT_KEY)).toBe(false);
-
-    upsertRecentRoom(h.storage, { code: "XTAB2345", role: "guest", password: "XTABPASS12345678" }, now);
-    h.storage.store.set(HOST_ROOMS_STORAGE_KEY, JSON.stringify([]));
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["XTAB2345"]);
-  });
-
-  it("formats relative timestamps and clamps future clock skew to Just now", () => {
-    const now = 1_700_000_000_000;
-    expect(formatRelativeTime(now + 60_000, now)).toBe("Just now");
-    expect(formatRelativeTime(now - 59_000, now)).toBe("Just now");
-    expect(formatRelativeTime(now - 5 * 60_000, now)).toBe("5m ago");
-    expect(formatRelativeTime(now - 3 * 3_600_000, now)).toBe("3h ago");
-    expect(formatRelativeTime(now - 4 * 86_400_000, now)).toBe("4d ago");
-  });
-
-  it("preserves post-clearAll and post-re-enable recordJoin across syncFromStorage and SessionController cross-lock ordering", async () => {
-    const now = 1_700_000_000_000;
-
-    // 1A: Standalone clearAll() -> recordJoin() -> syncFromStorage() before lock flushes
-    const h = makeHarness({ deferredLocks: true, now: () => now });
-    h.ctrl.recordJoin({ code: "AAAA2345", password: "OLDPASS123456789" });
-    await h.flush();
-    h.ctrl.clearAll();
-    h.ctrl.recordJoin({ code: "BBBB2345", password: "NEWPASS123456789" });
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-    await h.flush();
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-    expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
-
-    // 1C: setDisabled(true) -> setDisabled(false) -> recordJoin() -> syncFromStorage() before lock #1 flushes
-    h.ctrl.setDisabled(true);
-    h.ctrl.setDisabled(false);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms()).toEqual([]); // pre-disable BBBB2345 must not resurrect
-    h.ctrl.recordJoin({ code: "CCCC2345", password: "REENPASS12345678" });
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.isDisabled()).toBe(false);
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
-    await h.flush();
-    expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
-    expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["CCCC2345"]);
-
-    // 1B: Real SessionController cross-lock ordering where screenshare:host-rooms resolves before screenshare:recent-rooms
-    const fullStorage = createFullMemoryStorage();
-    const sessStorage = createFullMemoryStorage();
-    const queues = new Map<string, Array<() => Promise<void>>>();
-    const tasks: Promise<unknown>[] = [];
-    const keyedLocks = {
-      request: (name: string, cb: () => unknown) =>
-        new Promise<void>((resolve, reject) => {
-          const list = queues.get(name) ?? [];
-          list.push(async () => {
-            try {
-              await cb();
-              resolve();
-            } catch (err: unknown) {
-              reject(err instanceof Error ? err : new Error(String(err)));
-            }
-          });
-          queues.set(name, list);
-        }),
-    } as unknown as LockManager;
-    const flushQueue = async (name: string): Promise<void> => {
-      const list = queues.get(name);
-      while (list && list.length > 0) {
-        const next = list.shift();
-        await next?.();
-      }
-    };
-
-    let recentCtrl: RecentRoomsController | null = null;
-    const session = new SessionController({
-      getLocalStorage: () => fullStorage,
-      getSessionStorage: () => sessStorage,
-      getLocks: () => keyedLocks,
-      runBackground: (t) => {
-        tasks.push(t);
-      },
-      onForgetHostUiChange: () => {
-        recentCtrl?.syncFromStorage();
+      initialStorage: {
+        [RECENT_ROOMS_OPT_OUT_KEY]: "1",
+        [RECENT_ROOMS_STORAGE_KEY]: "{corrupt",
       },
     });
-    recentCtrl = new RecentRoomsController({
-      getLocalStorage: () => fullStorage,
-      getLocks: () => keyedLocks,
-      runBackground: (t) => {
-        tasks.push(t);
-      },
-      hasSavedCreatorHostFor: (code) => session.hasSavedCreatorHostFor(code),
-      onRemoveHostToken: (code, onlyIfMatching) => session.forgetCreatorHostToken(code, onlyIfMatching),
-      onForgetAllHostTokens: () => session.forgetAllHostTokens(),
-      onChange: vi.fn(),
-      now: () => now,
-    });
+    expect(s.ctrl.isDisabled()).toBe(true);
+    expect(s.ctrl.getRooms()).toEqual([]);
+    // Opt-out prevents background pruning from modifying storage
+    expect(s.storage.store.get(RECENT_ROOMS_STORAGE_KEY)).toBe("{corrupt");
 
-    session.saveCreatorHostToken("AAAA2345", "tok-old");
-    recentCtrl.recordJoin({ code: "AAAA2345", password: "OLDPASS123456789" });
-    await flushQueue(HOST_ROOMS_LOCK_NAME);
-    await flushQueue(RECENT_ROOMS_LOCK_NAME);
-
-    recentCtrl.clearAll();
-    recentCtrl.recordJoin({ code: "BBBB2345", password: "NEWPASS123456789" });
-    await flushQueue(HOST_ROOMS_LOCK_NAME); // triggers onForgetHostUiChange -> syncFromStorage() while pendingClearAll > 0
-    expect(recentCtrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-
-    await flushQueue(RECENT_ROOMS_LOCK_NAME);
-    await Promise.all(tasks);
-    expect(recentCtrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-    expect(loadRecentRooms(fullStorage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
+    s.onChange.mockClear();
+    s.ctrl.syncFromStorage();
+    expect(s.onChange).toHaveBeenCalledTimes(1);
+    expect(s.ctrl.getRooms()).toEqual([]);
   });
 
-  it("guards remove + subsequent recordJoin under single-flight and rejected lock fallback", async () => {
+  it("serializes async Web Lock writes FIFO, respects external opt-out, and prunes stale disk entries", async () => {
     const now = 1_700_000_000_000;
-    const storage = makeMemoryStorage();
-    const tasks: Promise<unknown>[] = [];
-    const rejectHolders: Array<(err: Error) => void> = [];
-    let lockCall = 0;
-
     const locks: LockManagerLike = {
-      request: (_name, cb) => {
-        lockCall += 1;
-        if (lockCall === 1) {
-          return new Promise<void>((_resolve, reject) => {
-            rejectHolders.push(reject);
-          });
-        }
-        return Promise.resolve(cb());
+      request: async (_name, cb) => {
+        await Promise.resolve();
+        await cb();
       },
     };
-
-    const ctrl = new RecentRoomsController({
-      getLocalStorage: () => storage,
-      getLocks: () => locks,
-      runBackground: (t) => {
-        tasks.push(t);
+    const s = makeControllerSetup({
+      locks,
+      now: () => now,
+      initialStorage: {
+        [RECENT_ROOMS_STORAGE_KEY]: JSON.stringify([
+          { code: "EXPD2345", role: "guest", lastJoinedAt: 1 },
+          { code: "KEEP2345", role: "guest", lastJoinedAt: now - 1000 },
+        ]),
       },
+    });
+
+    // Startup sync detects stale entry and schedules locked prune
+    expect(s.ctrl.getRooms().map((r) => r.code)).toEqual(["KEEP2345"]);
+    await s.flush();
+    expect(JSON.parse(s.storage.store.get(RECENT_ROOMS_STORAGE_KEY) ?? "[]")).toHaveLength(1);
+
+    // Back-to-back join + password patch settle in strict FIFO order under Web Lock
+    s.ctrl.recordJoin({ code: "MNPQ2345" });
+    s.ctrl.updatePassword("MNPQ2345", "PASS_FIFO_123456", false);
+    await s.flush();
+    expect(s.ctrl.getRooms().find((r) => r.code === "MNPQ2345")?.password).toBe("PASS_FIFO_123456");
+
+    // External opt-out flag on disk aborts queued patch and join, clears storage, and flips controller disabled
+    s.storage.store.set(RECENT_ROOMS_OPT_OUT_KEY, "1");
+    s.ctrl.updatePassword("MNPQ2345", "PASS_BLCK_999999", false);
+    await s.flush();
+    expect(s.ctrl.isDisabled()).toBe(true);
+    expect(s.ctrl.getRooms()).toEqual([]);
+    expect(s.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+
+    // Re-enable externally, then test external opt-out during join and during stale prune
+    s.storage.store.delete(RECENT_ROOMS_OPT_OUT_KEY);
+    s.storage.store.set(
+      RECENT_ROOMS_STORAGE_KEY,
+      JSON.stringify([{ code: "SYNC2345", role: "guest", lastJoinedAt: now, peerNames: ["Zed"] }]),
+    );
+    s.ctrl.syncFromStorage();
+    expect(s.ctrl.isDisabled()).toBe(false);
+    expect(s.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNC2345"]);
+
+    s.storage.store.set(RECENT_ROOMS_OPT_OUT_KEY, "1");
+    s.ctrl.recordJoin({ code: "BKMN2345", password: "PASS_BKMN_123456" });
+    await s.flush();
+    expect(s.ctrl.isDisabled()).toBe(true);
+    expect(s.storage.store.has(RECENT_ROOMS_STORAGE_KEY)).toBe(false);
+  });
+
+  it("tolerates throwing storage reads/writes without corrupting state", () => {
+    const throwing: StorageLike = {
+      getItem: () => { throw new Error("SecurityError"); },
+      setItem: () => { throw new Error("QuotaExceededError"); },
+      removeItem: () => { throw new Error("SecurityError"); },
+    };
+    const ctrl = new RecentRoomsController({
+      getLocalStorage: () => throwing,
+      getLocks: () => null,
+      runBackground: vi.fn(),
       hasSavedCreatorHostFor: () => false,
       onRemoveHostToken: vi.fn(),
       onForgetAllHostTokens: vi.fn(),
       onChange: vi.fn(),
-      now: () => now,
     });
-
-    ctrl.remove("AAAA2345");
-    ctrl.recordJoin({ code: "AAAA2345", password: "NEWPASS123456789" });
-    await Promise.resolve();
-    expect(lockCall).toBe(1);
-    expect(loadRecentRooms(storage, now)).toEqual([]);
-
-    rejectHolders[0]?.(new Error("AbortError"));
-    await Promise.all(tasks);
-
-    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345"]);
-    expect(loadRecentRooms(storage, now).map((r) => r.code)).toEqual(["AAAA2345"]);
+    expect(ctrl.getRooms()).toEqual([]);
+    ctrl.recordJoin({ code: "AAAA2345" });
+    ctrl.updatePassword("AAAA2345", "PASS_12345678901", false);
+    ctrl.setDisabled(true);
+    ctrl.clearAll();
+    expect(ctrl.isDisabled()).toBe(true);
+    // Throwing read during syncFromStorage preserves in-memory disabled state
+    ctrl.syncFromStorage();
+    expect(ctrl.isDisabled()).toBe(true);
   });
 
-  it("clears host-rooms via onRemoveHostToken on handleFatalError(kicked | bad-password) so rooms do not resurrect", async () => {
+  it("shields opt-out, re-enable, clearAll, and remove from re-entrant syncFromStorage under async locks", async () => {
     const now = 1_700_000_000_000;
-    const creatorCodes = new Set(["KYCK2345", "BADP2345"]);
-    const h = makeHarness({
-      creatorCodes,
-      now: () => now,
-    });
-    writePersistedHostToken(h.storage, "KYCK2345", "tok-kick", now);
-    writePersistedHostToken(h.storage, "BADP2345", "tok-badp", now);
-    h.ctrl.recordJoin({ code: "KYCK2345", password: "PASS123456789012" });
-    h.ctrl.recordJoin({ code: "BADP2345", password: "PASS223456789012" });
-    await h.flush();
-
-    expect(h.ctrl.handleFatalError("KYCK2345", "kicked", "tok-kick")).toBe(true);
-    expect(h.ctrl.handleFatalError("BADP2345", "bad-password", "tok-badp")).toBe(true);
-    expect(h.onRemoveHostToken).toHaveBeenCalledWith("KYCK2345", "tok-kick");
-    expect(h.onRemoveHostToken).toHaveBeenCalledWith("BADP2345", "tok-badp");
-
-    // Even if host-rooms still had entries until its own lock completes, hasSavedCreatorHostFor + pendingRemovals prevent resurrection
-    await h.flush();
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms()).toEqual([]);
-    expect(readPersistedHostToken(h.storage, "KYCK2345", now)).toBe("tok-kick"); // mock onRemoveHostToken only updates creatorCodes
-
-    // Without expectedHostToken (unauthenticated guest fatal error), creator token is NOT wiped
-    h.onRemoveHostToken.mockClear();
-    creatorCodes.add("GUST2345");
-    writePersistedHostToken(h.storage, "GUST2345", "tok-other-tab", now);
-    h.ctrl.recordJoin({ code: "GUST2345", password: "GUEST_PASS_12345" });
-    await h.flush();
-    expect(h.ctrl.handleFatalError("GUST2345", "kicked")).toBe(true);
-    expect(h.onRemoveHostToken).not.toHaveBeenCalled();
-    expect(readPersistedHostToken(h.storage, "GUST2345", now)).toBe("tok-other-tab");
-  });
-
-  it("aligns password max length (128) across memory and storage, handles overlapping writes, and clears editingCode on external removal", async () => {
-    const now = 1_700_000_000_000;
-    const h = makeHarness({ deferredLocks: true, now: () => now });
-
-    // 80-char and 128-char passwords match between memory and storage; 129-char is rejected in both
-    h.ctrl.recordJoin({ code: "PASS8234", password: "A".repeat(80) });
-    h.ctrl.recordJoin({ code: "PASS28AA", password: "B".repeat(128) });
-    h.ctrl.recordJoin({ code: "PASS29AA", password: "C".repeat(129) });
-    expect(h.ctrl.getRooms().find((r) => r.code === "PASS8234")?.password).toBe("A".repeat(80));
-    expect(h.ctrl.getRooms().find((r) => r.code === "PASS28AA")?.password).toBe("B".repeat(128));
-    const memPass29 = h.ctrl.getRooms().find((r) => r.code === "PASS29AA");
-    expect(memPass29).toBeDefined();
-    expect(memPass29?.password).toBeUndefined();
-
-    // updatePassword ignores >128 char passwords without changing existing valid password
-    h.ctrl.updatePassword("PASS8234", "D".repeat(129), false);
-    expect(h.ctrl.getRooms().find((r) => r.code === "PASS8234")?.password).toBe("A".repeat(80));
-
-    // Single-flight queued writes for PASS8234: mid-flight syncFromStorage preserves pending in-memory entry
-    h.ctrl.updatePeers("PASS8234", ["PeerOne"]);
-    expect(h.pendingLockReleases).toHaveLength(1);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getRooms().find((r) => r.code === "PASS8234")?.peerNames).toEqual(["PeerOne"]);
-
-    await h.flush();
-    expect(loadRecentRooms(h.storage, now).find((r) => r.code === "PASS8234")?.password).toBe("A".repeat(80));
-    expect(loadRecentRooms(h.storage, now).find((r) => r.code === "PASS28AA")?.password).toBe("B".repeat(128));
-    const diskPass29 = loadRecentRooms(h.storage, now).find((r) => r.code === "PASS29AA");
-    expect(diskPass29).toBeDefined();
-    expect(diskPass29?.password).toBeUndefined();
-
-    // External storage removal clears active editingCode
-    h.ctrl.setEditingCode("PASS8234");
-    expect(h.ctrl.getEditingCode()).toBe("PASS8234");
-    h.storage.removeItem(RECENT_ROOMS_STORAGE_KEY);
-    h.ctrl.syncFromStorage();
-    expect(h.ctrl.getEditingCode()).toBeNull();
-  });
-
-  it("guards clearAll, setDisabled, and superseded enqueueWrite against rejected out-of-order lock fallbacks and preserves fields across rename", async () => {
-    const now = 1_700_000_000_000;
-
-    const createControllableHarness = () => {
-      const storage = makeMemoryStorage();
-      const tasks: Promise<unknown>[] = [];
-      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-      const locks: LockManagerLike = {
-        request: (_name, cb) =>
-          new Promise<void>((resolve, reject) => {
-            pending.push({
-              resolve: () => {
-                void Promise.resolve(cb()).finally(resolve);
-              },
-              reject,
-            });
-          }),
-      };
-      const ctrl = new RecentRoomsController({
-        getLocalStorage: () => storage,
-        getLocks: () => locks,
-        runBackground: (t) => {
-          tasks.push(t);
-        },
-        hasSavedCreatorHostFor: () => false,
-        onRemoveHostToken: vi.fn(),
-        onForgetAllHostTokens: vi.fn(),
-        onChange: vi.fn(),
-        now: () => now,
-      });
-      return { ctrl, storage, tasks, pending };
-    };
-
-    // 1. clearAll() + recordJoin("BBBB2345") under single-flight lock + AbortError fallback
-    {
-      const h = createControllableHarness();
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      h.pending.shift()?.resolve();
-      await Promise.all(h.tasks.splice(0));
-
-      h.ctrl.clearAll();
-      h.ctrl.recordJoin({ code: "BBBB2345", password: "NEWPASS123456789" });
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345"]);
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["BBBB2345"]);
-    }
-
-    // 2A. setDisabled(true) -> setDisabled(false) -> recordJoin("CCCC2345") under single-flight + AbortError fallback
-    {
-      const h = createControllableHarness();
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      h.pending.shift()?.resolve();
-      await Promise.all(h.tasks.splice(0));
-
-      h.ctrl.setDisabled(true);
-      h.ctrl.setDisabled(false);
-      h.ctrl.recordJoin({ code: "CCCC2345", password: "NEWPASS123456789" });
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.isDisabled()).toBe(false);
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-      expect(h.ctrl.isDisabled()).toBe(false);
-      expect(isRecentRoomsDisabled(h.storage)).toBe(false);
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345"]);
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["CCCC2345"]);
-    }
-
-    // 2B. setDisabled(false) -> setDisabled(true) under single-flight + AbortError fallback
-    {
-      const h = createControllableHarness();
-      h.ctrl.setDisabled(true);
-      h.pending.shift()?.resolve();
-      await Promise.all(h.tasks.splice(0));
-
-      h.ctrl.setDisabled(false);
-      h.ctrl.setDisabled(true);
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.isDisabled()).toBe(true);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-      expect(h.ctrl.isDisabled()).toBe(true);
-      expect(isRecentRoomsDisabled(h.storage)).toBe(true);
-    }
-
-    // 3. recordJoin + updatePassword + updatePeers + rename("") under single-flight + AbortError fallback
-    {
-      const h = createControllableHarness();
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      h.ctrl.updatePassword("AAAA2345", "NEW_PASSWORD_2222", false);
-      h.ctrl.updatePeers("AAAA2345", ["NewPeer"]);
-      h.ctrl.rename("AAAA2345", "");
-      expect(h.pending).toHaveLength(1);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-
-      const mem = h.ctrl.getRooms().find((r) => r.code === "AAAA2345");
-      const persisted = loadRecentRooms(h.storage, now).find((r) => r.code === "AAAA2345");
-      expect(mem?.password).toBe("NEW_PASSWORD_2222");
-      expect(mem?.peerNames).toEqual(["NewPeer"]);
-      expect(mem?.label).toBeUndefined();
-      expect(persisted?.password).toBe("NEW_PASSWORD_2222");
-      expect(persisted?.peerNames).toEqual(["NewPeer"]);
-      expect(persisted?.label).toBeUndefined();
-    }
-
-    // 4. Normal FIFO recordJoin -> rename (both non-empty and empty-clear) retains password and peerNames in storage
-    {
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-      h.ctrl.recordJoin({
-        code: "FFFF2345",
-        password: "FIFOPASS12345678",
-        peerNames: ["Alice", "Bob"],
-      });
-      h.ctrl.rename("FFFF2345", "Design Review");
-      await h.flush();
-
-      const named = loadRecentRooms(h.storage, now).find((r) => r.code === "FFFF2345");
-      expect(named).toMatchObject({
-        code: "FFFF2345",
-        password: "FIFOPASS12345678",
-        peerNames: ["Alice", "Bob"],
-        label: "Design Review",
-      });
-
-      h.ctrl.recordJoin({
-        code: "EMPT2345",
-        password: "EMPTPASS12345678",
-        peerNames: ["Carol"],
-      });
-      h.ctrl.rename("EMPT2345", "");
-      await h.flush();
-
-      const cleared = loadRecentRooms(h.storage, now).find((r) => r.code === "EMPT2345");
-      expect(cleared).toMatchObject({
-        code: "EMPT2345",
-        password: "EMPTPASS12345678",
-        peerNames: ["Carol"],
-      });
-      expect(cleared?.label).toBeUndefined();
-
-      // Clearing an existing persisted label followed immediately by updatePassword before lock flushes keeps label cleared
-      h.ctrl.rename("FFFF2345", "");
-      h.ctrl.updatePassword("FFFF2345", "FIFONEWP12345678", false);
-      await h.flush();
-      const afterClearThenPw = loadRecentRooms(h.storage, now).find((r) => r.code === "FFFF2345");
-      expect(afterClearThenPw?.password).toBe("FIFONEWP12345678");
-      expect(afterClearThenPw?.peerNames).toEqual(["Alice", "Bob"]);
-      expect(afterClearThenPw?.label).toBeUndefined();
-    }
-  });
-
-  it("does not resurrect deleted/kicked credentials or cleared labels on subsequent recordJoin (FIFO and rejected lock fallbacks)", async () => {
-    const now = 1_700_000_000_000;
-
-    // 1. Normal FIFO: remove -> recordJoin({ code }) does not resurrect password, label, or peerNames
-    {
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_123", peerNames: ["Alice"] });
-      h.ctrl.rename("AAAA2345", "Old Label");
-      await h.flush();
-
-      h.ctrl.remove("AAAA2345");
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      await h.flush();
-
-      const mem = h.ctrl.getRooms().find((r) => r.code === "AAAA2345");
-      const persisted = loadRecentRooms(h.storage, now).find((r) => r.code === "AAAA2345");
-      expect(mem?.password).toBeUndefined();
-      expect(mem?.label).toBeUndefined();
-      expect(mem?.peerNames).toEqual([]);
-      expect(persisted?.password).toBeUndefined();
-      expect(persisted?.label).toBeUndefined();
-      expect(persisted?.peerNames).toEqual([]);
-    }
-
-    // 2. Normal FIFO: handleFatalError("kicked"), handleCreatorHostForgotten (passwordless), and rename("") -> remove -> recordJoin({ password })
-    {
-      const creatorCodes = new Set(["HCST2345"]);
-      const h = makeHarness({ deferredLocks: true, creatorCodes, now: () => now });
-      h.ctrl.recordJoin({ code: "KCCK2345", password: "BANNED_PASSWORD1", peerNames: ["Host"] });
-      h.ctrl.rename("KCCK2345", "Kicked Room");
-      h.ctrl.recordJoin({ code: "HCST2345", peerNames: ["GuestOne"] });
-      h.ctrl.rename("HCST2345", "Host Room");
-      h.ctrl.recordJoin({ code: "AABB2345", password: "OLD_PASSWORD_123" });
-      h.ctrl.rename("AABB2345", "Secret Project");
-      await h.flush();
-
-      h.ctrl.handleFatalError("KCCK2345", "kicked");
-      h.ctrl.recordJoin({ code: "KCCK2345" });
-
-      creatorCodes.delete("HCST2345");
-      h.ctrl.handleCreatorHostForgotten("HCST2345");
-      h.ctrl.recordJoin({ code: "HCST2345" });
-
-      h.ctrl.rename("AABB2345", "");
-      h.ctrl.remove("AABB2345");
-      h.ctrl.recordJoin({ code: "AABB2345", password: "NEW_PASS_9999999" });
-      await h.flush();
-
-      for (const code of ["KCCK2345", "HCST2345"]) {
-        const mem = h.ctrl.getRooms().find((r) => r.code === code);
-        const persisted = loadRecentRooms(h.storage, now).find((r) => r.code === code);
-        expect(mem?.password).toBeUndefined();
-        expect(mem?.label).toBeUndefined();
-        expect(mem?.peerNames).toEqual([]);
-        expect(persisted?.password).toBeUndefined();
-        expect(persisted?.label).toBeUndefined();
-        expect(persisted?.peerNames).toEqual([]);
-      }
-
-      const memRejoined = h.ctrl.getRooms().find((r) => r.code === "AABB2345");
-      const persistedRejoined = loadRecentRooms(h.storage, now).find((r) => r.code === "AABB2345");
-      expect(memRejoined?.label).toBeUndefined();
-      expect(memRejoined?.password).toBe("NEW_PASS_9999999");
-      expect(persistedRejoined?.label).toBeUndefined();
-      expect(persistedRejoined?.password).toBe("NEW_PASS_9999999");
-    }
-
-    // 3. Single-flight + rejected lock (AbortError) fallback for remove, handleFatalError("kicked"), and rename("") -> remove -> recordJoin
-    {
-      const storage = makeMemoryStorage();
-      const tasks: Promise<unknown>[] = [];
-      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-      const locks: LockManagerLike = {
-        request: (_name, cb) =>
-          new Promise<void>((resolve, reject) => {
-            pending.push({
-              resolve: () => {
-                void Promise.resolve(cb()).finally(resolve);
-              },
-              reject,
-            });
-          }),
-      };
-      const ctrl = new RecentRoomsController({
-        getLocalStorage: () => storage,
-        getLocks: () => locks,
-        runBackground: (t) => {
-          tasks.push(t);
-        },
-        hasSavedCreatorHostFor: () => false,
-        onRemoveHostToken: vi.fn(),
-        onForgetAllHostTokens: vi.fn(),
-        onChange: vi.fn(),
-        now: () => now,
-      });
-
-      ctrl.recordJoin({ code: "XANE2345", password: "OLD_SECRET_12345", peerNames: ["Alice"] });
-      ctrl.rename("XANE2345", "Old Label");
-      ctrl.recordJoin({ code: "KCCK2345", password: "BANNED_PASSWORD1", peerNames: ["Host"] });
-      ctrl.rename("KCCK2345", "Kicked Room");
-      ctrl.recordJoin({ code: "XTHR2345", password: "OLD_SECRET_99999" });
-      ctrl.rename("XTHR2345", "Secret Project");
-      expect(pending).toHaveLength(1);
-      pending.shift()?.resolve();
-      await Promise.all(tasks.splice(0));
-
-      ctrl.remove("XANE2345");
-      ctrl.recordJoin({ code: "XANE2345" });
-
-      ctrl.handleFatalError("KCCK2345", "kicked");
-      ctrl.recordJoin({ code: "KCCK2345" });
-
-      ctrl.rename("XTHR2345", "");
-      ctrl.remove("XTHR2345");
-      ctrl.recordJoin({ code: "XTHR2345", password: "NEW_PASS_9999999" });
-
-      expect(pending).toHaveLength(1);
-      ctrl.syncFromStorage();
-      pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(tasks.splice(0));
-
-      for (const code of ["XANE2345", "KCCK2345"]) {
-        const mem = ctrl.getRooms().find((r) => r.code === code);
-        const persisted = loadRecentRooms(storage, now).find((r) => r.code === code);
-        expect(mem?.password).toBeUndefined();
-        expect(mem?.label).toBeUndefined();
-        expect(mem?.peerNames).toEqual([]);
-        expect(persisted?.password).toBeUndefined();
-        expect(persisted?.label).toBeUndefined();
-        expect(persisted?.peerNames).toEqual([]);
-      }
-
-      const memX3 = ctrl.getRooms().find((r) => r.code === "XTHR2345");
-      const persistedX3 = loadRecentRooms(storage, now).find((r) => r.code === "XTHR2345");
-      expect(memX3?.label).toBeUndefined();
-      expect(memX3?.password).toBe("NEW_PASS_9999999");
-      expect(persistedX3?.label).toBeUndefined();
-      expect(persistedX3?.password).toBe("NEW_PASS_9999999");
-    }
-  });
-
-  it("matches memory and localStorage LRU eviction order when 21 rooms are joined in the same millisecond", async () => {
-    const now = 1_700_000_000_000;
-    const h = makeHarness({ now: () => now });
-    const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    const codes = Array.from({ length: MAX_STORED_RECENT_ROOMS + 1 }, (_, i) => `${alphabet[i] ?? "A"}RUC2345`);
-
-    for (const code of codes) {
-      h.ctrl.recordJoin({ code });
-    }
-    await h.flush();
-
-    const memCodes = h.ctrl.getRooms().map((r) => r.code);
-    const persistedCodes = loadRecentRooms(h.storage, now).map((r) => r.code);
-    expect(memCodes).toHaveLength(MAX_STORED_RECENT_ROOMS);
-    expect(memCodes[0]).toBe(codes[MAX_STORED_RECENT_ROOMS]);
-    expect(memCodes).not.toContain(codes[0]);
-    expect(persistedCodes).toEqual(memCodes);
-  });
-
-  it("keeps memory and localStorage order identical across same-ms in-place updates and 21-room eviction", async () => {
-    const now = 1_700_000_000_000;
-
-    // 1. Two+ rooms joined in the same millisecond: rename, updatePassword, updatePeers, handleCreatorHostForgotten on older room
-    {
-      const creatorCodes = new Set(["CCCC2345"]);
-      const h = makeHarness({ creatorCodes, now: () => now });
-      h.ctrl.recordJoin({ code: "CCCC2345", password: "HOST_PASSWORD_12" });
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "GUEST_PASS_12345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      await h.flush();
-
-      h.ctrl.rename("CCCC2345", "Alpha");
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-
-      h.ctrl.updatePassword("CCCC2345", "HOST_PASSWORD_99", false);
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-
-      h.ctrl.updatePeers("CCCC2345", ["Alice", "Bob"]);
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-
-      creatorCodes.delete("CCCC2345");
-      h.ctrl.handleCreatorHostForgotten("CCCC2345");
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-    }
-
-    // 2. 20 rooms joined in the same millisecond -> mutate codes[0] via each in-place method -> join 21st room evicts codes[0] in both
-    const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    const codes = Array.from({ length: MAX_STORED_RECENT_ROOMS + 1 }, (_, i) => `${alphabet[i] ?? "A"}PWT2345`);
-    const mutations: Array<{
-      name: string;
-      mutate: (h: ReturnType<typeof makeHarness>, targetCode: string) => void;
-    }> = [
-      { name: "rename", mutate: (h, code) => h.ctrl.rename(code, "Keep This Room") },
-      { name: "updatePassword", mutate: (h, code) => h.ctrl.updatePassword(code, "UPDATED_PASS_123", false) },
-      { name: "updatePeers", mutate: (h, code) => h.ctrl.updatePeers(code, ["Bob"]) },
-      {
-        name: "handleCreatorHostForgotten",
-        mutate: (h, code) => {
-          h.creatorCodes.delete(code);
-          h.ctrl.handleCreatorHostForgotten(code);
-        },
+    const storage = makeMemoryStorage();
+    const hostCodes = new Set(["ABCD2345", "WXYZ2345"]);
+    const bgTasks: Promise<unknown>[] = [];
+    const locks: LockManagerLike = {
+      request: async (_name, cb) => {
+        await Promise.resolve();
+        await cb();
       },
-    ];
-
-    for (const { mutate } of mutations) {
-      const targetCode = codes[0] ?? "";
-      const h = makeHarness({ creatorCodes: new Set([targetCode]), now: () => now });
-      for (let i = 0; i < MAX_STORED_RECENT_ROOMS; i++) {
-        const code = codes[i] ?? "";
-        h.ctrl.recordJoin({ code, password: `INIT_PASS_${i}_1234` });
-      }
-      await h.flush();
-
-      mutate(h, targetCode);
-      h.ctrl.recordJoin({ code: codes[MAX_STORED_RECENT_ROOMS] ?? "" });
-      await h.flush();
-
-      const memCodes = h.ctrl.getRooms().map((r) => r.code);
-      const persistedCodes = loadRecentRooms(h.storage, now).map((r) => r.code);
-      expect(memCodes).toHaveLength(MAX_STORED_RECENT_ROOMS);
-      expect(memCodes).not.toContain(targetCode);
-      expect(persistedCodes).toEqual(memCodes);
-    }
-
-    // 3. Deferred-lock interleavings: recordJoin followed immediately by in-place mutation before lock flushes
-    {
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      await h.flush();
-
-      // Rejoin older room and immediately rename before lock resolves
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.rename("AAAA2345", "Promoted");
-      // Brand new room joined and immediately renamed before lock resolves
-      h.ctrl.recordJoin({ code: "CCCC2345" });
-      h.ctrl.rename("CCCC2345", "Brand New");
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["CCCC2345", "AAAA2345", "BBBB2345"]);
-
-      // Rejoin AAAA2345, then BBBB2345, then rename AAAA2345 before locks resolve -> BBBB2345 stays first
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      h.ctrl.rename("AAAA2345", "Still Second");
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-    }
-  });
-
-  it("does not resurrect cleared labels under 4-step and 5-step normal FIFO sequences", async () => {
-    for (const dt of [0, 100]) {
-      let now = 1_700_000_000_000;
-      const h = makeHarness({ deferredLocks: true, now: () => now });
-
-      // 4-step: recordJoin -> rename("Beta") -> recordJoin -> rename("")
-      h.ctrl.recordJoin({ code: "AFZZ2345" });
-      now += dt;
-      h.ctrl.rename("AFZZ2345", "Beta");
-      now += dt;
-      h.ctrl.recordJoin({ code: "AFZZ2345" });
-      now += dt;
-      h.ctrl.rename("AFZZ2345", "");
-      await h.flush();
-
-      const afzzMem = h.ctrl.getRooms().find((r) => r.code === "AFZZ2345");
-      const afzzDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "AFZZ2345");
-      expect(afzzMem).toBeDefined();
-      expect(afzzMem?.label).toBeUndefined();
-      expect(afzzDisk).toBeDefined();
-      expect(afzzDisk?.label).toBeUndefined();
-      h.ctrl.syncFromStorage();
-      const afzzSynced = h.ctrl.getRooms().find((r) => r.code === "AFZZ2345");
-      expect(afzzSynced).toBeDefined();
-      expect(afzzSynced?.label).toBeUndefined();
-
-      // 5-step -> recordJoin
-      h.ctrl.recordJoin({ code: "FYVE2345" });
-      now += dt;
-      h.ctrl.rename("FYVE2345", "My Room");
-      now += dt;
-      h.ctrl.recordJoin({ code: "FYVE2345" });
-      now += dt;
-      h.ctrl.rename("FYVE2345", "");
-      now += dt;
-      h.ctrl.recordJoin({ code: "FYVE2345" });
-      await h.flush();
-      const fiveMem = h.ctrl.getRooms().find((r) => r.code === "FYVE2345");
-      const fiveDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "FYVE2345");
-      expect(fiveMem).toBeDefined();
-      expect(fiveMem?.label).toBeUndefined();
-      expect(fiveDisk).toBeDefined();
-      expect(fiveDisk?.label).toBeUndefined();
-
-      // 5-step -> updatePeers
-      h.ctrl.recordJoin({ code: "PEER2345" });
-      now += dt;
-      h.ctrl.rename("PEER2345", "Temp Label");
-      now += dt;
-      h.ctrl.recordJoin({ code: "PEER2345" });
-      now += dt;
-      h.ctrl.rename("PEER2345", "");
-      now += dt;
-      h.ctrl.updatePeers("PEER2345", ["Bob"]);
-      await h.flush();
-      const peerMem = h.ctrl.getRooms().find((r) => r.code === "PEER2345");
-      const peerPersisted = loadRecentRooms(h.storage, now).find((r) => r.code === "PEER2345");
-      expect(peerMem?.label).toBeUndefined();
-      expect(peerMem?.peerNames).toEqual(["Bob"]);
-      expect(peerPersisted?.label).toBeUndefined();
-      expect(peerPersisted?.peerNames).toEqual(["Bob"]);
-
-      // rename("") -> rename("NewLabel") does not lose the new label
-      h.ctrl.rename("PEER2345", "");
-      h.ctrl.rename("PEER2345", "NewLabel");
-      await h.flush();
-      expect(h.ctrl.getRooms().find((r) => r.code === "PEER2345")?.label).toBe("NewLabel");
-      expect(loadRecentRooms(h.storage, now).find((r) => r.code === "PEER2345")?.label).toBe("NewLabel");
-
-      // rename("") -> remove() -> recordJoin() cleanly creates fresh unlabeled entry
-      h.ctrl.rename("PEER2345", "");
-      h.ctrl.remove("PEER2345");
-      h.ctrl.recordJoin({ code: "PEER2345", password: "FRESH_PASS_12345" });
-      await h.flush();
-      const peerFreshMem = h.ctrl.getRooms().find((r) => r.code === "PEER2345");
-      const peerFreshDisk = loadRecentRooms(h.storage, now).find((r) => r.code === "PEER2345");
-      expect(peerFreshMem).toBeDefined();
-      expect(peerFreshMem?.label).toBeUndefined();
-      expect(peerFreshDisk).toBeDefined();
-      expect(peerFreshDisk?.label).toBeUndefined();
-    }
-  });
-
-  it("keeps synthesized legacy host-rooms parity across same-ms rename, 21-room eviction, and multi-synth", async () => {
-    const now = 1_700_000_000_000;
-
-    // Edge 8a: persisted AAAA2345 at now + synthesized BBBB2345 at now -> rename(BBBB2345)
-    {
-      const h = makeHarness({ creatorCodes: new Set(["BBBB2345"]), deferredLocks: true, now: () => now });
-      upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
-      writePersistedHostToken(h.storage, "BBBB2345", "tok-b", now);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
-
-      h.ctrl.rename("BBBB2345", "Legacy Host Room");
-      await h.flush();
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345"]);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345"]);
-    }
-
-    // Edge 8b: 19 persisted + 1 synthesized at now -> rename(synth) -> join 21st evicts same room
-    {
-      const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-      const codes = Array.from({ length: MAX_STORED_RECENT_ROOMS + 1 }, (_, i) => `${alphabet[i] ?? "A"}HGC2345`);
-      const synthCode = codes[19] ?? "";
-      const newCode = codes[20] ?? "";
-      const h = makeHarness({ creatorCodes: new Set([synthCode]), deferredLocks: true, now: () => now });
-      for (let i = 18; i >= 0; i--) {
-        upsertRecentRoom(h.storage, { code: codes[i] ?? "", role: "guest", lastJoinedAt: now }, now);
-      }
-      writePersistedHostToken(h.storage, synthCode, "tok-synth", now);
-      h.ctrl.syncFromStorage();
-
-      h.ctrl.rename(synthCode, "Important Host");
-      h.ctrl.recordJoin({ code: newCode });
-      await h.flush();
-
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().some((r) => r.code === synthCode)).toBe(true);
-      expect(h.ctrl.getRooms().some((r) => r.code === codes[18])).toBe(false);
-    }
-
-    // Multi-synth [PERS, SYNA, SYNB] -> rename(SYNB) -> syncFromStorage() keeps exact order
-    {
-      const h = makeHarness({
-        creatorCodes: new Set(["SYNA2345", "SYNB2345"]),
-        deferredLocks: true,
-        now: () => now,
-      });
-      upsertRecentRoom(h.storage, { code: "PERS2345", role: "guest", lastJoinedAt: now }, now);
-      writePersistedHostToken(h.storage, "SYNA2345", "tok-s1", now);
-      writePersistedHostToken(h.storage, "SYNB2345", "tok-s2", now);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["PERS2345", "SYNA2345", "SYNB2345"]);
-
-      h.ctrl.rename("SYNB2345", "Named Second");
-      // Before flush, syncFromStorage preserves promoted order
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNB2345", "PERS2345", "SYNA2345"]);
-
-      await h.flush();
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["SYNB2345", "PERS2345"]);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["SYNB2345", "PERS2345", "SYNA2345"]);
-    }
-  });
-
-  it("maintains same-ms order under out-of-order rejected locks, 21-room eviction, and cross-tab sync", async () => {
-    const now = 1_700_000_000_000;
-    const makeLockHarness = () => {
-      const storage = makeMemoryStorage();
-      const tasks: Promise<unknown>[] = [];
-      const pending: Array<{ resolve: () => void; reject: (err: Error) => void }> = [];
-      const locks: LockManagerLike = {
-        request: (_name, cb) =>
-          new Promise<void>((resolve, reject) => {
-            pending.push({
-              resolve: () => {
-                void Promise.resolve(cb()).finally(resolve);
-              },
-              reject,
-            });
-          }),
-      };
-      const ctrl = new RecentRoomsController({
-        getLocalStorage: () => storage,
-        getLocks: () => locks,
-        runBackground: (t) => {
-          tasks.push(t);
-        },
-        hasSavedCreatorHostFor: () => false,
-        onRemoveHostToken: vi.fn(),
-        onForgetAllHostTokens: vi.fn(),
-        onChange: vi.fn(),
-        now: () => now,
-      });
-      return { ctrl, storage, tasks, pending };
+    };
+    let ctrl: RecentRoomsController;
+    const onChange = vi.fn();
+    ctrl = new RecentRoomsController({
+      getLocalStorage: () => storage,
+      getLocks: () => locks,
+      runBackground: (p) => bgTasks.push(p),
+      hasSavedCreatorHostFor: (c) => hostCodes.has(c),
+      onRemoveHostToken: (code) => {
+        hostCodes.delete(code);
+        ctrl.syncFromStorage();
+      },
+      onForgetAllHostTokens: () => {
+        hostCodes.clear();
+        ctrl.syncFromStorage();
+        bgTasks.push(Promise.resolve().then(() => ctrl.syncFromStorage()));
+      },
+      onChange,
+      now: () => now,
+    });
+    const flush = async () => {
+      while (bgTasks.length > 0) await Promise.all(bgTasks.splice(0));
     };
 
-    // 1. join(B, dt=0) -> join(A, dt=0) under single-flight + AbortError fallback
-    {
-      const h = makeLockHarness();
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
+    ctrl.recordJoin({ code: "ABCD2345", password: "PASS_ABCD_123456" });
+    ctrl.recordJoin({ code: "WXYZ2345", password: "PASS_WXYZ_123456" });
+    await flush();
+    expect(ctrl.getRooms()).toHaveLength(2);
 
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["AAAA2345", "BBBB2345"]);
-    }
+    ctrl.remove("ABCD2345");
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["WXYZ2345"]);
+    await flush();
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["WXYZ2345"]);
 
-    // 2. Edge 2: [C, A] seeded; join(A) -> rename(A) -> join(B) under single-flight + AbortError fallback
-    {
-      const h = makeLockHarness();
-      upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
-      upsertRecentRoom(h.storage, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
+    ctrl.clearAll();
+    expect(ctrl.getRooms()).toEqual([]);
+    await flush();
+    expect(ctrl.getRooms()).toEqual([]);
 
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.rename("AAAA2345", "RenamedA");
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      expect(h.pending).toHaveLength(1);
+    ctrl.recordJoin({ code: "MNPQ2345", password: "PASS_MNPQ_123456" });
+    await flush();
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["MNPQ2345"]);
 
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
+    ctrl.setDisabled(true);
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
+    await flush();
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
+    expect(storage.store.get(RECENT_ROOMS_OPT_OUT_KEY)).toBe("1");
 
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-    }
+    storage.store.set(HOST_ROOMS_STORAGE_KEY, JSON.stringify([{ code: "HTRM2345", token: "tok", updatedAt: now }]));
+    hostCodes.add("HTRM2345");
+    ctrl.setDisabled(false);
+    await flush();
+    expect(ctrl.isDisabled()).toBe(false);
+    expect(ctrl.getRooms().map((r) => r.code)).toEqual(["HTRM2345"]);
 
-    // 3. Edge 3: [C, A] seeded; join(A) -> join(B) -> rename(A) under single-flight + AbortError fallback
-    {
-      const h = makeLockHarness();
-      upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
-      upsertRecentRoom(h.storage, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
+    // Optimistic synchronous updates under async locks: flip-flop patches, rename UI, immediate host forget
+    ctrl.recordJoin({ code: "ABCD2345", password: "PASS_ONE_1234567", peerNames: ["Alice"] });
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS_ONE_1234567");
+    ctrl.updatePassword("ABCD2345", "PASS_TWO_1234567", false);
+    ctrl.updatePassword("ABCD2345", "PASS_ONE_1234567", false);
+    ctrl.updatePeers("ABCD2345", ["Alice", "Bob"]);
+    ctrl.updatePeers("ABCD2345", ["Alice"]);
+    ctrl.setEditingCode("ABCD2345");
+    onChange.mockClear();
+    ctrl.rename("ABCD2345", "Demo Room");
+    expect(ctrl.getEditingCode()).toBeNull();
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBe("Demo Room");
+    expect(onChange).toHaveBeenCalledTimes(1);
+    await flush();
+    // Immediate rename with same label still clears editingCode and notifies once without extra lock re-render
+    ctrl.setEditingCode("ABCD2345");
+    onChange.mockClear();
+    ctrl.rename("ABCD2345", "Demo Room");
+    expect(ctrl.getEditingCode()).toBeNull();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    await flush();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS_ONE_1234567");
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.peerNames).toEqual(["Alice"]);
 
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      h.ctrl.rename("AAAA2345", "RenamedA");
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
+    // Disk write failure (QuotaExceededError) rolls optimistic join and patch back to persisted state
+    const spySetItem = vi.spyOn(storage, "setItem").mockImplementation(() => {
+      throw new Error("QuotaExceededError");
+    });
+    ctrl.recordJoin({ code: "FAIL2345", password: "PASS_FAIL_123456" });
+    ctrl.updatePassword("ABCD2345", "PASS_BAD_9999999", false);
+    await flush();
+    spySetItem.mockRestore();
+    expect(ctrl.getRooms().find((r) => r.code === "FAIL2345")).toBeUndefined();
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS_ONE_1234567");
 
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
+    // Host forgotten immediately after recordJoin (before async lock settles) demotes synchronously & on disk
+    hostCodes.add("HSTS2345");
+    ctrl.recordJoin({ code: "HSTS2345", password: "PASS_HOST_123456" });
+    expect(ctrl.getRooms().find((r) => r.code === "HSTS2345")?.role).toBe("host");
+    hostCodes.delete("HSTS2345");
+    ctrl.handleCreatorHostForgotten("HSTS2345");
+    await flush();
+    expect(ctrl.getRooms().find((r) => r.code === "HSTS2345")?.role).toBe("guest");
 
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-    }
-
-    // 4. Edge 10: [C, A] seeded; join(A) -> join(B) -> remove(B) -> rename(A) under single-flight + AbortError fallback
-    {
-      const h = makeLockHarness();
-      upsertRecentRoom(h.storage, { code: "AAAA2345", role: "guest", lastJoinedAt: now }, now);
-      upsertRecentRoom(h.storage, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
-
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      h.ctrl.remove("BBBB2345");
-      h.ctrl.rename("AAAA2345", "RenamedA");
-      expect(h.pending).toHaveLength(1);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "CCCC2345"]);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["AAAA2345", "CCCC2345"]);
-    }
-
-    // 5. join(A) -> join(B) -> updatePassword(A) under single-flight + AbortError fallback
-    {
-      const h = makeLockHarness();
-      h.ctrl.recordJoin({ code: "AAAA2345", password: "OLD_PASSWORD_1111" });
-      h.ctrl.recordJoin({ code: "BBBB2345", password: "BBB_PASSWORD_2222" });
-      h.ctrl.updatePassword("AAAA2345", "NEW_PASSWORD_3333", false);
-      expect(h.pending).toHaveLength(1);
-
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-
-      expect(h.ctrl.getRooms()).toEqual(loadRecentRooms(h.storage, now));
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["BBBB2345", "AAAA2345"]);
-      expect(h.ctrl.getRooms()[1]?.password).toBe("NEW_PASSWORD_3333");
-    }
-
-    // 6. 21-room same-ms join under single-flight + AbortError fallback -> C1 stays evicted
-    {
-      const h = makeLockHarness();
-      const alphabet = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-      const codes = Array.from({ length: MAX_STORED_RECENT_ROOMS + 1 }, (_, i) => `${alphabet[i] ?? "A"}REJ2345`);
-      for (const code of codes) {
-        h.ctrl.recordJoin({ code });
-      }
-      expect(h.pending).toHaveLength(1);
-      h.pending.shift()?.reject(new Error("AbortError"));
-      await Promise.all(h.tasks.splice(0));
-
-      const memCodes = h.ctrl.getRooms().map((r) => r.code);
-      const persistedCodes = loadRecentRooms(h.storage, now).map((r) => r.code);
-      expect(memCodes).toHaveLength(MAX_STORED_RECENT_ROOMS);
-      expect(memCodes).not.toContain(codes[0]);
-      expect(persistedCodes).toEqual(memCodes);
-    }
-
-    // 7. Cross-tab storage preservation + syncFromStorage while in-place rename & unpersisted older join are pending
-    {
-      const h = makeLockHarness();
-      upsertRecentRoom(h.storage, { code: "XTAB2345", role: "guest", lastJoinedAt: now }, now);
-      upsertRecentRoom(h.storage, { code: "PERS2345", role: "guest", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
-
-      // In-place rename on XTAB2345 (index 1) stays at index 1 across syncFromStorage before lock flushes
-      h.ctrl.rename("XTAB2345", "CrossTab");
-      const lockRename = h.pending.shift();
-      // Tab 2 adds XTB22345 directly to storage
-      upsertRecentRoom(h.storage, { code: "XTB22345", role: "host", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code)).toEqual(["XTB22345", "PERS2345", "XTAB2345"]);
-      expect(h.ctrl.getRooms()[2]?.label).toBe("CrossTab");
-
-      lockRename?.resolve();
-      await Promise.all(h.tasks.splice(0));
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code)).toEqual(["XTB22345", "PERS2345", "XTAB2345"]);
-
-      // Queued joins [AAAA, BBBB] under single-flight while Tab B writes CCCC2345 to storage mid-flight
-      h.ctrl.recordJoin({ code: "AAAA2345" });
-      h.ctrl.recordJoin({ code: "BBBB2345" });
-      expect(h.pending).toHaveLength(1);
-      upsertRecentRoom(h.storage, { code: "CCCC2345", role: "guest", lastJoinedAt: now }, now);
-      h.ctrl.syncFromStorage();
-      expect(h.ctrl.getRooms().map((r) => r.code).slice(0, 3)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-      h.pending.shift()?.resolve();
-      await Promise.all(h.tasks.splice(0));
-      expect(loadRecentRooms(h.storage, now).map((r) => r.code).slice(0, 3)).toEqual(["BBBB2345", "AAAA2345", "CCCC2345"]);
-    }
+    // Cross-tab opt-out arriving while clearAll() awaits lock propagates disabled state
+    ctrl.clearAll();
+    storage.store.set(RECENT_ROOMS_OPT_OUT_KEY, "1");
+    await flush();
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
   });
 });
