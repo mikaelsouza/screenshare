@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ZERO_SHA = /^0+$/;
-const RUNTIME_SOURCE_PATTERN = /^(src|worker|shared|electron|scripts)\/.*\.tsx?$/;
+const RUNTIME_SOURCE_PATTERN = /^(src|worker|shared|electron|scripts)\/.*\.[cm]?tsx?$/;
 
 export function readMutatePatterns(configPath: string): string[] {
   const raw: unknown = JSON.parse(readFileSync(configPath, "utf8"));
@@ -86,7 +86,7 @@ export function selectExcludedMutateFiles(
     const normalized = toPosix(file);
     if (
       RUNTIME_SOURCE_PATTERN.test(normalized) &&
-      !normalized.endsWith(".d.ts") &&
+      !/\.d\.[cm]?ts$/.test(normalized) &&
       !eligible.has(normalized)
     ) {
       excluded.add(normalized);

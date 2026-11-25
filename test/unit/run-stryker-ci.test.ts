@@ -169,8 +169,12 @@ describe("run-stryker-ci", () => {
         "worker/room.ts",
         "shared/protocol.ts",
         "electron/main.ts",
+        "electron/preload.cts",
         "scripts/custom.ts",
+        "scripts/mod.mts",
         "src/vite-env.d.ts",
+        "electron/types.d.cts",
+        "scripts/types.d.mts",
         "test/unit/mesh.test.ts",
         "README.md",
         ".github/workflows/ci.yml",
@@ -179,13 +183,22 @@ describe("run-stryker-ci", () => {
 
       expect(selectExcludedMutateFiles(eligible, changed)).toEqual([
         "electron/main.ts",
+        "electron/preload.cts",
         "scripts/custom.ts",
+        "scripts/mod.mts",
         "shared/protocol.ts",
         "src/main.ts",
         "src/views/Badge.tsx",
         "worker/room.ts",
       ]);
-      expect(selectExcludedMutateFiles(eligible, ["test/unit/foo.test.ts", "src/vite-env.d.ts"])).toEqual([]);
+      expect(
+        selectExcludedMutateFiles(eligible, [
+          "test/unit/foo.test.ts",
+          "src/vite-env.d.ts",
+          "electron/types.d.cts",
+          "scripts/types.d.mts",
+        ]),
+      ).toEqual([]);
     });
   });
 

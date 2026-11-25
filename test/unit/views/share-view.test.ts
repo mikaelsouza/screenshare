@@ -192,4 +192,73 @@ describe("ShareLifecycle.forceStop", () => {
     expect(setup.renderRoster).not.toHaveBeenCalled();
     expect(setup.setSharing).not.toHaveBeenCalled();
   });
+
+  it("allows stopping a re-started capture while an older preempted stop() is still in flight", async () => {
+    const setup = makeFakeShareSetup();
+    await setup.share.start();
+
+    let resolveFirstStop!: () => void;
+    setup.setCapture.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveFirstStop = resolve;
+        }),
+    );
+
+    const stop1 = setup.share.stop();
+    setup.share.forceStop();
+
+    await setup.share.start();
+    expect(setup.share.capture).not.toBeNull();
+
+    const stop2 = setup.share.stop();
+    resolveFirstStop();
+    await Promise.all([stop1, stop2]);
+
+    expect(setup.share.capture).toBeNull();
+    expect(setup.stopCaptureController).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts in-flight start() standalone when forceStop() runs without incrementing session.joinGeneration", async () => {
+    const setup = makeFakeShareSetup();
+    let resolveAcquire!: (res: CaptureResult) => void;
+    setup.startCapture.mockImplementationOnce(
+      () =>
+        new Promise<CaptureResult>((resolve) => {
+          resolveAcquire = resolve;
+        }),
+    );
+
+    const startPromise = setup.share.start();
+    setup.share.forceStop();
+    resolveAcquire(makeFakeCaptureResult());
+    await startPromise;
+
+    expect(setup.share.capture).toBeNull();
+    expect(setup.setCapture).not.toHaveBeenCalled();
+    expect(setup.stopCaptureController).toHaveBeenCalledTimes(2);
+  });
+
+  it("cleans up mesh and UI when forceStop() runs while attachCapture awaits mesh.setCapture", async () => {
+    const setup = makeFakeShareSetup();
+    let resolveAttach!: () => void;
+    setup.setCapture.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveAttach = resolve;
+        }),
+    );
+
+    const startPromise = setup.share.start();
+    await vi.waitFor(() => {
+      expect(setup.setCapture).toHaveBeenCalledTimes(1);
+    });
+    setup.share.forceStop();
+    resolveAttach();
+    await startPromise;
+
+    expect(setup.share.capture).toBeNull();
+    expect(setup.setCapture).toHaveBeenLastCalledWith(null);
+    expect(setup.setSharing).toHaveBeenLastCalledWith(false);
+  });
 });
