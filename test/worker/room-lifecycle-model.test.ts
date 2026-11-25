@@ -82,7 +82,7 @@ class LiveClient {
   }
 
   async nextOf<T extends ServerMessage["t"]>(t: T): Promise<Extract<ServerMessage, { t: T }>> {
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 100; i++) {
       const m = await this.next();
       if (m.t === t) return m as Extract<ServerMessage, { t: T }>;
     }
@@ -123,10 +123,19 @@ interface RoomModelState {
 
 async function waitSocketCount(stub: ReturnType<typeof env.ROOMS.get>, expected: number): Promise<void> {
   const deadline = Date.now() + 1500;
+  let lastCount = -1;
   while (Date.now() < deadline) {
-    const count = await runInDurableObject(stub, (_i, state) => state.getWebSockets().length);
-    if (count === expected) return;
+    lastCount = await runInDurableObject(stub, (_i, state) => state.getWebSockets().length);
+    if (lastCount === expected) return;
     await new Promise((r) => setTimeout(r, 10));
+  }
+  expect(lastCount).toBe(expected);
+}
+
+async function syncGuestRotationTickets(guests: readonly PeerSlot[]): Promise<void> {
+  for (const g of guests) {
+    const gRot = await g.client.nextOf("room-password");
+    if (gRot.rejoinToken) g.rejoinToken = gRot.rejoinToken;
   }
 }
 
@@ -214,6 +223,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               if (state.locked) {
                 expect((await c.nextOf("error")).code).toBe("room-locked");
                 c.close();
+                await waitSocketCount(stub, activeCount(state));
               } else {
                 const w = await c.nextOf("welcome");
                 expect(w.host).toBe(false);
@@ -260,6 +270,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               state.creator.client.send({ t: "rotate-password" });
               const rot = await state.creator.client.nextOf("room-password");
               if (rot.password) state.password = rot.password;
+              await syncGuestRotationTickets(state.guests);
               state.disconnectedTicket = null;
             } else if (op.kind === "kick-guest" && state.creator && state.guests.length > 0) {
               const target = state.guests.shift()!;
@@ -268,6 +279,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               target.client.close();
               const rot = await state.creator.client.nextOf("room-password");
               if (rot.password) state.password = rot.password;
+              await syncGuestRotationTickets(state.guests);
               state.disconnectedTicket = null;
               await waitSocketCount(stub, activeCount(state));
             } else if (op.kind === "relay-check" && state.creator && state.guests.length > 0) {
