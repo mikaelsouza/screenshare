@@ -82,7 +82,7 @@ class LiveClient {
   }
 
   async nextOf<T extends ServerMessage["t"]>(t: T): Promise<Extract<ServerMessage, { t: T }>> {
-    for (let i = 0; i < 12; i++) {
+    for (let i = 0; i < 100; i++) {
       const m = await this.next();
       if (m.t === t) return m as Extract<ServerMessage, { t: T }>;
     }
@@ -123,10 +123,19 @@ interface RoomModelState {
 
 async function waitSocketCount(stub: ReturnType<typeof env.ROOMS.get>, expected: number): Promise<void> {
   const deadline = Date.now() + 1500;
+  let lastCount = -1;
   while (Date.now() < deadline) {
-    const count = await runInDurableObject(stub, (_i, state) => state.getWebSockets().length);
-    if (count === expected) return;
+    lastCount = await runInDurableObject(stub, (_i, state) => state.getWebSockets().length);
+    if (lastCount === expected) return;
     await new Promise((r) => setTimeout(r, 10));
+  }
+  expect(lastCount).toBe(expected);
+}
+
+async function syncGuestRotationTickets(guests: readonly PeerSlot[]): Promise<void> {
+  for (const g of guests) {
+    const gRot = await g.client.nextOf("room-password");
+    if (gRot.rejoinToken) g.rejoinToken = gRot.rejoinToken;
   }
 }
 
@@ -214,6 +223,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               if (state.locked) {
                 expect((await c.nextOf("error")).code).toBe("room-locked");
                 c.close();
+                await waitSocketCount(stub, activeCount(state));
               } else {
                 const w = await c.nextOf("welcome");
                 expect(w.host).toBe(false);
@@ -260,6 +270,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               state.creator.client.send({ t: "rotate-password" });
               const rot = await state.creator.client.nextOf("room-password");
               if (rot.password) state.password = rot.password;
+              await syncGuestRotationTickets(state.guests);
               state.disconnectedTicket = null;
             } else if (op.kind === "kick-guest" && state.creator && state.guests.length > 0) {
               const target = state.guests.shift()!;
@@ -268,6 +279,7 @@ describe("RoomDO stateful model (real workerd execution)", () => {
               target.client.close();
               const rot = await state.creator.client.nextOf("room-password");
               if (rot.password) state.password = rot.password;
+              await syncGuestRotationTickets(state.guests);
               state.disconnectedTicket = null;
               await waitSocketCount(stub, activeCount(state));
             } else if (op.kind === "relay-check" && state.creator && state.guests.length > 0) {
@@ -304,7 +316,8 @@ describe("RoomDO stateful model (real workerd execution)", () => {
                 });
                 const candidate = state.guests.find((g) => g.id === promotedId);
                 expect(candidate).toBeDefined();
-                const promo = await candidate!.client.nextOf("host-promoted");
+                let promo = await candidate!.client.nextOf("host-promoted");
+                while (promo.hostToken === undefined) promo = await candidate!.client.nextOf("host-promoted");
                 expect(promo.hostId).toBe(candidate!.id);
                 candidate!.host = true;
                 state.hostPromoted = true;
@@ -360,6 +373,52 @@ describe("RoomDO stateful model (real workerd execution)", () => {
     creator.send({ t: "join", room: code, displayName: "creator", hostToken: created.hostToken });
     expect((await creator.nextOf("welcome")).host).toBe(true);
     creator.close();
+    await waitSocketCount(stub, 0);
+  });
+
+  it("ignores queued peer host-promoted broadcasts when a second guest is promoted after the first disconnects", async () => {
+    const code = nextModelRoomCode();
+    const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+    const initRes = await stub.fetch("https://internal/init", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    });
+    const created = await initRes.json<{ code: string; password: string }>();
+
+    const g1 = await LiveClient.connect(code, "198.51.101.211");
+    g1.send({ t: "join", room: code, displayName: "g1", password: created.password });
+    const w1 = await g1.nextOf("welcome");
+
+    const g2 = await LiveClient.connect(code, "198.51.101.212");
+    g2.send({ t: "join", room: code, displayName: "g2", password: created.password });
+    const w2 = await g2.nextOf("welcome");
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    await runDurableObjectAlarm(stub);
+
+    const firstHostId = await runInDurableObject(stub, (_i, s) => {
+      for (const ws of s.getWebSockets()) {
+        const att = ws.deserializeAttachment() as { id?: string; joined?: boolean; host?: boolean } | null;
+        if (att?.joined && att.host) return att.id;
+      }
+      return undefined;
+    });
+    const first = firstHostId === w1.selfId ? { id: w1.selfId, client: g1 } : { id: w2.selfId, client: g2 };
+    const second = firstHostId === w1.selfId ? { id: w2.selfId, client: g2 } : { id: w1.selfId, client: g1 };
+    expect((await first.client.nextOf("host-promoted")).hostToken).toBeTruthy();
+
+    first.client.close();
+    await waitSocketCount(stub, 1);
+
+    await runInDurableObject(stub, (_i, s) => s.storage.put("hostGoneAt", Date.now() - 6 * 60_000));
+    await runDurableObjectAlarm(stub);
+
+    let promo = await second.client.nextOf("host-promoted");
+    while (promo.hostToken === undefined) promo = await second.client.nextOf("host-promoted");
+    expect(promo.hostId).toBe(second.id);
+
+    second.client.close();
     await waitSocketCount(stub, 0);
   });
 });

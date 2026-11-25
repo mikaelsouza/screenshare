@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InviteController } from "@src/controllers/invite-controller";
 import { PopoverToastController } from "@src/controllers/popover-toast-controller";
 import { RecentRoomsController } from "@src/controllers/recent-rooms-controller";
@@ -192,7 +192,12 @@ function setupDomEvents(opts?: {
 }
 
 describe("bindAllDomEvents", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
