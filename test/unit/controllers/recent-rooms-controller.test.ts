@@ -396,5 +396,44 @@ describe("RecentRoomsController", () => {
     await flush();
     expect(ctrl.isDisabled()).toBe(false);
     expect(ctrl.getRooms().map((r) => r.code)).toEqual(["HTRM2345"]);
+
+    // Optimistic synchronous updates under async locks: flip-flop patches, rename UI, immediate host forget
+    ctrl.recordJoin({ code: "ABCD2345", password: "PASS_ONE_1234567", peerNames: ["Alice"] });
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS_ONE_1234567");
+    ctrl.updatePassword("ABCD2345", "PASS_TWO_1234567", false);
+    ctrl.updatePassword("ABCD2345", "PASS_ONE_1234567", false);
+    ctrl.updatePeers("ABCD2345", ["Alice", "Bob"]);
+    ctrl.updatePeers("ABCD2345", ["Alice"]);
+    ctrl.setEditingCode("ABCD2345");
+    onChange.mockClear();
+    ctrl.rename("ABCD2345", "Demo Room");
+    expect(ctrl.getEditingCode()).toBeNull();
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.label).toBe("Demo Room");
+    expect(onChange).toHaveBeenCalledTimes(1);
+    // Immediate rename with same label still clears editingCode and notifies synchronously
+    ctrl.setEditingCode("ABCD2345");
+    onChange.mockClear();
+    ctrl.rename("ABCD2345", "Demo Room");
+    expect(ctrl.getEditingCode()).toBeNull();
+    expect(onChange).toHaveBeenCalledTimes(1);
+    await flush();
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.password).toBe("PASS_ONE_1234567");
+    expect(ctrl.getRooms().find((r) => r.code === "ABCD2345")?.peerNames).toEqual(["Alice"]);
+
+    // Host forgotten immediately after recordJoin (before async lock settles) demotes synchronously & on disk
+    hostCodes.add("HSTS2345");
+    ctrl.recordJoin({ code: "HSTS2345", password: "PASS_HOST_123456" });
+    expect(ctrl.getRooms().find((r) => r.code === "HSTS2345")?.role).toBe("host");
+    hostCodes.delete("HSTS2345");
+    ctrl.handleCreatorHostForgotten("HSTS2345");
+    await flush();
+    expect(ctrl.getRooms().find((r) => r.code === "HSTS2345")?.role).toBe("guest");
+
+    // Cross-tab opt-out arriving while clearAll() awaits lock propagates disabled state
+    ctrl.clearAll();
+    storage.store.set(RECENT_ROOMS_OPT_OUT_KEY, "1");
+    await flush();
+    expect(ctrl.isDisabled()).toBe(true);
+    expect(ctrl.getRooms()).toEqual([]);
   });
 });

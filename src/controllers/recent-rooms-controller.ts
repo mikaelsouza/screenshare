@@ -184,24 +184,44 @@ export class RecentRoomsController {
       ...(cleanPeers.length > 0 ? { peerNames: cleanPeers } : {}),
     };
 
+    const optimistic = upsertJoinEntry(this.rooms, op, now);
+    if (optimistic) {
+      this.rooms = optimistic;
+      this.normalizeUiState();
+      if (this.env.getLocks()) this.env.onChange();
+    }
+
     this.applyLockedMutation((storage, lockNow) => {
       if (this.isExternallyDisabled(storage)) return;
       const loaded = tryLoadRecentRooms(storage, lockNow);
       if (!loaded.ok) return;
       const next = upsertJoinEntry(loaded.entries, op, lockNow);
-      if (!next || !writePersistedRecentRooms(storage, next)) return;
+      if (!next || !writePersistedRecentRooms(storage, next)) {
+        this.refreshFromDisk(storage, lockNow, loaded.entries);
+        return;
+      }
       this.refreshFromDisk(storage, lockNow, next);
     });
   }
 
-  private applyPatch(op: RecentRoomPatchOp): void {
+  private applyPatch(op: RecentRoomPatchOp, forceNotify: boolean = false): void {
+    const optimistic = patchEntryInList(this.rooms, op, this.now(), [], (c) => this.env.hasSavedCreatorHostFor(c));
+    if (optimistic) {
+      this.rooms = optimistic;
+      this.normalizeUiState();
+    }
+    if ((optimistic || forceNotify) && this.env.getLocks()) this.env.onChange();
+
     this.applyLockedMutation((storage, now) => {
       if (this.isExternallyDisabled(storage)) return;
       const loaded = tryLoadRecentRooms(storage, now);
       if (!loaded.ok) return;
       const hostRooms = listPersistedHostRooms(storage, now);
       const next = patchEntryInList(loaded.entries, op, now, hostRooms, (c) => this.env.hasSavedCreatorHostFor(c));
-      if (!next || !writePersistedRecentRooms(storage, next)) return;
+      if (!next || !writePersistedRecentRooms(storage, next)) {
+        this.refreshFromDisk(storage, now, loaded.entries);
+        return;
+      }
       this.refreshFromDisk(storage, now, next);
     });
   }
@@ -234,12 +254,15 @@ export class RecentRoomsController {
       return;
     }
     const nextLabel = sanitizeRecentRoomLabel(label);
-    this.applyPatch({
-      kind: "patch",
-      code: upper,
-      field: "label",
-      ...(nextLabel !== undefined ? { label: nextLabel } : {}),
-    });
+    this.applyPatch(
+      {
+        kind: "patch",
+        code: upper,
+        field: "label",
+        ...(nextLabel !== undefined ? { label: nextLabel } : {}),
+      },
+      true,
+    );
   }
 
   private removeEntry(upper: string, demoteIfPassworded: boolean, cleanupToken?: () => void): boolean {
@@ -321,6 +344,7 @@ export class RecentRoomsController {
     this.applyLockedMutation((storage) => {
       clearAllPersistedRecentRooms(storage);
       this.rooms = [];
+      this.isExternallyDisabled(storage);
     });
   }
 
