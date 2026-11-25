@@ -5,6 +5,8 @@ import {
   formatChatTime,
   type ChatEntry,
 } from "../controllers/chat-controller";
+import { trimCodeUnits } from "../ui-model";
+import { createEl as el } from "./dom";
 import { createIcon } from "./icons";
 import "./chat.css";
 
@@ -38,28 +40,6 @@ interface ChatDomRefs {
   sendBtn: HTMLButtonElement;
   chatBtn: HTMLButtonElement;
   badgeEl: HTMLSpanElement;
-}
-
-function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function trimToMaxChatLength(raw: string): string {
-  const trimmed = raw.trim();
-  if (trimmed.length <= MAX_CHAT_LENGTH) return trimmed;
-  let end = MAX_CHAT_LENGTH;
-  const code = trimmed.charCodeAt(end - 1);
-  if (code >= 0xd800 && code <= 0xdbff) {
-    end -= 1;
-  }
-  return trimmed.slice(0, end).trimEnd();
 }
 
 function isNearBottom(node: HTMLElement): boolean {
@@ -222,7 +202,7 @@ export function mountChatFeature(deps: ChatFeatureDeps): ChatFeatureHandle {
 
   const submit = (): void => {
     if (!connected || !ready) return;
-    const text = trimToMaxChatLength(dom.input.value);
+    const text = trimCodeUnits(dom.input.value, MAX_CHAT_LENGTH);
     if (!text) return;
     if (deps.sendMessage(text)) {
       dom.input.value = "";

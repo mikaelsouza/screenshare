@@ -1,5 +1,6 @@
 import { isValidRoomCode, z } from "@shared/protocol";
 import type { PersistedHostRoom } from "./host-tokens";
+import { trimCodeUnits } from "./ui-model";
 
 /** Maximum number of recently visited rooms retained in localStorage. */
 export const MAX_STORED_RECENT_ROOMS = 20;
@@ -54,20 +55,10 @@ const RecentRoomRawSchema = z.object({
   label: z.string().optional(),
 });
 
-function trimCodeUnits(raw: string, maxLen: number): string {
-  if (raw.length <= maxLen) return raw;
-  let end = maxLen;
-  const unit = raw.charCodeAt(end - 1);
-  if (unit >= 0xd800 && unit <= 0xdbff) {
-    end -= 1;
-  }
-  return raw.slice(0, end).trimEnd();
-}
-
 /** Trim and clamp a local room nickname to `MAX_RECENT_ROOM_LABEL_LEN`, returning undefined if blank. */
 export function sanitizeRecentRoomLabel(raw: string | undefined): string | undefined {
   if (raw === undefined) return undefined;
-  const trimmed = trimCodeUnits(raw.trim(), MAX_RECENT_ROOM_LABEL_LEN);
+  const trimmed = trimCodeUnits(raw, MAX_RECENT_ROOM_LABEL_LEN);
   return trimmed.length > 0 ? trimmed : undefined;
 }
 
@@ -76,7 +67,7 @@ export function sanitizePeerNames(names: readonly string[] | undefined): string[
   if (!names) return [];
   const out: string[] = [];
   for (const name of names) {
-    const clean = trimCodeUnits(name.trim(), MAX_PEER_NAME_LEN);
+    const clean = trimCodeUnits(name, MAX_PEER_NAME_LEN);
     if (clean.length === 0) continue;
     out.push(clean);
     if (out.length >= MAX_RECENT_ROOM_PEERS) break;

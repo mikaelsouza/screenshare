@@ -1,4 +1,4 @@
-import type { LockManagerLike, StorageLike } from "./host-tokens";
+import { runWithStorageLock, type LockManagerLike, type StorageLike } from "./host-tokens";
 import {
   MAX_CLOCK_SKEW_MS,
   MAX_RECENT_ROOM_LABEL_LEN,
@@ -176,21 +176,9 @@ export function clearAllPersistedRecentRooms(storage: StorageLike | null | undef
 }
 
 /** Serialize a storage read-modify-write callback across tabs via the Web Locks API when available. */
-export async function runWithRecentRoomsLock(
+export function runWithRecentRoomsLock(
   locks: LockManagerLike | null | undefined,
   fn: () => void,
 ): Promise<void> {
-  if (!locks) {
-    fn();
-    return;
-  }
-  let ran = false;
-  try {
-    await locks.request(RECENT_ROOMS_LOCK_NAME, () => {
-      ran = true;
-      fn();
-    });
-  } catch {
-    if (!ran) fn();
-  }
+  return runWithStorageLock(locks, RECENT_ROOMS_LOCK_NAME, fn);
 }

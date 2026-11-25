@@ -6,6 +6,8 @@
  * capture IPC (`preload.cts`) to an untrusted origin or alter its profile path.
  */
 
+import { hasControlChar } from "./security.js";
+
 export const DEFAULT_REMOTE_APP_URL = "https://screenshare.webmikas.com";
 const DEFAULT_ALLOWED_ORIGIN: string = new URL(DEFAULT_REMOTE_APP_URL).origin;
 
@@ -23,14 +25,6 @@ export interface ResolvedElectronConfig {
   allowedAppOrigin: string;
   devServerUrl: string | undefined;
   smokeUserDataDir: string | undefined;
-}
-
-function hasControlChar(value: string): boolean {
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (code <= 0x1f || code === 0x7f) return true;
-  }
-  return false;
 }
 
 function parseAllowedHttpUrl(raw: string | undefined): string | undefined {
