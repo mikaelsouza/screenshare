@@ -32,6 +32,7 @@ export class ShareLifecycle {
   private activeCapture: CaptureResult | null = null;
   private pending = false;
   private stopPromise: Promise<void> | null = null;
+  private forceStopGen = 0;
   private activeCaptureWarning: string | null = null;
 
   constructor(ctx: ShareLifecycleContext) {
@@ -62,10 +63,15 @@ export class ShareLifecycle {
     }
   }
 
+  private isStaleShare(shareGen: number, forceGen: number): boolean {
+    return shareGen !== this.ctx.session.joinGeneration || forceGen !== this.forceStopGen || !this.ctx.getMesh();
+  }
+
   private async startInner(): Promise<void> {
     const mesh = this.ctx.getMesh();
     if (!mesh) return;
     const shareGen = this.ctx.session.joinGeneration;
+    const forceGen = this.forceStopGen;
     this.ctx.closeAllPopovers();
     this.ctx.invite.setRevealed(false);
 
@@ -79,15 +85,15 @@ export class ShareLifecycle {
       if (!audio.supported && audio.reason) this.ctx.setStatus(audio.reason, "warn");
     }
 
-    const acquired = await this.acquireCapture(shareGen);
+    const acquired = await this.acquireCapture(shareGen, forceGen);
     if (!acquired) return;
-    await this.attachCapture(acquired, shareGen);
+    await this.attachCapture(acquired, shareGen, forceGen);
   }
 
-  private async acquireCapture(shareGen: number): Promise<CaptureResult | null> {
+  private async acquireCapture(shareGen: number, forceGen: number): Promise<CaptureResult | null> {
     try {
       const result = await this.ctx.captureController.start(QUALITY_PRESETS[currentPreset()]);
-      if (shareGen !== this.ctx.session.joinGeneration || !this.ctx.getMesh()) {
+      if (this.isStaleShare(shareGen, forceGen)) {
         this.ctx.captureController.stop();
         return null;
       }
@@ -95,7 +101,7 @@ export class ShareLifecycle {
       return result;
     } catch (err) {
       console.warn("[main] capture cancelled or failed", err);
-      if (shareGen !== this.ctx.session.joinGeneration || !this.ctx.getMesh()) {
+      if (this.isStaleShare(shareGen, forceGen)) {
         return null;
       }
       const message = describeCaptureError(err, this.ctx.captureController.kind);
@@ -107,9 +113,9 @@ export class ShareLifecycle {
     }
   }
 
-  private async attachCapture(cap: CaptureResult, shareGen: number): Promise<void> {
+  private async attachCapture(cap: CaptureResult, shareGen: number, forceGen: number): Promise<void> {
     const mesh = this.ctx.getMesh();
-    if (!mesh || shareGen !== this.ctx.session.joinGeneration) {
+    if (!mesh || this.isStaleShare(shareGen, forceGen) || this.activeCapture !== cap) {
       await this.stop();
       return;
     }
@@ -126,8 +132,13 @@ export class ShareLifecycle {
       await this.stop();
       return;
     }
-    if (shareGen !== this.ctx.session.joinGeneration || !this.ctx.getMesh()) {
-      await this.stop();
+    if (this.isStaleShare(shareGen, forceGen) || this.activeCapture !== cap) {
+      if (this.activeCapture === cap) {
+        await this.stop();
+      } else {
+        await this.ctx.getMesh()?.setCapture(null);
+        this.clearStoppedUi();
+      }
       return;
     }
     if (this.activeCaptureWarning !== null) {
@@ -137,6 +148,16 @@ export class ShareLifecycle {
       }
       this.activeCaptureWarning = null;
     }
+    syncMuteAudioButton(this.ctx.ui, this.activeCapture);
+    this.ctx.syncViewState();
+    this.ctx.renderRoster();
+  }
+
+  private clearStoppedUi(): void {
+    this.ctx.health.clearOutbound();
+    this.ctx.tileCtrl.clearOutboundStats();
+    this.ctx.tileView.renderSelfPreview(null);
+    this.ctx.getClient()?.setSharing(false);
     syncMuteAudioButton(this.ctx.ui, this.activeCapture);
     this.ctx.syncViewState();
     this.ctx.renderRoster();
@@ -152,26 +173,36 @@ export class ShareLifecycle {
     });
   }
 
+  forceStop(): void {
+    if (!this.activeCapture && !this.pending) return;
+    this.forceStopGen++;
+    this.stopPromise = null;
+    this.ctx.captureController.stop();
+    this.activeCapture = null;
+    this.activeCaptureWarning = null;
+    syncMuteAudioButton(this.ctx.ui, null);
+  }
+
   stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     if (!this.activeCapture) return Promise.resolve();
+    const cap = this.activeCapture;
     const run = (async () => {
+      let owned = false;
       try {
         await this.ctx.getMesh()?.setCapture(null);
       } finally {
-        this.ctx.captureController.stop();
-        this.activeCapture = null;
-        this.activeCaptureWarning = null;
+        if (this.activeCapture === cap) {
+          owned = true;
+          this.ctx.captureController.stop();
+          this.activeCapture = null;
+          this.activeCaptureWarning = null;
+        }
       }
-      this.ctx.health.clearOutbound();
-      this.ctx.tileCtrl.clearOutboundStats();
-      this.ctx.tileView.renderSelfPreview(null);
-      this.ctx.getClient()?.setSharing(false);
-      syncMuteAudioButton(this.ctx.ui, this.activeCapture);
-      this.ctx.syncViewState();
-      this.ctx.renderRoster();
+      if (!owned) return;
+      this.clearStoppedUi();
     })().finally(() => {
-      this.stopPromise = null;
+      if (this.stopPromise === run) this.stopPromise = null;
     });
     this.stopPromise = run;
     return run;
