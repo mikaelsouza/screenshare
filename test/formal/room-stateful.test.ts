@@ -5,6 +5,7 @@ import { MAX_ROOM_SIZE, generateRoomCode, generateRoomPassword, type SignalData 
 import type { CaptureResult } from "@src/capture";
 import { Mesh, type MeshCallbacks, type MeshOptions } from "@src/mesh";
 import { SignalingClient, type RoomInfo } from "@src/signaling";
+import { RateLimiter } from "@worker/ratelimit";
 import {
   CONNECTED_TICKET_TTL_MS,
   DISCONNECTED_REJOIN_TTL_MS,
@@ -94,7 +95,8 @@ class VirtualRoomHarness {
   emptySince: number | undefined;
   hostGoneAt: number | undefined;
   lastHostActiveAt: number | undefined;
-  readonly passwordFailures = new Map<string, number[]>();
+  readonly passwordFailures = new RateLimiter(15, 60_000, 2_048);
+  passwordFailureChecks = 0;
   readonly unjoinedSockets: UnjoinedSocketSpec[] = [];
 
   password: string;
@@ -156,7 +158,7 @@ class VirtualRoomHarness {
   private earliestUnjoinedDeadline(): number | null {
     let earliest: number | null = null;
     for (const s of this.unjoinedSockets) {
-      const d = s.openedAt + 10_000;
+      const d = Math.max(this.now + 1000, s.openedAt + 10_000);
       if (earliest === null || d < earliest) earliest = d;
     }
     return earliest;
@@ -171,14 +173,8 @@ class VirtualRoomHarness {
   }
 
   private checkPasswordFailureRate(ip: string, now: number): boolean {
-    const recent = (this.passwordFailures.get(ip) ?? []).filter((t) => now - t < 60_000);
-    if (recent.length >= 20) {
-      this.passwordFailures.set(ip, recent);
-      return false;
-    }
-    recent.push(now);
-    this.passwordFailures.set(ip, recent);
-    return true;
+    this.passwordFailureChecks += 1;
+    return this.passwordFailures.check(ip, now);
   }
 
   private creatorActivityCap(): number {
@@ -313,6 +309,15 @@ class VirtualRoomHarness {
     return true;
   }
 
+  private isMissingEmptySinceExpired(): boolean {
+    const capTtl = this.hasCreatorHostKey() ? EMPTY_ROOM_TTL_MS : UNUSED_ROOM_TTL_MS;
+    return (
+      this.lastHostActiveAt !== undefined &&
+      this.now >= this.lastHostActiveAt + capTtl &&
+      (!this.hasCreatorHostKey() || this.everJoined)
+    );
+  }
+
   private reconcileBeforeAdmit(): "expired" | "ok" {
     if (!this.claimed) return "ok";
     if (this.peers.size > 0) {
@@ -324,6 +329,10 @@ class VirtualRoomHarness {
       return "ok";
     }
     if (this.emptySince === undefined) {
+      if (this.isMissingEmptySinceExpired()) {
+        this.expireRoom();
+        return "expired";
+      }
       this.emptySince = this.now;
       return "ok";
     }
@@ -374,6 +383,7 @@ class VirtualRoomHarness {
     const activeMatch =
       offeredRejoinHash !== null &&
       [...this.peers.values()].some((p) => p.rejoinHash === offeredRejoinHash);
+    const passwordFailureRateLimited = this.passwordFailures.isLimited(req.ip, this.now);
 
     const decision = evaluateAdmission({
       claimed: this.claimed,
@@ -390,6 +400,7 @@ class VirtualRoomHarness {
       offeredPasswordHash,
       offeredHostHash,
       hasActiveSocketMatch: activeMatch,
+      passwordFailureRateLimited,
       checkPasswordFailureRate: () => this.checkPasswordFailureRate(req.ip, this.now),
     });
     if (!decision.ok) return { ok: false, code: decision.code };
@@ -419,13 +430,14 @@ class VirtualRoomHarness {
     if (promo.markHostPromoted) this.hostPromoted = true;
 
     const currentId = this.nextUuid("peer");
+    const supersededIds = new Set(superseded.map((p) => p.id));
     const resumed = isResume
       ? resolveResumeAttachment({
           currentId,
           clientSharing: req.sharing,
           superseded: sup,
           memberTicket: decision.memberTicket,
-          activePeerIds: new Set<string>(),
+          activePeerIds: new Set([...this.peers.keys()].filter((id) => !supersededIds.has(id))),
         })
       : { id: currentId, sharing: false };
 
@@ -594,6 +606,36 @@ class VirtualRoomHarness {
     return evaluateSignalRelay(from, to, "offer");
   }
 
+  private runEmptyAlarm(): void {
+    if (this.emptySince === undefined) {
+      if (this.isMissingEmptySinceExpired()) {
+        this.expireRoom();
+        return;
+      }
+      this.emptySince = this.now;
+    }
+    const expiry = computeCredentialExpiry(
+      this.emptySince,
+      this.everJoined,
+      this.lastHostActiveAt,
+      this.hasCreatorHostKey(),
+    );
+    if (this.now >= expiry) {
+      this.expireRoom();
+      return;
+    }
+    if (!this.hasCreatorHostKey()) {
+      const backfilled = this.backfillUnjoinedLegacyCreatorHash();
+      if (!backfilled && this.lastHostActiveAt === undefined) {
+        this.lastHostActiveAt = this.emptySince;
+      }
+    }
+    if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
+      this.resetEmptySession();
+    }
+    this.syncAlarm();
+  }
+
   advanceTimeAndRunAlarm(deltaMs: number): void {
     this.now += deltaMs;
     if (!this.claimed) {
@@ -602,27 +644,7 @@ class VirtualRoomHarness {
     }
     this.sweepStaleUnjoined();
     if (this.peers.size === 0) {
-      if (this.emptySince === undefined) this.emptySince = this.now;
-      const expiry = computeCredentialExpiry(
-        this.emptySince,
-        this.everJoined,
-        this.lastHostActiveAt,
-        this.hasCreatorHostKey(),
-      );
-      if (this.now >= expiry) {
-        this.expireRoom();
-        return;
-      }
-      if (!this.hasCreatorHostKey()) {
-        const backfilled = this.backfillUnjoinedLegacyCreatorHash();
-        if (!backfilled && this.lastHostActiveAt === undefined) {
-          this.lastHostActiveAt = this.emptySince;
-        }
-      }
-      if (!this.sessionCleaned && this.now - this.emptySince >= EMPTY_SESSION_CLEANUP_MS) {
-        this.resetEmptySession();
-      }
-      this.syncAlarm();
+      this.runEmptyAlarm();
       return;
     }
 
@@ -799,7 +821,7 @@ class JoinCreatorCommand implements RoomCommand {
   }
   check = (m: Readonly<RoomModel>): boolean => !m.expired && m.connectedIds.length < MAX_ROOM_SIZE;
   run(m: RoomModel, real: VirtualRoomHarness): void {
-    const prevFailureCount = real.passwordFailures.get("198.51.100.1")?.length ?? 0;
+    const prevFailureChecks = real.passwordFailureChecks;
     const prevLastActive = real.lastHostActiveAt;
     const res = real.admitAndJoin({
       name: "creator",
@@ -809,7 +831,7 @@ class JoinCreatorCommand implements RoomCommand {
     });
     if (!real.claimed) {
       assert.deepEqual(res, { ok: false, code: "bad-password" });
-      assert.equal(real.passwordFailures.get("198.51.100.1")?.length ?? 0, prevFailureCount);
+      assert.equal(real.passwordFailureChecks, prevFailureChecks);
       m.expired = true;
       m.connectedIds = [];
       m.hostIds = [];
@@ -962,11 +984,9 @@ class JoinWithStaleSecretCommand implements RoomCommand {
     const pool = this.usePreLock ? m.leakedPreLockPasswords : m.rotatedPasswords;
     const staleSecret = pool[pool.length - 1];
     if (!staleSecret || staleSecret === real.password) return;
-    const recentFailures = (real.passwordFailures.get("198.51.100.99") ?? []).filter(
-      (t) => real.now - t < 60_000,
-    ).length;
+    const wasRateLimited = real.passwordFailures.isLimited("198.51.100.99", real.now);
     const res = real.admitAndJoin({ name: "eve", ip: "198.51.100.99", password: staleSecret });
-    assert.deepEqual(res, { ok: false, code: recentFailures >= 20 ? "rate-limited" : "bad-password" });
+    assert.deepEqual(res, { ok: false, code: wasRateLimited ? "rate-limited" : "bad-password" });
     assertRoomInvariants(m, real);
   }
   toString = (): string => `JoinWithStaleSecret(preLock=${String(this.usePreLock)})`;

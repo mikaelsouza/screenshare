@@ -29,7 +29,7 @@ This repository is a P2P screen-sharing web & Windows Electron app backed by a C
   - **Reusable credentials cap:** Retain room credentials for `EMPTY_ROOM_TTL_MS` (**90 days**) anchored to `LAST_HOST_ACTIVE_KEY` (creator activity), enforced even while occupied by promoted guests (`OCCUPIED_FALLBACK_ALARM_MS` + `creatorActivityCap`). Pre-deploy rooms lacking `CREATOR_HOST_KEY` stay on their non-sliding 12-hour TTL.
   - **Lazy pre-admit reconciliation:** `reconcileEmptyTimersBeforeAdmit()` must expire overdue rooms (closing sibling sockets with `1001`) before `admit()` without charging `passwordFailures`.
 - **Host Token Provenance (Client):** Persist creator `hostToken`s only in `localStorage` (`host-rooms` via `src/host-tokens.ts`, bounded to 20 rooms, 90d TTL, 5m clock-skew guard, Web Locks `screenshare:host-rooms` + cross-tab `storage` sync). Keep mid-session promoted guest tokens strictly in memory (`sessionHostTokens`), never overwriting creator provenance.
-- **Recent Rooms Persistence (Client):** Persist recent room rejoin state only in `localStorage` (`recent-rooms` and opt-out flag `recent-rooms-disabled` via `src/recent-rooms.ts`, `src/recent-rooms-model.ts`, and `src/controllers/recent-rooms-controller.ts`), bounded to `20` rooms, `90d` TTL, `5m` clock-skew guard, `4` peer names, `40`-char local label, and `128`-char invite secret. Serialize updates across tabs via Web Lock `screenshare:recent-rooms` + `storage` sync, driven by a single-flight FIFO queue and pure replay reducer (`applyRecentRoomOp`, `computeRecentRoomsView`). Opt-out (`recent-rooms-disabled`) suppresses persistence and clears stored rooms.
+- **Recent Rooms Persistence (Client):** Persist recent room rejoin state only in `localStorage` (`recent-rooms` and opt-out flag `recent-rooms-disabled` via `src/recent-rooms.ts`, `src/recent-rooms-model.ts`, and `src/controllers/recent-rooms-controller.ts`), bounded to `20` rooms, `90d` TTL, `5m` clock-skew guard, `4` peer names, `40`-char local label, and `128`-char invite secret. Serialize read-modify-write updates across tabs via Web Lock `screenshare:recent-rooms` (`enqueueLocked` + `refreshFromDisk`) + `storage` sync. Opt-out (`recent-rooms-disabled`) suppresses persistence and clears stored rooms.
 
 ---
 
@@ -70,5 +70,5 @@ This repository is a P2P screen-sharing web & Windows Electron app backed by a C
 
 - Always pass PR and issue bodies via `--body-file` (written cleanly to a file or heredoc), never inline double-quoted `--body "..."` strings (avoids shell escape corruption such as `\t`/`^G`).
 - Before closing any issue referencing a PR, verify `gh pr view <num> --json state,mergedAt` confirms `mergedAt != null`.
-- Every deferred follow-up from a PR review or security audit must be tracked as a GitHub Issue or an `it.todo("...")` entry before merge.
+- Every deferred follow-up from a PR review or security audit must be tracked as a GitHub Issue before merge.
 - For runtime and security changes, run a context-isolated **Breaker** verification pass (given only `AGENTS.md` and `git diff`, with no implementation rationale) to write adversarial tests against the diff.
