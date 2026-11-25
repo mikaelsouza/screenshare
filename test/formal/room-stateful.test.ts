@@ -5,6 +5,7 @@ import { MAX_ROOM_SIZE, generateRoomCode, generateRoomPassword, type SignalData 
 import type { CaptureResult } from "@src/capture";
 import { Mesh, type MeshCallbacks, type MeshOptions } from "@src/mesh";
 import { SignalingClient, type RoomInfo } from "@src/signaling";
+import { RateLimiter } from "@worker/ratelimit";
 import {
   CONNECTED_TICKET_TTL_MS,
   DISCONNECTED_REJOIN_TTL_MS,
@@ -94,7 +95,8 @@ class VirtualRoomHarness {
   emptySince: number | undefined;
   hostGoneAt: number | undefined;
   lastHostActiveAt: number | undefined;
-  readonly passwordFailures = new Map<string, number[]>();
+  readonly passwordFailures = new RateLimiter(15, 60_000, 2_048);
+  passwordFailureChecks = 0;
   readonly unjoinedSockets: UnjoinedSocketSpec[] = [];
 
   password: string;
@@ -170,16 +172,9 @@ class VirtualRoomHarness {
     }
   }
 
-  private isPasswordFailureRateLimited(ip: string, now: number): boolean {
-    const recent = (this.passwordFailures.get(ip) ?? []).filter((t) => now - t < 60_000);
-    this.passwordFailures.set(ip, recent);
-    return recent.length >= 15;
-  }
-
   private checkPasswordFailureRate(ip: string, now: number): boolean {
-    if (this.isPasswordFailureRateLimited(ip, now)) return false;
-    this.passwordFailures.get(ip)!.push(now);
-    return true;
+    this.passwordFailureChecks += 1;
+    return this.passwordFailures.check(ip, now);
   }
 
   private creatorActivityCap(): number {
@@ -388,7 +383,7 @@ class VirtualRoomHarness {
     const activeMatch =
       offeredRejoinHash !== null &&
       [...this.peers.values()].some((p) => p.rejoinHash === offeredRejoinHash);
-    const passwordFailureRateLimited = this.isPasswordFailureRateLimited(req.ip, this.now);
+    const passwordFailureRateLimited = this.passwordFailures.isLimited(req.ip, this.now);
 
     const decision = evaluateAdmission({
       claimed: this.claimed,
@@ -826,7 +821,7 @@ class JoinCreatorCommand implements RoomCommand {
   }
   check = (m: Readonly<RoomModel>): boolean => !m.expired && m.connectedIds.length < MAX_ROOM_SIZE;
   run(m: RoomModel, real: VirtualRoomHarness): void {
-    const prevFailureCount = real.passwordFailures.get("198.51.100.1")?.length ?? 0;
+    const prevFailureChecks = real.passwordFailureChecks;
     const prevLastActive = real.lastHostActiveAt;
     const res = real.admitAndJoin({
       name: "creator",
@@ -836,7 +831,7 @@ class JoinCreatorCommand implements RoomCommand {
     });
     if (!real.claimed) {
       assert.deepEqual(res, { ok: false, code: "bad-password" });
-      assert.equal(real.passwordFailures.get("198.51.100.1")?.length ?? 0, prevFailureCount);
+      assert.equal(real.passwordFailureChecks, prevFailureChecks);
       m.expired = true;
       m.connectedIds = [];
       m.hostIds = [];
@@ -989,11 +984,9 @@ class JoinWithStaleSecretCommand implements RoomCommand {
     const pool = this.usePreLock ? m.leakedPreLockPasswords : m.rotatedPasswords;
     const staleSecret = pool[pool.length - 1];
     if (!staleSecret || staleSecret === real.password) return;
-    const recentFailures = (real.passwordFailures.get("198.51.100.99") ?? []).filter(
-      (t) => real.now - t < 60_000,
-    ).length;
+    const wasRateLimited = real.passwordFailures.isLimited("198.51.100.99", real.now);
     const res = real.admitAndJoin({ name: "eve", ip: "198.51.100.99", password: staleSecret });
-    assert.deepEqual(res, { ok: false, code: recentFailures >= 20 ? "rate-limited" : "bad-password" });
+    assert.deepEqual(res, { ok: false, code: wasRateLimited ? "rate-limited" : "bad-password" });
     assertRoomInvariants(m, real);
   }
   toString = (): string => `JoinWithStaleSecret(preLock=${String(this.usePreLock)})`;
