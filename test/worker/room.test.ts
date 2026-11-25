@@ -3477,9 +3477,11 @@ describe("Worker and RoomDO uncovered branch coverage", () => {
     await observer.nextOf("peer-joined");
     await host.nextOf("peer-joined");
 
-    // Resume guest in-place while toggling sharing=true and supplying HOST_TOKEN (also evicts old host socket)
+    // Close original host first so resuming guest deterministically upgrades host + sharing in-place
+    host.close();
+    expect((await observer.nextOf("peer-left")).id).toBe(wHost.selfId);
+
     const resumed = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.142" });
-    const hostReplaced = closeCodeOf(host.ws);
     const guestReplaced = closeCodeOf(guest.ws);
     resumed.send({
       t: "join",
@@ -3491,22 +3493,40 @@ describe("Worker and RoomDO uncovered branch coverage", () => {
       sharing: true,
     });
     const wResumed = await resumed.nextOf("welcome");
+    expect(wResumed.selfId).toBe(wGuest.selfId);
     expect(wResumed.host).toBe(true);
 
-    // Observer receives peer-left for the evicted non-matching socket + peer-state + host-promoted
-    const events: ServerMessage[] = [
-      await observer.next(),
-      await observer.next(),
-      await observer.next(),
-    ];
-    expect(events).toContainEqual({ t: "peer-left", id: wHost.selfId });
-    expect(events).toContainEqual({ t: "peer-state", id: wResumed.selfId, sharing: true });
-    expect(events).toContainEqual({ t: "host-promoted", hostId: wResumed.selfId });
-    expect(await hostReplaced).toBe(1008);
+    const promoEvents: ServerMessage[] = [await observer.next(), await observer.next()];
+    expect(promoEvents).toContainEqual({ t: "peer-state", id: wResumed.selfId, sharing: true });
+    expect(promoEvents).toContainEqual({ t: "host-promoted", hostId: wResumed.selfId });
     expect(await guestReplaced).toBe(1008);
 
+    // Multi-socket eviction (isResume matching both another guest ticket and an active host socket)
+    const extraGuest = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.143" });
+    const wExtra = await extraGuest.join("extra");
+    await observer.nextOf("peer-joined");
+    await resumed.nextOf("peer-joined");
+
+    const multi = await Client.connect(CODE, { "CF-Connecting-IP": "198.51.100.143" });
+    const resumedEvicted = closeCodeOf(resumed.ws);
+    const extraEvicted = closeCodeOf(extraGuest.ws);
+    multi.send({
+      t: "join",
+      room: CODE,
+      displayName: "extra",
+      hostToken: HOST_TOKEN,
+      rejoinToken: wExtra.rejoinToken,
+      resume: true,
+    });
+    const wMulti = await multi.nextOf("welcome");
+    expect([wResumed.selfId, wExtra.selfId]).toContain(wMulti.selfId);
+    const leftId = wMulti.selfId === wExtra.selfId ? wResumed.selfId : wExtra.selfId;
+    expect((await observer.nextOf("peer-left")).id).toBe(leftId);
+    expect(await resumedEvicted).toBe(1008);
+    expect(await extraEvicted).toBe(1008);
+
     observer.close();
-    resumed.close();
+    multi.close();
   });
 });
 
