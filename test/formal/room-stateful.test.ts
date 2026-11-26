@@ -121,9 +121,9 @@ class VirtualRoomHarness {
     this.creatorHostHash = opts.legacy ? null : cHash;
     this.emptySince = this.now;
     this.lastHostActiveAt = opts.legacy ? undefined : this.now;
+    this.sessionCleaned = !opts.legacy || Boolean(opts.legacyJoined);
     if (opts.legacy && opts.legacyJoined) {
       this.everJoined = true;
-      this.sessionCleaned = true;
     }
     this.syncAlarm();
   }
@@ -332,6 +332,12 @@ class VirtualRoomHarness {
       if (this.isMissingEmptySinceExpired()) {
         this.expireRoom();
         return "expired";
+      }
+      if (!this.hasCreatorHostKey()) {
+        const backfilled = this.backfillUnjoinedLegacyCreatorHash();
+        if (!backfilled && this.lastHostActiveAt === undefined) {
+          this.lastHostActiveAt = this.now;
+        }
       }
       this.emptySince = this.now;
       return "ok";
@@ -565,6 +571,7 @@ class VirtualRoomHarness {
     this.password = nextPassword;
     this.passwordHash = nextHash;
     this.members = capByExpiry(nextMembers, (m) => m.until, MAX_STORED_ENTRIES, protectedHashes);
+    this.syncAlarm();
     return deliveries;
   }
 
@@ -1405,7 +1412,7 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
             hostIds: [],
             emptySince: real.now,
             hostGoneAt: null,
-            sessionCleaned: legacyVariant === "legacy-joined",
+            sessionCleaned: legacyVariant !== "legacy-unjoined",
             disconnectedTokens: new Map(),
             kickedIps: new Map(),
             leakedPreLockPasswords: [],
@@ -1420,6 +1427,11 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
     );
     expect(totalRuns).toBe(150);
 
+    // Deterministic assertion: freshly initialized modern room starts with sessionCleaned === true and 12h initial alarm.
+    const freshModern = new VirtualRoomHarness();
+    expect(freshModern.sessionCleaned).toBe(true);
+    expect(freshModern.alarmDeadline).toBe(freshModern.now + UNUSED_ROOM_TTL_MS);
+
     // Deterministic regression 1: creator joins, locks, disconnects, then 3x host-grace steps (301s each = 903s >= 15m)
     // must trigger cumulative empty-session cleanup (unlock + secret rotation) in both harness and model.
     const regReal = new VirtualRoomHarness();
@@ -1431,7 +1443,7 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       hostIds: [],
       emptySince: regReal.now,
       hostGoneAt: null,
-      sessionCleaned: false,
+      sessionCleaned: true,
       disconnectedTokens: new Map(),
       kickedIps: new Map(),
       leakedPreLockPasswords: [],
@@ -1467,7 +1479,7 @@ describe("Stateful Model-Based Invariants: RoomDO Multi-Tier Lifecycle & Client 
       hostIds: [],
       emptySince: promoReal.now,
       hostGoneAt: null,
-      sessionCleaned: false,
+      sessionCleaned: true,
       disconnectedTokens: new Map(),
       kickedIps: new Map(),
       leakedPreLockPasswords: [],
