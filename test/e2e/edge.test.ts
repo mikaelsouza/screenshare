@@ -132,7 +132,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await stopServer(server);
   });
 
-  await it("creates a room with Create and displays the 1C-2 invite menu", async () => {
+  await it("creates a room with Create and displays the invite menu", async () => {
     await host.click("#create");
     await waitFor(host, inRoom, { label: "host in the new room" });
     assert.equal(await host.evaluate(() => window.location.hash), "", "URL hash must stay empty after Create");
@@ -207,7 +207,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await host.click("#roster-btn"); // close so incoming join lights unread dot
   });
 
-  await it("shows inline lobby errors for invalid/wrong invites, lets valid invite in, and lights 2AB-2 join awareness", async () => {
+  await it("shows inline lobby errors for invalid/wrong invites, lets valid invite in, and lights join awareness", async () => {
     await joinWith(other, "BAD");
     await waitFor(
       other,
@@ -247,7 +247,7 @@ await describe("edge cases in a real browser", { concurrency: 1 }, async () => {
     await waitFor(
       host,
       () => !document.getElementById("roster-unread-dot")?.hidden && !document.getElementById("join-chip")?.hidden,
-      { label: "host to see 2AB-2 unread dot and join chip" },
+      { label: "host to see unread dot and join chip" },
     );
     await openRoster(host);
     assert.equal(
