@@ -65,7 +65,7 @@ async function readHostInvite(page: Page): Promise<string> {
   return value;
 }
 
-await describe("recent rooms & passwordless rejoin (Mock #12) end-to-end", { concurrency: 1 }, async () => {
+await describe("recent rooms & passwordless rejoin end-to-end", { concurrency: 1 }, async () => {
   before(async () => {
     server = await startServer(PORT);
     browser = await launchBrowser();
