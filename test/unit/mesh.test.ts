@@ -387,6 +387,8 @@ describe("Mesh and PeerLink", () => {
 
     // Pause aaron via control channel, keep bob active
     aaronPc.dataChannels[0]!.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    await Promise.resolve();
+    await Promise.resolve();
     expect(aaronSender.getParameters().encodings?.[0]?.active).toBe(false);
 
     const newPreset = { label: "1080p60", width: 1920, height: 1080, frameRate: 60, maxBitrate: 8_000_000 };
@@ -486,11 +488,14 @@ describe("Mesh and PeerLink", () => {
 
     // Far end says they are NOT viewing tile
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    await Promise.resolve();
+    await Promise.resolve();
     const sender = pc.senders[0]!;
     expect(sender.getParameters().encodings?.[0]?.active).toBe(false);
 
     // Far end says they are viewing tile again
     ch.onmessage?.({ data: JSON.stringify({ c: "view", want: true }) });
+    await new Promise((r) => setTimeout(r, 0));
     expect(sender.getParameters().encodings?.[0]?.active).toBe(true);
 
     // Ignores malformed messages
@@ -1165,6 +1170,7 @@ describe("negotiation recovery", () => {
       // Once the 1s window elapses, bob's budget resets and view toggles work again
       vi.advanceTimersByTime(1_000);
       bobCh.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+      await Promise.resolve();
       await Promise.resolve();
       expect(mesh.isPeerViewing("bob")).toBe(false);
       expect(bobSetParamsSpy).toHaveBeenCalledTimes(callsAtLimit + 1);
@@ -2761,6 +2767,70 @@ describe("adversarial persistent-transceiver & race probes", () => {
     } finally {
       globalThis.MediaStream = origMediaStream;
     }
+  });
+
+  it("serializes control view setSenderActive calls through mediaQueue without racing reapplyEncoding", async () => {
+    const mesh = new Mesh("me", { ...opts }, () => {}, cb());
+    mesh.addMember("bob", false);
+    await mesh.setCapture(makeCapture(false));
+
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    const control = pc.dataChannels[0]!;
+    const videoTx = pc.transceivers.find((tx) => tx.sender.track?.kind === "video")!;
+    const sender = videoTx.sender as unknown as {
+      getParameters: () => RTCRtpSendParameters;
+      setParameters: (params: RTCRtpSendParameters) => Promise<void>;
+    };
+
+    const events: string[] = [];
+    let releaseApply!: () => void;
+    const origGet = sender.getParameters.bind(sender);
+    const origSet = sender.setParameters.bind(sender);
+    let blockNextSet = true;
+
+    sender.getParameters = () => {
+      events.push("getParameters");
+      return origGet();
+    };
+    sender.setParameters = (params) => {
+      events.push(`setParameters(active=${String(params.encodings?.[0]?.active)})`);
+      if (blockNextSet) {
+        blockNextSet = false;
+        return new Promise<void>((resolve) => {
+          releaseApply = () => {
+            void origSet(params).then(resolve);
+          };
+        });
+      }
+      return origSet(params);
+    };
+
+    // Start reapplyEncoding, which acquires mediaQueue and blocks in setParameters
+    const reapplyPromise = mesh.setDegradation("clarity");
+    await Promise.resolve();
+    expect(events).toEqual(["getParameters", "setParameters(active=true)"]);
+
+    // While reapplyEncoding is in-flight, a control view=false message arrives
+    control.onmessage?.({ data: JSON.stringify({ c: "view", want: false }) });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Must NOT call getParameters/setParameters concurrently before reapplyEncoding finishes
+    expect(events).toEqual(["getParameters", "setParameters(active=true)"]);
+
+    // Release reapplyEncoding; queued setSenderActive(false) runs only after reapplyEncoding completes
+    releaseApply();
+    await reapplyPromise;
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(events).toEqual([
+      "getParameters",
+      "setParameters(active=true)",
+      "getParameters",
+      "setParameters(active=false)",
+      "getParameters",
+    ]);
+    expect(origGet().encodings?.[0]?.active).toBe(false);
   });
 });
 
