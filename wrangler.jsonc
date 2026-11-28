@@ -1,7 +1,7 @@
 {
   "name": "screenshare",
   "main": "worker/index.ts",
-  "compatibility_date": "2026-08-22",
+  "compatibility_date": "2026-11-04",
   "compatibility_flags": ["nodejs_compat"],
 
   "assets": {
@@ -34,6 +34,7 @@
     { "name": "ROOM_LIMITER", "namespace_id": "3102", "simple": { "limit": 20, "period": 60 } }
   ]
 
-  // Attach the custom domain once DNS is ready:
+  // Custom domain (screenshare.webmikas.com) is bound in the Cloudflare dashboard
+  // so CI deploys only need Workers Scripts permissions (no Zone/DNS write scope).
   // "routes": [{ "pattern": "screenshare.webmikas.<tld>", "custom_domain": true }]
 }
