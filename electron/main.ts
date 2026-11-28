@@ -122,7 +122,10 @@ async function pollFollowState(profile: FollowProfile, state: FollowSessionState
     );
     const status = state.follower.evaluate(followWindows);
     if (!status) return;
-    if (status.sourceId) audioSession.switchWindow(status.sourceId);
+    if (status.sourceId) {
+      lastPickedSource = { id: status.sourceId, name: status.title ?? "" };
+      audioSession.switchWindow(status.sourceId);
+    }
     sendFollowUpdate(profile, status);
     if (status.role === "ended") stopFollow();
   } catch (err) {

@@ -456,7 +456,7 @@ class PeerLink {
     ch.onmessage = (ev) => {
       this.controlLimiter.handle(ev.data, (msg) => {
         this.remoteWantsVideo = msg.want;
-        void this.setSenderActive(msg.want);
+        void this.enqueueMedia(() => this.setSenderActive(msg.want));
       });
     };
   }
