@@ -88,3 +88,18 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Post-deploy live smoke check
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEADERS="$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors --max-time 15 -D - -o /dev/null https://screenshare.webmikas.com/)"
+          LOWER="$(printf '%s\n' "$HEADERS" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
+          printf '%s\n' "$LOWER" | grep -Eq '^http/[0-9.]+ 200'
+          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*script-src 'self'"
+          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*require-trusted-types-for 'script'"
+          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*trusted-types 'none'"
+          printf '%s\n' "$LOWER" | grep -Eq '^strict-transport-security:.*max-age='
+          printf '%s\n' "$LOWER" | grep -Eq '^x-frame-options:.*deny'
+          printf '%s\n' "$LOWER" | grep -Eq '^x-content-type-options:.*nosniff'
+          echo "Live smoke check passed for https://screenshare.webmikas.com/"

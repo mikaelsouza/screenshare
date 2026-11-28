@@ -1,16 +1,23 @@
 version: 2
 updates:
-  # Keeps the SHA-pinned actions in deploy.yml current.
+  # Keeps the SHA-pinned actions across workflows current.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
 
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
-    # Dev tooling only; group it so an update is one PR, not one per package.
+    cooldown:
+      default-days: 7
+    # Group dev tooling together, but keep Electron separate so Chromium/Electron
+    # runtime updates stand out as desktop-release-worthy PRs.
     groups:
       dev-dependencies:
         dependency-type: development
+        exclude-patterns:
+          - "electron"
