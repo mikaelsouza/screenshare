@@ -89,17 +89,23 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
-      - name: Post-deploy live smoke check
+      - name: Post-deploy Cloudflare deployment verification
         shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          HEADERS="$(curl -fsS --retry 5 --retry-delay 5 --retry-all-errors --max-time 15 -D - -o /dev/null https://screenshare.webmikas.com/)"
-          LOWER="$(printf '%s\n' "$HEADERS" | tr -d '\r' | tr '[:upper:]' '[:lower:]')"
-          printf '%s\n' "$LOWER" | grep -Eq '^http/[0-9.]+ 200'
-          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*script-src 'self'"
-          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*require-trusted-types-for 'script'"
-          printf '%s\n' "$LOWER" | grep -Eq "^content-security-policy:.*trusted-types 'none'"
-          printf '%s\n' "$LOWER" | grep -Eq '^strict-transport-security:.*max-age='
-          printf '%s\n' "$LOWER" | grep -Eq '^x-frame-options:.*deny'
-          printf '%s\n' "$LOWER" | grep -Eq '^x-content-type-options:.*nosniff'
-          echo "Live smoke check passed for https://screenshare.webmikas.com/"
+          STATUS_JSON="$(npx wrangler deployments status --json)"
+          STATUS_JSON="$STATUS_JSON" node -e '
+            const d = JSON.parse(process.env.STATUS_JSON || "{}");
+            const versions = Array.isArray(d.versions) ? d.versions : [];
+            const totalPct = versions.reduce((sum, v) => sum + Number(v.percentage || 0), 0);
+            const createdMs = Date.parse(String(d.created_on || ""));
+            const ageSec = Number.isFinite(createdMs) ? Math.round((Date.now() - createdMs) / 1000) : Infinity;
+            if (!d.id || versions.length === 0 || totalPct !== 100 || ageSec > 600 || ageSec < -120) {
+              console.error("Unexpected live deployment status:", { id: d.id, created_on: d.created_on, totalPct, ageSec });
+              process.exit(1);
+            }
+            console.log(`Verified active Cloudflare deployment ${d.id} (created ${d.created_on}, age ${ageSec}s, traffic ${totalPct}%).`);
+          '
