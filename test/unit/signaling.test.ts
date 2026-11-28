@@ -156,8 +156,14 @@ describe("SignalingClient reconnection", () => {
     ws.onmessage?.({ data: "ping" });
     ws.onmessage?.({ data: "pong" });
 
-    // unparseable message is ignored without throwing
-    ws.onmessage?.({ data: "not json" });
+    // unparseable message is ignored without throwing and logs only payload length
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      ws.onmessage?.({ data: "not json" });
+      expect(warnSpy).toHaveBeenCalledWith("[signaling] unparseable message", { length: 8 });
+    } finally {
+      warnSpy.mockRestore();
+    }
     ws.onerror?.();
   });
 
@@ -1091,6 +1097,309 @@ describe("SignalingClient keepalive and session resumption", () => {
     cNoChat.close();
   });
 });
+
+describe("SignalingClient mutation & edge-case coverage", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    FakeWebSocket.instances = [];
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "https:", host: "example.com" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it("omits empty tokens on join and accurately populates optional RoomInfo fields on welcome", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h, () => ({
+      password: "",
+      hostToken: undefined,
+      rejoinToken: "",
+    }));
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    const joinPayload = JSON.parse(ws.sent[0]!) as Record<string, unknown>;
+    expect(Object.keys(joinPayload).sort()).toEqual(["displayName", "room", "t"]);
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        t: "welcome",
+        selfId: "me",
+        peers: [],
+        host: true,
+        locked: true,
+        password: "secret",
+        hostToken: "htok",
+        rejoinToken: "rtok",
+      }),
+    });
+    expect(h.onWelcome).toHaveBeenCalledWith("me", [], {
+      host: true,
+      locked: true,
+      password: "secret",
+      hostToken: "htok",
+      rejoinToken: "rtok",
+    });
+
+    const h2 = handlers();
+    const c2 = new SignalingClient("ABCDEFGH", "bob", h2);
+    c2.connect();
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.open();
+    ws2.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "p2", peers: [] }) });
+    const room = h2.onWelcome.mock.calls[0]?.[2] as Record<string, unknown>;
+    expect(room).toEqual({ host: false, locked: false });
+    expect("password" in room).toBe(false);
+    expect("hostToken" in room).toBe(false);
+    expect("rejoinToken" in room).toBe(false);
+    c.close();
+    c2.close();
+  });
+
+  it("replays last non-fatal error when followed by a 1008 close", () => {
+    const h = handlers();
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+
+    ws.onmessage?.({ data: JSON.stringify({ t: "error", code: "rate-limited", message: "Slow down" }) });
+    ws.serverClose(1008);
+
+    expect(h.onError).toHaveBeenCalledTimes(2);
+    expect(h.onError).toHaveBeenNthCalledWith(1, "rate-limited", "Slow down");
+    expect(h.onError).toHaveBeenNthCalledWith(2, "rate-limited", "Slow down");
+    expect(c.isFatal).toBe(true);
+  });
+
+  it("enforces exact MAX_CAPACITY_RETRIES (5) and MAX_INITIAL_RETRIES (8) boundaries", () => {
+    const hCap = handlers();
+    const cCap = new SignalingClient("ABCDEFGH", "alice", hCap);
+    for (let i = 0; i < 5; i++) {
+      cCap.connect();
+      const ws = FakeWebSocket.instances[i]!;
+      ws.open();
+      ws.serverClose(1013);
+      expect(cCap.isFatal).toBe(false);
+    }
+    vi.advanceTimersByTime(30_000);
+    expect(FakeWebSocket.instances.length).toBeGreaterThan(5);
+    const ws6 = FakeWebSocket.instances[FakeWebSocket.instances.length - 1]!;
+    ws6.open();
+    ws6.serverClose(1013);
+    expect(cCap.isFatal).toBe(true);
+    expect(hCap.onError).toHaveBeenCalledWith(
+      "rate-limited",
+      "The room is still at capacity. Try again in a minute.",
+    );
+    const countBefore = FakeWebSocket.instances.length;
+    cCap.connect();
+    expect(FakeWebSocket.instances).toHaveLength(countBefore);
+
+    FakeWebSocket.instances = [];
+    const hInit = handlers();
+    const cInit = new SignalingClient("ABCDEFGH", "bob", hInit);
+    cInit.connect();
+    for (let i = 0; i < 7; i++) {
+      const ws = FakeWebSocket.instances[i]!;
+      ws.serverClose(1006);
+      expect(cInit.isFatal).toBe(false);
+      vi.advanceTimersByTime(30_000);
+    }
+    FakeWebSocket.instances[7]!.serverClose(1006);
+    expect(cInit.isFatal).toBe(true);
+    expect(hInit.onError).toHaveBeenCalledWith(
+      "connection-failed",
+      "Could not connect to that room. Check your connection and try again.",
+    );
+  });
+
+  it("tracks isReady, ignores stale sockets, and cleans up timers on connect() and close()", () => {
+    const winListeners = new Map<string, Set<() => void>>();
+    vi.stubGlobal("window", {
+      addEventListener: (ev: string, fn: () => void) => {
+        if (!winListeners.has(ev)) winListeners.set(ev, new Set());
+        winListeners.get(ev)!.add(fn);
+      },
+      removeEventListener: (ev: string, fn: () => void) => {
+        winListeners.get(ev)?.delete(fn);
+      },
+    });
+
+    const h = handlers();
+    const cEarly = new SignalingClient("ABCDEFGH", "early", h);
+    expect(() => cEarly.close()).not.toThrow();
+
+    const c = new SignalingClient("ABCDEFGH", "alice", h);
+    c.connect();
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.open();
+    ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+    expect(c.isReady).toBe(true);
+
+    // Ready state reflects underlying WebSocket.readyState
+    ws1.readyState = FakeWebSocket.CLOSED;
+    expect(c.isReady).toBe(false);
+    ws1.readyState = FakeWebSocket.OPEN;
+    expect(c.isReady).toBe(true);
+
+    // Replacing active socket ignores oldWs.onclose and stops old pings
+    c.connect();
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws1.serverClose(1006);
+    expect(h.onStatus).not.toHaveBeenCalledWith("closed");
+    vi.advanceTimersByTime(15_000);
+    expect(ws1.sent.filter((m) => m === "ping")).toHaveLength(0);
+
+    // Closing a welcomed socket resets isReady and stops pings
+    ws2.open();
+    ws2.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+    expect(c.isReady).toBe(true);
+    ws2.serverClose(1006);
+    expect(c.isReady).toBe(false);
+    const sentAtClose = ws2.sent.length;
+    vi.advanceTimersByTime(15_000);
+    // Reconnect happened by 15s, old ws2 should not receive pings
+    expect(ws2.sent.slice(sentAtClose).filter((m) => m === "ping")).toHaveLength(0);
+
+    // Pending reconnect timer is cancelled when connect() is called manually
+    const ws3 = FakeWebSocket.instances[2]!;
+    ws3.open();
+    ws3.serverClose(1006);
+    c.connect();
+    const countAfterManual = FakeWebSocket.instances.length;
+    vi.advanceTimersByTime(20_000);
+    expect(FakeWebSocket.instances).toHaveLength(countAfterManual);
+
+    // close() after disconnect cancels pending reconnect, clears queue, and ignores online events
+    const ws4 = FakeWebSocket.instances[countAfterManual - 1]!;
+    ws4.open();
+    ws4.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+    ws4.serverClose(1006);
+    c.signal("p2", { k: "offer", sdp: "v=0" });
+    c.close();
+    vi.advanceTimersByTime(20_000);
+    expect(FakeWebSocket.instances).toHaveLength(countAfterManual);
+    for (const fn of winListeners.get("online") ?? []) fn();
+    expect(FakeWebSocket.instances).toHaveLength(countAfterManual);
+
+    c.connect();
+    const ws5 = FakeWebSocket.instances[countAfterManual]!;
+    ws5.open();
+    ws5.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+    expect(ws5.sent).toHaveLength(1); // only join; old queued signal was cleared
+    c.close();
+  });
+
+  it("ignores optional room-event frames when handlers are omitted", () => {
+    const c = new SignalingClient("ABCDEFGH", "alice", handlers());
+    c.connect();
+    const ws = FakeWebSocket.instances[0]!;
+    ws.open();
+    ws.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+
+    expect(() => {
+      ws.onmessage?.({ data: JSON.stringify({ t: "room-state", locked: true }) });
+      ws.onmessage?.({ data: JSON.stringify({ t: "room-password", password: "abc" }) });
+      ws.onmessage?.({ data: JSON.stringify({ t: "peer-renamed", id: "p2", name: "robert" }) });
+      ws.onmessage?.({ data: JSON.stringify({ t: "host-promoted", hostId: "me" }) });
+    }).not.toThrow();
+    c.close();
+  });
+
+  it("handles visibility/online wakeup, exact 65s watchdog boundary, and backoff jitter", () => {
+    const docListeners = new Map<string, Set<() => void>>();
+    const winListeners = new Map<string, Set<() => void>>();
+    let visibilityState = "hidden";
+    vi.stubGlobal("document", {
+      get visibilityState() {
+        return visibilityState;
+      },
+      addEventListener: (ev: string, fn: () => void) => {
+        if (!docListeners.has(ev)) docListeners.set(ev, new Set());
+        docListeners.get(ev)!.add(fn);
+      },
+      removeEventListener: (ev: string, fn: () => void) => {
+        docListeners.get(ev)?.delete(fn);
+      },
+    });
+    vi.stubGlobal("window", {
+      addEventListener: (ev: string, fn: () => void) => {
+        if (!winListeners.has(ev)) winListeners.set(ev, new Set());
+        winListeners.get(ev)!.add(fn);
+      },
+      removeEventListener: (ev: string, fn: () => void) => {
+        winListeners.get(ev)?.delete(fn);
+      },
+    });
+
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    const randSpy = vi.spyOn(Math, "random").mockReturnValue(1);
+    try {
+      const h = handlers();
+      const c = new SignalingClient("ABCDEFGH", "alice", h);
+      c.connect();
+      const ws1 = FakeWebSocket.instances[0]!;
+      ws1.open();
+      ws1.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+
+      // Attempt 0 backoff with random()=1: 500 * 2^0 * (0.7 + 0.6) = 650ms
+      ws1.serverClose(1006);
+      // Hidden visibilitychange does not reconnect
+      for (const fn of docListeners.get("visibilitychange") ?? []) fn();
+      expect(FakeWebSocket.instances).toHaveLength(1);
+
+      vi.advanceTimersByTime(600);
+      expect(FakeWebSocket.instances).toHaveLength(1);
+      vi.advanceTimersByTime(60);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+
+      // Attempt 1 backoff with random()=1: 500 * 2^1 * 1.3 = 1300ms
+      const ws2 = FakeWebSocket.instances[1]!;
+      ws2.open();
+      ws2.serverClose(1006);
+      vi.advanceTimersByTime(1200);
+      expect(FakeWebSocket.instances).toHaveLength(2);
+      vi.advanceTimersByTime(110);
+      expect(FakeWebSocket.instances).toHaveLength(3);
+
+      // window online triggers reconnectNow and cancels pending reconnect timer
+      const ws3 = FakeWebSocket.instances[2]!;
+      ws3.open();
+      ws3.serverClose(1006);
+      for (const fn of winListeners.get("online") ?? []) fn();
+      expect(FakeWebSocket.instances).toHaveLength(4);
+      vi.advanceTimersByTime(20_000);
+      expect(FakeWebSocket.instances).toHaveLength(4);
+
+      // Exact 65_000ms boundary sends PING instead of reconnecting (> 65_000, not >= 65_000)
+      const ws4 = FakeWebSocket.instances[3]!;
+      ws4.open();
+      ws4.onmessage?.({ data: JSON.stringify({ t: "welcome", selfId: "me", peers: [] }) });
+      visibilityState = "visible";
+      const baseTime = Date.now();
+      vi.setSystemTime(baseTime + 65_000);
+      for (const fn of docListeners.get("visibilitychange") ?? []) fn();
+      expect(FakeWebSocket.instances).toHaveLength(4);
+      expect(ws4.sent.filter((m) => m === "ping").length).toBeGreaterThanOrEqual(1);
+
+      // Also test ping interval at exact 65_000ms without advancing system clock past 65_000ms
+      ws4.onmessage?.({ data: JSON.stringify({ t: "peer-state", id: "p2", sharing: false }) });
+      vi.advanceTimersByTime(14_999);
+      vi.setSystemTime(Date.now() + 50_000);
+      vi.advanceTimersByTime(1);
+      expect(FakeWebSocket.instances).toHaveLength(4);
+      c.close();
+    } finally {
+      randSpy.mockRestore();
+    }
+  });
+});
+
 
 
 

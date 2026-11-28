@@ -206,7 +206,7 @@ export class SignalingClient {
       if (raw === PONG || raw === PING) return; // keepalive, not protocol traffic
       const msg = parseServerMessage(raw);
       if (!msg) {
-        console.warn("[signaling] unparseable message", raw.slice(0, 120));
+        console.warn("[signaling] unparseable message", { length: raw.length });
         return;
       }
       this.dispatch(msg);
