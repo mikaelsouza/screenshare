@@ -7,10 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (MAJOR.MINOR.PATCH); leave empty to use package.json version"
-        required: false
+        description: "Release version (MAJOR.MINOR.PATCH, e.g. 1.0.8)"
+        required: true
         type: string
-        default: ""
 
 permissions:
   contents: read
@@ -67,11 +66,11 @@ jobs:
             RELEASE_VERSION="${BASH_REMATCH[1]}"
           else
             TRIMMED_INPUT="$(printf '%s' "${INPUT_VERSION:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-            if [ -n "$TRIMMED_INPUT" ]; then
-              RAW_VERSION="${TRIMMED_INPUT#v}"
-            else
-              RAW_VERSION="$(node -p "require('./package.json').version")"
+            if [ -z "$TRIMMED_INPUT" ]; then
+              echo "::error::Release version input is required for workflow_dispatch (expected MAJOR.MINOR.PATCH)."
+              exit 1
             fi
+            RAW_VERSION="${TRIMMED_INPUT#v}"
             if [[ ! "$RAW_VERSION" =~ ^([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
               echo "::error::Release version '$RAW_VERSION' must match MAJOR.MINOR.PATCH"
               exit 1
